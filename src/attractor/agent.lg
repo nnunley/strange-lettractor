@@ -123,15 +123,101 @@
     (catch Object e
       (str "Error listing directory " dir ": " e))))
 
+(defn- acquire-session-lock! [lock]
+  (loop []
+    (when-not (compare-and-set! lock false true)
+      (core/sleep 1)
+      (recur))))
+
+(defn- with-session-lock [session operation]
+  (let [lock (:lifecycle_lock @session)]
+    (acquire-session-lock! lock)
+    (try
+      (operation)
+      (finally
+        (reset! lock false)))))
+
+(def ^:dynamic *delivering-session-id* nil)
+
+(defn- deliver-event! [session stamped listener]
+  (binding [*delivering-session-id* (:id @session)]
+    (let [stored-listener (:event_fn @session)]
+      (when stored-listener
+        (try
+          (stored-listener stamped)
+          (catch Object e
+            (swap! (:listener_errors @session) conj e))))
+      (when (and listener (not= listener stored-listener))
+        (try
+          (listener stamped)
+          (catch Object e
+            (swap! (:listener_errors @session) conj e))))))
+  stamped)
+
+(defn- drain-event-deliveries! [session]
+  (let [active (:delivery_active @session)]
+    (when (compare-and-set! active false true)
+      (loop []
+        (let [delivery
+              (with-session-lock
+                session
+                (fn []
+                  (let [queued @(:delivery_queue @session)]
+                    (if (seq queued)
+                      (do
+                        (reset! (:delivery_queue @session)
+                                (vec (rest queued)))
+                        (first queued))
+                      (do
+                        (reset! active false)
+                        nil)))))]
+          (when delivery
+            (deliver-event! session (:event delivery) (:listener delivery))
+            (when-let [delivered (:delivered delivery)]
+              (deliver delivered true))
+            (recur)))))))
+
+(defn- stamped-event [session event]
+  (assoc event
+         :timestamp (System/currentTimeMillis)
+         :session_id (:id @session)))
+
 (defn- emit-event! [session event & [listener]]
-  (let [stored-listener (:event_fn @session)
-        stamped (assoc event
-                       :timestamp (System/currentTimeMillis)
-                       :session_id (:id @session))]
-    (swap! (:events @session) conj stamped)
-    (when stored-listener (stored-listener stamped))
-    (when (and listener (not= listener stored-listener))
-      (listener stamped))
+  (let [stamped
+        (with-session-lock
+          session
+          (fn []
+            (when (and (not= :closed (:state @session))
+                       (not @(:session_end_emitted @session)))
+              (let [value (stamped-event session event)]
+                (swap! (:events @session) conj value)
+                (swap! (:delivery_queue @session) conj
+                       {:event value :listener listener})
+                value))))]
+    (when stamped (drain-event-deliveries! session))
+    stamped))
+
+(defn- publish-session-end! [session event listener]
+  (let [delivered (promise)
+        stamped
+        (with-session-lock
+          session
+          (fn []
+            (when (compare-and-set! (:session_end_emitted @session)
+                                    false true)
+              (let [value
+                    (stamped-event
+                      session
+                      (merge {:type :session_end :state :closed} event))]
+                (swap! (:events @session) conj value)
+                (swap! (:delivery_queue @session) conj
+                       {:event value :listener listener
+                        :delivered delivered})
+                value))))]
+    (when stamped (drain-event-deliveries! session))
+    (when (and stamped
+               (not= *delivering-session-id* (:id @session)))
+      @delivered)
     stamped))
 
 (defn session-events [session]
@@ -304,11 +390,20 @@
                  :llm_client (:llm_client options)
                  :event_fn (:on_event options)
                  :events (atom [])
+                 :lifecycle_lock (atom false)
+                 :delivery_queue (atom [])
+                 :delivery_active (atom false)
+                 :listener_errors (atom [])
                  :project_docs project-docs
                  :environment_snapshot snapshot
                  :state :idle
                  :abort_signaled false
+                 :llm_abort_controller (llm/make-abort-controller)
+                 :active_stream_close nil
+                 :cleanup_started (atom false)
+                 :cleanup_error (atom nil)
                  :cleanup_done false
+                 :session_end_emitted (atom false)
                  :history []
                  :steering-queue []
                  :followup-queue []
@@ -330,40 +425,126 @@
       session)))
 
 ;; Inject a steering message into the session
+(defn- enqueue-session-message! [session queue-key msg]
+  (let [queued?
+        (with-session-lock
+          session
+          (fn []
+            (when (and (not= :closed (:state @session))
+                       (not @(:session_end_emitted @session)))
+              (swap! session update queue-key conj msg)
+              true)))]
+    (if queued?
+      session
+      (throw (ex-info "Cannot enqueue input after the session is closed"
+                      {:category :session-closed
+                       :session_id (:id @session)})))))
+
 (defn steer-session! [session msg]
-  (swap! session update :steering-queue conj msg)
-  session)
+  (enqueue-session-message! session :steering-queue msg))
 
 (defn follow-up-session! [session msg]
-  (swap! session update :followup-queue conj msg)
-  session)
+  (enqueue-session-message! session :followup-queue msg))
 
 (defn- cleanup-session! [session]
-  (when-not (:cleanup_done @session)
-    (doseq [[agent-id _] (:subagents @session)]
-      (close-subagent! session agent-id))
-    (when-let [cleanup (get-in @session [:execution_env :cleanup])]
-      (cleanup))
-    (swap! session assoc :cleanup_done true))
+  (if (compare-and-set! (:cleanup_started @session) false true)
+    (let [errors (atom [])]
+      (try
+        (when-let [close-stream (:active_stream_close @session)]
+          (try
+            (close-stream)
+            (catch Object e (swap! errors conj e))))
+        (swap! session assoc :active_stream_close nil)
+        (doseq [[agent-id _] (:subagents @session)]
+          (try
+            (close-subagent! session agent-id)
+            (catch Object e (swap! errors conj e))))
+        (when-let [cleanup (get-in @session [:execution_env :cleanup])]
+          (try
+            (cleanup)
+            (catch Object e (swap! errors conj e))))
+        (finally
+          (when (seq @errors)
+            (reset! (:cleanup_error @session) (first @errors)))
+          (swap! session assoc :cleanup_done true))))
+    (loop []
+      (when-not (:cleanup_done @session)
+        (core/sleep 1)
+        (recur))))
+  (when-let [error @(:cleanup_error @session)]
+    (throw error))
   session)
+
+(defn- emit-session-end! [session event on-event]
+  (publish-session-end! session event on-event))
 
 (defn close-session! [session & [on-event]]
-  (cleanup-session! session)
-  (swap! session assoc :state :closed)
-  (emit-event! session {:type :session_end :state :closed} on-event)
-  session)
+  (with-session-lock session (fn [] (swap! session assoc :state :closed)))
+  (let [cleanup-error
+        (try
+          (cleanup-session! session)
+          nil
+          (catch Object e e))]
+    (emit-session-end!
+      session
+      (if cleanup-error {:cleanup_error (str cleanup-error)} {})
+      on-event)
+    (if cleanup-error
+      (throw cleanup-error)
+      session)))
+
+(defn- close-session-after-error! [session error on-event]
+  (with-session-lock session (fn [] (swap! session assoc :state :closed)))
+  (let [cleanup-error
+        (try
+          (cleanup-session! session)
+          nil
+          (catch Object e e))]
+    (emit-session-end!
+      session
+      (cond-> {:error (str error)}
+        cleanup-error (assoc :cleanup_error (str cleanup-error)))
+      on-event)))
 
 (defn abort-session! [session & [on-event]]
-  (swap! session assoc :abort_signaled true)
+  (with-session-lock
+    session
+    (fn [] (swap! session assoc :abort_signaled true :state :closed)))
+  (when-let [abort (get-in @session [:llm_abort_controller :abort])]
+    (abort))
   (close-session! session on-event))
+
+(defn- session-stopped? [session]
+  (or (:abort_signaled @session)
+      (= :closed (:state @session))))
+
+(defn- register-active-stream-close! [session close-fn]
+  (let [closed (atom false)
+        close-once
+        (fn []
+          (when (compare-and-set! closed false true)
+            (close-fn)))]
+    (swap! session assoc :active_stream_close close-once)
+    (when (session-stopped? session)
+      (close-once))))
+
+(defn- append-history-if-open! [session turn]
+  (with-session-lock
+    session
+    (fn []
+      (when (and (not= :closed (:state @session))
+                 (not @(:session_end_emitted @session)))
+        (swap! session update :history conj turn)
+        true))))
 
 (defn- drain-steering! [session event-fn]
   (let [queued (:steering-queue @session)]
     (doseq [msg queued]
-      (swap! session update :history conj
-             {:type :steering :role :user :content msg
-              :timestamp (System/currentTimeMillis)})
-      (event-fn {:type :steering_injected :content msg}))
+      (when (append-history-if-open!
+              session
+              {:type :steering :role :user :content msg
+               :timestamp (System/currentTimeMillis)})
+        (event-fn {:type :steering_injected :content msg})))
     (swap! session assoc :steering-queue [])))
 
 (defn- history-to-messages [history]
@@ -452,6 +633,57 @@
       (get-in response [:message :tool_calls])
       []))
 
+(defn- stream-response! [session stream-fn request event-fn]
+  (let [accumulator (llm/make-stream-accumulator)
+        text-started (atom false)
+        finish-seen (atom false)
+        ensure-text-start!
+        (fn []
+          (when (compare-and-set! text-started false true)
+            (event-fn {:type :assistant_text_start})))
+        stream-request
+        (assoc request
+               :register_stream_close
+               (fn [close-fn]
+                 (register-active-stream-close! session close-fn)))]
+    (try
+      (doseq [event (stream-fn stream-request)]
+        (when-not (session-stopped? session)
+          (llm/stream-accumulator-process! accumulator event)
+          (case (:type event)
+            :stream_start (ensure-text-start!)
+            :text_start (ensure-text-start!)
+            :text_delta
+            (do
+              (ensure-text-start!)
+              (event-fn {:type :assistant_text_delta
+                         :delta (:delta event)
+                         :text_id (:text_id event)}))
+            :text_end nil
+            :finish (reset! finish-seen true)
+            :error
+            (throw
+              (ex-info (str "LLM stream failed: " (:error event))
+                       {:category :provider-stream
+                        :provider_error (:error event)}))
+            nil)))
+      (if (session-stopped? session)
+        nil
+        (do
+          (when-not @finish-seen
+            (throw (ex-info "LLM stream ended before a finish event"
+                            {:category :provider-stream})))
+          (ensure-text-start!)
+          (or (llm/stream-accumulator-response accumulator)
+              {:message {:role :assistant :content ""}
+               :tool_calls []})))
+      (finally
+        (when-let [close-stream (:active_stream_close @session)]
+          (try
+            (close-stream)
+            (catch Object _ nil)))
+        (swap! session assoc :active_stream_close nil)))))
+
 (defn- tool-call-signature [tool-call]
   [(or (:name tool-call) (get tool-call "name"))
    (or (:arguments tool-call) (get tool-call "arguments"))])
@@ -481,21 +713,53 @@
             [1 2 3]))))))
 
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
-(defn process-input! [session prompt & [on-event]]
+(defn- process-input-cycle! [session prompt on-event followup?]
   (let [event-fn (fn [event] (emit-event! session event on-event))
         config (:config @session)
         profile (:provider_profile @session)
         environment (:execution_env @session)
-        complete-fn (or (:complete_fn config)
-                        (when-let [client (:llm_client @session)]
-                          (fn [request] (llm/client-complete client request)))
-                        (fn [request] (llm/complete request)))
+        client (:llm_client @session)
+        stream-fn
+        (cond
+          (:stream_fn config) (:stream_fn config)
+          (:complete_fn config) nil
+          (or (= "mock" (:id profile))
+              (not (:supports_streaming profile))) nil
+          client (fn [request] (llm/client-stream client request))
+          :else (fn [request] (llm/stream request)))
+        complete-fn
+        (when-not stream-fn
+          (or (:complete_fn config)
+              (when client
+                (fn [request] (llm/client-complete client request)))
+              (fn [request] (llm/complete request))))
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)]
-    (swap! session assoc :state :processing)
-    (swap! session update :history conj
-           {:type :user :role :user :content prompt
-            :timestamp (System/currentTimeMillis)})
+    (when-not
+      (with-session-lock
+        session
+        (fn []
+          (when (and (if followup?
+                       (= :processing (:state @session))
+                       (contains? #{:idle :awaiting_input}
+                                  (:state @session)))
+                     (not @(:session_end_emitted @session)))
+            (swap! session
+                   (fn [state]
+                     (-> state
+                         (assoc :state :processing)
+                         (update :history conj
+                                 {:type :user :role :user :content prompt
+                                  :timestamp (System/currentTimeMillis)}))))
+            true)))
+      (let [closed? (session-stopped? session)]
+        (throw
+          (ex-info
+            (if closed?
+              "Cannot process input after the session is closed"
+              "Cannot process concurrent input while the session is busy")
+            {:category (if closed? :session-closed :session-busy)
+             :session_id (:id @session)}))))
     (event-fn {:type :user_input :content prompt})
     (drain-steering! session event-fn)
     (let [result
@@ -503,13 +767,17 @@
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))]
-              (if (or (and (> round-limit 0) (>= round-count round-limit))
-                      (and (> turn-limit 0) (>= assistant-count turn-limit))
-                      (:abort_signaled @session))
+              (cond
+                (session-stopped? session) last-text
+
+                (or (and (> round-limit 0) (>= round-count round-limit))
+                    (and (> turn-limit 0) (>= assistant-count turn-limit)))
                 (do
                   (event-fn {:type :turn_limit :round round-count
                              :total_turns assistant-count})
                   last-text)
+
+                :else
                 (let [system-prompt
                       (assemble-system-prompt
                         profile environment
@@ -524,71 +792,110 @@
                                :tools (profiles/profile-tools profile)
                                :tool_choice {:mode "auto"}
                                :reasoning_effort (:reasoning_effort config)
-                               :provider_options (:provider_options profile)}
-                      _assistant-start (event-fn {:type :assistant_text_start})
+                               :provider_options (:provider_options profile)
+                               :abort_signal
+                               (get-in @session [:llm_abort_controller :signal])}
                       response
                       (try
-                        (complete-fn request)
+                        (if stream-fn
+                          (stream-response! session stream-fn request event-fn)
+                          (do
+                            (event-fn {:type :assistant_text_start})
+                            (complete-fn request)))
                         (catch Object e
-                          (event-fn {:type :error :error (str e)
-                                     :category (:category (ex-data e))})
-                          (cleanup-session! session)
-                          (swap! session assoc :state :closed)
-                          (event-fn {:type :session_end :state :closed
-                                     :error (str e)})
-                          (throw e)))
-                      text (response-content response)
-                      tool-calls (response-tool-calls response)
-                      assistant-turn {:type :assistant
-                                      :role :assistant
-                                      :content text
-                                      :tool_calls tool-calls
-                                      :reasoning (:reasoning response)
-                                      :usage (:usage response)
-                                      :response_id (:id response)
-                                      :timestamp (System/currentTimeMillis)}]
-                  (swap! session update :history conj assistant-turn)
-                  (event-fn {:type :assistant_text_end :text text
-                             :reasoning (:reasoning response)})
-                  (if (empty? tool-calls)
-                    text
-                    (let [execute-call
-                          (fn [tool-call]
-                            (execute-single-tool session tool-call event-fn))
-                          results
-                          (if (and (:supports_parallel_tool_calls profile)
-                                   (> (count tool-calls) 1))
-                            (vec (pmap execute-call tool-calls))
-                            (mapv execute-call tool-calls))]
-                      (swap! session update :history conj
-                             {:type :tool_results :role :tool :results results
-                              :timestamp (System/currentTimeMillis)})
-                      (drain-steering! session event-fn)
-                      (when (and (:enable_loop_detection config)
-                                 (detect-loop (:history @session)
-                                              (:loop_detection_window config)))
-                        (let [warning
-                              (str "Loop detected: recent tool calls repeat. "
-                                   "Try a different approach.")]
-                          (swap! session update :history conj
-                                 {:type :steering :role :user :content warning
-                                  :timestamp (System/currentTimeMillis)})
-                          (event-fn {:type :loop_detection :message warning})))
-                      (recur (inc round-count) text)))))))]
-      (cond
-        (:abort_signaled @session) result
+                          (if (session-stopped? session)
+                            nil
+                            (do
+                              (event-fn {:type :error :error (str e)
+                                         :category (:category (ex-data e))})
+                              (close-session-after-error! session e on-event)
+                              (throw e)))))]
+                  (if (session-stopped? session)
+                    last-text
+                    (let [text (response-content response)
+                          tool-calls (response-tool-calls response)
+                          assistant-turn {:type :assistant
+                                          :role :assistant
+                                          :content text
+                                          :tool_calls tool-calls
+                                          :reasoning (:reasoning response)
+                                          :usage (:usage response)
+                                          :response_id (:id response)
+                                          :timestamp (System/currentTimeMillis)}]
+                      (if-not (append-history-if-open! session assistant-turn)
+                        last-text
+                        (do
+                          (event-fn {:type :assistant_text_end :text text
+                                     :reasoning (:reasoning response)})
+                          (if (empty? tool-calls)
+                            text
+                            (if (session-stopped? session)
+                              text
+                              (let [execute-call
+                                    (fn [tool-call]
+                                      (execute-single-tool session tool-call event-fn))
+                                    results
+                                    (if (and (:supports_parallel_tool_calls profile)
+                                             (> (count tool-calls) 1))
+                                      (vec (pmap execute-call tool-calls))
+                                      (mapv execute-call tool-calls))
+                                    recorded?
+                                    (append-history-if-open!
+                                      session
+                                      {:type :tool_results :role :tool
+                                       :results results
+                                       :timestamp (System/currentTimeMillis)})]
+                                (if-not recorded?
+                                  text
+                                  (do
+                                    (drain-steering! session event-fn)
+                                    (when (and (:enable_loop_detection config)
+                                               (detect-loop
+                                                 (:history @session)
+                                                 (:loop_detection_window config)))
+                                      (let [warning
+                                            (str "Loop detected: recent tool calls repeat. "
+                                                 "Try a different approach.")]
+                                        (when (append-history-if-open!
+                                                session
+                                                {:type :steering :role :user
+                                                 :content warning
+                                                 :timestamp (System/currentTimeMillis)})
+                                          (event-fn
+                                            {:type :loop_detection
+                                             :message warning}))))
+                                    (recur (inc round-count) text))))))))))))))]
+      (let [decision
+            (with-session-lock
+              session
+              (fn []
+                (cond
+                  (= :closed (:state @session)) {:kind :stopped}
+                  (seq (:followup-queue @session))
+                  (let [next-input (first (:followup-queue @session))]
+                    (swap! session update :followup-queue
+                           (fn [queued] (vec (rest queued))))
+                    {:kind :followup :input next-input})
+                  :else
+                  (do
+                    (swap! session assoc :state :idle)
+                    {:kind :idle}))))]
+        (case (:kind decision)
+          :stopped result
+          :followup
+          (try
+            (process-input-cycle! session (:input decision) on-event true)
+            (catch Object e
+              (if (and (session-stopped? session)
+                       (= :session-closed (:category (ex-data e))))
+                result
+                (throw e))))
+          (do
+            (event-fn {:type :processing_end})
+            result))))))
 
-        (seq (:followup-queue @session))
-        (let [next-input (first (:followup-queue @session))]
-          (swap! session update :followup-queue
-                 (fn [queued] (vec (rest queued))))
-          (process-input! session next-input event-fn))
-
-        :else
-        (do
-          (swap! session assoc :state :idle)
-          (event-fn {:type :processing_end})
-          result)))))
+(defn process-input! [session prompt & [on-event]]
+  (process-input-cycle! session prompt on-event false))
 
 ;; Compatibility name used by the Attractor codergen backend.
 (defn run-agent-turn! [session prompt & [on-event]]

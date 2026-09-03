@@ -1,8 +1,10 @@
 (ns attractor.agent-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [clojure.core :as core]
             [attractor.agent :as agent]
             [attractor.execution :as execution]
+            [attractor.llm :as llm]
             [attractor.profiles :as profiles]))
 
 (deftest test-character-truncation-preserves-head-and-tail
@@ -58,6 +60,12 @@
     (is (= "call-1" (get-in @session [:history 2 :results 0 :tool_call_id])))
     (is (some (fn [event] (= :tool_call_end (:type event))) @events))
     (is (= :tool (get-in @requests [1 :messages 3 :role])))))
+
+(deftest test-default-mock-session-retains-offline-completion
+  (let [session (agent/make-session {:project_docs []})
+        result (agent/process-input! session "offline work")]
+    (is (str/includes? result "[Mock LLM (default)]"))
+    (is (str/includes? result "offline work"))))
 
 (deftest test-agent-honors-tool-round-limit
   (let [calls (atom 0)
@@ -162,11 +170,349 @@
         closed (agent/make-session {:execution_env environment})
         aborted (agent/make-session {:execution_env environment})]
     (agent/close-session! closed)
+    (agent/close-session! closed)
     (is (= :closed (:state @closed)))
+    (agent/abort-session! aborted)
     (agent/abort-session! aborted)
     (is (= :closed (:state @aborted)))
     (is (true? (:abort_signaled @aborted)))
-    (is (= 2 @cleanups))))
+    (is (= 2 @cleanups))
+    (is (= 1 (count (filter #(= :session_end (:type %))
+                            (agent/session-events closed)))))
+    (is (= 1 (count (filter #(= :session_end (:type %))
+                            (agent/session-events aborted)))))))
+
+(deftest test-session-streams-assistant-text-deltas
+  (let [events (atom [])
+        requests (atom [])
+        stream-closes (atom 0)
+        adapter
+        (llm/make-adapter
+          "openai"
+          (fn [_] (throw (ex-info "blocking completion was used" {})))
+          (fn [request]
+            (swap! requests conj request)
+            ((:register_stream_close request)
+             (fn [] (swap! stream-closes inc)))
+            [{:type :stream_start}
+             {:type :text_start :text_id "text"}
+             {:type :text_delta :text_id "text" :delta "Hel"}
+             {:type :text_end :text_id "text"}
+             {:type :text_start :text_id "text-2"}
+             {:type :text_delta :text_id "text-2" :delta "lo"}
+             {:type :text_end :text_id "text-2"}
+             {:type :finish :finish_reason :stop :usage {}
+              :response {:id "stream-response"
+                         :message {:role :assistant :content "Hello"}
+                         :tool_calls [] :usage {}
+                         :finish_reason :stop}}]))
+        client (llm/make-client {:providers {"openai" adapter}
+                                 :default_provider "openai"})
+        session
+        (agent/make-session
+          {:model "openai/test"
+           :llm_client client})
+        result
+        (agent/process-input! session "work"
+                              (fn [event] (swap! events conj event)))]
+    (is (= "Hello" result))
+    (is (= 1 @stream-closes))
+    (is (= [:user :assistant] (mapv :type (:history @session))))
+    (is (fn? (get-in @requests [0 :abort_signal :aborted?])))
+    (is (= [:assistant_text_start :assistant_text_delta
+            :assistant_text_delta :assistant_text_end]
+           (mapv :type
+                 (filter #(contains? #{:assistant_text_start
+                                       :assistant_text_delta
+                                       :assistant_text_end}
+                                     (:type %))
+                         @events))))
+    (is (= ["Hel" "lo"]
+           (mapv :delta
+                 (filter #(= :assistant_text_delta (:type %)) @events))))
+    (is (= "Hello"
+           (:text (last (filter #(= :assistant_text_end (:type %)) @events)))))))
+
+(deftest test-abort-closes-active-session-stream-once
+  (let [started (promise)
+        stream-closed (atom false)
+        captured-signal (atom nil)
+        session
+        (agent/make-session
+          {:model "mock/test"
+           :stream_fn
+           (fn [request]
+             (reset! captured-signal (:abort_signal request))
+             ((:register_stream_close request)
+              (fn [] (reset! stream-closed true)))
+             (concat
+               [{:type :stream_start}]
+               (lazy-seq
+                 (deliver started :started)
+                 (loop []
+                   (when-not @stream-closed
+                     (core/sleep 5)
+                     (recur)))
+                 [])))})
+        task (core/future (agent/process-input! session "work"))]
+    (is (= :started (deref started 1000 :timeout)))
+    (agent/abort-session! session)
+    (is (= "" (deref task 1000 :timeout)))
+    (is (true? @stream-closed))
+    (is (true? ((:aborted? @captured-signal))))
+    (is (= :closed (:state @session)))
+    (is (empty? (filter #(= :assistant (:type %)) (:history @session))))
+    (is (= 1 (count (filter #(= :session_end (:type %))
+                            (agent/session-events session)))))))
+
+(deftest test-closed-sessions-reject-input-without-mutation
+  (let [calls (atom 0)
+        options {:project_docs []
+                 :complete_fn
+                 (fn [_]
+                   (swap! calls inc)
+                   {:message {:role :assistant :content "unexpected"}})}
+        closed (agent/make-session options)
+        aborted (agent/make-session options)]
+    (agent/close-session! closed)
+    (agent/abort-session! aborted)
+    (doseq [session [closed aborted]]
+      (let [history-before (:history @session)
+            events-before (agent/session-events session)
+            category
+            (try
+              (do (agent/process-input! session "too late") nil)
+              (catch Object error (:category (ex-data error))))]
+        (is (= :session-closed category))
+        (is (= history-before (:history @session)))
+        (is (= events-before (agent/session-events session)))
+        (is (= :closed (:state @session)))))
+    (is (= 0 @calls))))
+
+(deftest test-stream-exits-close-provider-resource-on-errors
+  (doseq [mode [:error_event :thrown_tail]]
+    (let [closes (atom 0)
+          stream-fn
+          (fn [request]
+            ((:register_stream_close request)
+             (fn [] (swap! closes inc)))
+            (if (= mode :error_event)
+              [{:type :stream_start}
+               {:type :error :error {:message "provider failed"}}]
+              (concat
+                [{:type :stream_start}]
+                (lazy-seq
+                  (throw (ex-info "tail failed" {:category :network}))))))
+          session (agent/make-session {:model "mock/test"
+                                       :stream_fn stream-fn})
+          thrown?
+          (try
+            (do (agent/process-input! session "work") false)
+            (catch Object _ true))]
+      (is (true? thrown?))
+      (is (= 1 @closes))
+      (is (= :closed (:state @session)))
+      (is (= 1 (count (filter #(= :session_end (:type %))
+                              (agent/session-events session))))))))
+
+(deftest test-reasoning-only-stream-still-brackets-assistant-turn
+  (let [events (atom [])
+        session
+        (agent/make-session
+          {:model "mock/test"
+           :stream_fn
+           (fn [_]
+             [{:type :stream_start}
+              {:type :reasoning_delta :reasoning_delta "thinking"}
+              {:type :finish :finish_reason :stop :usage {}
+               :response {:message {:role :assistant :content ""}
+                          :reasoning "thinking" :tool_calls []
+                          :usage {} :finish_reason :stop}}])})]
+    (is (= "" (agent/process-input!
+                 session "work" (fn [event] (swap! events conj event)))))
+    (is (= [:assistant_text_start :assistant_text_end]
+           (mapv :type
+                 (filter #(contains? #{:assistant_text_start
+                                       :assistant_text_end}
+                                     (:type %))
+                         @events))))
+    (is (= "thinking"
+           (:reasoning
+             (last (filter #(= :assistant_text_end (:type %)) @events)))))))
+
+(deftest test-abort-from-delta-listener-is-terminal
+  (let [stream-closes (atom 0)
+        session
+        (agent/make-session
+          {:model "mock/test"
+           :stream_fn
+           (fn [request]
+             ((:register_stream_close request)
+              (fn [] (swap! stream-closes inc)))
+             [{:type :stream_start}
+              {:type :text_delta :delta "before"}
+              {:type :text_delta :delta "after"}
+              {:type :finish :finish_reason :stop :usage {}
+               :response {:message {:role :assistant :content "beforeafter"}
+                          :tool_calls [] :usage {} :finish_reason :stop}}])})
+        result
+        (agent/process-input!
+          session "work"
+          (fn [event]
+            (when (and (= :assistant_text_delta (:type event))
+                       (= "before" (:delta event)))
+              (agent/abort-session! session))))
+        session-events (agent/session-events session)]
+    (is (= "" result))
+    (is (= 1 @stream-closes))
+    (is (= :session_end (:type (last session-events))))
+    (is (= ["before"]
+           (mapv :delta
+                 (filter #(= :assistant_text_delta (:type %))
+                         session-events))))
+    (is (empty? (filter #(= :assistant (:type %)) (:history @session))))))
+
+(deftest test-cross-thread-abort-delivers-session-end-after-pending-callback
+  (let [delta-entered (promise)
+        release-delta (promise)
+        callback-order (atom [])
+        listener
+        (fn [event]
+          (case (:type event)
+            :assistant_text_delta
+            (do
+              (deliver delta-entered :entered)
+              (deref release-delta 1000 :timeout)
+              (swap! callback-order conj :delta))
+            :session_end (swap! callback-order conj :session_end)
+            nil))
+        session
+        (agent/make-session
+          {:model "mock/test"
+           :on_event listener
+           :stream_fn
+           (fn [request]
+             ((:register_stream_close request) (fn [] nil))
+             [{:type :stream_start}
+              {:type :text_delta :delta "partial"}
+              {:type :finish :finish_reason :stop :usage {}
+               :response {:message {:role :assistant :content "partial"}
+                          :tool_calls [] :usage {}
+                          :finish_reason :stop}}])})
+        processing (core/future (agent/process-input! session "work"))]
+    (is (= :entered (deref delta-entered 1000 :timeout)))
+    (let [aborting (core/future (agent/abort-session! session))]
+      (is (= :timeout (deref aborting 20 :timeout)))
+      (deliver release-delta :released)
+      (is (not= :timeout (deref aborting 1000 :timeout))))
+    (is (= "" (deref processing 1000 :timeout)))
+    (is (= [:delta :session_end] @callback-order))))
+
+(deftest test-session-rejects-concurrent-process-input
+  (let [started (promise)
+        release-response (promise)
+        calls (atom 0)
+        session
+        (agent/make-session
+          {:project_docs []
+           :complete_fn
+           (fn [_]
+             (swap! calls inc)
+             (deliver started :started)
+             (deref release-response 1000 :timeout)
+             {:message {:role :assistant :content "done"}
+              :tool_calls []})})
+        first-input (core/future (agent/process-input! session "first"))]
+    (is (= :started (deref started 1000 :timeout)))
+    (is (= :session-busy
+           (try
+             (do (agent/process-input! session "second") nil)
+             (catch Object error (:category (ex-data error))))))
+    (is (= ["first"]
+           (mapv :content
+                 (filter #(= :user (:type %)) (:history @session)))))
+    (is (= 1 @calls))
+    (deliver release-response :released)
+    (is (= "done" (deref first-input 1000 :timeout)))))
+
+(deftest test-followup-enqueued-at-completion-boundary-is-processed
+  (let [holder (atom nil)
+        calls (atom [])
+        queued (atom false)
+        session
+        (agent/make-session
+          {:project_docs []
+           :on_event
+           (fn [event]
+             (when (and (= :assistant_text_end (:type event))
+                        (compare-and-set! queued false true))
+               (agent/follow-up-session! @holder "boundary followup")))
+           :complete_fn
+           (fn [request]
+             (let [content
+                   (:content
+                     (last (filter #(= :user (:role %))
+                                   (:messages request))))]
+               (swap! calls conj content)
+               {:message {:role :assistant :content (str "done: " content)}
+                :tool_calls []}))})]
+    (reset! holder session)
+    (is (= "done: boundary followup"
+           (agent/process-input! session "first")))
+    (is (= ["first" "boundary followup"] @calls))
+    (is (empty? (:followup-queue @session)))
+    (is (= :idle (:state @session)))))
+
+(deftest test-listener-errors-cannot-bypass-stream-cleanup
+  (let [closes (atom 0)
+        session
+        (agent/make-session
+          {:model "mock/test"
+           :on_event (fn [_] (throw (ex-info "listener failed" {})))
+           :stream_fn
+           (fn [request]
+             ((:register_stream_close request)
+              (fn [] (swap! closes inc)))
+             [{:type :stream_start}
+              {:type :error :error {:message "provider failed"}}])})
+        thrown?
+        (try
+          (do (agent/process-input! session "work") false)
+          (catch Object _ true))]
+    (is (true? thrown?))
+    (is (= 1 @closes))
+    (is (= :closed (:state @session)))
+    (is (= :session_end (:type (last (agent/session-events session)))))
+    (is (seq @(:listener_errors @session)))))
+
+(deftest test-closed-session-rejects-steering-and-followups
+  (let [session (agent/make-session {:project_docs []})]
+    (agent/close-session! session)
+    (doseq [enqueue [(fn [] (agent/steer-session! session "steer"))
+                     (fn [] (agent/follow-up-session! session "follow"))]]
+      (is (= :session-closed
+             (try
+               (do (enqueue) nil)
+               (catch Object error (:category (ex-data error)))))))
+    (is (empty? (:steering-queue @session)))
+    (is (empty? (:followup-queue @session)))))
+
+(deftest test-cleanup-failure-still-emits-session-end
+  (let [session
+        (agent/make-session
+          {:execution_env
+           (execution/make-environment
+             {:cleanup (fn [] (throw (ex-info "cleanup failed" {})))})})
+        thrown?
+        (try
+          (do (agent/close-session! session) false)
+          (catch Object _ true))
+        endings (filter #(= :session_end (:type %))
+                        (agent/session-events session))]
+    (is (true? thrown?))
+    (is (= :closed (:state @session)))
+    (is (= 1 (count endings)))
+    (is (str/includes? (:cleanup_error (first endings)) "cleanup failed"))))
 
 (deftest test-session-event-stream-brackets-lifecycle-and-stamps-events
   (let [delivered (atom [])
