@@ -184,10 +184,9 @@
     (concat (base-tools edit-kind default-shell-timeout grep-output-modes)
             extra-tools)))
 
-(defn- provider-prompt [provider editing-guidance]
+(defn- provider-prompt [instructions]
   (fn [environment project-docs]
-    (str "You are the " provider " coding agent. " editing-guidance "\n"
-         "Work carefully, inspect files before editing, and verify changes.\n"
+    (str instructions "\n\n"
          "Working directory: " ((:working_directory environment)) "\n"
          "Platform: " ((:platform environment))
          (when (seq project-docs)
@@ -198,8 +197,20 @@
     {:id "openai" :model (or model "gpt-5.2-codex")
      :tool_registry (profile-registry "apply_patch" nil false [])
      :build_system_prompt
-     (provider-prompt "OpenAI/Codex"
-                      "Use apply_patch for precise file modifications.")}))
+     (provider-prompt
+       (str
+         "You are an OpenAI Codex coding agent. Work directly in the repository "
+         "and use the available tools to complete the user's request.\n"
+         "Inspect relevant files before changing them. Use read_file and search "
+         "tools to gather context, and use shell for commands that materially "
+         "advance or verify the task.\n"
+         "Use apply_patch for precise file modifications. Every patch must use "
+         "the v4a envelope beginning with `*** Begin Patch` and ending with "
+         "`*** End Patch`; keep each patch scoped and preserve unrelated work.\n"
+         "Prefer root-cause fixes and maintain the project's existing style. "
+         "If a tool reports an error, diagnose it from the evidence before "
+         "retrying. Verify changes with focused tests and then the appropriate "
+         "broader checks."))}))
 
 (defn create-anthropic-profile [& [model]]
   (make-profile
@@ -207,8 +218,19 @@
      :tool_registry (profile-registry "edit_file" 120000 true [])
      :default_command_timeout_ms 120000
      :build_system_prompt
-     (provider-prompt "Anthropic/Claude"
-                      "Use exact old_string/new_string edits; old_string must be unique.")}))
+     (provider-prompt
+       (str
+         "You are an Anthropic Claude coding agent. Use the available tools to "
+         "understand the codebase, make requested changes, and validate them.\n"
+         "Read before editing. Choose the narrowest suitable tool: search and "
+         "read_file for investigation, edit_file for existing files, write_file "
+         "for new or deliberately complete replacements, and shell for execution.\n"
+         "With edit_file, old_string must match the file exactly and must be "
+         "unique unless replace_all is intentionally true. Prefer editing an "
+         "existing file over rewriting it with write_file, and preserve unrelated "
+         "user changes.\n"
+         "Fix underlying causes, follow repository conventions, handle tool errors "
+         "from their evidence, and verify the result with focused and broader tests."))}))
 
 (defn create-gemini-profile [& [model]]
   (let [read-many
@@ -232,8 +254,17 @@
        :tool_registry (profile-registry "edit_file" nil false
                                         [read-many list-dir])
        :build_system_prompt
-       (provider-prompt "Google/Gemini"
-                        "Use the available filesystem tools and honor GEMINI.md guidance.")})))
+       (provider-prompt
+         (str
+           "You are a Google Gemini coding agent. Use the available tools to "
+           "inspect, modify, and verify the repository.\n"
+           "Treat applicable GEMINI.md files as project instructions. Use list_dir "
+           "to understand directory structure, read_many_files when several files "
+           "are relevant, search tools to locate code, edit_file for exact scoped "
+           "changes, and shell to run commands.\n"
+           "Read relevant code before editing, preserve unrelated work, follow the "
+           "project's conventions, address root causes, recover thoughtfully from "
+           "tool errors, and verify changes with focused tests and broader checks."))})))
 
 (defn create-profile [provider model]
   (case provider

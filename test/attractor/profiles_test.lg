@@ -1,5 +1,6 @@
 (ns attractor.profiles-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
             [attractor.profiles :as profiles]))
 
 (deftest test-tool-registry-is-latest-wins
@@ -124,6 +125,28 @@
                "new_string" "y" "replace_all" false}
               environment)))
     (is (= [["a.txt" "x" "y" false]] @calls))))
+
+(deftest test-provider-system-prompts-cover-native-agent-conventions
+  (let [environment {:working_directory (fn [] "/workspace")
+                     :platform (fn [] "test-os")}
+        prompt (fn [profile]
+                 (str/lower-case
+                   (profiles/build-system-prompt profile environment [])))
+        openai (prompt (profiles/create-openai-profile))
+        anthropic (prompt (profiles/create-anthropic-profile))
+        gemini (prompt (profiles/create-gemini-profile))]
+    (doseq [topic ["openai codex" "tool" "apply_patch"
+                   "*** begin patch" "verify" "error"]]
+      (is (str/includes? openai topic) topic))
+    (doseq [topic ["anthropic claude" "tool" "read before"
+                   "edit_file" "old_string" "unique" "write_file"
+                   "verify"]]
+      (is (str/includes? anthropic topic) topic))
+    (doseq [topic ["google gemini" "tool" "gemini.md"
+                   "read_many_files" "list_dir" "edit_file" "verify"]]
+      (is (str/includes? gemini topic) topic))
+    (is (not= openai anthropic))
+    (is (not= anthropic gemini))))
 
 (deftest test-profile-compatibility-api
   (is (= "openai" (:id (profiles/create-openai-profile))))
