@@ -1,7 +1,11 @@
 (ns attractor.server
   (:require [clojure.string :as str]
             [json :as json]
+            [io :as io]
+            [os :as os]
             [attractor.parser :as parser]
+            [attractor.transforms :as transforms]
+            [attractor.validation :as validation]
             [attractor.engine :as engine]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
@@ -25,6 +29,29 @@
              "Access-Control-Allow-Origin" "*"}
    :body (str text)})
 
+(defn svg-response [svg]
+  {:status 200
+   :headers {"Content-Type" "image/svg+xml"
+             "Access-Control-Allow-Origin" "*"}
+   :body svg})
+
+(defn prepare-graph [dot-source]
+  (let [graph (transforms/apply-transforms (parser/parse-dot dot-source))]
+    (validation/validate-or-raise graph)
+    graph))
+
+(defn render-graph-svg [dot-source]
+  (let [dot-path (str (os/temp-dir) "/strange-lettractor-" (random-uuid) ".dot")]
+    (try
+      (io/spit dot-path dot-source)
+      (let [result (os/sh "dot" "-Tsvg" dot-path)]
+        (if (zero? (:exit result))
+          (:out result)
+          (throw (ex-info (str "Graphviz failed: " (:err result))
+                          {:exit (:exit result)}))))
+      (finally
+        (os/sh "rm" "-f" dot-path)))))
+
 ;; Handle POST /pipelines (start pipeline)
 (defn handle-start-pipeline [req]
   (try
@@ -35,11 +62,12 @@
                         {"dot" body})
                       body)
           dot-source (or (get body-data "dot") (get body-data :dot) "")
-          graph (parser/parse-dot dot-source)
-          pipeline-id (str "pipe-" (System/currentTimeMillis))
+          graph (prepare-graph dot-source)
+          pipeline-id (str "pipe-" (random-uuid))
           events-atom (atom [])
           questions-atom (atom {})
           pending-answers (atom {})
+          cancelled (atom false)
           ctx (context/make-context)
           logs-dir (str "attractor_runs/" pipeline-id)]
 
@@ -50,7 +78,11 @@
                                   (swap! questions-atom assoc qid q)
                                   ;; Wait for answer to be posted or timeout
                                   (loop [wait-ms 0]
-                                    (if-let [ans (get @pending-answers qid)]
+                                    (if @cancelled
+                                      (do
+                                        (swap! questions-atom dissoc qid)
+                                        {:value :cancelled :text "cancelled"})
+                                      (if-let [ans (get @pending-answers qid)]
                                       (do
                                         (swap! questions-atom dissoc qid)
                                         (swap! pending-answers dissoc qid)
@@ -61,7 +93,7 @@
                                           (or (:default q) {:value :timeout :text "timeout"}))
                                         (do
                                           (core/sleep 200)
-                                          (recur (+ wait-ms 200))))))))
+                                          (recur (+ wait-ms 200)))))))))
                               (ask-multiple [this questions]
                                 (vec (map (fn [q] (interviewer/ask this q)) questions)))
                               (inform [_ _ _] nil))
@@ -80,6 +112,7 @@
                 :events events-atom
                 :questions questions-atom
                 :pending-answers pending-answers
+                :cancelled cancelled
                 :context ctx
                 :logs_root logs-dir})
 
@@ -89,6 +122,7 @@
             (let [outcome (engine/run-pipeline graph {:context ctx
                                                       :logs-root logs-dir
                                                       :registry registry
+                                                      :cancelled? (fn [] @cancelled)
                                                       :on-event on-event})]
               (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
             (catch Object e
@@ -150,12 +184,14 @@
             ;; POST /pipelines/:id/cancel
             (and (= method :post) (= sub-route "cancel"))
             (do
+              (when-let [cancelled (:cancelled pipe)]
+                (reset! cancelled true))
               (swap! active-pipelines update pipe-id assoc :status :cancelled)
               (json-response {:id pipe-id :status "cancelled"}))
 
             ;; GET /pipelines/:id/graph
             (and (= method :get) (= sub-route "graph"))
-            (text-response (:dot pipe))
+            (svg-response (render-graph-svg (:dot pipe)))
 
             ;; GET /pipelines/:id/questions
             (and (= method :get) (= sub-route "questions"))

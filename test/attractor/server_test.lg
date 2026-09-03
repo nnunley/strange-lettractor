@@ -1,5 +1,6 @@
 (ns attractor.server-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
             [json :as json]
             [os :as os]
             [attractor.context :as context]
@@ -27,3 +28,45 @@
     (is (= "review" (get body "current_node")))
     (is (= ["start" "plan"] (get body "completed_nodes")))
     (is (= "ship" (get-in body ["context_values" "goal"])))))
+
+(deftest test-server-prepares-and-validates-submitted-pipelines
+  (let [invalid (server/handle-start-pipeline
+                  {:body "digraph G { only [shape=box] }"})]
+    (is (= 400 (:status invalid))))
+  (let [source
+        "digraph G {
+           graph [goal=\"Ship it\"]
+           start [shape=Mdiamond]
+           work [prompt=\"Do $goal\"]
+           exit [shape=Msquare]
+           start -> work -> exit
+         }"
+        response (server/handle-start-pipeline {:body source})
+        body (json/read-json (:body response))
+        pipeline (get @server/active-pipelines (get body "id"))]
+    (is (= 201 (:status response)))
+    (is (= "Do Ship it" (get-in pipeline [:graph :nodes "work" :prompt])))))
+
+(deftest test-server-cancel-signals-running-engine
+  (let [cancelled (atom false)
+        _ (reset! server/active-pipelines
+                  {"pipe-cancel" {:id "pipe-cancel" :status :running
+                                  :cancelled cancelled}})
+        response (server/app-handler
+                   {:request-method "POST"
+                    :path "/pipelines/pipe-cancel/cancel"})]
+    (is (= 200 (:status response)))
+    (is (true? @cancelled))
+    (is (= :cancelled (get-in @server/active-pipelines
+                              ["pipe-cancel" :status])))))
+
+(deftest test-server-graph-endpoint-returns-svg
+  (reset! server/active-pipelines
+          {"pipe-graph" {:id "pipe-graph"
+                         :dot "digraph G { start -> exit }"}})
+  (let [response (server/app-handler
+                   {:request-method "GET"
+                    :path "/pipelines/pipe-graph/graph"})]
+    (is (= 200 (:status response)))
+    (is (= "image/svg+xml" (get-in response [:headers "Content-Type"])))
+    (is (str/includes? (:body response) "<svg"))))

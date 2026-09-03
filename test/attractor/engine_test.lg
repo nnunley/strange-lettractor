@@ -80,3 +80,22 @@ digraph Gate {
     (is (= :success (:status res)))
     (is (= ["start" "flaky" "fix" "flaky" "exit"] (:completed_nodes res)))
     (os/sh "rm" "-rf" logs)))
+
+(deftest test-pipeline-honors-cancellation-signal
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   exit [shape=Msquare]
+                   start -> exit
+                 }")
+        cancelled (atom true)
+        logs "test_engine_cancelled"
+        events (atom [])
+        result (e/run-pipeline graph
+                               {:logs-root logs
+                                :cancelled? (fn [] @cancelled)
+                                :on-event (fn [event]
+                                            (swap! events conj event))})]
+    (is (= :cancelled (:status result)))
+    (is (some #(= :pipeline.cancelled (:type %)) @events))
+    (os/sh "rm" "-rf" logs)))

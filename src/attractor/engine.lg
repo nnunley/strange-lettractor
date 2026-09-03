@@ -221,6 +221,7 @@
    (let [ctx (or (:context options) (context/make-context))
          logs-root (context/init-run-dir (:logs-root options) graph)
          on-event (or (:on-event options) (fn [_] nil))
+         cancelled? (or (:cancelled? options) (fn [] false))
          registry (or (:registry options) (handlers/make-handler-registry))
          parallel-executor (get @registry handlers/parallel-executor-key)
          _parallel-init (when parallel-executor
@@ -243,12 +244,23 @@
             node-outcomes (normalize-node-outcomes (:node-outcomes options))
             step-count 0]
 
-       ;; Safety limit on steps to avoid infinite loops (10,000 steps max)
-       (if (> step-count 10000)
+       (cond
+         (cancelled?)
+         (let [res {:status :cancelled
+                    :failure_reason "Pipeline cancelled"
+                    :completed_nodes completed-nodes
+                    :context (context/ctx-snapshot ctx)}]
+           (on-event {:type :pipeline.cancelled
+                      :completed_nodes completed-nodes})
+           res)
+
+         ;; Safety limit on steps to avoid infinite loops (10,000 steps max)
+         (> step-count 10000)
          (let [res {:status :fail :failure_reason "Pipeline step limit exceeded (10000 steps)" :completed_nodes completed-nodes}]
            (on-event {:type :pipeline.failed :error (:failure_reason res)})
            res)
 
+         :else
          (let [node-id (:id current-node)]
            (context/ctx-set! ctx "current_node" node-id)
 
