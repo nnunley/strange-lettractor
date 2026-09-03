@@ -248,6 +248,10 @@
          (when-not (str/blank? user-instructions)
            (str "\n\n" user-instructions)))))
 
+(declare register-subagent-tools! close-subagent!)
+
+(def subagent-tool-names #{"spawn_agent" "send_input" "wait" "close_agent"})
+
 ;; Tool Dispatcher
 (defn execute-tool [tool-name args]
   (case tool-name
@@ -262,9 +266,16 @@
 (defn make-session [& [opts]]
   (let [options (or opts {})
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
-        profile (or (:provider_profile options)
-                    (profiles/create-profile (:provider parsed-model)
-                                             (:model parsed-model)))
+        base-profile (or (:provider_profile options)
+                         (profiles/create-profile (:provider parsed-model)
+                                                  (:model parsed-model)))
+        profile (assoc base-profile :tool_registry
+                       (atom @(get base-profile :tool_registry)))
+        _depth-tools
+        (when (>= (or (:subagent_depth options) 0)
+                  (or (:max_subagent_depth options) 1))
+          (swap! (:tool_registry profile)
+                 (fn [tools] (apply dissoc tools subagent-tool-names))))
         environment (assoc (or (:execution_env options)
                                (execution/make-local-environment
                                  {:default_command_timeout_ms
@@ -286,7 +297,7 @@
             (discover-project-docs environment (:id profile)))
           snapshot (environment-snapshot environment (:model profile))
           session
-          (atom {:id (str "agent-" (random-uuid))
+          (atom {:id (or (:id options) (str "agent-" (random-uuid)))
                  :model (:model profile)
                  :provider_profile profile
                  :execution_env environment
@@ -301,14 +312,20 @@
                  :history []
                  :steering-queue []
                  :followup-queue []
+                 :subagents {}
+                 :subagent_depth (or (:subagent_depth options) 0)
                  :config (merge {:max_turns 0
                                  :max_tool_rounds_per_input 0
                                  :default_command_timeout_ms 10000
                                  :max_command_timeout_ms 600000
                                  :reasoning_effort nil
                                  :enable_loop_detection true
-                                 :loop_detection_window 10}
+                                 :loop_detection_window 10
+                                 :max_subagent_depth 1}
                                 options)})]
+      (when (< (:subagent_depth @session)
+               (or (get-in @session [:config :max_subagent_depth]) 1))
+        (register-subagent-tools! session))
       (emit-event! session {:type :session_start})
       session)))
 
@@ -323,6 +340,8 @@
 
 (defn- cleanup-session! [session]
   (when-not (:cleanup_done @session)
+    (doseq [[agent-id _] (:subagents @session)]
+      (close-subagent! session agent-id))
     (when-let [cleanup (get-in @session [:execution_env :cleanup])]
       (cleanup))
     (swap! session assoc :cleanup_done true))
@@ -574,6 +593,157 @@
 ;; Compatibility name used by the Attractor codergen backend.
 (defn run-agent-turn! [session prompt & [on-event]]
   (process-input! session prompt on-event))
+
+(defn- subagent-arg [arguments key]
+  (or (get arguments key) (get arguments (keyword key))))
+
+(defn- subagent-turn-count [session]
+  (count (filter (fn [turn] (= :assistant (:type turn)))
+                 (:history @session))))
+
+(defn- start-subagent-run! [parent agent-id input]
+  (let [child (get-in @parent [:subagents agent-id :session])]
+    (when (nil? child)
+      (throw (ex-info (str "Unknown subagent: " agent-id)
+                      {:category :unknown-subagent :agent_id agent-id})))
+    (swap! parent update-in [:subagents agent-id]
+           assoc :status :running :result nil)
+    (let [task
+          (core/future
+            (try
+              (let [output (process-input! child input)
+                    result {:output output :success true
+                            :turns_used (subagent-turn-count child)}]
+                (swap! parent update-in [:subagents agent-id]
+                       assoc :status :completed :result result)
+                result)
+              (catch Object e
+                (let [result {:output (str e) :success false
+                              :turns_used (subagent-turn-count child)}]
+                  (swap! parent update-in [:subagents agent-id]
+                         assoc :status :failed :result result)
+                  result))))]
+      (swap! parent assoc-in [:subagents agent-id :future] task)
+      {:agent_id agent-id :status :running})))
+
+(defn spawn-subagent! [parent arguments]
+  (let [depth (:subagent_depth @parent)
+        max-depth (or (get-in @parent [:config :max_subagent_depth]) 1)]
+    (when (>= depth max-depth)
+      (throw (ex-info "Subagent depth limit reached"
+                      {:category :subagent-depth-limit
+                       :depth depth :max_depth max-depth})))
+    (let [task (subagent-arg arguments "task")
+          _ (when (str/blank? task)
+              (throw (ex-info "Subagent task is required"
+                              {:category :invalid-subagent-task})))
+          requested-dir (subagent-arg arguments "working_dir")
+          parent-environment (:execution_env @parent)
+          scoped-environment
+          (if (and (not (str/blank? requested-dir))
+                   (:with_working_directory parent-environment))
+            ((:with_working_directory parent-environment) requested-dir)
+            parent-environment)
+          ;; The parent owns shared-environment lifecycle cleanup.
+          child-environment (assoc scoped-environment
+                              :initialize (fn [] nil)
+                              :cleanup (fn [] nil))
+          parent-profile (:provider_profile @parent)
+          requested-model (subagent-arg arguments "model")
+          child-profile (if (str/blank? requested-model)
+                          parent-profile
+                          (profiles/create-profile (:id parent-profile)
+                                                   requested-model))
+          child-id (str "agent-" (random-uuid))
+          child
+          (make-session
+            {:id child-id
+             :provider_profile child-profile
+             :execution_env child-environment
+             :llm_client (:llm_client @parent)
+             :complete_fn (get-in @parent [:config :complete_fn])
+             :max_turns (or (subagent-arg arguments "max_turns") 0)
+             :max_tool_rounds_per_input
+             (get-in @parent [:config :max_tool_rounds_per_input])
+             :max_subagent_depth max-depth
+             :subagent_depth (inc depth)
+             :on_event
+             (fn [event]
+               (emit-event! parent
+                            {:type :subagent_event
+                             :agent_id child-id
+                             :event event}))})
+          agent-id (:id @child)]
+      (swap! parent assoc-in [:subagents agent-id]
+             {:id agent-id :session child :status :starting
+              :future nil :result nil})
+      (start-subagent-run! parent agent-id task))))
+
+(defn send-subagent-input! [parent agent-id message]
+  (let [handle (get-in @parent [:subagents agent-id])]
+    (when (nil? handle)
+      (throw (ex-info (str "Unknown subagent: " agent-id)
+                      {:category :unknown-subagent :agent_id agent-id})))
+    (if (= :running (:status handle))
+      (do
+        (follow-up-session! (:session handle) message)
+        {:agent_id agent-id :status :running :queued true})
+      (start-subagent-run! parent agent-id message))))
+
+(defn wait-subagent! [parent agent-id]
+  (let [handle (get-in @parent [:subagents agent-id])]
+    (when (nil? handle)
+      (throw (ex-info (str "Unknown subagent: " agent-id)
+                      {:category :unknown-subagent :agent_id agent-id})))
+    (if-let [task (:future handle)]
+      @task
+      (:result handle))))
+
+(defn close-subagent! [parent agent-id]
+  (let [handle (get-in @parent [:subagents agent-id])]
+    (when (nil? handle)
+      (throw (ex-info (str "Unknown subagent: " agent-id)
+                      {:category :unknown-subagent :agent_id agent-id})))
+    (abort-session! (:session handle))
+    (swap! parent update-in [:subagents agent-id] assoc :status :closed)
+    {:agent_id agent-id :status :closed}))
+
+(defn- subagent-tool [name description properties required executor]
+  {:definition
+   {:name name :description description
+    :parameters (cond-> {:type "object" :properties properties}
+                  (seq required) (assoc :required required))}
+   :executor executor})
+
+(defn register-subagent-tools! [session]
+  (let [registry (get-in @session [:provider_profile :tool_registry])
+        tools
+        [(subagent-tool
+           "spawn_agent" "Spawn a scoped coding subagent"
+           {:task {:type "string"} :working_dir {:type "string"}
+            :model {:type "string"} :max_turns {:type "integer"}}
+           ["task"]
+           (fn [arguments _] (spawn-subagent! session arguments)))
+         (subagent-tool
+           "send_input" "Send another input to a subagent"
+           {:agent_id {:type "string"} :message {:type "string"}}
+           ["agent_id" "message"]
+           (fn [arguments _]
+             (send-subagent-input! session
+                                   (subagent-arg arguments "agent_id")
+                                   (subagent-arg arguments "message"))))
+         (subagent-tool
+           "wait" "Wait for a subagent and return its result"
+           {:agent_id {:type "string"}} ["agent_id"]
+           (fn [arguments _]
+             (wait-subagent! session (subagent-arg arguments "agent_id"))))
+         (subagent-tool
+           "close_agent" "Terminate a subagent"
+           {:agent_id {:type "string"}} ["agent_id"]
+           (fn [arguments _]
+             (close-subagent! session (subagent-arg arguments "agent_id"))))]]
+    (doseq [tool tools] (profiles/register-tool! registry tool))
+    session))
 
 ;; CodergenBackend implementation backed by the Coding Agent Loop
 (defn make-agent-codergen-backend [& [session-opts]]

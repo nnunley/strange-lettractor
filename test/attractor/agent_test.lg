@@ -114,7 +114,8 @@
                        "cwd=/virtual/project"))
     (is (= "test-provider" (get-in @requests [0 :provider])))
     (is (= "native-model" (get-in @requests [0 :model])))
-    (is (= "read_file" (get-in @requests [0 :tools 0 :name])))))
+    (is (some #(= "read_file" (:name %))
+              (get-in @requests [0 :tools])))))
 
 (deftest test-session-processes-followups-after-current-input
   (let [prompts (atom [])
@@ -254,3 +255,57 @@
       (is (str/includes? prompt "<tools>"))
       (is (str/includes? prompt "project rules"))
       (is (str/ends-with? prompt "highest priority")))))
+
+(deftest test-subagent-lifecycle-shares-environment-and-is-depth-limited
+  (let [environment (execution/make-environment
+                      {:working_directory (fn [] "/shared")})
+        parent (agent/make-session
+                 {:execution_env environment
+                  :max_subagent_depth 1
+                  :complete_fn
+                  (fn [request]
+                    (let [last-user
+                          (:content
+                            (last (filter #(= :user (:role %))
+                                          (:messages request))))]
+                      {:message {:role :assistant
+                                 :content (str "done: " last-user)}
+                       :tool_calls []}))})
+        spawned (agent/spawn-subagent! parent {"task" "inspect"})
+        agent-id (:agent_id spawned)
+        result (agent/wait-subagent! parent agent-id)
+        child (get-in @parent [:subagents agent-id :session])]
+    (is (= "done: inspect" (:output result)))
+    (is (true? (:success result)))
+    (is (= 1 (:turns_used result)))
+    (is (= "/shared"
+           ((get-in @child [:execution_env :working_directory]))))
+    (is (not= (:history @parent) (:history @child)))
+    (is (contains?
+          (set (profiles/registry-names
+                 (get-in @parent [:provider_profile :tool_registry])))
+          "spawn_agent"))
+    (is (not (contains?
+               (set (profiles/registry-names
+                      (get-in @child [:provider_profile :tool_registry])))
+               "spawn_agent")))
+    (is (= :closed (:status (agent/close-subagent! parent agent-id))))))
+
+(deftest test-subagent-send-input-runs-another-independent-cycle
+  (let [parent (agent/make-session
+                 {:complete_fn
+                  (fn [request]
+                    {:message
+                     {:role :assistant
+                      :content
+                      (str "reply: "
+                           (:content
+                             (last (filter #(= :user (:role %))
+                                           (:messages request)))))}
+                     :tool_calls []})})
+        agent-id (:agent_id (agent/spawn-subagent! parent {"task" "one"}))]
+    (agent/wait-subagent! parent agent-id)
+    (is (= :running (:status
+                      (agent/send-subagent-input! parent agent-id "two"))))
+    (is (= "reply: two"
+           (:output (agent/wait-subagent! parent agent-id))))))

@@ -125,6 +125,10 @@
              :duration_ms duration}))]
     (make-environment
       {:working_directory (fn [] working-dir)
+       :with_working_directory
+       (fn [directory]
+         (make-local-environment
+           (assoc options :working_dir (path-for directory))))
        :platform (fn [] (os/os-name))
        :os_version (fn [] (str (os/os-name) "/" (os/arch)))
        :inspect_command
