@@ -1889,7 +1889,7 @@
         (mapcat (fn [event] (gemini-stream-events request state event))
                 (parse-sse-lines (stream-lines (:body resp))))))))
 
-(defn stream [request & [client-opts]]
+(defn- provider-stream [request & [client-opts]]
   (let [opts (merge request client-opts)
         parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
         provider (:provider parsed)
@@ -1900,6 +1900,97 @@
       "gemini" (gemini-stream req (:api_key opts) (:base_url opts))
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
                       {:provider provider :category :configuration})))))
+
+(defn make-stream-accumulator []
+  (atom {:started false
+         :text ""
+         :reasoning ""
+         :tool_calls {}
+         :tool_order []
+         :error nil
+         :response nil}))
+
+(defn- stream-tool-id [tool-call]
+  (or (:id tool-call) (get tool-call "id") ""))
+
+(defn- update-stream-tool! [accumulator tool-call]
+  (let [call-id (stream-tool-id tool-call)
+        existing (get-in @accumulator [:tool_calls call-id])
+        old-arguments (:arguments existing)
+        new-arguments (:arguments tool-call)
+        arguments
+        (cond
+          (and (string? old-arguments) (string? new-arguments))
+          (str old-arguments new-arguments)
+
+          (and (map? old-arguments) (map? new-arguments))
+          (merge old-arguments new-arguments)
+
+          (some? new-arguments) new-arguments
+          :else old-arguments)
+        merged (cond-> (merge existing tool-call)
+                 (some? arguments) (assoc :arguments arguments))]
+    (when-not (contains? (:tool_calls @accumulator) call-id)
+      (swap! accumulator update :tool_order conj call-id))
+    (swap! accumulator assoc-in [:tool_calls call-id] merged)))
+
+(defn stream-accumulator-process! [accumulator event]
+  (case (:type event)
+    :stream_start (swap! accumulator assoc
+                         :started true
+                         :text ""
+                         :reasoning ""
+                         :tool_calls {}
+                         :tool_order []
+                         :error nil
+                         :response nil
+                         :finish_reason nil
+                         :usage {})
+    :text_delta (swap! accumulator update :text append-string (:delta event))
+    :reasoning_delta
+    (swap! accumulator update :reasoning append-string
+           (:reasoning_delta event))
+    :tool_call_start (update-stream-tool! accumulator (:tool_call event))
+    :tool_call_delta (update-stream-tool! accumulator (:tool_call event))
+    :tool_call_end (update-stream-tool! accumulator (:tool_call event))
+    :error (swap! accumulator assoc :error (:error event))
+    :finish (swap! accumulator assoc
+                   :response (:response event)
+                   :finish_reason (:finish_reason event)
+                   :usage (:usage event))
+    nil)
+  event)
+
+(defn stream-accumulator-response [accumulator]
+  (let [snapshot @accumulator]
+    (or (:response snapshot)
+        (when (or (:started snapshot)
+                  (not (str/blank? (:text snapshot)))
+                  (not (str/blank? (:reasoning snapshot)))
+                  (seq (:tool_order snapshot)))
+          (let [tool-calls
+                (mapv (fn [call-id]
+                        (get-in snapshot [:tool_calls call-id]))
+                      (:tool_order snapshot))
+                parts
+                (vec
+                  (concat
+                    (when-not (str/blank? (:reasoning snapshot))
+                      [{:kind :thinking
+                        :thinking {:text (:reasoning snapshot)}}])
+                    (when-not (str/blank? (:text snapshot))
+                      [{:kind :text :text (:text snapshot)}])
+                    (map (fn [call]
+                           {:kind :tool_call :tool_call call})
+                         tool-calls)))]
+            {:message {:role :assistant
+                       :content parts
+                       :parts parts
+                       :text (:text snapshot)}
+             :reasoning (:reasoning snapshot)
+             :tool_calls tool-calls
+             :usage (or (:usage snapshot) {})
+             :finish_reason (:finish_reason snapshot)})))))
 
 ;; Provider adapter and configurable Client layer
 (defn make-adapter [name complete-fn stream-fn & [opts]]
@@ -2347,3 +2438,141 @@
       (throw (ex-info (str "No object generated: " reason)
                       {:category :no-object-generated :reason reason})))
     (assoc result :output parsed)))
+
+(defn- streamed-continuation-messages [conversation response tool-calls tool-results]
+  (let [assistant-message
+        (assoc (or (:message response)
+                   {:role :assistant :content ""})
+               :role :assistant
+               :tool_calls tool-calls)
+        tool-messages
+        (mapv (fn [result] {:role :tool :content [result]}) tool-results)]
+    (vec (concat conversation [assistant-message] tool-messages))))
+
+(defn- safe-stream-tail [events]
+  (lazy-seq
+    (try
+      (when-let [remaining (seq events)]
+        (cons (first remaining)
+              (safe-stream-tail (rest remaining))))
+      (catch Object e
+        (list {:type :error :error e})))))
+
+(defn- open-stream-events [client request retry-policy]
+  (let [opened
+        (retry
+          (fn []
+            (let [events (seq (client-stream client request))]
+              (if events
+                {:empty false
+                 :first (first events)
+                 :rest (rest events)}
+                {:empty true})))
+          retry-policy)]
+    (if (:empty opened)
+      []
+      (cons (:first opened) (safe-stream-tail (:rest opened))))))
+
+(defn- high-level-stream-events
+  [client request conversation tools round-number max-tool-rounds stop-when
+   steps retry-policy accumulator]
+  (lazy-seq
+    (let [provider-events
+          (open-stream-events
+            client (assoc request :messages conversation) retry-policy)
+          observed-events
+          (map (fn [event]
+                 (stream-accumulator-process! accumulator event))
+               provider-events)]
+      (concat
+        observed-events
+        (lazy-seq
+          (let [response (stream-accumulator-response accumulator)
+                tool-calls (or (:tool_calls response) [])
+                can-execute
+                (and (seq tool-calls)
+                     (nil? (:error @accumulator))
+                     (tool-call-finish? response)
+                     (< round-number max-tool-rounds)
+                     (empty?
+                       (filter (fn [call]
+                                 (passive-tool-call? tools call))
+                               tool-calls)))]
+            (when can-execute
+              (let [tool-results (execute-tool-calls tools tool-calls)
+                    step (step-result response tool-results)
+                    next-steps (conj steps step)
+                    stop? (and (some? stop-when) (stop-when next-steps))
+                    step-event {:type :step_finish
+                                :step step
+                                :step_number (inc round-number)}]
+                (cons
+                  step-event
+                  (when-not stop?
+                    (high-level-stream-events
+                      client request
+                      (streamed-continuation-messages
+                        conversation response tool-calls tool-results)
+                      tools (inc round-number) max-tool-rounds stop-when
+                      next-steps retry-policy accumulator)))))))))))
+
+(defn high-level-stream [model prompt & [opts]]
+  (let [options (or opts {})
+        prompt-present (or (some? prompt) (contains? options :prompt))
+        messages-present (contains? options :messages)
+        prompt-value (if (some? prompt) prompt (:prompt options))]
+    (when (= prompt-present messages-present)
+      (throw (ex-info "Exactly one of prompt or messages must be provided"
+                      {:category :invalid-request})))
+    (let [input-messages (if messages-present
+                           (:messages options)
+                           [{:role :user :content prompt-value}])
+          messages (if (some? (:system options))
+                     (vec (cons {:role :system :content (:system options)}
+                                input-messages))
+                     (vec input-messages))
+          request-options
+          (dissoc
+            (dissoc
+              (dissoc
+                (dissoc
+                  (dissoc
+                    (dissoc
+                      (dissoc
+                        (dissoc options :client)
+                        :prompt)
+                      :system)
+                    :messages)
+                  :max_tool_rounds)
+                :stop_when)
+              :retry_policy)
+            :max_retries)
+          request (merge request-options {:model model :messages messages})
+          client (generation-client options)
+          tools (or (:tools options) [])
+          retry-policy (cond-> (or (:retry_policy options) {})
+                         (contains? options :max_retries)
+                         (assoc :max_retries (:max_retries options)))
+          max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
+          accumulator (make-stream-accumulator)
+          events
+          (high-level-stream-events
+            client request messages tools 0 max-tool-rounds
+            (:stop_when options) [] retry-policy accumulator)]
+      {:events events
+       :text_stream
+       (map :delta (filter (fn [event] (= :text_delta (:type event))) events))
+       :response (fn [] (stream-accumulator-response accumulator))
+       :partial_response (fn [] (stream-accumulator-response accumulator))})))
+
+;; A map request selects the low-level provider API. A model string selects
+;; the high-level streaming API and returns a StreamResult-compatible map.
+(defn stream
+  ([request]
+   (provider-stream request nil))
+  ([request-or-model options-or-prompt]
+   (if (map? request-or-model)
+     (provider-stream request-or-model options-or-prompt)
+     (high-level-stream request-or-model options-or-prompt {})))
+  ([model prompt options]
+   (high-level-stream model prompt options)))

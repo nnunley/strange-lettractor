@@ -947,6 +947,162 @@
     (is (= "hi" (:delta (first events))))
     (is (true? (:observed (first events))))))
 
+(deftest test-stream-accumulator-builds-a-response
+  (let [acc (llm/make-stream-accumulator)]
+    (llm/stream-accumulator-process! acc {:type :stream_start})
+    (llm/stream-accumulator-process!
+      acc {:type :text_delta :delta "Hel"})
+    (is (= "Hel"
+           (get-in (llm/stream-accumulator-response acc)
+                   [:message :text])))
+    (llm/stream-accumulator-process!
+      acc {:type :finish
+           :response {:id "done" :message {:text "Hello"}
+                      :usage {:total_tokens 3}
+                      :finish_reason :stop}})
+    (is (= "done" (:id (llm/stream-accumulator-response acc))))))
+
+(deftest test-stream-accumulator-includes-partial-tool-calls
+  (let [acc (llm/make-stream-accumulator)
+        call {:id "call-1" :name "lookup" :arguments {}}]
+    (llm/stream-accumulator-process! acc {:type :stream_start})
+    (llm/stream-accumulator-process!
+      acc {:type :tool_call_start :tool_call call})
+    (llm/stream-accumulator-process!
+      acc {:type :tool_call_delta
+           :tool_call (assoc call :arguments "{\"q\":")})
+    (is (= "{\"q\":"
+           (get-in (llm/stream-accumulator-response acc)
+                   [:tool_calls 0 :arguments])))
+    (llm/stream-accumulator-process!
+      acc {:type :tool_call_end
+           :tool_call (assoc call :arguments {"q" "x"})})
+    (let [response (llm/stream-accumulator-response acc)]
+      (is (= {"q" "x"} (get-in response [:tool_calls 0 :arguments])))
+      (is (= :tool_call
+             (get-in response [:message :content 0 :kind]))))))
+
+(deftest test-high-level-stream-exposes-events-text-and-final-response
+  (let [adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_] nil)
+          (fn [_]
+            [{:type :stream_start}
+             {:type :text_start :text_id "text"}
+             {:type :text_delta :text_id "text" :delta "Hi"}
+             {:type :text_end :text_id "text"}
+             {:type :finish :finish_reason :stop :usage {}
+              :response {:id "response" :message {:text "Hi"}
+                         :tool_calls [] :usage {}
+                         :finish_reason :stop}}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream "mock/model" "hello" {:client client})
+        events (vec (:events result))]
+    (is (= [:stream_start :text_start :text_delta :text_end :finish]
+           (mapv :type events)))
+    (is (= ["Hi"] (vec (:text_stream result))))
+    (is (= "Hi" (get-in ((:response result)) [:message :text])))))
+
+(deftest test-high-level-stream-executes-tools-between-streaming-steps
+  (let [requests (atom [])
+        executions (atom [])
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_] nil)
+          (fn [request]
+            (swap! requests conj request)
+            (if (= 1 (count @requests))
+              [{:type :stream_start}
+               {:type :tool_call_start
+                :tool_call {:id "call-1" :name "lookup"
+                            :arguments {"q" "x"}}}
+               {:type :tool_call_end
+                :tool_call {:id "call-1" :name "lookup"
+                            :arguments {"q" "x"}}}
+               {:type :finish :finish_reason :tool_calls :usage {}
+                :response
+                {:message {:role :assistant :content ""}
+                 :tool_calls [{:id "call-1" :name "lookup"
+                               :arguments {"q" "x"}}]
+                 :usage {} :finish_reason :tool_calls}}]
+              [{:type :stream_start}
+               {:type :text_start :text_id "text"}
+               {:type :text_delta :text_id "text" :delta "done"}
+               {:type :text_end :text_id "text"}
+               {:type :finish :finish_reason :stop :usage {}
+                :response {:message {:text "done"}
+                           :tool_calls [] :usage {}
+                           :finish_reason :stop}}])))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        tool {:name "lookup"
+              :parameters {:type "object"
+                           :properties {"q" {:type "string"}}
+                           :required ["q"]}
+              :execute (fn [args]
+                         (swap! executions conj args)
+                         "found")}
+        result (llm/stream "mock/model" "go"
+                           {:client client :tools [tool]
+                            :max_tool_rounds 1})
+        events (vec (:events result))]
+    (is (= 2 (count @requests)))
+    (is (= [{"q" "x"}] @executions))
+    (is (= 1 (count (filter #(= :step_finish (:type %)) events))))
+    (is (= :tool (get-in @requests [1 :messages 2 :role])))
+    (is (= "done" (get-in ((:response result)) [:message :text])))))
+
+(deftest test-high-level-stream-retries-failure-before-first-event
+  (let [attempts (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [_]
+            (let [attempt (swap! attempts inc)]
+              (if (= attempt 1)
+                (lazy-seq
+                  (throw (ex-info "connect failed" {:retryable true})))
+                [{:type :stream_start}
+                 {:type :finish :finish_reason :stop :usage {}
+                  :response {:message {:text "ok"}
+                             :tool_calls [] :usage {}
+                             :finish_reason :stop}}]))))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream
+                 "mock/model" "go"
+                 {:client client :max_retries 1
+                  :retry_policy {:sleep_fn (fn [_] nil)}})
+        events (vec (:events result))]
+    (is (= 2 @attempts))
+    (is (= [:stream_start :finish] (mapv :type events)))))
+
+(deftest test-high-level-stream-emits-error-after-partial-delivery
+  (let [attempts (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [_]
+            (swap! attempts inc)
+            (lazy-seq
+              (cons {:type :text_delta :delta "partial"}
+                    (lazy-seq
+                      (throw (ex-info "stream broke" {:retryable true})))))))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream
+                 "mock/model" "go"
+                 {:client client :max_retries 2
+                  :retry_policy {:sleep_fn (fn [_] nil)}})
+        events (vec (:events result))]
+    (is (= 1 @attempts))
+    (is (= [:text_delta :error] (mapv :type events)))
+    (is (= "partial"
+           (get-in ((:partial_response result)) [:message :text])))))
+
 (deftest test-client-initializes-and-closes-adapters
   (let [events (atom [])
         adapter (llm/make-adapter
