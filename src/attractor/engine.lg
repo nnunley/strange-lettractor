@@ -91,6 +91,18 @@
                     (when (seq unconditional)
                       (best-by-weight-then-lexical unconditional))))))))))))
 
+(defn- select-failure-edge [node outcome ctx graph]
+  (let [matching (filter (fn [edge]
+                           (and (= "outcome=fail"
+                                   (str/lower-case
+                                     (str/replace (or (:condition edge) "")
+                                                  #"\s+" "")))
+                                (conditions/evaluate-condition
+                                  (:condition edge) outcome ctx)))
+                         (parser/outgoing-edges graph (:id node)))]
+    (when (seq matching)
+      (best-by-weight-then-lexical matching))))
+
 ;; Check if a node is terminal (shape=Msquare or id matches exit/end/done)
 (defn terminal-node? [node]
   (or (= (:shape node) "Msquare")
@@ -115,34 +127,143 @@
         t4 (let [t (:fallback_retry_target graph)] (when-not (str/blank? t) t))]
     (or t1 t2 t3 t4)))
 
-;; Backoff delay calculation in milliseconds
-(defn delay-for-attempt [attempt initial-delay-ms backoff-factor max-delay-ms]
-  (let [initial (or initial-delay-ms 200)
-        factor (or backoff-factor 2.0)
-        cap (or max-delay-ms 60000)
-        computed (* initial (math/pow factor (double (dec attempt))))]
-    (long (min computed (double cap)))))
+(defn- resolve-node-retry-target [node]
+  (let [primary (when node
+                  (let [target (:retry_target node)]
+                    (when-not (str/blank? target) target)))
+        fallback (when node
+                   (let [target (:fallback_retry_target node)]
+                     (when-not (str/blank? target) target)))]
+    (or primary fallback)))
+
+;; Named retry policies from Section 3.6. A node or graph max_retries value
+;; remains authoritative unless max_attempts is explicitly supplied by a caller.
+(def retry-policy-presets
+  {:none {:max_attempts 1 :initial_delay_ms 0 :backoff_factor 1.0}
+   :standard {:max_attempts 5 :initial_delay_ms 200 :backoff_factor 2.0}
+   :aggressive {:max_attempts 5 :initial_delay_ms 500 :backoff_factor 2.0}
+   :linear {:max_attempts 3 :initial_delay_ms 500 :backoff_factor 1.0}
+   :patient {:max_attempts 3 :initial_delay_ms 2000 :backoff_factor 3.0}})
+
+(defn retryable-error? [error]
+  (let [data (or (ex-data error) {})
+        explicit (:retryable data)
+        status (or (:status data) (:status_code data))
+        category (keyword
+                   (str/replace (name (or (:category data) :unknown))
+                                "-" "_"))
+        message (str/lower-case (str error))]
+    (cond
+      (some? explicit) (true? explicit)
+      (= status 429) true
+      (and (number? status) (>= status 500) (< status 600)) true
+      (#{:network_error :rate_limit_error :server_error
+         :timeout_error :transient_error} category) true
+      (or (str/includes? message "timed out")
+          (str/includes? message "timeout")
+          (str/includes? message "connection reset")
+          (str/includes? message "connection refused")) true
+      :else false)))
+
+(defn build-retry-policy [node graph options]
+  (let [requested (or (:retry-policy options) {})
+        preset-name (when (:name requested)
+                      (keyword (name (:name requested))))
+        preset (if preset-name
+                 (or (get retry-policy-presets preset-name) {})
+                 {})
+        configured (merge {:initial_delay_ms 200
+                           :backoff_factor 2.0
+                           :max_delay_ms 60000
+                           :jitter true}
+                          preset
+                          requested)
+        node-max-retries (:max_retries node)
+        graph-max-retries (or (:default_max_retries graph) 0)
+        explicit-attrs (or (:explicit_attrs graph) #{})
+        graph-explicit? (or (contains? explicit-attrs :default_max_retries)
+                            (contains? explicit-attrs :default_max_retry))]
+    (assoc configured
+           :max_attempts (max 1 (or (:max_attempts requested)
+                                    (when (some? node-max-retries)
+                                      (inc node-max-retries))
+                                    (when graph-explicit?
+                                      (inc graph-max-retries))
+                                    (:max_attempts preset)
+                                    (inc graph-max-retries)))
+           :should_retry (or (:should_retry requested) retryable-error?))))
+
+;; Backoff delay calculation in milliseconds. The four-argument form is kept
+;; for callers of the original API; the policy form also supports jitter.
+(defn delay-for-attempt
+  ([attempt initial-delay-ms backoff-factor max-delay-ms]
+   (delay-for-attempt attempt
+                      {:initial_delay_ms initial-delay-ms
+                       :backoff_factor backoff-factor
+                       :max_delay_ms max-delay-ms
+                       :jitter false}
+                      (fn [] 0.5)))
+  ([attempt policy random-fn]
+   (let [initial (or (:initial_delay_ms policy) 200)
+         factor (or (:backoff_factor policy) 2.0)
+         cap (or (:max_delay_ms policy) 60000)
+         computed (min (* initial
+                          (math/pow factor (double (dec attempt))))
+                       (double cap))
+         jittered (if (:jitter policy)
+                    (* computed (+ 0.5 (double (random-fn))))
+                    computed)]
+     (long jittered))))
+
+(defn- schedule-retry! [runtime policy node-id attempt on-event]
+  (let [delay-ms (delay-for-attempt attempt policy (:random-fn runtime))]
+    (swap! (:retry-counts runtime) assoc node-id attempt)
+    (on-event {:type :stage.retrying :node_id node-id
+               :attempt attempt :delay_ms delay-ms})
+    ((:sleep-fn runtime) delay-ms)))
 
 ;; Execute node with retry logic (Section 3.5 & 3.6)
-(defn execute-with-retry [handler node ctx graph logs-root on-event]
-  (let [node-max-retries (:max_retries node)
-        graph-max-retries (:default_max_retries graph)
-        max-retries (or node-max-retries graph-max-retries 0)
-        max-attempts (inc max-retries)
-        node-id (:id node)]
+(defn execute-with-retry
+  ([handler node ctx graph logs-root on-event]
+   (execute-with-retry handler node ctx graph logs-root on-event {}))
+  ([handler node ctx graph logs-root on-event options]
+   (let [policy (build-retry-policy node graph options)
+         max-attempts (:max_attempts policy)
+         node-id (:id node)
+         retry-counts (or (:retry-counts options) (atom {}))
+         runtime {:retry-counts retry-counts
+                  :sleep-fn (or (:sleep-fn options) core/sleep)
+                  :random-fn (or (:random-fn options) rand)}
+         prior-retries (or (get @retry-counts node-id)
+                           (get @retry-counts (keyword node-id))
+                           0)]
 
-    (loop [attempt 1]
+    (loop [attempt (inc prior-retries)]
       (on-event {:type :stage.started :node_id node-id :attempt attempt :max_attempts max-attempts})
-      (let [outcome (try
-                      (handler node ctx graph logs-root)
-                      (catch Object e
-                        {:status :fail :failure_reason (str e)}))
+      (let [execution (try
+                        {:outcome (handler node ctx graph logs-root)}
+                        (catch Object e {:error e}))
+            error (:error execution)
+            outcome (or (:outcome execution)
+                        {:status :fail :failure_reason (str error)})
             st (:status outcome)]
 
         (cond
+          error
+          (if (and ((:should_retry policy) error)
+                   (< attempt max-attempts))
+            (do
+              (schedule-retry! runtime policy node-id attempt on-event)
+              (recur (inc attempt)))
+            (do
+              (on-event {:type :stage.failed :node_id node-id
+                         :outcome outcome :will_retry false})
+              outcome))
+
           ;; Success or Partial Success
           (#{:success :partial_success} st)
           (do
+            (swap! retry-counts assoc node-id 0)
             (context/ctx-set! ctx (str "internal.retry_count." node-id) 0)
             (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
             outcome)
@@ -150,13 +271,14 @@
           ;; Retry requested
           (= st :retry)
           (if (< attempt max-attempts)
-            (let [delay-ms (delay-for-attempt attempt 200 2.0 60000)]
+            (do
               (context/ctx-set! ctx (str "internal.retry_count." node-id) attempt)
-              (on-event {:type :stage.retrying :node_id node-id :attempt attempt :delay_ms delay-ms})
-              (core/sleep (min delay-ms 1000)) ; small sleep
+              (schedule-retry! runtime policy node-id attempt on-event)
               (recur (inc attempt)))
             (if (:allow_partial node)
               (let [res {:status :partial_success :notes "retries exhausted, partial accepted"}]
+                (swap! retry-counts assoc node-id 0)
+                (context/ctx-set! ctx (str "internal.retry_count." node-id) 0)
                 (on-event {:type :stage.completed :node_id node-id :status :partial_success :outcome res})
                 res)
               (let [res {:status :fail :failure_reason (or (:failure_reason outcome) "max retries exceeded")}]
@@ -165,22 +287,16 @@
 
           ;; Permanent Failure
           (= st :fail)
-          (if (< attempt max-attempts)
-            (let [delay-ms (delay-for-attempt attempt 200 2.0 60000)]
-              (context/ctx-set! ctx (str "internal.retry_count." node-id) attempt)
-              (on-event {:type :stage.retrying :node_id node-id :attempt attempt :delay_ms delay-ms})
-              (core/sleep (min delay-ms 1000))
-              (recur (inc attempt)))
-            (do
-              (on-event {:type :stage.failed :node_id node-id :outcome outcome :will_retry false})
-              outcome))
+          (do
+            (on-event {:type :stage.failed :node_id node-id :outcome outcome :will_retry false})
+            outcome)
 
           :else
           (do
             (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
-            outcome))))))
+            outcome)))))))
 
-(defn execute-subgraph [start-node-id ctx graph logs-root registry on-event]
+(defn execute-subgraph [start-node-id ctx graph logs-root registry on-event retry-options]
   (loop [current-node (parser/find-node graph start-node-id)
          last-outcome {:status :success}
          step-count 0]
@@ -199,7 +315,8 @@
 
       :else
       (let [handler (handlers/resolve-handler registry current-node)
-            outcome (execute-with-retry handler current-node ctx graph logs-root on-event)
+            outcome (execute-with-retry handler current-node ctx graph logs-root
+                                        on-event retry-options)
             node-id (:id current-node)]
         (write-stage-status! logs-root node-id outcome)
         (context/ctx-apply-updates! ctx (:context_updates outcome))
@@ -207,9 +324,18 @@
                           (if (keyword? (:status outcome))
                             (name (:status outcome))
                             (str (:status outcome))))
-        (let [next-edge (select-edge current-node outcome ctx graph)]
+        (let [next-edge (if (= :fail (:status outcome))
+                          (select-failure-edge current-node outcome ctx graph)
+                          (select-edge current-node outcome ctx graph))]
           (if (nil? next-edge)
-            outcome
+            (if (= :fail (:status outcome))
+              (let [retry-target (resolve-node-retry-target current-node)]
+                (if (and retry-target (parser/find-node graph retry-target))
+                  (recur (parser/find-node graph retry-target)
+                         outcome
+                         (inc step-count))
+                  outcome))
+              outcome)
             (recur (parser/find-node graph (:to next-edge))
                    outcome
                    (inc step-count))))))))
@@ -223,12 +349,18 @@
          on-event (or (:on-event options) (fn [_] nil))
          cancelled? (or (:cancelled? options) (fn [] false))
          registry (or (:registry options) (handlers/make-handler-registry))
+         retry-counts (or (:retry-counts options)
+                          (atom (or (:node-retries options) {})))
+         retry-options (assoc options :retry-counts retry-counts)
          parallel-executor (get @registry handlers/parallel-executor-key)
          _parallel-init (when parallel-executor
                           (reset! parallel-executor
                                   (fn [target-id branch-ctx branch-graph branch-logs]
                                     (execute-subgraph target-id branch-ctx branch-graph
-                                                      branch-logs registry on-event))))
+                                                      branch-logs registry on-event
+                                                      (assoc retry-options
+                                                             :retry-counts
+                                                             (atom {}))))))
          initial-start-node (if (:start-at options)
                               (parser/find-node graph (:start-at options))
                               (val (parser/find-start-node graph)))]
@@ -291,7 +423,7 @@
                    (let [cp {:timestamp (str (System/currentTimeMillis))
                              :current_node node-id
                              :completed_nodes (conj completed-nodes node-id)
-                             :node_retries {}
+                             :node_retries @retry-counts
                              :node_outcomes node-outcomes
                              :context_values (context/ctx-snapshot ctx)
                              :logs (:logs @ctx)}]
@@ -301,7 +433,8 @@
 
              ;; Step 2: Execute node handler with retry policy
              (let [handler (handlers/resolve-handler registry current-node)
-                   outcome (execute-with-retry handler current-node ctx graph logs-root on-event)
+                   outcome (execute-with-retry handler current-node ctx graph logs-root
+                                               on-event retry-options)
                    st (:status outcome)]
 
                ;; The engine owns the status-file contract for every handler,
@@ -322,7 +455,7 @@
                  (let [cp {:timestamp (str (System/currentTimeMillis))
                            :current_node node-id
                            :completed_nodes new-completed
-                           :node_retries {}
+                           :node_retries @retry-counts
                            :node_outcomes new-outcomes
                            :context_values (context/ctx-snapshot ctx)
                            :logs (:logs @ctx)}]
@@ -330,14 +463,16 @@
                    (on-event {:type :checkpoint.saved :node_id node-id}))
 
                  ;; Step 6: Select next edge
-                 (let [next-edge (if-let [next-node-id (:next_node_id outcome)]
-                                   {:to next-node-id}
-                                   (select-edge current-node outcome ctx graph))]
+                 (let [next-edge (if (= st :fail)
+                                   (select-failure-edge current-node outcome ctx graph)
+                                   (if-let [next-node-id (:next_node_id outcome)]
+                                     {:to next-node-id}
+                                     (select-edge current-node outcome ctx graph)))]
                    (if (nil? next-edge)
                      ;; No edge selected: handle failure routing or exit
                      (if (= st :fail)
                        ;; Try failure routing (Section 3.7)
-                       (let [retry-target (resolve-retry-target current-node graph)]
+                       (let [retry-target (resolve-node-retry-target current-node)]
                          (if (and retry-target (parser/find-node graph retry-target))
                            (recur (parser/find-node graph retry-target)
                                   new-completed
@@ -360,7 +495,9 @@
                      (if (:loop_restart next-edge)
                        (let [fresh-logs (str logs-root "_restart_" (System/currentTimeMillis))]
                          (on-event {:type :pipeline.restarting :target (:to next-edge) :new_logs fresh-logs})
-                         (run-pipeline graph (assoc options :start-at (:to next-edge) :logs-root fresh-logs)))
+                         (run-pipeline graph (assoc options :start-at (:to next-edge)
+                                                   :logs-root fresh-logs
+                                                   :retry-counts retry-counts)))
 
                        ;; Step 8: Advance to next node
                        (let [next-node (parser/find-node graph (:to next-edge))]
@@ -382,18 +519,41 @@
         ctx (context/make-context (:context_values cp))
         completed-nodes (:completed_nodes cp)
         last-node (parser/find-node graph last-node-id)
-        outcome {:status (keyword (context/ctx-get-string ctx "outcome" "success"))
-                 :preferred_label (context/ctx-get-string ctx "preferred_label" "")}
-        next-edge (when last-node (select-edge last-node outcome ctx graph))]
+        node-outcomes (normalize-node-outcomes (:node_outcomes cp))
+        saved-outcome (get node-outcomes last-node-id)
+        outcome (or saved-outcome
+                    {:status (keyword
+                               (context/ctx-get-string ctx "outcome" "success"))
+                     :preferred_label
+                     (context/ctx-get-string ctx "preferred_label" "")})
+        failed? (= :fail (:status outcome))
+        next-edge (when last-node
+                    (if failed?
+                      (select-failure-edge last-node outcome ctx graph)
+                      (select-edge last-node outcome ctx graph)))
+        retry-target (when (and failed? (nil? next-edge))
+                       (resolve-node-retry-target last-node))
+        next-id (or (:to next-edge) retry-target)]
 
-    (if (and next-edge (parser/find-node graph (:to next-edge)))
+    (cond
+      (and next-id (parser/find-node graph next-id))
       (run-pipeline graph (assoc options
                             :context ctx
-                            :start-at (:to next-edge)
+                            :start-at next-id
                             :completed-nodes completed-nodes
-                            :node-outcomes (:node_outcomes cp)))
-      (run-pipeline graph (assoc options
-                            :context ctx
-                            :start-at last-node-id
-                            :completed-nodes completed-nodes
-                            :node-outcomes (:node_outcomes cp))))))
+                            :node-outcomes node-outcomes
+                            :node-retries (:node_retries cp)))
+
+      failed?
+      (cond-> {:status :fail
+               :failure_reason (or (:failure_reason outcome)
+                                   "Stage failed and no route found")
+               :completed_nodes completed-nodes
+               :context (context/ctx-snapshot ctx)}
+        (:goal_gate last-node) (assoc :unsatisfied_gate last-node-id))
+
+      :else
+      {:status :success
+       :notes "Pipeline checkpoint already represents a completed run"
+       :completed_nodes completed-nodes
+       :context (context/ctx-snapshot ctx)})))

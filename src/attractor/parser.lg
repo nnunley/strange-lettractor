@@ -228,7 +228,8 @@
       (let [[attrs next-idx] (parse-attr-block-tokens tokens (inc idx))]
         (-> state
             (assoc :idx next-idx)
-            (update :graph-attrs merge attrs)))
+            (update :graph-attrs merge attrs)
+            (update :explicit-graph-attrs into (keys attrs))))
 
       ;; node [ ... ]
       (= val "node")
@@ -283,7 +284,8 @@
                 (assoc :current-subgraph updated-sub)))
           (-> state
               (assoc :idx next-i)
-              (assoc-in [:graph-attrs (keyword k-name)] v))))
+              (assoc-in [:graph-attrs (keyword k-name)] v)
+              (update :explicit-graph-attrs conj (keyword k-name)))))
 
       ;; Node or Edge statement
       (= (:type tok) :word)
@@ -399,6 +401,7 @@
                                        :default_fidelity ""}
                          :node-defaults {:shape "box"}
                          :edge-defaults {:weight 0}
+                         :explicit-graph-attrs #{}
                          :nodes {}
                          :edges []
                          :subgraphs []
@@ -413,16 +416,25 @@
                 _ (when-not (= (:idx state) n)
                     (throw (ex-info "Unexpected tokens after graph closing '}'"
                                     {:token-index (:idx state)})))
-                ga (:graph-attrs state)]
+                ga (:graph-attrs state)
+                explicit-ga (:explicit-graph-attrs state)
+                default-max-retries
+                (cond
+                  (contains? explicit-ga :default_max_retries)
+                  (:default_max_retries ga)
+                  (contains? explicit-ga :default_max_retry)
+                  (:default_max_retry ga)
+                  :else 0)]
             {:id graph-id
              :goal (or (:goal ga) "")
              :label (or (:label ga) "")
              :model_stylesheet (or (:model_stylesheet ga) "")
-             :default_max_retries (or (:default_max_retries ga) (:default_max_retry ga) 0)
+             :default_max_retries (or default-max-retries 0)
              :default_fidelity (or (:default_fidelity ga) "")
              :retry_target (or (:retry_target ga) "")
              :fallback_retry_target (or (:fallback_retry_target ga) "")
              :attrs ga
+             :explicit_attrs explicit-ga
              :nodes (:nodes state)
              :edges (:edges state)
              :subgraphs (:subgraphs state)})

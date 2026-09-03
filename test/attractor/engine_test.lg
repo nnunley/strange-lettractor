@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.parser :as p]
             [attractor.engine :as e]
+            [attractor.context :as c]
             [attractor.handlers :as h]
             [attractor.interviewer :as i]
             [json :as json]
@@ -99,3 +100,303 @@ digraph Gate {
     (is (= :cancelled (:status result)))
     (is (some #(= :pipeline.cancelled (:type %)) @events))
     (os/sh "rm" "-rf" logs)))
+
+(deftest test-pipeline-retry-policy-controls-backoff-without-real-sleep
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   flaky [shape=box, max_retries=2]
+                   exit [shape=Msquare]
+                   start -> flaky -> exit
+                 }")
+        attempts (atom 0)
+        delays (atom [])
+        events (atom [])
+        backend (fn [node _ _]
+                  (if (= "flaky" (:id node))
+                    (if (< (swap! attempts inc) 3)
+                      {:status :retry :failure_reason "transient"}
+                      {:status :success})
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_retry_policy"
+        result (e/run-pipeline
+                 graph
+                 {:registry registry
+                  :logs-root logs
+                  :retry-policy {:initial_delay_ms 10
+                                 :backoff_factor 3.0
+                                 :max_delay_ms 20
+                                 :jitter false}
+                  :sleep-fn (fn [delay] (swap! delays conj delay))
+                  :on-event (fn [event] (swap! events conj event))})
+        retry-events (filter #(= :stage.retrying (:type %)) @events)
+        checkpoint (c/load-checkpoint (str logs "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= [10 20] @delays))
+    (is (= [10 20] (mapv :delay_ms retry-events)))
+    (is (= {"start" 0 "flaky" 0}
+           (:node_retries checkpoint)))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-terminal-handler-exception-is-not-retried
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   broken [shape=box, max_retries=3]
+                   exit [shape=Msquare]
+                   start -> broken -> exit
+                 }")
+        attempts (atom 0)
+        backend (fn [node _ _]
+                  (if (= "broken" (:id node))
+                    (do
+                      (swap! attempts inc)
+                      (throw (ex-info "invalid configuration"
+                                      {:category :configuration_error
+                                       :retryable false})))
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_terminal_error"
+        result (e/run-pipeline
+                 graph
+                 {:registry registry :logs-root logs
+                  :sleep-fn (fn [_] nil)})]
+    (is (= :fail (:status result)))
+    (is (= 1 @attempts))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-named-retry-policies-respect-explicit-node-limits
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   work [shape=box]
+                   limited [shape=box, max_retries=1]
+                   exit [shape=Msquare]
+                   start -> work -> limited -> exit
+                 }")
+        standard (e/build-retry-policy
+                   (p/find-node graph "work") graph
+                   {:retry-policy {:name :standard}})
+        node-limited (e/build-retry-policy
+                       (p/find-node graph "limited") graph
+                       {:retry-policy {:name :standard}})]
+    (is (= 5 (:max_attempts standard)))
+    (is (= 2 (:max_attempts node-limited)))
+    (is (= 300
+           (e/delay-for-attempt
+             1 {:initial_delay_ms 200 :backoff_factor 2.0
+                :max_delay_ms 60000 :jitter true}
+             (fn [] 1.0))))))
+
+(deftest test-resume-restores-consumed-node-retries
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   work [shape=box, max_retries=2]
+                   exit [shape=Msquare]
+                   start -> work -> exit
+                 }")
+        logs "test_engine_retry_resume"
+        checkpoint-path (str logs "/checkpoint.edn")
+        _ (os/sh "mkdir" "-p" logs)
+        _ (c/save-checkpoint
+            {:timestamp "before-resume"
+             :current_node "start"
+             :completed_nodes ["start"]
+             :node_retries {"work" 1}
+             :node_outcomes {"start" {:status :success}}
+             :context_values {"outcome" "success"}
+             :logs []}
+            checkpoint-path)
+        attempts (atom 0)
+        delays (atom [])
+        backend (fn [node _ _]
+                  (if (= "work" (:id node))
+                    (do (swap! attempts inc)
+                        {:status :retry :failure_reason "still transient"})
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/resume-pipeline
+                 checkpoint-path graph
+                 {:registry registry :logs-root logs
+                  :retry-policy {:jitter false :initial_delay_ms 1}
+                  :sleep-fn (fn [delay] (swap! delays conj delay))})
+        final-checkpoint (c/load-checkpoint checkpoint-path)]
+    (is (= :fail (:status result)))
+    (is (= 2 @attempts))
+    (is (= [2] @delays) (str "restored retry delays: " @delays))
+    (is (= 2 (get (:node_retries final-checkpoint) "work")))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-resume-does-not-repeat-a-completed-failed-node
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   work [shape=box, max_retries=2]
+                   exit [shape=Msquare]
+                   start -> work -> exit
+                 }")
+        logs "test_engine_completed_failure_resume"
+        checkpoint-path (str logs "/checkpoint.edn")
+        _ (os/sh "mkdir" "-p" logs)
+        _ (c/save-checkpoint
+            {:timestamp "after-failure"
+             :current_node "work"
+             :completed_nodes ["start" "work"]
+             :node_retries {"start" 0 "work" 2}
+             :node_outcomes {"start" {:status :success}
+                             "work" {:status :fail
+                                     :failure_reason "max retries exceeded"}}
+             :context_values {"outcome" "fail"}
+             :logs []}
+            checkpoint-path)
+        attempts (atom 0)
+        backend (fn [_ _ _]
+                  (swap! attempts inc)
+                  {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/resume-pipeline checkpoint-path graph
+                                  {:registry registry :logs-root logs
+                                   :sleep-fn (fn [_] nil)})]
+    (is (= :fail (:status result)))
+    (is (= 0 @attempts))
+    (is (= ["start" "work"] (:completed_nodes result)))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-allow-partial-resets-retry-counter
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   work [shape=box, max_retries=1, allow_partial=true]
+                   exit [shape=Msquare]
+                   start -> work -> exit
+                 }")
+        backend (fn [node _ _]
+                  (if (= "work" (:id node))
+                    {:status :retry :failure_reason "not complete"}
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_allow_partial"
+        result (e/run-pipeline graph {:registry registry :logs-root logs
+                                      :retry-policy {:jitter false}
+                                      :sleep-fn (fn [_] nil)})
+        checkpoint (c/load-checkpoint (str logs "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= 0 (get (:node_retries checkpoint) "work")))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-failure-routing-only-selects-explicit-fail-edge
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   broken [shape=box]
+                   contextual [shape=box]
+                   failed [shape=box]
+                   exit [shape=Msquare]
+                   start -> broken
+                   broken -> contextual [condition=\"context.route=yes\", weight=10]
+                   broken -> failed [condition=\"outcome=fail\", weight=0]
+                   contextual -> exit
+                   failed -> exit
+                 }")
+        ctx (c/make-context {"route" "yes"})
+        backend (fn [node _ _]
+                  (if (= "broken" (:id node))
+                    {:status :fail :failure_reason "broken"}
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_explicit_fail_edge"
+        result (e/run-pipeline graph {:registry registry :context ctx
+                                      :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (some #{"failed"} (:completed_nodes result)))
+    (is (not (some #{"contextual"} (:completed_nodes result))))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-ordinary-failure-does-not-use-graph-goal-gate-target
+  (let [graph (p/parse-dot
+                "digraph G {
+                   graph [retry_target=\"repair\"]
+                   start [shape=Mdiamond]
+                   broken [shape=box]
+                   repair [shape=box]
+                   exit [shape=Msquare]
+                   start -> broken -> exit
+                   repair -> exit
+                 }")
+        backend (fn [node _ _]
+                  (if (= "broken" (:id node))
+                    {:status :fail :failure_reason "permanent"}
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_graph_retry_target_scope"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :fail (:status result)))
+    (is (not (some #{"repair"} (:completed_nodes result))))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-explicit-zero-and-legacy-graph-retry-limits
+  (let [zero-graph (p/parse-dot
+                     "digraph G {
+                        graph [default_max_retries=0]
+                        start [shape=Mdiamond]
+                        work [shape=box]
+                        exit [shape=Msquare]
+                        start -> work -> exit
+                      }")
+        legacy-graph (p/parse-dot
+                       "digraph G {
+                          graph [default_max_retry=2]
+                          start [shape=Mdiamond]
+                          work [shape=box]
+                          exit [shape=Msquare]
+                          start -> work -> exit
+                        }")]
+    (is (= 1 (:max_attempts
+               (e/build-retry-policy
+                 (p/find-node zero-graph "work") zero-graph
+                 {:retry-policy {:name :standard}}))))
+    (is (= 3 (:max_attempts
+               (e/build-retry-policy
+                 (p/find-node legacy-graph "work") legacy-graph {}))))))
+
+(deftest test-retryable-error-classification-accepts-portable-categories
+  (is (true? (e/retryable-error?
+               (ex-info "network unavailable" {:category :network-error}))))
+  (is (true? (e/retryable-error?
+               (ex-info "provider unavailable" {:status 599}))))
+  (is (false? (e/retryable-error?
+                (ex-info "invalid status" {:status 600})))))
+
+(deftest test-subgraph-failure-uses-node-retry-target
+  (let [graph (p/parse-dot
+                "digraph G {
+                   branch [shape=box, retry_target=\"repair\"]
+                   repair [shape=box]
+                   join [shape=tripleoctagon]
+                   exit [shape=Msquare]
+                   branch -> join
+                   repair -> join
+                   join -> exit
+                 }")
+        backend (fn [node _ _]
+                  (if (= "branch" (:id node))
+                    {:status :fail :failure_reason "branch failed"}
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/execute-subgraph
+                 "branch" (c/make-context) graph
+                 "test_engine_subgraph_retry_target" registry (fn [_] nil)
+                 {:retry-counts (atom {}) :sleep-fn (fn [_] nil)})]
+    (is (= :success (:status result)))
+    (is (= "join" (:boundary_node_id result)))
+    (os/sh "rm" "-rf" "test_engine_subgraph_retry_target")))
