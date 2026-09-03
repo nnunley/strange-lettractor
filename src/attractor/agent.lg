@@ -141,11 +141,19 @@
                     (profiles/create-profile (:provider parsed-model)
                                              (:model parsed-model)))
         environment (assoc (or (:execution_env options)
-                               (execution/make-local-environment))
+                               (execution/make-local-environment
+                                 {:default_command_timeout_ms
+                                  (or (:default_command_timeout_ms options)
+                                      (:default_command_timeout_ms profile)
+                                      10000)
+                                  :max_command_timeout_ms
+                                  (or (:max_command_timeout_ms options) 600000)}))
                            :default_command_timeout_ms
                            (or (:default_command_timeout_ms options)
                                (:default_command_timeout_ms profile)
-                               10000))]
+                               10000)
+                           :max_command_timeout_ms
+                           (or (:max_command_timeout_ms options) 600000))]
     ((:initialize environment))
     (atom {:id (str "agent-" (System/currentTimeMillis))
            :model (:model profile)

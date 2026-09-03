@@ -127,15 +127,19 @@
         glob-def (definition "glob" "Find files by pattern"
                              {:pattern {:type "string"} :path {:type "string"}}
                              ["pattern"])]
-    [(registered read-def
+    (vec
+      (remove
+        nil?
+        [(registered read-def
                  (fn [args env]
                    ((:read_file env) (arg args "file_path")
                     (arg args "offset") (arg args "limit"))))
-     (registered write-def
+         (when-not (= edit-kind "apply_patch")
+           (registered write-def
                  (fn [args env]
                    ((:write_file env) (arg args "file_path") (arg args "content"))
-                   "File written"))
-     (registered edit-def
+                   "File written")))
+         (registered edit-def
                  (if (= edit-kind "apply_patch")
                    (fn [args env]
                      (if-let [apply-patch (:apply_patch env)]
@@ -158,9 +162,9 @@
      (registered grep-def
                  (fn [args env]
                    ((:grep env) (arg args "pattern") (arg args "path") args)))
-     (registered glob-def
+         (registered glob-def
                  (fn [args env]
-                   ((:glob env) (arg args "pattern") (arg args "path"))))]))
+                   ((:glob env) (arg args "pattern") (arg args "path"))))]))))
 
 (defn- profile-registry [edit-kind extra-tools]
   (make-tool-registry (concat (base-tools edit-kind) extra-tools)))

@@ -48,3 +48,36 @@
       ;; macOS canonicalizes /var to /private/var in pwd output.
       (is (str/ends-with? (str/trim (:stdout result))
                           "/lettractor-execution-write-test")))))
+
+(deftest test-local-command-timeout-terminates-the-process-group
+  (let [root (str (os/temp-dir) "/lettractor-execution-timeout-test")
+        marker (str root "/descendant-survived")
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)
+        result ((:exec_command environment)
+                (str "trap '' TERM; printf partial; sleep 5; "
+                     "printf leaked > " marker)
+                100 nil nil)]
+    (is (= 124 (:exit_code result)))
+    (is (true? (:timed_out result)))
+    (is (str/includes? (:stdout result) "partial"))
+    (is (str/includes? (:stderr result) "Command timed out after 100ms"))
+    (is (false? ((:file_exists environment) "descendant-survived")))))
+
+(deftest test-local-command-filters-secrets-and-allows-explicit-environment
+  (let [secret-name "LETTRACTOR_EXECUTION_TEST_API_KEY"
+        _ (os/setenv secret-name "do-not-leak")
+        environment (execution/make-local-environment)
+        result ((:exec_command environment)
+                "printf '%s|%s' \"$LETTRACTOR_EXECUTION_TEST_API_KEY\" \"$VISIBLE_VALUE\""
+                1000 nil {"VISIBLE_VALUE" "explicit"})]
+    (is (= 0 (:exit_code result)))
+    (is (= "|explicit" (:stdout result)))))
+
+(deftest test-local-command-timeout-is-clamped-to-configured-maximum
+  (let [environment (execution/make-local-environment
+                      {:default_command_timeout_ms 1000
+                       :max_command_timeout_ms 50})
+        result ((:exec_command environment) "sleep 1" 5000 nil nil)]
+    (is (= 124 (:exit_code result)))
+    (is (str/includes? (:stderr result) "after 50ms"))))

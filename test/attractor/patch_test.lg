@@ -1,0 +1,82 @@
+(ns attractor.patch-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.execution :as execution]))
+
+(deftest test-apply-patch-add-update-move-and-delete
+  (let [root (str (os/temp-dir) "/lettractor-patch-test-" (random-uuid))
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)
+        _ ((:write_file environment) "old.txt" "alpha\nbeta\ngamma\n")
+        _ ((:write_file environment) "delete.txt" "obsolete\n")
+        result
+        ((:apply_patch environment)
+         (str "*** Begin Patch\n"
+              "*** Add File: nested/new.txt\n"
+              "+created\n"
+              "*** Update File: old.txt\n"
+              "*** Move to: moved.txt\n"
+              "@@ alpha\n"
+              " alpha\n"
+              "-beta\n"
+              "+second\n"
+              " gamma\n"
+              "*** Delete File: delete.txt\n"
+              "*** End Patch\n"))]
+    (is (str/includes? result "3 operation(s)"))
+    (is (= "created\n" (io/slurp (str root "/nested/new.txt"))))
+    (is (= "alpha\nsecond\ngamma\n" (io/slurp (str root "/moved.txt"))))
+    (is (false? ((:file_exists environment) "old.txt")))
+    (is (false? ((:file_exists environment) "delete.txt")))))
+
+(deftest test-apply-patch-supports-multiple-hunks-and-fuzzy-whitespace
+  (let [root (str (os/temp-dir) "/lettractor-patch-fuzzy-" (random-uuid))
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)
+        _ ((:write_file environment) "sample.txt"
+           "first\nvalue   =   1\nmiddle\nflag = false\nlast\n")]
+    ((:apply_patch environment)
+     (str "*** Begin Patch\n"
+          "*** Update File: sample.txt\n"
+          "@@ value = 1\n"
+          "-value = 1\n"
+          "+value = 2\n"
+          "@@ flag = false\n"
+          "-flag = false\n"
+          "+flag = true\n"
+          "*** End Patch\n"))
+    (is (= "first\nvalue = 2\nmiddle\nflag = true\nlast\n"
+           (io/slurp (str root "/sample.txt"))))))
+
+(deftest test-apply-patch-uses-hunk-hint-to-disambiguate
+  (let [root (str (os/temp-dir) "/lettractor-patch-hint-" (random-uuid))
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)
+        _ ((:write_file environment) "repeated.txt"
+           "section one\nvalue = 1\nsection two\nvalue = 1\n")]
+    ((:apply_patch environment)
+     (str "*** Begin Patch\n"
+          "*** Update File: repeated.txt\n"
+          "@@ section two\n"
+          "-value = 1\n"
+          "+value = 2\n"
+          "*** End Patch\n"))
+    (is (= "section one\nvalue = 1\nsection two\nvalue = 2\n"
+           (io/slurp (str root "/repeated.txt"))))))
+
+(deftest test-apply-patch-rejects-malformed-and-escaping-paths
+  (let [root (str (os/temp-dir) "/lettractor-patch-invalid-" (random-uuid))
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)]
+    (is (true?
+          (try
+            (do ((:apply_patch environment) "*** Add File: nope\n+x\n") false)
+            (catch Object _ true))))
+    (is (true?
+          (try
+            (do ((:apply_patch environment)
+                 "*** Begin Patch\n*** Add File: ../escape.txt\n+x\n*** End Patch\n")
+                false)
+            (catch Object _ true))))))

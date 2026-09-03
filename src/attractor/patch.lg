@@ -1,0 +1,239 @@
+(ns attractor.patch
+  (:require [clojure.string :as str]
+            [io :as io]
+            [os :as os]))
+
+(defn- invalid-patch [message]
+  (throw (ex-info (str "Invalid patch: " message)
+                  {:category :invalid-patch})))
+
+(defn- header-path [line prefix]
+  (let [path (subs line (count prefix))]
+    (when (str/blank? path)
+      (invalid-patch (str "missing path after " prefix)))
+    path))
+
+(defn- parse-hunks [lines start]
+  (loop [index start hunks []]
+    (if (>= index (count lines))
+      (invalid-patch "unterminated update operation")
+      (let [line (get lines index)]
+        (cond
+          (or (= line "*** End Patch")
+              (str/starts-with? line "*** Add File: ")
+              (str/starts-with? line "*** Delete File: ")
+              (str/starts-with? line "*** Update File: "))
+          [hunks index]
+
+          (not (str/starts-with? line "@@"))
+          (invalid-patch (str "expected hunk header, got: " line))
+
+          :else
+          (let [hint (str/trim (subs line 2))
+                [hunk-lines next-index]
+                (loop [cursor (inc index) accumulated []]
+                  (if (>= cursor (count lines))
+                    [accumulated cursor]
+                    (let [hunk-line (get lines cursor)]
+                      (if (or (str/starts-with? hunk-line "@@")
+                              (str/starts-with? hunk-line "*** "))
+                        [accumulated cursor]
+                        (let [prefix (when (pos? (count hunk-line))
+                                       (subs hunk-line 0 1))]
+                          (when-not (#{" " "+" "-"} prefix)
+                            (invalid-patch (str "invalid hunk line: " hunk-line)))
+                          (recur (inc cursor)
+                                 (conj accumulated
+                                       {:kind (case prefix
+                                                " " :context
+                                                "+" :add
+                                                "-" :delete)
+                                        :text (subs hunk-line 1)})))))))]
+            (when (empty? hunk-lines)
+              (invalid-patch "hunk must contain at least one line"))
+            (let [cursor (if (and (< next-index (count lines))
+                                  (= (get lines next-index) "*** End of File"))
+                           (inc next-index)
+                           next-index)]
+              (recur cursor (conj hunks {:hint hint :lines hunk-lines})))))))))
+
+(defn parse-patch [patch]
+  (let [lines (vec (str/split (str patch) #"\r?\n"))]
+    (when (or (empty? lines) (not= (first lines) "*** Begin Patch"))
+      (invalid-patch "missing *** Begin Patch"))
+    (loop [index 1 operations []]
+      (when (>= index (count lines))
+        (invalid-patch "missing *** End Patch"))
+      (let [line (get lines index)]
+        (cond
+          (= line "*** End Patch")
+          (if (= index (dec (count lines)))
+            operations
+            (invalid-patch "content follows *** End Patch"))
+
+          (str/starts-with? line "*** Add File: ")
+          (let [path (header-path line "*** Add File: ")
+                [content next-index]
+                (loop [cursor (inc index) added []]
+                  (if (>= cursor (count lines))
+                    (invalid-patch "unterminated add operation")
+                    (let [added-line (get lines cursor)]
+                      (if (str/starts-with? added-line "*** ")
+                        [(str (str/join "\n" added)
+                              (when (seq added) "\n")) cursor]
+                        (do
+                          (when-not (str/starts-with? added-line "+")
+                            (invalid-patch (str "added line must start with +: " added-line)))
+                          (recur (inc cursor) (conj added (subs added-line 1))))))))]
+            (recur next-index (conj operations {:op :add :path path :content content})))
+
+          (str/starts-with? line "*** Delete File: ")
+          (recur (inc index)
+                 (conj operations {:op :delete
+                                   :path (header-path line "*** Delete File: ")}))
+
+          (str/starts-with? line "*** Update File: ")
+          (let [path (header-path line "*** Update File: ")
+                possible-move-index (inc index)
+                move? (and (< possible-move-index (count lines))
+                           (str/starts-with? (get lines possible-move-index)
+                                             "*** Move to: "))
+                move-to (when move?
+                          (header-path (get lines possible-move-index)
+                                       "*** Move to: "))
+                hunk-start (if move? (inc possible-move-index) possible-move-index)
+                [hunks next-index] (parse-hunks lines hunk-start)]
+            (when (empty? hunks)
+              (invalid-patch (str "update for " path " has no hunks")))
+            (recur next-index
+                   (conj operations {:op :update :path path
+                                     :move_to move-to :hunks hunks})))
+
+          :else (invalid-patch (str "unknown operation: " line)))))))
+
+(defn- safe-relative-path [path]
+  (let [parts (str/split path #"/")]
+    (when (or (str/starts-with? path "/")
+              (some (fn [part] (or (= part "..") (= part ""))) parts))
+      (invalid-patch (str "path must stay within the working directory: " path)))
+    path))
+
+(defn- resolve-path [root path]
+  (str root "/" (safe-relative-path path)))
+
+(defn- parent-path [path]
+  (let [index (str/last-index-of path "/")]
+    (when (and (some? index) (> index 0))
+      (subs path 0 index))))
+
+(defn- normalize-match-line [line]
+  (-> line
+      (str/replace #"\s+" " ")
+      str/trim
+      (str/replace "“" "\"")
+      (str/replace "”" "\"")
+      (str/replace "‘" "'")
+      (str/replace "’" "'")
+      (str/replace "–" "-")
+      (str/replace "—" "-")))
+
+(defn- matches-at? [content-lines old-lines index fuzzy?]
+  (and (<= (+ index (count old-lines)) (count content-lines))
+       (every?
+         (fn [offset]
+           (let [actual (get content-lines (+ index offset))
+                 expected (get old-lines offset)]
+             (if fuzzy?
+               (= (normalize-match-line actual) (normalize-match-line expected))
+               (= actual expected))))
+         (range (count old-lines)))))
+
+(defn- find-hunk-index [content-lines old-lines hint]
+  (let [indices (range 0 (inc (- (count content-lines) (count old-lines))))
+        exact (vec (filter (fn [index]
+                             (matches-at? content-lines old-lines index false))
+                           indices))
+        fuzzy (when (empty? exact)
+                (vec (filter (fn [index]
+                               (matches-at? content-lines old-lines index true))
+                             indices)))
+        candidates (if (seq exact) exact fuzzy)
+        normalized-hint (normalize-match-line hint)
+        hint-index
+        (when-not (str/blank? hint)
+          (first
+            (filter
+              (fn [index]
+                (str/includes? (normalize-match-line (get content-lines index))
+                               normalized-hint))
+              (range (count content-lines)))))
+        hinted-match (when (and (some? hint-index) (seq candidates))
+                       (or (first (filter (fn [index] (>= index hint-index))
+                                          candidates))
+                           (last candidates)))]
+    (or hinted-match (first candidates)
+        (when (empty? old-lines)
+          (if (str/blank? hint)
+            (count content-lines)
+            (when (some? hint-index) (inc hint-index)))))))
+
+(defn- apply-hunk [content-lines hunk]
+  (let [old-lines (mapv :text
+                        (remove (fn [line] (= :add (:kind line)))
+                                (:lines hunk)))
+        new-lines (mapv :text
+                        (remove (fn [line] (= :delete (:kind line)))
+                                (:lines hunk)))
+        index (find-hunk-index content-lines old-lines (:hint hunk))]
+    (when (nil? index)
+      (invalid-patch (str "hunk did not match"
+                          (when-not (str/blank? (:hint hunk))
+                            (str " near " (:hint hunk))))))
+    (vec (concat (subvec content-lines 0 index)
+                 new-lines
+                 (subvec content-lines (+ index (count old-lines)))))))
+
+(defn- split-content [content]
+  {:lines (let [parts (vec (str/split content #"\n"))]
+            (if (and (str/ends-with? content "\n")
+                     (seq parts)
+                     (= "" (last parts)))
+              (pop parts)
+              parts))
+   :trailing_newline (str/ends-with? content "\n")})
+
+(defn- join-content [lines trailing-newline]
+  (str (str/join "\n" lines) (when trailing-newline "\n")))
+
+(defn apply-patch [working-dir patch]
+  (let [operations (parse-patch patch)]
+    (doseq [operation operations]
+      (let [source (resolve-path working-dir (:path operation))]
+        (case (:op operation)
+          :add
+          (do
+            (when (os/stat source)
+              (invalid-patch (str "file already exists: " (:path operation))))
+            (when-let [parent (parent-path source)] (io/mkdir parent))
+            (io/spit source (:content operation)))
+
+          :delete
+          (do
+            (when-not (os/stat source)
+              (invalid-patch (str "file does not exist: " (:path operation))))
+            (os/sh "rm" "-f" source))
+
+          :update
+          (do
+            (when-not (os/stat source)
+              (invalid-patch (str "file does not exist: " (:path operation))))
+            (let [original (io/slurp source)
+                  split (split-content original)
+                  updated-lines (reduce apply-hunk (:lines split) (:hunks operation))
+                  target (if-let [move-to (:move_to operation)]
+                           (resolve-path working-dir move-to)
+                           source)]
+              (when-let [parent (parent-path target)] (io/mkdir parent))
+              (io/spit target (join-content updated-lines (:trailing_newline split)))
+              (when (not= target source) (os/sh "rm" "-f" source)))))))
+    (str "Applied " (count operations) " operation(s)")))

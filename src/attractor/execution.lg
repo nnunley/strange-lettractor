@@ -1,7 +1,8 @@
 (ns attractor.execution
   (:require [clojure.string :as str]
             [io :as io]
-            [os :as os]))
+            [os :as os]
+            [attractor.patch :as patch]))
 
 (defn make-environment [operations]
   (merge {:initialize (fn [] nil)
@@ -47,26 +48,81 @@
       (recur (+ index (count needle)) (inc total))
       total)))
 
+(def command-wrapper
+  (str
+    "set -m\n"
+    "workdir=$1\n"
+    "timeout_s=$2\n"
+    "command_text=$3\n"
+    "timeout_marker=$4\n"
+    "shift 4\n"
+    "cd \"$workdir\" || exit 126\n"
+    "while IFS='=' read -r name value; do\n"
+    "  case \"$name\" in\n"
+    "    *_API_KEY|*_SECRET|*_TOKEN|*PASSWORD*|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|GOOGLE_APPLICATION_CREDENTIALS) unset \"$name\" ;;\n"
+    "  esac\n"
+    "done < <(env)\n"
+    "while [ \"$#\" -ge 2 ]; do\n"
+    "  export \"$1=$2\"\n"
+    "  shift 2\n"
+    "done\n"
+    "( eval \"$command_text\" ) &\n"
+    "child=$!\n"
+    "(\n"
+    "  sleep \"$timeout_s\"\n"
+    "  : > \"$timeout_marker\"\n"
+    "  kill -TERM -\"$child\" 2>/dev/null || exit 0\n"
+    "  sleep 2\n"
+    "  kill -KILL -\"$child\" 2>/dev/null || true\n"
+    ") &\n"
+    "watchdog=$!\n"
+    "wait \"$child\"\n"
+    "status=$?\n"
+    "if [ -e \"$timeout_marker\" ]; then\n"
+    "  wait \"$watchdog\" 2>/dev/null\n"
+    "  exit 124\n"
+    "fi\n"
+    "kill \"$watchdog\" 2>/dev/null\n"
+    "wait \"$watchdog\" 2>/dev/null\n"
+    "exit \"$status\"\n"))
+
 (defn make-local-environment [& [opts]]
   (let [options (or opts {})
         working-dir (or (:working_dir options) (os/cwd))
+        default-timeout (max 1 (or (:default_command_timeout_ms options) 10000))
+        max-timeout (max 1 (or (:max_command_timeout_ms options) 600000))
         path-for (fn [path] (resolve-path working-dir path))
         exec-command
         (fn [command timeout-ms requested-dir env-vars]
           (let [dir (or requested-dir working-dir)
                 started (System/currentTimeMillis)
-                task (future
-                       (os/sh "/bin/bash" "-c"
-                              "cd \"$1\" && shift && eval \"$1\""
-                              "lettractor" dir command))
-                timeout (max 1 (or timeout-ms 10000))
-                result (deref task timeout :timed-out)
-                duration (- (System/currentTimeMillis) started)]
-            (if (= result :timed-out)
-              {:stdout "" :stderr (str "Command timed out after " timeout "ms")
-               :exit_code 124 :timed_out true :duration_ms duration}
-              {:stdout (:out result) :stderr (:err result)
-               :exit_code (:exit result) :timed_out false :duration_ms duration})))]
+                timeout (min max-timeout (max 1 (or timeout-ms default-timeout)))
+                marker (str (os/temp-dir) "/lettractor-timeout-" (random-uuid))
+                environment-args
+                (vec (mapcat (fn [[key value]] [(str key) (str value)])
+                             (or env-vars {})))
+                result (apply os/sh
+                              (concat ["/bin/bash" "-c" command-wrapper
+                                       "lettractor" dir
+                                       (str (/ timeout 1000.0))
+                                       (str command) marker]
+                                      environment-args))
+                timed-out (some? (os/stat marker))
+                _cleanup (os/sh "rm" "-f" marker)
+                duration (- (System/currentTimeMillis) started)
+                timeout-message
+                (str "[ERROR: Command timed out after " timeout
+                     "ms. Partial output is shown above.\n"
+                     "You can retry with a longer timeout by setting the timeout_ms parameter.]")]
+            {:stdout (:out result)
+             :stderr (if timed-out
+                       (str (:err result)
+                            (when-not (str/blank? (:err result)) "\n")
+                            timeout-message)
+                       (:err result))
+             :exit_code (if timed-out 124 (:exit result))
+             :timed_out timed-out
+             :duration_ms duration}))]
     (make-environment
       {:working_directory (fn [] working-dir)
        :platform (fn [] (os/os-name))
@@ -81,6 +137,7 @@
            (io/spit resolved content)
            nil))
        :file_exists (fn [path] (some? (os/stat (path-for path))))
+       :apply_patch (fn [patch-text] (patch/apply-patch working-dir patch-text))
        :edit_file
        (fn [path old-string new-string replace-all]
          (let [resolved (path-for path)
