@@ -115,3 +115,54 @@
     (is (= "test-provider" (get-in @requests [0 :provider])))
     (is (= "native-model" (get-in @requests [0 :model])))
     (is (= "read_file" (get-in @requests [0 :tools 0 :name])))))
+
+(deftest test-session-processes-followups-after-current-input
+  (let [prompts (atom [])
+        events (atom [])
+        complete-fn
+        (fn [request]
+          (let [user-content
+                (:content
+                  (last (filter #(= :user (:role %)) (:messages request))))]
+            (swap! prompts conj user-content)
+            {:message {:role :assistant :content (str "done: " user-content)}
+             :tool_calls []}))
+        session (agent/make-session {:complete_fn complete-fn})]
+    (agent/follow-up-session! session "second")
+    (is (= "done: second"
+           (agent/process-input! session "first"
+                                 (fn [event] (swap! events conj event)))))
+    (is (= ["first" "second"] @prompts))
+    (is (empty? (:followup-queue @session)))
+    (is (= 1 (count (filter #(= :processing_end (:type %)) @events))))))
+
+(deftest test-session-detects-repeating-tool-call-loops
+  (let [events (atom [])
+        calls (atom 0)
+        complete-fn
+        (fn [_]
+          (swap! calls inc)
+          {:message {:role :assistant :content ""}
+           :tool_calls [{:id (str "call-" @calls)
+                         :name "missing" :arguments {"x" 1}}]})
+        session (agent/make-session {:complete_fn complete-fn
+                                     :max_tool_rounds_per_input 3
+                                     :loop_detection_window 2})]
+    (agent/process-input! session "loop"
+                          (fn [event] (swap! events conj event)))
+    (is (some #(= :loop_detection (:type %)) @events))
+    (is (some #(= :steering (:type %)) (:history @session)))))
+
+(deftest test-session-close-and-abort-run-environment-cleanup
+  (let [cleanups (atom 0)
+        environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! cleanups inc))})
+        closed (agent/make-session {:execution_env environment})
+        aborted (agent/make-session {:execution_env environment})]
+    (agent/close-session! closed)
+    (is (= :closed (:state @closed)))
+    (agent/abort-session! aborted)
+    (is (= :closed (:state @aborted)))
+    (is (true? (:abort_signaled @aborted)))
+    (is (= 2 @cleanups))))

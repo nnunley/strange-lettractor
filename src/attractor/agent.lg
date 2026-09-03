@@ -153,6 +153,8 @@
            :execution_env environment
            :llm_client (:llm_client options)
            :state :idle
+           :abort_signaled false
+           :cleanup_done false
            :history []
            :steering-queue []
            :followup-queue []
@@ -173,6 +175,23 @@
 (defn follow-up-session! [session msg]
   (swap! session update :followup-queue conj msg)
   session)
+
+(defn- cleanup-session! [session]
+  (when-not (:cleanup_done @session)
+    (when-let [cleanup (get-in @session [:execution_env :cleanup])]
+      (cleanup))
+    (swap! session assoc :cleanup_done true))
+  session)
+
+(defn close-session! [session & [on-event]]
+  (cleanup-session! session)
+  (swap! session assoc :state :closed)
+  ((or on-event (fn [_] nil)) {:type :session_end :state :closed})
+  session)
+
+(defn abort-session! [session & [on-event]]
+  (swap! session assoc :abort_signaled true)
+  (close-session! session on-event))
 
 (defn- drain-steering! [session event-fn]
   (let [queued (:steering-queue @session)]
@@ -267,6 +286,34 @@
       (get-in response [:message :tool_calls])
       []))
 
+(defn- tool-call-signature [tool-call]
+  [(or (:name tool-call) (get tool-call "name"))
+   (or (:arguments tool-call) (get tool-call "arguments"))])
+
+(defn detect-loop [history window-size]
+  (let [signatures
+        (vec (mapcat
+               (fn [turn]
+                 (if (= :assistant (:type turn))
+                   (map tool-call-signature (or (:tool_calls turn) []))
+                   []))
+               history))
+        window (max 1 (or window-size 10))]
+    (if (< (count signatures) window)
+      false
+      (let [recent (subvec signatures (- (count signatures) window))]
+        (boolean
+          (some
+            (fn [pattern-length]
+              (and (<= pattern-length window)
+                   (= 0 (mod window pattern-length))
+                   (every?
+                     (fn [index]
+                       (= (get recent index)
+                          (get recent (mod index pattern-length))))
+                     (range pattern-length window))))
+            [1 2 3]))))))
+
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn process-input! [session prompt & [on-event]]
   (let [event-fn (or on-event (fn [_] nil))
@@ -289,7 +336,8 @@
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))]
               (if (or (and (> round-limit 0) (>= round-count round-limit))
-                      (and (> turn-limit 0) (>= assistant-count turn-limit)))
+                      (and (> turn-limit 0) (>= assistant-count turn-limit))
+                      (:abort_signaled @session))
                 (do
                   (event-fn {:type :turn_limit :round round-count
                              :total_turns assistant-count})
@@ -330,10 +378,30 @@
                       (swap! session update :history conj
                              {:type :tool_results :role :tool :results results})
                       (drain-steering! session event-fn)
+                      (when (and (:enable_loop_detection config)
+                                 (detect-loop (:history @session)
+                                              (:loop_detection_window config)))
+                        (let [warning
+                              (str "Loop detected: recent tool calls repeat. "
+                                   "Try a different approach.")]
+                          (swap! session update :history conj
+                                 {:type :steering :role :user :content warning})
+                          (event-fn {:type :loop_detection :message warning})))
                       (recur (inc round-count) text)))))))]
-      (swap! session assoc :state :idle)
-      (event-fn {:type :processing_end})
-      result)))
+      (cond
+        (:abort_signaled @session) result
+
+        (seq (:followup-queue @session))
+        (let [next-input (first (:followup-queue @session))]
+          (swap! session update :followup-queue
+                 (fn [queued] (vec (rest queued))))
+          (process-input! session next-input event-fn))
+
+        :else
+        (do
+          (swap! session assoc :state :idle)
+          (event-fn {:type :processing_end})
+          result)))))
 
 ;; Compatibility name used by the Attractor codergen backend.
 (defn run-agent-turn! [session prompt & [on-event]]
