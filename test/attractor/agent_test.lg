@@ -147,6 +147,47 @@
     (is (empty? (:followup-queue @session)))
     (is (= 1 (count (filter #(= :processing_end (:type %)) @events))))))
 
+(deftest test-reasoning-effort-can-change-before-the-next-model-round
+  (let [requests (atom [])
+        session-holder (atom nil)
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool!
+            registry
+            {:definition {:name "raise_effort" :description "Raise effort"
+                          :parameters {:type "object" :properties {}}}
+             :executor
+             (fn [_ _]
+               (agent/set-reasoning-effort! @session-holder "high")
+               "effort updated")})
+        profile (profiles/make-profile
+                  {:id "test" :model "test-model"
+                   :tool_registry registry})
+        complete-fn
+        (fn [request]
+          (swap! requests conj request)
+          (if (= 1 (count @requests))
+            {:message {:role :assistant :content ""}
+             :tool_calls [{:id "effort-1" :name "raise_effort"
+                           :arguments {}}]}
+            {:message {:role :assistant :content "done"}
+             :tool_calls []}))
+        session (agent/make-session {:provider_profile profile
+                                     :complete_fn complete-fn})]
+    (reset! session-holder session)
+    (is (= "done" (agent/process-input! session "work")))
+    (is (= [nil "high"] (mapv :reasoning_effort @requests)))
+    (is (= "high" (get-in @session [:config :reasoning_effort])))
+    (is (= :invalid-reasoning-effort
+           (try
+             (do (agent/set-reasoning-effort! session "enormous") nil)
+             (catch Object error (:category (ex-data error))))))))
+
+(deftest test-session-rejects-invalid-initial-reasoning-effort
+  (is (= :invalid-reasoning-effort
+         (try
+           (do (agent/make-session {:reasoning_effort "enormous"}) nil)
+           (catch Object error (:category (ex-data error)))))))
+
 (deftest test-session-detects-repeating-tool-call-loops
   (let [events (atom [])
         calls (atom 0)

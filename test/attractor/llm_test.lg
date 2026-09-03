@@ -242,6 +242,123 @@
     (is (= 321 (get compatible "max_tokens")))
     (is (= ["END" "STOP"] (get compatible "stop")))))
 
+(deftest test-reasoning-effort-translates-across-native-providers
+  (let [captures (atom {})
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))]
+    (llm/openai-complete
+      {:model "gpt-test" :api_key "key" :messages []
+       :reasoning_effort "high"
+       :transport (transport :openai
+                             {:id "o" :status "completed"
+                              :output [] :usage {}})})
+    (llm/anthropic-complete
+      {:model "claude-test" :api_key "key" :messages []
+       :reasoning_effort "high"
+       :transport (transport :anthropic
+                             {:id "a" :content [] :stop_reason "end_turn"
+                              :usage {}})})
+    (llm/gemini-complete
+      {:model "gemini-3-test" :api_key "key" :messages []
+       :reasoning_effort "high"
+       :transport (transport :gemini
+                             {:responseId "g" :candidates []
+                              :usageMetadata {}})})
+    (let [openai (json/read-json (:body (:openai @captures)))
+          anthropic-request (:anthropic @captures)
+          anthropic (json/read-json (:body anthropic-request))
+          gemini (json/read-json (:body (:gemini @captures)))]
+      (is (= "high" (get-in openai ["reasoning" "effort"])))
+      (is (= {"type" "enabled" "budget_tokens" 3072}
+             (get anthropic "thinking")))
+      (is (= 4096 (get anthropic "max_tokens")))
+      (is (str/includes?
+            (get-in anthropic-request [:headers "anthropic-beta"])
+            "interleaved-thinking-2025-05-14"))
+      (is (= "high"
+             (get-in gemini
+                     ["generationConfig" "thinkingConfig"
+                      "thinkingLevel"]))))))
+
+(deftest test-explicit-thinking-options-override-portable-reasoning-effort
+  (let [captures (atom {})
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))]
+    (llm/anthropic-complete
+      {:model "claude-test" :api_key "key" :messages []
+       :reasoning_effort "low"
+       :provider_options
+       {:anthropic {:thinking {:type "enabled" :budget_tokens 1500}}}
+       :transport (transport :anthropic
+                             {:id "a" :content [] :stop_reason "end_turn"
+                              :usage {}})})
+    (llm/gemini-complete
+      {:model "gemini-3-test" :api_key "key" :messages []
+       :reasoning_effort "low"
+       :provider_options
+       {:gemini {:generationConfig
+                 {:thinkingConfig {:thinkingLevel "medium"}}}}
+       :transport (transport :gemini
+                             {:responseId "g" :candidates []
+                              :usageMetadata {}})})
+    (is (= 1500
+           (get-in (json/read-json (:body (:anthropic @captures)))
+                   ["thinking" "budget_tokens"])))
+    (is (= "medium"
+           (get-in (json/read-json (:body (:gemini @captures)))
+                   ["generationConfig" "thinkingConfig"
+                    "thinkingLevel"])))))
+
+(deftest test-anthropic-validates-final-merged-thinking-budget
+  (let [response {:status 200
+                  :body (json/write-json
+                          {:id "a" :content [] :stop_reason "end_turn"
+                           :usage {}})}
+        capture (atom nil)
+        valid
+        (llm/anthropic-complete
+          {:model "claude" :api_key "key" :messages []
+           :provider_options
+           {:anthropic {:max_tokens 6000
+                        :thinking {:type "enabled" :budget_tokens 5000}}}
+           :transport (fn [request] (reset! capture request) response)})]
+    (is (= 6000
+           (get (json/read-json (:body @capture)) "max_tokens")))
+    (is (= "a" (:id valid)))
+    (doseq [options
+            [{:reasoning_effort "high"
+              :provider_options {:anthropic {:max_tokens 1000}}}
+             {:provider_options
+              {:anthropic
+               {:thinking {:type "enabled" :budget_tokens 5000}}}}]]
+      (is (= :invalid-request
+             (try
+               (do (llm/anthropic-complete
+                     (merge {:model "claude" :api_key "key" :messages []}
+                            options))
+                   nil)
+               (catch Object error (:category (ex-data error)))))))))
+
+(deftest test-native-adapters-reject-invalid-reasoning-effort
+  (doseq [call [(fn [] (llm/openai-complete
+                         {:model "gpt" :api_key "key" :messages []
+                          :reasoning_effort "enormous"}))
+                (fn [] (llm/anthropic-complete
+                         {:model "claude" :api_key "key" :messages []
+                          :reasoning_effort "enormous"}))
+                (fn [] (llm/gemini-complete
+                         {:model "gemini" :api_key "key" :messages []
+                          :reasoning_effort "enormous"}))]]
+    (is (= :invalid-reasoning-effort
+           (try (do (call) nil)
+                (catch Object error (:category (ex-data error))))))))
+
 (deftest test-adapters-omit-unset-generation-settings
   (let [captures (atom {})
         transport

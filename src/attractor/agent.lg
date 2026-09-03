@@ -349,8 +349,22 @@
     (str "Unknown tool: " tool-name)))
 
 ;; Create an Agent Session
+(defn- validated-reasoning-effort [value]
+  (when (some? value)
+    (let [normalized (str/lower-case
+                       (if (keyword? value) (name value) (str value)))]
+      (when-not (contains? #{"low" "medium" "high"} normalized)
+        (throw
+          (ex-info (str "Invalid reasoning_effort: " value)
+                   {:category :invalid-reasoning-effort
+                    :reasoning_effort value
+                    :valid_values ["low" "medium" "high"]})))
+      normalized)))
+
 (defn make-session [& [opts]]
   (let [options (or opts {})
+        reasoning-effort (validated-reasoning-effort
+                           (:reasoning_effort options))
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
         base-profile (or (:provider_profile options)
                          (profiles/create-profile (:provider parsed-model)
@@ -410,20 +424,35 @@
                  :followup-queue []
                  :subagents {}
                  :subagent_depth (or (:subagent_depth options) 0)
-                 :config (merge {:max_turns 0
-                                 :max_tool_rounds_per_input 0
-                                 :default_command_timeout_ms 10000
-                                 :max_command_timeout_ms 600000
-                                 :reasoning_effort nil
-                                 :enable_loop_detection true
-                                 :loop_detection_window 10
-                                 :max_subagent_depth 1}
-                                options)})]
+                 :config (assoc
+                           (merge {:max_turns 0
+                                   :max_tool_rounds_per_input 0
+                                   :default_command_timeout_ms 10000
+                                   :max_command_timeout_ms 600000
+                                   :reasoning_effort nil
+                                   :enable_loop_detection true
+                                   :loop_detection_window 10
+                                   :max_subagent_depth 1}
+                                  options)
+                           :reasoning_effort reasoning-effort)})]
       (when (< (:subagent_depth @session)
                (or (get-in @session [:config :max_subagent_depth]) 1))
         (register-subagent-tools! session))
       (emit-event! session {:type :session_start})
       session)))
+
+(defn set-reasoning-effort! [session value]
+  (let [effort (validated-reasoning-effort value)]
+    (with-session-lock
+      session
+      (fn []
+        (when (= :closed (:state @session))
+          (throw
+            (ex-info "Cannot change reasoning effort on a closed session"
+                     {:category :session-closed
+                      :session_id (:id @session)})))
+        (swap! session assoc-in [:config :reasoning_effort] effort)))
+    effort))
 
 ;; Inject a steering message into the session
 (defn- enqueue-session-message! [session queue-key msg]
@@ -831,7 +860,8 @@
                                           (history-to-messages (:history @session))))
                                :tools (profiles/profile-tools profile)
                                :tool_choice {:mode "auto"}
-                               :reasoning_effort (:reasoning_effort config)
+                               :reasoning_effort
+                               (get-in @session [:config :reasoning_effort])
                                :provider_options (:provider_options profile)
                                :abort_signal
                                (get-in @session [:llm_abort_controller :signal])}
