@@ -244,18 +244,24 @@
             :tools (or (:tools opts) [])})))
 
 ;; Mock Provider for reproducible offline execution & testing
+(declare message-text-content)
+
 (defn mock-complete [request & [mock-handler]]
   (if mock-handler
     (mock-handler request)
     (let [last-msg (last (:messages request))
           text (if (map? last-msg)
-                 (or (:content last-msg) "")
-                 (str last-msg))]
+                 (message-text-content last-msg)
+                 (str last-msg))
+          response-text
+          (str "[Mock LLM (" (:model request) ")]: Response to: "
+               (subs text 0 (min (count text) 100)))
+          parts [{:kind :text :text response-text}]]
       {:id (str "mock-" (System/currentTimeMillis))
        :model (:model request)
        :provider "mock"
        :message {:role :assistant
-                 :content (str "[Mock LLM (" (:model request) ")]: Response to: " (subs text 0 (min (count text) 100)))}
+                 :content parts :parts parts :text response-text}
        :usage {:input_tokens 50 :output_tokens 50 :total_tokens 100}
        :finish_reason :stop})))
 
@@ -333,21 +339,178 @@
                     {:provider provider :category :configuration})))
   key)
 
-(defn- anthropic-content-part [part]
-  (if (some? (get part "type"))
+(defn- content-kind [part]
+  (let [kind (or (:kind part) (:type part) (get part "kind") (get part "type"))]
+    (when (some? kind)
+      (if (keyword? kind) kind (keyword (str kind))))))
+
+(defn- message-content-parts [message]
+  (let [content (:content message)
+        parts (:parts message)]
+    (cond
+      (seq parts) (vec parts)
+      (vector? content) content
+      (nil? content) []
+      (and (string? content) (str/blank? content)) []
+      :else [{:kind :text :text (str content)}])))
+
+(defn- message-text [message]
+  (str/join
+    ""
+    (map (fn [part]
+           (let [kind (content-kind part)]
+             (if (= kind :text)
+               (or (:text part) (get part "text") (:content part) "")
+               (throw
+                 (ex-info "System and developer messages support text content only"
+                          {:category :invalid-request
+                           :role (:role message)
+                           :content_kind kind})))))
+         (message-content-parts message))))
+
+(defn message-text-content [message]
+  (let [content (:content message)]
+    (if (string? content)
+      content
+      (str/join
+        ""
+        (map (fn [part]
+               (if (= :text (content-kind part))
+                 (or (:text part) (get part "text") (:content part) "")
+                 ""))
+             (message-content-parts message))))))
+
+(defn response-text [response]
+  (or (get-in response [:message :text])
+      (when-let [message (:message response)]
+        (message-text-content message))
+      (:text response)
+      ""))
+
+(defn- local-file-url? [url]
+  (and (string? url)
+       (or (str/starts-with? url "/")
+           (str/starts-with? url "./")
+           (str/starts-with? url "~/"))))
+
+(defn- expand-local-path [path]
+  (if (str/starts-with? path "~/")
+    (str (or (os/getenv "HOME") "") (subs path 1))
+    path))
+
+(defn- infer-media-type [location default-type]
+  (let [value (str/lower-case (str (or location "")))]
+    (cond
+      (some? (re-find #"\\.png(?:[?#].*)?$" value)) "image/png"
+      (some? (re-find #"\\.jpe?g(?:[?#].*)?$" value)) "image/jpeg"
+      (some? (re-find #"\\.gif(?:[?#].*)?$" value)) "image/gif"
+      (some? (re-find #"\\.webp(?:[?#].*)?$" value)) "image/webp"
+      (some? (re-find #"\\.heic(?:[?#].*)?$" value)) "image/heic"
+      (some? (re-find #"\\.heif(?:[?#].*)?$" value)) "image/heif"
+      (some? (re-find #"\\.pdf(?:[?#].*)?$" value)) "application/pdf"
+      (some? (re-find #"\\.wav(?:[?#].*)?$" value)) "audio/wav"
+      (some? (re-find #"\\.mp3(?:[?#].*)?$" value)) "audio/mpeg"
+      :else default-type)))
+
+(defn- content-data [part data-key]
+  (or (get part data-key)
+      (get part (name data-key))
+      part))
+
+(defn- resolve-binary-content [part data-key default-type]
+  (let [data-map (content-data part data-key)
+        url (or (:url data-map) (get data-map "url"))
+        data (or (:data data-map) (get data-map "data"))
+        media-type (or (:media_type data-map) (get data-map "media_type")
+                       (:media-type data-map) (get data-map "media-type"))]
+    (when (= (some? url) (some? data))
+      (throw (ex-info (str (name data-key) " content requires exactly one of url or data")
+                      {:category :invalid-request :content_kind data-key})))
+    (if (local-file-url? url)
+      (let [path (expand-local-path url)]
+        {:data (base64-encode (io/slurp path))
+         :media_type (or media-type (infer-media-type path default-type))})
+      (if (some? url)
+        {:url url
+         :media_type (or media-type (infer-media-type url default-type))}
+        {:data (base64-encode data)
+         :media_type (or media-type default-type)}))))
+
+(defn- unsupported-content! [provider kind]
+  (throw (ex-info (str provider " does not support " (name (or kind :unknown)) " content")
+                  {:category :invalid-request
+                   :provider provider
+                   :content_kind kind})))
+
+(defn- tool-result-data [part]
+  (if (= (content-kind part) :tool_result)
+    (content-data part :tool_result)
+    part))
+
+(defn- tool-call-data [part]
+  (content-data part :tool_call))
+
+(declare provider-tool-result-content tool-result-image)
+
+(defn- openai-content-part [role part]
+  (if (some? (:provider_data part))
+    (:provider_data part)
+    (if (some? (get part "type"))
     part
-    (let [kind (or (:kind part) (:type part))
+    (let [kind (content-kind part)]
+      (case kind
+        :text {:type (if (= role :assistant) "output_text" "input_text")
+               :text (or (:text part) (:content part) "")}
+        :image
+        (let [image (resolve-binary-content part :image "image/png")
+              image-data (content-data part :image)]
+          (cond-> {:type "input_image"
+                   :image_url (or (:url image)
+                                  (str "data:" (:media_type image)
+                                       ";base64," (:data image)))}
+            (some? (or (:detail image-data) (get image-data "detail")))
+            (assoc :detail (or (:detail image-data) (get image-data "detail")))))
+        (:audio :document) (unsupported-content! "openai" kind)
+        (unsupported-content! "openai" kind))))))
+
+(defn- anthropic-content-part [part]
+  (if (some? (:provider_data part))
+    (:provider_data part)
+    (if (some? (get part "type"))
+    part
+    (let [kind (content-kind part)
           thinking (:thinking part)]
       (case kind
-        (:thinking "thinking")
+        :thinking
         {:type "thinking"
          :thinking (or (:text thinking) (:text part) "")
          :signature (or (:signature thinking) (:signature part) "")}
-        (:redacted_thinking "redacted_thinking")
+        :redacted_thinking
         {:type "redacted_thinking"
          :data (or (:data thinking) (:data part) "")}
-        (:text "text") {:type "text" :text (or (:text part) (:content part) "")}
-        part))))
+        :text {:type "text" :text (or (:text part) (:content part) "")}
+        :image
+        (let [image (resolve-binary-content part :image "image/png")]
+          {:type "image"
+           :source (if (:url image)
+                     {:type "url" :url (:url image)}
+                     {:type "base64" :media_type (:media_type image)
+                      :data (:data image)})})
+        :audio (unsupported-content! "anthropic" kind)
+        :document
+        (let [document (resolve-binary-content part :document "application/pdf")]
+          {:type "document"
+           :source (if (:url document)
+                     {:type "url" :url (:url document)}
+                     {:type "base64" :media_type (:media_type document)
+                      :data (:data document)})})
+        :tool_call
+        (let [call (content-data part :tool_call)]
+          {:type "tool_use"
+           :id (or (:id call) (get call "id"))
+           :name (or (:name call) (get call "name"))
+           :input (or (:arguments call) (get call "arguments") {})})
+        (unsupported-content! "anthropic" kind))))))
 
 (defn- anthropic-message [message]
   (let [role (:role message)
@@ -358,32 +521,51 @@
       (= role :tool)
       {:role "user"
        :content (mapv (fn [result]
-                        {:type "tool_result"
-                         :tool_use_id (:tool_call_id result)
-                         :content (str (:content result))
-                         :is_error (boolean (:is_error result))})
+                        (let [value (tool-result-data result)]
+                          (let [text (provider-tool-result-content
+                                       (or (:content value)
+                                           (get value "content") ""))
+                                image (tool-result-image value)]
+                            {:type "tool_result"
+                             :tool_use_id (or (:tool_call_id value)
+                                              (get value "tool_call_id"))
+                             :content (if image
+                                        [{:type "text" :text text}
+                                         {:type "image"
+                                          :source {:type "base64"
+                                                   :media_type (:media_type image)
+                                                   :data (:data image)}}]
+                                        text)
+                             :is_error (boolean (or (:is_error value)
+                                                    (get value "is_error")))})))
                       content)}
 
       (= role :assistant)
-      {:role "assistant"
-       :content (vec
-                  (concat
-                    (if (seq prior-parts)
-                      (map anthropic-content-part prior-parts)
-                      (when-not (str/blank? (str content))
-                        [{:type "text" :text (str content)}]))
-                    (map (fn [call]
-                           {:type "tool_use"
-                            :id (:id call)
-                            :name (:name call)
-                            :input (:arguments call)})
-                         (or tool-calls []))))}
+      (let [source-parts (if (and (not (seq prior-parts))
+                                  (not (vector? content))
+                                  (str/blank? (str content)))
+                           []
+                           (message-content-parts message))
+            embeds-tool-calls
+            (some (fn [part]
+                    (contains? #{:tool_call :tool_use} (content-kind part)))
+                  source-parts)]
+        {:role "assistant"
+         :content (vec
+                    (concat
+                      (map anthropic-content-part source-parts)
+                      (when-not embeds-tool-calls
+                        (map (fn [call]
+                               {:type "tool_use"
+                                :id (:id call)
+                                :name (:name call)
+                                :input (:arguments call)})
+                             (or tool-calls [])))))} )
 
       :else
       {:role "user"
-       :content (if (seq prior-parts)
-                  (mapv anthropic-content-part prior-parts)
-                  [{:type "text" :text (str content)}])})))
+       :content (mapv anthropic-content-part
+                      (message-content-parts message))})))
 
 (defn- merge-anthropic-messages [messages]
   (reduce
@@ -420,6 +602,19 @@
     (vector? value) (mapv json-safe value)
     (seq? value) (mapv json-safe value)
     :else value))
+
+(defn- provider-tool-result-content [content]
+  (if (string? content)
+    content
+    (json/write-json (json-safe content))))
+
+(defn- tool-result-image [result]
+  (let [data (or (:image_data result) (get result "image_data"))]
+    (when (some? data)
+      {:data (base64-encode data)
+       :media_type (or (:image_media_type result)
+                       (get result "image_media_type")
+                       "image/png")})))
 
 (defn- provider-options [request provider]
   (let [options (or (:provider_options request) {})]
@@ -522,26 +717,67 @@
 
             (= role :tool)
             (map (fn [result]
-                   {:type "function_call_output"
-                    :call_id (:tool_call_id result)
-                    :output (str (:content result))})
+                   (let [value (tool-result-data result)]
+                     (let [text (provider-tool-result-content
+                                  (or (:content value)
+                                      (get value "content") ""))
+                           image (tool-result-image value)]
+                       {:type "function_call_output"
+                        :call_id (or (:tool_call_id value)
+                                     (get value "tool_call_id"))
+                        :output (if image
+                                  [{:type "input_text" :text text}
+                                   {:type "input_image"
+                                    :image_url
+                                    (str "data:" (:media_type image)
+                                         ";base64," (:data image))}]
+                                  text)})))
                  content)
 
             (= role :assistant)
-            (concat
-              (when-not (str/blank? (str content))
-                [{:type "message" :role "assistant"
-                  :content [{:type "output_text" :text (str content)}]}])
-              (map (fn [call]
-                     {:type "function_call"
-                      :call_id (:id call)
-                      :name (:name call)
-                      :arguments (json/write-json (json-safe (:arguments call)))})
-                   (or (:tool_calls message) [])))
+            (let [source-parts (message-content-parts message)
+                  embedded-calls (map tool-call-data
+                                      (filter (fn [part]
+                                                (= :tool_call (content-kind part)))
+                                              source-parts))
+                  call-item
+                  (fn [call]
+                    {:type "function_call"
+                     :call_id (or (:id call) (get call "id"))
+                     :name (or (:name call) (get call "name"))
+                     :arguments (json/write-json
+                                  (json-safe
+                                    (or (:arguments call)
+                                        (get call "arguments") {})))})
+                  ordered-items
+                  (reduce
+                    (fn [items part]
+                      (cond
+                        (= :tool_call (content-kind part))
+                        (conj items (call-item (tool-call-data part)))
+
+                        (= :input_item (:provider_location part))
+                        (conj items (:provider_data part))
+
+                        :else
+                        (let [content-part (openai-content-part role part)]
+                          (if (and (seq items)
+                                   (= "message" (:type (last items))))
+                            (conj (vec (butlast items))
+                                  (update (last items) :content conj content-part))
+                            (conj items {:type "message" :role "assistant"
+                                         :content [content-part]})))))
+                    []
+                    source-parts)]
+              (if (seq embedded-calls)
+                ordered-items
+                (into ordered-items
+                      (map call-item (or (:tool_calls message) [])))))
 
             :else
             [{:type "message" :role "user"
-              :content [{:type "input_text" :text (str content)}]}])))
+              :content (mapv (fn [part] (openai-content-part role part))
+                             (message-content-parts message))}])))
       messages)))
 
 (defn- openai-output-text [output]
@@ -556,6 +792,67 @@
               (filter (fn [item] (= (get item "type") "message"))
                       (or output [])))))
 
+(defn- normalize-openai-parts [output]
+  (vec
+    (mapcat
+      (fn [item]
+        (case (get item "type")
+          "message"
+          (mapcat
+            (fn [part]
+              (case (get part "type")
+                "output_text" [{:kind :text :text (or (get part "text") "")}]
+                "output_image"
+                [{:kind :image
+                  :image {:url (or (get part "image_url") (get part "url"))}}]
+                [{:kind (keyword (or (get part "type") "provider_content"))
+                  :provider_data part
+                  :provider_location :content}]))
+            (or (get item "content") []))
+          "function_call"
+          (map (fn [call] {:kind :tool_call :tool_call call})
+               (normalize-openai-tool-calls [item]))
+          [{:kind (keyword (or (get item "type") "provider_content"))
+            :provider_data item
+            :provider_location :input_item}]))
+      (or output []))))
+
+(defn- openai-compatible-content-part [part]
+  (if (some? (:provider_data part))
+    (:provider_data part)
+    (let [kind (content-kind part)]
+      (case kind
+        :text {:type "text" :text (or (:text part) (:content part) "")}
+        :image
+        (let [image (resolve-binary-content part :image "image/png")
+              image-data (content-data part :image)]
+          {:type "image_url"
+           :image_url
+           (cond-> {:url (or (:url image)
+                             (str "data:" (:media_type image)
+                                  ";base64," (:data image)))}
+             (some? (or (:detail image-data) (get image-data "detail")))
+             (assoc :detail (or (:detail image-data)
+                                (get image-data "detail"))))})
+        (:audio :document)
+        (unsupported-content! "openai-compatible" kind)
+        (unsupported-content! "openai-compatible" kind)))))
+
+(defn- normalize-openai-compatible-content [content]
+  (if (string? content)
+    (if (str/blank? content) [] [{:kind :text :text content}])
+    (mapv
+      (fn [part]
+        (case (get part "type")
+          "text" {:kind :text :text (or (get part "text") "")}
+          "image_url"
+          {:kind :image
+           :image {:url (get-in part ["image_url" "url"])
+                   :detail (get-in part ["image_url" "detail"])}}
+          {:kind (keyword (or (get part "type") "provider_content"))
+           :provider_data part}))
+      (or content []))))
+
 (defn- openai-compatible-messages [messages]
   (vec
     (mapcat
@@ -564,21 +861,43 @@
               content (:content message)]
           (if (= role :tool)
             (map (fn [result]
-                   {:role "tool"
-                    :tool_call_id (:tool_call_id result)
-                    :content (str (:content result))})
+                   (let [value (tool-result-data result)]
+                     {:role "tool"
+                      :tool_call_id (or (:tool_call_id value)
+                                        (get value "tool_call_id"))
+                      :content (provider-tool-result-content
+                                 (or (:content value)
+                                     (get value "content") ""))}))
                  content)
-            [(cond-> {:role (name role) :content (str content)}
-               (seq (:tool_calls message))
+            (let [source-parts (message-content-parts message)
+                  ordinary-parts (filter (fn [part]
+                                           (not= :tool_call (content-kind part)))
+                                         source-parts)
+                  embedded-calls (map tool-call-data
+                                      (filter (fn [part]
+                                                (= :tool_call (content-kind part)))
+                                              source-parts))
+                  calls (if (seq embedded-calls)
+                          embedded-calls
+                          (or (:tool_calls message) []))]
+              [(cond-> {:role (name role)
+                        :content (if (or (= role :system) (= role :developer))
+                                   (message-text message)
+                                   (mapv openai-compatible-content-part
+                                         ordinary-parts))}
+               (seq calls)
                (assoc :tool_calls
                       (mapv (fn [call]
-                              {:id (:id call)
+                              {:id (or (:id call) (get call "id"))
                                :type "function"
                                :function
-                               {:name (:name call)
+                               {:name (or (:name call) (get call "name"))
                                 :arguments
-                                (json/write-json (json-safe (:arguments call)))}})
-                            (:tool_calls message))))])))
+                                (json/write-json
+                                  (json-safe
+                                    (or (:arguments call)
+                                        (get call "arguments") {})))}})
+                            calls)))]))))
       messages)))
 
 (defn openai-compatible-complete [request & [api-key base-url]]
@@ -611,12 +930,25 @@
       (let [body (json/read-json body-str)
             choice (first (get body "choices"))
             message (or (get choice "message") {})
+            text (if (string? (get message "content"))
+                   (or (get message "content") "")
+                   (str/join ""
+                             (map (fn [part]
+                                    (if (= (get part "type") "text")
+                                      (or (get part "text") "") ""))
+                                  (or (get message "content") []))))
+            text-parts (normalize-openai-compatible-content (get message "content"))
+            tool-calls (normalize-openai-tool-calls (get message "tool_calls"))
+            parts (vec (concat text-parts
+                               (map (fn [call]
+                                      {:kind :tool_call :tool_call call})
+                                    tool-calls)))
             usage (or (get body "usage") {})]
         {:id (get body "id")
          :model (or (get body "model") (:model request))
          :provider provider
-         :message {:role :assistant :content (or (get message "content") "")}
-         :tool_calls (normalize-openai-tool-calls (get message "tool_calls"))
+         :message {:role :assistant :content parts :parts parts :text text}
+         :tool_calls tool-calls
          :usage {:input_tokens (or (get usage "prompt_tokens") 0)
                  :output_tokens (or (get usage "completion_tokens") 0)
                  :total_tokens (or (get usage "total_tokens") 0)}
@@ -628,7 +960,7 @@
         url (resolve-openai-url (or base-url (:base_url request)))
         messages (or (:messages request) [])
         instructions (str/join "\n\n"
-                               (map (fn [m] (str (:content m)))
+                               (map message-text
                                     (filter (fn [m]
                                               (or (= (:role m) :system)
                                                   (= (:role m) :developer)))
@@ -665,11 +997,13 @@
         tool-calls (normalize-openai-tool-calls call-items)
         usage (or (get body "usage") {})
         input-details (or (get usage "input_tokens_details") {})
-        output-details (or (get usage "output_tokens_details") {})]
+        output-details (or (get usage "output_tokens_details") {})
+        parts (normalize-openai-parts output)]
     {:id (get body "id")
      :model (or (get body "model") (:model request))
      :provider "openai"
-     :message {:role :assistant :content (openai-output-text output)}
+     :message {:role :assistant :content parts :parts parts
+               :text (openai-output-text output)}
      :tool_calls tool-calls
      :usage {:input_tokens (or (get usage "input_tokens") 0)
              :output_tokens (or (get usage "output_tokens") 0)
@@ -703,7 +1037,7 @@
         schema-prompt (schema-instruction request)
         system-text (str/join "\n\n"
                               (filter (fn [text] (not (str/blank? (str text))))
-                                      (concat (map :content system-messages)
+                                      (concat (map message-text system-messages)
                                               [schema-prompt])))
         non-system (remove (fn [m]
                              (or (= (:role m) :system)
@@ -773,6 +1107,41 @@
      :cache_write_tokens (or (get usage "cache_creation_input_tokens") 0)
      :total_tokens (+ input output)}))
 
+(defn- normalize-anthropic-part [block]
+  (case (get block "type")
+    "text" {:kind :text :text (or (get block "text") "")}
+    "image"
+    (let [source (or (get block "source") {})]
+      {:kind :image
+       :image (if (= (get source "type") "url")
+                {:url (get source "url")
+                 :media_type (get source "media_type")}
+                {:data (base64-decode (or (get source "data") ""))
+                 :media_type (get source "media_type")})})
+    "document"
+    (let [source (or (get block "source") {})]
+      {:kind :document
+       :document (if (= (get source "type") "url")
+                   {:url (get source "url")
+                    :media_type (get source "media_type")}
+                   {:data (base64-decode (or (get source "data") ""))
+                    :media_type (get source "media_type")})})
+    "tool_use"
+    {:kind :tool_call
+     :tool_call {:id (or (get block "id") "")
+                 :name (or (get block "name") "")
+                 :arguments (or (get block "input") {})}}
+    "thinking"
+    {:kind :thinking
+     :thinking {:text (or (get block "thinking") "")
+                :signature (get block "signature")
+                :redacted false}}
+    "redacted_thinking"
+    {:kind :redacted_thinking
+     :thinking {:data (get block "data") :redacted true}}
+    {:kind (keyword (or (get block "type") "provider_content"))
+     :provider_data block}))
+
 (defn- normalize-anthropic-response [request body-map]
   (let [content-blocks (or (get body-map "content") [])
         text (str/join ""
@@ -792,11 +1161,12 @@
         usage (assoc base-usage :reasoning_tokens
                      (if (str/blank? reasoning)
                        0
-                       (quot (+ (count reasoning) 3) 4)))]
+                       (quot (+ (count reasoning) 3) 4)))
+        parts (mapv normalize-anthropic-part content-blocks)]
     {:id (get body-map "id")
      :model (or (get body-map "model") (:model request))
      :provider "anthropic"
-     :message {:role :assistant :content text :parts content-blocks}
+     :message {:role :assistant :content parts :parts parts :text text}
      :reasoning reasoning
      :tool_calls tool-calls
      :usage usage
@@ -822,34 +1192,100 @@
         (catch Object e (throw e)))))
 
 ;; Gemini native generateContent adapter.
-(defn- gemini-message [message]
+(defn- gemini-content-part [part]
+  (if (some? (:provider_data part))
+    (:provider_data part)
+    (if (or (some? (get part "text"))
+          (some? (get part "inlineData"))
+          (some? (get part "fileData"))
+          (some? (get part "functionCall"))
+          (some? (get part "functionResponse")))
+      part
+      (let [kind (content-kind part)]
+      (case kind
+        :text {:text (or (:text part) (:content part) "")}
+        (:image :audio :document)
+        (let [binary (resolve-binary-content
+                       part kind
+                       (case kind
+                         :image "image/png"
+                         :audio "audio/wav"
+                         "application/pdf"))]
+          (if (:url binary)
+            {:fileData {:mimeType (:media_type binary)
+                        :fileUri (:url binary)}}
+            {:inlineData {:mimeType (:media_type binary)
+                          :data (:data binary)}}))
+        :tool_call
+        (let [call (content-data part :tool_call)]
+          {:functionCall
+           {:name (or (:name call) (get call "name"))
+            :args (or (:arguments call) (get call "arguments") {})}})
+        :thinking
+        (let [thinking (content-data part :thinking)]
+          {:text (or (:text thinking) (get thinking "text") "")
+           :thought true})
+        (unsupported-content! "gemini" kind))))))
+
+(defn- gemini-message [message call-names]
   (let [role (:role message)
         content (:content message)
         tool-calls (:tool_calls message)]
     (cond
       (= role :tool)
       {:role "user"
-       :parts (mapv (fn [result]
-                      {:functionResponse
-                       {:id (:tool_call_id result)
-                        :name (:tool_name result)
-                        :response (if (:is_error result)
-                                    {:error (:content result)}
-                                    {:output (:content result)})}})
-                    content)}
+       :parts (vec
+                (mapcat
+                  (fn [result]
+                    (let [value (tool-result-data result)
+                          result-content (or (:content value)
+                                             (get value "content"))
+                          is-error (or (:is_error value)
+                                       (get value "is_error"))
+                          image (tool-result-image value)]
+                      (concat
+                        [{:functionResponse
+                          {:name (or (:tool_name value)
+                                     (get value "tool_name")
+                                     (when call-names
+                                       (get @call-names
+                                            (or (:tool_call_id value)
+                                                (get value "tool_call_id"))))
+                                     "")
+                           :response (if is-error
+                                       {:error result-content}
+                                       (if (map? result-content)
+                                         result-content
+                                         {:result result-content}))}}]
+                        (when image
+                          [{:inlineData {:mimeType (:media_type image)
+                                         :data (:data image)}}]))))
+                  content))}
 
       (= role :assistant)
-      {:role "model"
-       :parts (vec
-                (concat
-                  (when-not (str/blank? (str content)) [{:text (str content)}])
-                  (map (fn [call]
-                         {:functionCall {:id (:id call)
-                                         :name (:name call)
-                                         :args (:arguments call)}})
-                       (or tool-calls []))))}
+      (let [source-parts (if (and (not (seq (:parts message)))
+                                  (not (vector? content))
+                                  (str/blank? (str content)))
+                           []
+                           (message-content-parts message))
+            embeds-tool-calls
+            (some (fn [part]
+                    (or (= :tool_call (content-kind part))
+                        (some? (get part "functionCall"))))
+                  source-parts)]
+        {:role "model"
+         :parts (vec
+                  (concat
+                    (map gemini-content-part source-parts)
+                    (when-not embeds-tool-calls
+                      (map (fn [call]
+                             {:functionCall {:name (:name call)
+                                             :args (:arguments call)}})
+                           (or tool-calls [])))))} )
 
-      :else {:role "user" :parts [{:text (str content)}]})))
+      :else {:role "user"
+             :parts (mapv gemini-content-part
+                          (message-content-parts message))})))
 
 (defn normalize-gemini-tool-calls [parts]
   (mapv (fn [part]
@@ -866,8 +1302,9 @@
                                   (or (= (:role m) :system)
                                       (= (:role m) :developer)))
                                 (:messages request))
-        system-text (str/join "\n\n" (map (fn [m] (str (:content m))) system-messages))
-        contents (mapv gemini-message
+        system-text (str/join "\n\n" (map message-text system-messages))
+        call-names (:gemini_call_names request)
+        contents (mapv (fn [message] (gemini-message message call-names))
                        (remove (fn [m]
                                  (or (= (:role m) :system)
                                      (= (:role m) :developer)))
@@ -900,6 +1337,55 @@
    :cache_read_tokens (or (get usage "cachedContentTokenCount") 0)
    :total_tokens (or (get usage "totalTokenCount") 0)})
 
+(defn- content-kind-for-media-type [media-type]
+  (let [mime (str/lower-case (str (or media-type "")))]
+    (cond
+      (str/starts-with? mime "image/") :image
+      (str/starts-with? mime "audio/") :audio
+      :else :document)))
+
+(defn- normalize-gemini-parts [native-parts]
+  (reduce
+    (fn [[parts calls] part]
+      (cond
+        (some? (get part "functionCall"))
+        (let [native (get part "functionCall")
+              call {:id (or (get native "id") (str "call_" (random-uuid)))
+                    :name (or (get native "name") "")
+                    :arguments (or (get native "args") {})}]
+          [(conj parts {:kind :tool_call :tool_call call})
+           (conj calls call)])
+
+        (some? (get part "text"))
+        (if (get part "thought")
+          [(conj parts {:kind :thinking
+                        :thinking {:text (or (get part "text") "")
+                                   :redacted false}})
+           calls]
+          [(conj parts {:kind :text :text (or (get part "text") "")}) calls])
+
+        (some? (get part "inlineData"))
+        (let [inline (get part "inlineData")
+              mime (get inline "mimeType")
+              kind (content-kind-for-media-type mime)]
+          [(conj parts {:kind kind
+                        kind {:data (base64-decode (or (get inline "data") ""))
+                              :media_type mime}})
+           calls])
+
+        (some? (get part "fileData"))
+        (let [file (get part "fileData")
+              mime (get file "mimeType")
+              kind (content-kind-for-media-type mime)]
+          [(conj parts {:kind kind
+                        kind {:url (get file "fileUri") :media_type mime}})
+           calls])
+
+        :else
+        [(conj parts {:kind :provider_content :provider_data part}) calls]))
+    [[] []]
+    (or native-parts [])))
+
 (defn- normalize-gemini-response [request body]
   (let [candidate (first (get body "candidates"))
         parts (or (get-in candidate ["content" "parts"]) [])
@@ -909,12 +1395,18 @@
                                     (or (get part "text") "")
                                     ""))
                                 parts))
-        tool-calls (normalize-gemini-tool-calls parts)
+        normalized (normalize-gemini-parts parts)
+        content-parts (first normalized)
+        tool-calls (second normalized)
         usage (gemini-usage (or (get body "usageMetadata") {}))]
+    (when-let [call-names (:gemini_call_names request)]
+      (doseq [call tool-calls]
+        (swap! call-names assoc (:id call) (:name call))))
     {:id (get body "responseId")
      :model (or (get body "modelVersion") (:model request))
      :provider "gemini"
-     :message {:role :assistant :content text :parts parts}
+     :message {:role :assistant :content content-parts :parts content-parts
+               :text text}
      :tool_calls tool-calls
      :usage usage
      :finish_reason (if (seq tool-calls)
@@ -1287,11 +1779,22 @@
 (defn- gemini-stream-response [request state raw]
   (let [snapshot @state
         tool-calls (:tool_calls snapshot)
-        usage (gemini-usage (:usage snapshot))]
+        usage (gemini-usage (:usage snapshot))
+        parts (vec
+                (concat
+                  (when-not (str/blank? (:reasoning snapshot))
+                    [{:kind :thinking
+                      :thinking {:text (:reasoning snapshot)
+                                 :redacted false}}])
+                  (when-not (str/blank? (:text snapshot))
+                    [{:kind :text :text (:text snapshot)}])
+                  (map (fn [call] {:kind :tool_call :tool_call call})
+                       tool-calls)))]
     {:id (:id snapshot)
      :model (or (:model snapshot) (:model request))
      :provider "gemini"
-     :message {:role :assistant :content (:text snapshot)}
+     :message {:role :assistant :content parts :parts parts
+               :text (:text snapshot)}
      :tool_calls tool-calls
      :usage usage
      :finish_reason (if (seq tool-calls)
@@ -1333,6 +1836,9 @@
     (doseq [part reasoning-parts]
       (swap! state update :reasoning append-string (get part "text")))
     (when (seq calls) (swap! state update :tool_calls into calls))
+    (when-let [call-names (:gemini_call_names request)]
+      (doseq [call calls]
+        (swap! call-names assoc (:id call) (:name call))))
     (when finish-provider (swap! state assoc :finish_reason finish-provider))
     (let [start-events (when first-event? [{:type :stream_start :raw body}])
           text-events (concat
@@ -1414,7 +1920,11 @@
 (defn make-provider-adapter [provider & [opts]]
   (let [name (str/lower-case provider)
         options (or opts {})
-        request-with-options (fn [request] (merge options request))
+        gemini-call-names (when (= name "gemini") (atom {}))
+        request-with-options
+        (fn [request]
+          (cond-> (merge options request)
+            gemini-call-names (assoc :gemini_call_names gemini-call-names)))
         complete-fn
         (fn [request]
           (let [req (request-with-options request)]
@@ -1670,7 +2180,7 @@
     (= :tool_calls (if (map? reason) (:reason reason) reason))))
 
 (defn- step-result [response tool-results]
-  {:text (or (get-in response [:message :content]) "")
+  {:text (response-text response)
    :reasoning (:reasoning response)
    :tool_calls (or (:tool_calls response) [])
    :tool_results tool-results
@@ -1680,7 +2190,7 @@
    :warnings []})
 
 (defn- generate-result [response tool-results steps total-usage]
-  {:text (or (get-in response [:message :content]) "")
+  {:text (response-text response)
    :reasoning (:reasoning response)
    :tool_calls (or (:tool_calls response) [])
    :tool_results tool-results

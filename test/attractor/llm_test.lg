@@ -179,6 +179,15 @@
     (is (nil? (:max_tokens request)))
     (is (nil? (:reasoning_effort request)))))
 
+(deftest test-mock-provider-uses-canonical-content-parts
+  (let [response
+        (llm/complete
+          {:provider "mock" :model "mock-test"
+           :messages [{:role :user
+                       :content [{:kind :text :text "hello"}]}]})]
+    (is (= :text (get-in response [:message :content 0 :kind])))
+    (is (str/includes? (llm/response-text response) "hello"))))
+
 (deftest test-provider-options-pass-through
   (let [openai-captured (atom nil)
         anthropic-captured (atom nil)
@@ -235,6 +244,481 @@
     (is (= "cachedContents/1" (get gemini-body "cachedContent")))
     (is (= "BLOCK_NONE"
            (get-in gemini-body ["safetySettings" 0 "threshold"])))))
+
+(deftest test-multimodal-image-parts-translate-across-native-providers
+  (let [messages
+        [{:role :system
+          :content [{:kind :text :text "Analyze precisely"}]}
+         {:role :developer
+          :content [{:kind :text :text "Follow policy"}]}
+         {:role :user
+          :content
+          [{:kind :text :text "Describe these images"}
+           {:kind :image
+            :image {:url "https://example.test/chart.png"
+                    :media_type "image/png" :detail "high"}}
+           {:kind :image
+            :image {:data (byte-array [137 80 78 71])
+                    :media_type "image/png"}}]}]
+        openai-captured (atom nil)
+        anthropic-captured (atom nil)
+        gemini-captured (atom nil)
+        complete-response
+        (fn [provider]
+          (case provider
+            :openai {:id "o" :status "completed" :output [] :usage {}}
+            :anthropic {:id "a" :content [] :stop_reason "end_turn" :usage {}}
+            {:responseId "g" :candidates [] :usageMetadata {}}))
+        _ (llm/openai-complete
+            {:model "gpt-test" :api_key "key" :messages messages
+             :transport (fn [request]
+                          (reset! openai-captured request)
+                          {:status 200
+                           :body (json/write-json (complete-response :openai))})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key" :messages messages
+             :transport (fn [request]
+                          (reset! anthropic-captured request)
+                          {:status 200
+                           :body (json/write-json (complete-response :anthropic))})})
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key" :messages messages
+             :transport (fn [request]
+                          (reset! gemini-captured request)
+                          {:status 200
+                           :body (json/write-json (complete-response :gemini))})})
+        openai-content
+        (get-in (json/read-json (:body @openai-captured)) ["input" 0 "content"])
+        anthropic-content
+        (get-in (json/read-json (:body @anthropic-captured)) ["messages" 0 "content"])
+        gemini-parts
+        (get-in (json/read-json (:body @gemini-captured)) ["contents" 0 "parts"])]
+    (is (= "Analyze precisely\n\nFollow policy"
+           (get (json/read-json (:body @openai-captured)) "instructions")))
+    (is (= "Analyze precisely\n\nFollow policy"
+           (get-in (json/read-json (:body @anthropic-captured))
+                   ["system" 0 "text"])))
+    (is (= "Analyze precisely\n\nFollow policy"
+           (get-in (json/read-json (:body @gemini-captured))
+                   ["systemInstruction" "parts" 0 "text"])))
+    (is (= {"type" "input_text" "text" "Describe these images"}
+           (get openai-content 0)))
+    (is (= {"type" "input_image"
+            "image_url" "https://example.test/chart.png"
+            "detail" "high"}
+           (get openai-content 1)))
+    (is (= "data:image/png;base64,iVBORw=="
+           (get-in openai-content [2 "image_url"])))
+    (is (= {"type" "url" "url" "https://example.test/chart.png"}
+           (get-in anthropic-content [1 "source"])))
+    (is (= {"type" "base64" "media_type" "image/png"
+            "data" "iVBORw=="}
+           (get-in anthropic-content [2 "source"])))
+    (is (= {"mimeType" "image/png"
+            "fileUri" "https://example.test/chart.png"}
+           (get-in gemini-parts [1 "fileData"])))
+    (is (= {"mimeType" "image/png" "data" "iVBORw=="}
+           (get-in gemini-parts [2 "inlineData"])))))
+
+(deftest test-local-image-path-is-inlined-and-mime-type-is-inferred
+  (let [path (str "/tmp/strange-lettractor-image-" (random-uuid) ".png")
+        captured (atom nil)]
+    (spit path (byte-array [0 255]))
+    (try
+      (llm/gemini-complete
+        {:model "gemini-test" :api_key "key"
+         :messages [{:role :user
+                     :content [{:kind :image :image {:url path}}]}]
+         :transport
+         (fn [request]
+           (reset! captured request)
+           {:status 200
+            :body (json/write-json
+                    {:responseId "g" :candidates [] :usageMetadata {}})})})
+      (let [inline-data
+            (get-in (json/read-json (:body @captured))
+                    ["contents" 0 "parts" 0 "inlineData"])]
+        (is (= "image/png" (get inline-data "mimeType")))
+        (is (= "AP8=" (get inline-data "data"))))
+      (finally
+        (delete-file path)))))
+
+(deftest test-binary-content-requires-exactly-one-source
+  (doseq [image [{:url "https://example.test/x.png" :data "PNG"}
+                 {}]]
+    (let [error
+          (try
+            (llm/openai-complete
+              {:model "gpt" :api_key "key"
+               :messages [{:role :user
+                           :content [{:kind :image :image image}]}]
+               :transport (fn [_] (throw (ex-info "network called" {})))})
+            nil
+            (catch Object e e))]
+      (is (= :invalid-request (:category (ex-data error))))
+      (is (= :image (:content_kind (ex-data error)))))))
+
+(deftest test-provider-specific-content-parts-replay-verbatim
+  (let [openai-captured (atom nil)
+        anthropic-captured (atom nil)
+        gemini-captured (atom nil)
+        send
+        (fn [complete model part capture response]
+          (complete
+            {:model model :api_key "key"
+             :messages [{:role :assistant
+                         :content [{:kind :provider_content
+                                    :provider_data part}]}]
+             :transport
+             (fn [request]
+               (reset! capture request)
+               {:status 200 :body (json/write-json response)})}))]
+    (send llm/openai-complete "gpt"
+          {"type" "refusal" "refusal" "cannot"}
+          openai-captured
+          {:id "o" :status "completed" :output [] :usage {}})
+    (send llm/anthropic-complete "claude"
+          {"type" "server_tool_use" "name" "search"}
+          anthropic-captured
+          {:id "a" :content [] :stop_reason "end_turn" :usage {}})
+    (send llm/gemini-complete "gemini"
+          {"executableCode" {"language" "PYTHON" "code" "1+1"}}
+          gemini-captured
+          {:responseId "g" :candidates [] :usageMetadata {}})
+    (is (= "cannot"
+           (get-in (json/read-json (:body @openai-captured))
+                   ["input" 0 "content" 0 "refusal"])))
+    (is (= "search"
+           (get-in (json/read-json (:body @anthropic-captured))
+                   ["messages" 0 "content" 0 "name"])))
+    (is (= "1+1"
+           (get-in (json/read-json (:body @gemini-captured))
+                   ["contents" 0 "parts" 0 "executableCode" "code"])))))
+
+(deftest test-openai-top-level-provider-items-replay-at-top-level
+  (let [first-response
+        (llm/openai-complete
+          {:model "gpt" :api_key "key" :messages []
+           :transport
+           (fn [_]
+             {:status 200
+              :body (json/write-json
+                      {:id "o1" :status "completed" :usage {}
+                       :output [{:type "computer_call" :id "computer-1"
+                                 :action {:type "screenshot"}}]})})})
+        captured (atom nil)
+        _ (llm/openai-complete
+            {:model "gpt" :api_key "key"
+             :messages [(:message first-response)]
+             :transport
+             (fn [request]
+               (reset! captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "o2" :status "completed"
+                         :output [] :usage {}})})})
+        replay-input (get (json/read-json (:body @captured)) "input")]
+    (is (= :input_item
+           (get-in first-response
+                   [:message :content 0 :provider_location])))
+    (is (= "computer_call" (get-in replay-input [0 "type"])))
+    (is (nil? (get-in replay-input [0 "content"])))))
+
+(deftest test-openai-preserves-interleaved-top-level-item-order
+  (let [first-response
+        (llm/openai-complete
+          {:model "gpt" :api_key "key" :messages []
+           :transport
+           (fn [_]
+             {:status 200
+              :body (json/write-json
+                      {:id "o1" :status "completed" :usage {}
+                       :output [{:type "reasoning" :id "reasoning-1"
+                                 :summary []}
+                                {:type "function_call" :call_id "call-1"
+                                 :name "inspect" :arguments "{}"}
+                                {:type "computer_call" :id "computer-1"
+                                 :action {:type "screenshot"}}]})})})
+        captured (atom nil)
+        _ (llm/openai-complete
+            {:model "gpt" :api_key "key"
+             :messages [(:message first-response)]
+             :transport
+             (fn [request]
+               (reset! captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "o2" :status "completed"
+                         :output [] :usage {}})})})
+        replay-input (get (json/read-json (:body @captured)) "input")]
+    (is (= ["reasoning" "function_call" "computer_call"]
+           (mapv (fn [item] (get item "type")) replay-input)))))
+
+(deftest test-provider-media-responses-normalize-and-replay
+  (let [anthropic-response
+        (llm/anthropic-complete
+          {:model "claude" :api_key "key" :messages []
+           :transport
+           (fn [_]
+             {:status 200
+              :body (json/write-json
+                      {:id "a" :stop_reason "end_turn" :usage {}
+                       :content
+                       [{:type "image"
+                         :source {:type "base64" :media_type "image/png"
+                                  :data "iVBORw=="}}]})})})
+        anthropic-replay (atom nil)
+        _ (llm/anthropic-complete
+            {:model "claude" :api_key "key"
+             :messages [(:message anthropic-response)]
+             :transport
+             (fn [request]
+               (reset! anthropic-replay request)
+               {:status 200
+                :body (json/write-json
+                        {:id "a2" :stop_reason "end_turn" :usage {}
+                         :content []})})})
+        gemini-response
+        (llm/gemini-complete
+          {:model "gemini" :api_key "key" :messages []
+           :transport
+           (fn [_]
+             {:status 200
+              :body (json/write-json
+                      {:responseId "g"
+                       :candidates
+                       [{:finishReason "STOP"
+                         :content {:parts
+                                   [{:inlineData
+                                     {:mimeType "image/png"
+                                      :data "iVBORw=="}}]}}]
+                       :usageMetadata {}})})})
+        gemini-replay (atom nil)
+        _ (llm/gemini-complete
+            {:model "gemini" :api_key "key"
+             :messages [(:message gemini-response)]
+             :transport
+             (fn [request]
+               (reset! gemini-replay request)
+               {:status 200
+                :body (json/write-json
+                        {:responseId "g2" :candidates []
+                         :usageMetadata {}})})})]
+    (is (= :image
+           (get-in anthropic-response [:message :content 0 :kind])))
+    (is (= "iVBORw=="
+           (get-in (json/read-json (:body @anthropic-replay))
+                   ["messages" 0 "content" 0 "source" "data"])))
+    (is (= :image (get-in gemini-response [:message :content 0 :kind])))
+    (is (= "iVBORw=="
+           (get-in (json/read-json (:body @gemini-replay))
+                   ["contents" 0 "parts" 0 "inlineData" "data"])))))
+
+(deftest test-audio-and-document-parts-translate-or-fail-explicitly
+  (let [captured (atom nil)
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key"
+             :messages
+             [{:role :user
+               :content
+               [{:kind :audio
+                 :audio {:data "WAV" :media_type "audio/wav"}}
+                {:kind :document
+                 :document {:url "https://example.test/report.pdf"}}]}]
+             :transport
+             (fn [request]
+               (reset! captured request)
+               {:status 200
+                :body (json/write-json
+                        {:responseId "g" :candidates [] :usageMetadata {}})})})
+        parts (get-in (json/read-json (:body @captured))
+                      ["contents" 0 "parts"])]
+    (is (= "audio/wav" (get-in parts [0 "inlineData" "mimeType"])))
+    (is (= "V0FW" (get-in parts [0 "inlineData" "data"])))
+    (is (= "application/pdf" (get-in parts [1 "fileData" "mimeType"])))
+    (doseq [[provider complete message]
+            [["openai" llm/openai-complete
+              {:kind :document :document {:data "PDF"}}]
+             ["anthropic" llm/anthropic-complete
+              {:kind :audio :audio {:data "WAV"}}]]]
+      (let [error
+            (try
+              (complete
+                {:model "test" :api_key "key"
+                 :messages [{:role :user :content [message]}]
+                 :transport (fn [_] (throw (ex-info "should not send" {})))})
+              nil
+              (catch Object e e))]
+        (is (= :invalid-request (:category (ex-data error))))
+        (is (= provider (:provider (ex-data error))))))))
+
+(deftest test-portable-tool-content-parts-round-trip
+  (let [assistant
+        {:role :assistant
+         :content
+         [{:kind :text :text "checking"}
+          {:kind :tool_call
+           :tool_call {:id "call-9" :name "lookup"
+                       :arguments {:query "weather"}}}]}
+        tool-result
+        {:role :tool
+         :content
+         [{:kind :tool_result
+           :tool_result {:tool_call_id "call-9" :tool_name "lookup"
+                         :content "sunny" :is_error false}}]}
+        openai-captured (atom nil)
+        anthropic-captured (atom nil)
+        gemini-captured (atom nil)
+        _ (llm/openai-complete
+            {:model "gpt-test" :api_key "key"
+             :messages [assistant tool-result]
+             :transport
+             (fn [request]
+               (reset! openai-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "o" :status "completed" :output [] :usage {}})})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key"
+             :messages [assistant tool-result]
+             :transport
+             (fn [request]
+               (reset! anthropic-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "a" :content [] :stop_reason "end_turn" :usage {}})})})
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key"
+             :messages [assistant tool-result]
+             :transport
+             (fn [request]
+               (reset! gemini-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:responseId "g" :candidates [] :usageMetadata {}})})})
+        openai-input (get (json/read-json (:body @openai-captured)) "input")
+        anthropic-messages
+        (get (json/read-json (:body @anthropic-captured)) "messages")
+        gemini-contents
+        (get (json/read-json (:body @gemini-captured)) "contents")]
+    (is (= ["message" "function_call" "function_call_output"]
+           (mapv #(get % "type") openai-input)))
+    (is (= "call-9" (get-in openai-input [2 "call_id"])))
+    (is (= "tool_use"
+           (get-in anthropic-messages [0 "content" 1 "type"])))
+    (is (= "tool_result"
+           (get-in anthropic-messages [1 "content" 0 "type"])))
+    (is (= "lookup"
+           (get-in gemini-contents [0 "parts" 1 "functionCall" "name"])))
+    (is (= "sunny"
+           (get-in gemini-contents
+                   [1 "parts" 0 "functionResponse" "response" "result"])))))
+
+(deftest test-gemini-adapter-retains-synthetic-call-name-mapping
+  (let [requests (atom [])
+        responses
+        (atom
+          [{:responseId "g1"
+            :candidates
+            [{:finishReason "STOP"
+              :content {:role "model"
+                        :parts [{:text "considering" :thought true}
+                                {:functionCall
+                                 {:name "lookup" :args {:q "x"}}}]}}]
+            :usageMetadata {}}
+           {:responseId "g2" :candidates [] :usageMetadata {}}])
+        adapter
+        (llm/make-provider-adapter
+          "gemini"
+          {:api_key "key"
+           :transport
+           (fn [request]
+             (swap! requests conj request)
+             (let [body (first @responses)]
+               (swap! responses #(vec (rest %)))
+               {:status 200 :body (json/write-json body)}))})
+        client (llm/make-client {:providers {"gemini" adapter}
+                                 :default_provider "gemini"})
+        first-response
+        (llm/client-complete client {:model "gemini-test"
+                                     :messages [{:role :user :content "go"}]})
+        call-id (get-in first-response [:tool_calls 0 :id])
+        _ (llm/client-complete
+            client
+            {:model "gemini-test"
+             :messages
+             [{:role :assistant
+               :content (get-in first-response [:message :parts])}
+              {:role :tool
+               :content [{:kind :tool_result
+                          :tool_result {:tool_call_id call-id
+                                        :content "ok"
+                                        :is_error false}}]}]})
+        replay (json/read-json (:body (second @requests)))]
+    (is (str/starts-with? call-id "call_"))
+    (is (= true
+           (get-in replay ["contents" 0 "parts" 0 "thought"])))
+    (is (= "lookup"
+           (get-in replay ["contents" 0 "parts" 1 "functionCall" "name"])))
+    (is (= "lookup"
+           (get-in replay
+                   ["contents" 1 "parts" 0 "functionResponse" "name"])))
+    (is (nil?
+          (get-in replay
+                  ["contents" 1 "parts" 0 "functionResponse" "id"])))))
+
+(deftest test-structured-tool-results-use-provider-safe-encoding
+  (let [result
+        {:role :tool
+         :content [{:kind :tool_result
+                    :tool_result {:tool_call_id "call-1"
+                                  :tool_name "lookup"
+                                  :content {:forecast "sunny" :degrees 72}
+                                  :image_data (byte-array [137 80 78 71])
+                                  :image_media_type "image/png"
+                                  :is_error false}}]}
+        captures (atom {})
+        response-for
+        (fn [provider]
+          (case provider
+            :openai {:id "o" :status "completed" :output [] :usage {}}
+            :anthropic {:id "a" :content [] :stop_reason "end_turn" :usage {}}
+            {:responseId "g" :candidates [] :usageMetadata {}}))
+        transport
+        (fn [provider]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json (response-for provider))}))]
+    (llm/openai-complete {:model "gpt" :api_key "key" :messages [result]
+                          :transport (transport :openai)})
+    (llm/anthropic-complete {:model "claude" :api_key "key" :messages [result]
+                             :transport (transport :anthropic)})
+    (llm/gemini-complete {:model "gemini" :api_key "key" :messages [result]
+                          :transport (transport :gemini)})
+    (let [openai-body (json/read-json (:body (:openai @captures)))
+          anthropic-body (json/read-json (:body (:anthropic @captures)))
+          gemini-body (json/read-json (:body (:gemini @captures)))]
+      (is (= "sunny"
+             (get (json/read-json
+                    (get-in openai-body ["input" 0 "output" 0 "text"]))
+                  "forecast")))
+      (is (= "data:image/png;base64,iVBORw=="
+             (get-in openai-body ["input" 0 "output" 1 "image_url"])))
+      (is (= 72
+             (get (json/read-json
+                    (get-in anthropic-body
+                            ["messages" 0 "content" 0 "content" 0 "text"]))
+                  "degrees")))
+      (is (= "iVBORw=="
+             (get-in anthropic-body
+                     ["messages" 0 "content" 0 "content" 1 "source" "data"])))
+      (is (= "sunny"
+             (get-in gemini-body
+                     ["contents" 0 "parts" 0 "functionResponse"
+                      "response" "forecast"])))
+      (is (= "iVBORw=="
+             (get-in gemini-body
+                     ["contents" 0 "parts" 1 "inlineData" "data"]))))))
 
 (deftest test-structured-response-format-translation
   (let [schema {:type "object"
@@ -715,7 +1199,7 @@
            (mapv :type events)))
     (is (= ["Hel" "lo"]
            (mapv :delta (filter (fn [event] (= (:type event) :text_delta)) events))))
-    (is (= "Hello" (get-in (last events) [:response :message :content])))
+    (is (= "Hello" (get-in (last events) [:response :message :text])))
     (is (= 3 (get-in (last events) [:usage :total_tokens])))))
 
 (deftest test-sse-parser-handles-multiline-retry-comments-and-eof
@@ -761,7 +1245,7 @@
            (mapv :type events)))
     (is (= ["Hel" "lo"]
            (mapv :delta (filter (fn [event] (= (:type event) :text_delta)) events))))
-    (is (= "Hello" (get-in (last events) [:response :message :content])))
+    (is (= "Hello" (get-in (last events) [:response :message :text])))
     (is (= 5 (get-in (last events) [:usage :total_tokens])))
     (is (= :stop (get-in (last events) [:finish_reason])))))
 
@@ -792,8 +1276,53 @@
     (is (not (str/blank? (get-in (first tool-events) [:tool_call :id]))))
     (is (= (get-in (first tool-events) [:tool_call :id])
            (get-in (second tool-events) [:tool_call :id])))
-    (is (= "Hello" (get-in (last events) [:response :message :content])))
+    (is (= "Hello" (get-in (last events) [:response :message :text])))
     (is (= 1 (get-in (last events) [:usage :reasoning_tokens])))))
+
+(deftest test-gemini-stream-thought-and-call-state-survive-continuation
+  (let [replay-captured (atom nil)
+        adapter
+        (llm/make-provider-adapter
+          "gemini"
+          {:api_key "key"
+           :transport
+           (fn [request]
+             (if (= :stream (:as request))
+               {:status 200
+                :body
+                (str "data: {\"responseId\":\"g1\","
+                     "\"candidates\":[{\"content\":{\"parts\":["
+                     "{\"text\":\"thinking\",\"thought\":true},"
+                     "{\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]},"
+                     "\"finishReason\":\"STOP\"}],\"usageMetadata\":{}}\n\n")}
+               (do
+                 (reset! replay-captured request)
+                 {:status 200
+                  :body (json/write-json
+                          {:responseId "g2" :candidates []
+                           :usageMetadata {}})})))})
+        client (llm/make-client {:providers {"gemini" adapter}
+                                 :default_provider "gemini"})
+        events (vec (llm/client-stream
+                      client {:model "gemini-test"
+                              :messages [{:role :user :content "go"}]}))
+        response (:response (last events))
+        call-id (get-in response [:tool_calls 0 :id])
+        _ (llm/client-complete
+            client
+            {:model "gemini-test"
+             :messages
+             [(:message response)
+              {:role :tool
+               :content [{:kind :tool_result
+                          :tool_result {:tool_call_id call-id
+                                        :content "ok" :is_error false}}]}]})
+        replay (json/read-json (:body @replay-captured))]
+    (is (= [:thinking :tool_call]
+           (mapv :kind (get-in response [:message :content]))))
+    (is (= "lookup"
+           (get-in replay
+                   ["contents" 1 "parts" 0 "functionResponse" "name"])))))
 
 (deftest test-provider-tool-call-normalization
   (let [openai (llm/normalize-openai-tool-calls
@@ -846,8 +1375,14 @@
     (is (= "Be exact" (get-in payload ["systemInstruction" "parts" 0 "text"])))
     (is (= "read_file"
            (get-in payload ["tools" 0 "functionDeclarations" 0 "name"])))
-    (is (= "Checking" (get-in response [:message :content])))
+    (is (= "Checking" (get-in response [:message :text])))
     (is (= "read_file" (get-in response [:tool_calls 0 :name])))
+    (is (= :text (get-in response [:message :parts 0 :kind])))
+    (is (= :tool_call (get-in response [:message :parts 1 :kind])))
+    (is (= (get-in response [:tool_calls 0 :id])
+           (get-in response [:message :parts 1 :tool_call :id])))
+    (is (= (get-in response [:message :parts])
+           (get-in response [:message :content])))
     (is (= 1 (get-in response [:usage :reasoning_tokens])))
     (is (= :tool_calls (:finish_reason response)))))
 
@@ -879,7 +1414,7 @@
     (is (= "tool_use" (get-in payload ["messages" 0 "content" 0 "type"])))
     (is (= "tool_result" (get-in payload ["messages" 1 "content" 0 "type"])))
     (is (= "call-1" (get-in payload ["messages" 1 "content" 0 "tool_use_id"])))
-    (is (= "Done" (get-in response [:message :content])))
+    (is (= "Done" (get-in response [:message :text])))
     (is (= :stop (:finish_reason response)))))
 
 (deftest test-anthropic-alternation-thinking-and-prompt-caching
@@ -944,8 +1479,13 @@
                        "prompt-caching-2024-07-31"))
     (is (= "reasoning" (:reasoning response)))
     (is (= 3 (get-in response [:usage :reasoning_tokens])))
-    (is (= "sig-1" (get-in response [:message :parts 0 "signature"])))
-    (is (= "opaque" (get-in response [:message :parts 1 "data"])))
+    (is (= :thinking (get-in response [:message :parts 0 :kind])))
+    (is (= "sig-1"
+           (get-in response [:message :parts 0 :thinking :signature])))
+    (is (= :redacted_thinking (get-in response [:message :parts 1 :kind])))
+    (is (= "opaque"
+           (get-in response [:message :parts 1 :thinking :data])))
+    (is (= parts (get-in response [:message :content])))
     (is (= 20 (get-in response [:usage :cache_read_tokens])))
     (is (= 10 (get-in response [:usage :cache_write_tokens])))
     (is (= "thinking" (get-in replay-payload ["messages" 1 "content" 0 "type"])))
@@ -1004,7 +1544,10 @@
            :reasoning_effort "high" :max_tokens 123
            :messages
            [{:role :system :content "Be exact"}
-            {:role :user :content "Read it"}
+            {:role :user
+             :content [{:kind :text :text "Read it"}
+                       {:kind :image
+                        :image {:url "https://example.test/file.png"}}]}
             {:role :assistant :content ""
              :tool_calls [{:id "old-call" :name "directory_list"
                            :arguments {"path" "."}}]}
@@ -1022,8 +1565,14 @@
     (is (= "read_file" (get-in payload ["tools" 0 "name"])))
     (is (= "high" (get-in payload ["reasoning" "effort"])))
     (is (= 123 (get payload "max_output_tokens")))
-    (is (= "I will read it" (get-in response [:message :content])))
+    (is (= "I will read it" (get-in response [:message :text])))
     (is (= "read_file" (get-in response [:tool_calls 0 :name])))
+    (is (= [:text :tool_call]
+           (mapv :kind (get-in response [:message :parts]))))
+    (is (= [:text :tool_call]
+           (mapv :kind (get-in response [:message :content]))))
+    (is (= "call-1"
+           (get-in response [:message :parts 1 :tool_call :id])))
     (is (= 2 (get-in response [:usage :reasoning_tokens])))
     (is (= 3 (get-in response [:usage :cache_read_tokens])))
     (is (= :tool_calls (:finish_reason response)))))
@@ -1055,7 +1604,10 @@
            :transport transport
            :messages
            [{:role :system :content "Be exact"}
-            {:role :user :content "Read it"}
+            {:role :user
+             :content [{:kind :text :text "Read it"}
+                       {:kind :image
+                        :image {:url "https://example.test/file.png"}}]}
             {:role :assistant :content ""
              :tool_calls [{:id "call-1" :name "directory_list"
                            :arguments {"path" "."}}]}
@@ -1068,10 +1620,13 @@
     (is (= "http://localhost:11434/v1/chat/completions" (:url @captured)))
     (is (= "messages" (if (some? (get payload "messages")) "messages" "input")))
     (is (= "function" (get-in payload ["tools" 0 "type"])))
+    (is (= "https://example.test/file.png"
+           (get-in payload
+                   ["messages" 1 "content" 1 "image_url" "url"])))
     (is (= "directory_list"
            (get-in payload ["messages" 2 "tool_calls" 0 "function" "name"])))
     (is (= "tool" (get-in payload ["messages" 3 "role"])))
-    (is (= "Checking" (get-in response [:message :content])))
+    (is (= "Checking" (get-in response [:message :text])))
     (is (= "read_file" (get-in response [:tool_calls 0 :name])))
     (is (= 8 (get-in response [:usage :input_tokens])))
     (is (= :tool_calls (:finish_reason response)))))

@@ -442,7 +442,7 @@
             result))))))
 
 (defn- response-content [response]
-  (or (get-in response [:message :content])
+  (or (when (:message response) (llm/response-text response))
       (:text response)
       (:content response)
       ""))
