@@ -31,7 +31,8 @@
     (is (= "wasm" ((:platform environment))))))
 
 (deftest test-local-environment-writes-edits-and-executes-in-working-directory
-  (let [root (str (os/temp-dir) "/lettractor-execution-write-test")
+  (let [directory-name (str "lettractor-execution-write-test-" (random-uuid))
+        root (str (os/temp-dir) "/" directory-name)
         environment (execution/make-local-environment {:working_dir root})]
     ((:write_file environment) "nested/file.txt" "same\nsame")
     (is (true? ((:file_exists environment) "nested/file.txt")))
@@ -48,7 +49,7 @@
       (is (= 0 (:exit_code result)))
       ;; macOS canonicalizes /var to /private/var in pwd output.
       (is (str/ends-with? (str/trim (:stdout result))
-                          "/lettractor-execution-write-test")))))
+                          (str "/" directory-name))))))
 
 (deftest test-local-command-timeout-terminates-the-process-group
   (let [root (str (os/temp-dir) "/lettractor-execution-timeout-test")

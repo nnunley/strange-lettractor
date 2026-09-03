@@ -127,6 +127,36 @@
     (is (some #(= "read_file" (:name %))
               (get-in @requests [0 :tools])))))
 
+(deftest test-session-never-executes-malformed-tool-arguments
+  (let [executed (atom false)
+        requests (atom [])
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool!
+            registry
+            {:definition
+             {:name "side_effect" :description "Must not execute"
+              :parameters {:type "object" :properties {}}}
+             :executor (fn [_ _] (reset! executed true) "ran")})
+        profile (profiles/make-profile
+                  {:id "test-provider" :model "native-model"
+                   :tool_registry registry})
+        complete-fn
+        (fn [request]
+          (swap! requests conj request)
+          (if (= 1 (count @requests))
+            {:message {:role :assistant :content ""}
+             :tool_calls [{:id "bad-call" :name "side_effect"
+                           :arguments "{bad"}]}
+            {:message {:role :assistant :content "recovered"}
+             :tool_calls []}))
+        session (agent/make-session {:provider_profile profile
+                                     :complete_fn complete-fn})]
+    (is (= "recovered" (agent/process-input! session "work")))
+    (is (false? @executed))
+    (is (str/includes?
+          (get-in @session [:history 2 :results 0 :content])
+          "Tool error"))))
+
 (deftest test-session-processes-followups-after-current-input
   (let [prompts (atom [])
         events (atom [])

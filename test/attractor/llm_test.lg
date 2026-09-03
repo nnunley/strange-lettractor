@@ -1896,6 +1896,16 @@
           (first (llm/validate-json-schema 1.0 {:type "integer"}))))
     (is (false?
           (first (llm/validate-json-schema 1.5 {:type "integer"}))))
+    (is (true?
+          (first
+            (llm/validate-json-schema
+              {"count" 2}
+              {:type :object :properties {:count {:type :integer}}}))))
+    (is (false?
+          (first
+            (llm/validate-json-schema
+              {"count" "not-an-integer"}
+              {:type :object :properties {:count {:type :integer}}}))))
     (is (false?
           (first
             (llm/validate-json-schema
@@ -2390,6 +2400,105 @@
     (is (= "README.md" (get-in openai [0 :arguments "path"])))
     (is (= "write_file" (:name (first anthropic))))
     (is (= "x" (get-in anthropic [0 :arguments "path"])))))
+
+(deftest test-malformed-openai-tool-arguments-never-execute
+  (doseq [raw-arguments ["{bad" "null" "[]" "42" nil]]
+    (let [calls (atom 0)
+          executed (atom false)
+          transport
+          (fn [_]
+            (let [call-number (swap! calls inc)]
+              {:status 200
+               :body
+               (json/write-json
+                 (if (= call-number 1)
+                   {:id "response-1" :model "gpt-test" :status "completed"
+                    :output
+                    [{:type "function_call" :call_id "bad-call"
+                      :name "side_effect" :arguments raw-arguments}]
+                    :usage {}}
+                   {:id "response-2" :model "gpt-test" :status "completed"
+                    :output
+                    [{:type "message" :role "assistant"
+                      :content [{:type "output_text" :text "recovered"}]}]
+                    :usage {}}))}))
+          adapter (llm/make-provider-adapter
+                    "openai" {:api_key "key" :transport transport})
+          client (llm/make-client {:providers {"openai" adapter}
+                                   :default_provider "openai"})
+          result
+          (llm/generate
+            "gpt-test" "go"
+            {:client client :max_tool_rounds 1
+             :tools
+             [{:name "side_effect" :description "Must not execute"
+               :parameters {:type "object" :properties {}}
+               :execute (fn [_] (reset! executed true) "ran")} ]})
+          bad-call (get-in result [:steps 0 :tool_calls 0])
+          bad-result (get-in result [:steps 0 :tool_results 0])]
+      (is (= 2 @calls))
+      (is (false? @executed))
+      (is (contains? bad-call :raw_arguments))
+      (is (= raw-arguments (:raw_arguments bad-call)))
+      (is (true? (:is_error bad-result)))
+      (is (str/includes? (:content bad-result) "Tool error")))))
+
+(deftest test-malformed-compatible-stream-tool-arguments-never-execute
+  (doseq [raw-arguments ["{bad" "null" "[]" "42" "" "   "]]
+    (let [calls (atom 0)
+          executed (atom false)
+          tool-chunk
+          {:id "stream-1"
+           :choices
+           [{:delta
+             {:tool_calls
+              [{:index 0 :id "bad-call" :type "function"
+                :function {:name "side_effect"
+                           :arguments raw-arguments}}]}
+             :finish_reason nil}]}
+          tool-finish
+          {:choices [{:delta {} :finish_reason "tool_calls"}]}
+          text-chunk
+          {:id "stream-2"
+           :choices
+           [{:delta {:content "recovered"}
+             :finish_reason "stop"}]}
+          stream-body
+          (fn [chunks]
+            (str (str/join "" (map (fn [chunk]
+                                     (str "data: " (json/write-json chunk)
+                                          "\n\n"))
+                                   chunks))
+                 "data: [DONE]\n\n"))
+          transport
+          (fn [_]
+            {:status 200
+             :body (if (= 1 (swap! calls inc))
+                     (stream-body [tool-chunk tool-finish])
+                     (stream-body [text-chunk]))})
+          adapter (llm/make-provider-adapter
+                    "ollama" {:transport transport})
+          client (llm/make-client {:providers {"ollama" adapter}
+                                   :default_provider "ollama"})
+          result
+          (llm/stream
+            "local-test" "go"
+            {:client client :max_tool_rounds 1
+             :tools
+             [{:name "side_effect" :description "Must not execute"
+               :parameters {:type "object" :properties {}}
+               :execute (fn [_] (reset! executed true) "ran")} ]})
+          events (vec (:events result))
+          step (first (filter (fn [event]
+                                (= :step_finish (:type event)))
+                              events))
+          bad-call (get-in step [:step :tool_calls 0])
+          bad-result (get-in step [:step :tool_results 0])]
+      (is (= 2 @calls))
+      (is (false? @executed))
+      (is (= raw-arguments (:raw_arguments bad-call)))
+      (is (true? (:is_error bad-result)))
+      (is (= "recovered" (get-in (last events) [:response :message :text]))))))
 
 (deftest test-gemini-native-request-and-response
   (let [captured (atom nil)

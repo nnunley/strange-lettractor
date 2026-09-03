@@ -308,14 +308,13 @@ digraph Gate {
                     {:status :success}))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_allow_partial"
+        logs (str (os/temp-dir) "/test_engine_allow_partial-" (random-uuid))
         result (e/run-pipeline graph {:registry registry :logs-root logs
                                       :retry-policy {:jitter false}
                                       :sleep-fn (fn [_] nil)})
         checkpoint (c/load-checkpoint (str logs "/checkpoint.edn"))]
     (is (= :success (:status result)))
-    (is (= 0 (get (:node_retries checkpoint) "work")))
-    (os/sh "rm" "-rf" logs)))
+    (is (= 0 (get (:node_retries checkpoint) "work")))))
 
 (deftest test-failure-routing-only-selects-explicit-fail-edge
   (let [graph (p/parse-dot

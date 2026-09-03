@@ -652,14 +652,20 @@
   (if (string? arguments)
     (try
       (json/read-json arguments)
-      (catch Object _ {}))
-    (or arguments {})))
+      ;; Keep malformed provider output invalid. Replacing it with an empty
+      ;; object could satisfy a permissive schema and execute the tool.
+      (catch Object _ arguments))
+    arguments))
 
 (defn- execute-single-tool [session tool-call event-fn]
   (let [tool-name (or (:name tool-call) (get tool-call "name") "")
         call-id (or (:id tool-call) (get tool-call "id") "")
-        args (normalize-tool-arguments
-               (or (:arguments tool-call) (get tool-call "arguments") {}))
+        raw-args (cond
+                   (contains? tool-call :arguments) (:arguments tool-call)
+                   (contains? tool-call "arguments")
+                   (get tool-call "arguments")
+                   :else {})
+        args (normalize-tool-arguments raw-args)
         registered (profiles/registry-get
                      (get-in @session [:provider_profile :tool_registry])
                      tool-name)]
@@ -671,7 +677,11 @@
         (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
         result)
       (try
-        (let [[valid? reason]
+        (let [_ (when-not (map? args)
+                  (throw
+                    (ex-info "Tool arguments must be a JSON object"
+                             {:category :invalid-tool-arguments})))
+              [valid? reason]
               (llm/validate-json-schema
                 args (get-in registered [:definition :parameters]))
               _ (when-not valid?

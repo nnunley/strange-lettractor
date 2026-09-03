@@ -20,6 +20,18 @@
     (profiles/unregister-tool! registry "lookup")
     (is (nil? (profiles/registry-get registry "lookup")))))
 
+(deftest test-tool-registry-requires-object-parameter-schemas
+  (doseq [parameters [nil {:properties {}} {:type "array"}]]
+    (is (= :invalid-tool-definition
+           (try
+             (do
+               (profiles/register-tool!
+                 (profiles/make-tool-registry)
+                 {:definition {:name "unsafe" :parameters parameters}
+                  :executor (fn [_ _] "unsafe")})
+               nil)
+             (catch Object error (:category (ex-data error))))))))
+
 (deftest test-provider-profiles-have-provider-aligned-editing-tools
   (let [openai (profiles/create-openai-profile "gpt-5-codex")
         anthropic (profiles/create-anthropic-profile "claude-sonnet")

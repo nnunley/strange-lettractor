@@ -311,14 +311,23 @@
   (mapv
     (fn [tool-call]
       (let [function-data (or (get tool-call "function") tool-call)
-            raw-arguments (or (get function-data "arguments") "{}")
+            arguments-present? (contains? function-data "arguments")
+            supplied-arguments (get function-data "arguments")
+            raw-arguments (if arguments-present? supplied-arguments "{}")
             arguments (if (string? raw-arguments)
                         (try (json/read-json raw-arguments)
-                             (catch Object _ {}))
+                             ;; Preserve malformed provider output so the tool
+                             ;; execution layer can return an error result. An
+                             ;; empty map could pass a permissive schema and
+                             ;; incorrectly execute a side-effecting tool.
+                             (catch Object _ raw-arguments))
                         raw-arguments)]
-        {:id (or (get tool-call "call_id") (get tool-call "id") "")
-         :name (or (get function-data "name") "")
-         :arguments arguments}))
+        (cond->
+          {:id (or (get tool-call "call_id") (get tool-call "id") "")
+           :name (or (get function-data "name") "")
+           :arguments arguments}
+          arguments-present?
+          (assoc :raw_arguments supplied-arguments))))
     (or tool-calls [])))
 
 (defn normalize-anthropic-tool-calls [content-blocks]
@@ -1835,10 +1844,13 @@
   (let [index (or (get native "index") (count (:tool_order @state)))
         existing (get-in @state [:tools index])
         function-data (or (get native "function") {})
+        arguments-present? (contains? function-data "arguments")
         argument-delta (or (get function-data "arguments") "")
         call {:id (or (get native "id") (:id existing) (str "call_" index))
               :name (or (get function-data "name") (:name existing) "")
-              :arguments (append-string (:arguments existing) argument-delta)}
+              :arguments (append-string (:arguments existing) argument-delta)
+              :arguments_present (or (:arguments_present existing)
+                                     arguments-present?)}
         first-delta? (nil? existing)]
     (when first-delta?
       (swap! state update :tool_order conj index))
@@ -1848,13 +1860,17 @@
      :raw raw}))
 
 (defn- compatible-stream-tool-call [call]
-  (let [arguments (:arguments call)]
-    (assoc call :arguments
-           (if (str/blank? arguments)
-             {}
-             (try
-               (json/read-json arguments)
-               (catch Object _ {}))))))
+  (let [arguments (:arguments call)
+        arguments-present? (:arguments_present call)]
+    (cond->
+      (assoc (dissoc call :arguments_present) :arguments
+             (if (and (not arguments-present?) (str/blank? arguments))
+               {}
+               (try
+                 (json/read-json arguments)
+                 (catch Object _ arguments))))
+      (and arguments-present? (string? arguments))
+      (assoc :raw_arguments arguments))))
 
 (defn- compatible-stream-response [request state]
   (let [snapshot @state
@@ -2772,12 +2788,21 @@
    :is_error true})
 
 (defn- parse-tool-arguments [tool-call]
-  (let [arguments (or (:arguments tool-call)
-                      (get tool-call "arguments")
-                      {})]
-    (if (string? arguments)
-      (json/read-json arguments)
-      arguments)))
+  (let [arguments (cond
+                    (contains? tool-call :arguments)
+                    (:arguments tool-call)
+                    (contains? tool-call "arguments")
+                    (get tool-call "arguments")
+                    :else {})
+        parsed (if (string? arguments)
+                 (json/read-json arguments)
+                 arguments)]
+    (when-not (map? parsed)
+      (throw
+        (ex-info "Tool arguments must be a JSON object"
+                 {:category :invalid-tool-arguments
+                  :arguments parsed})))
+    parsed))
 
 (declare validate-json-schema)
 
@@ -2936,7 +2961,7 @@
 (defn- schema-type-valid? [value expected]
   (if (sequential? expected)
     (some (fn [candidate] (schema-type-valid? value candidate)) expected)
-    (case expected
+    (case (if (keyword? expected) (name expected) expected)
       "object" (map? value)
       "array" (vector? value)
       "string" (string? value)

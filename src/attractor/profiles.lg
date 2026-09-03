@@ -1,16 +1,34 @@
 (ns attractor.profiles
   (:require [clojure.string :as str]))
 
-(defn make-tool-registry [& [tools]]
-  (atom (into {} (map (fn [tool]
-                        [(get-in tool [:definition :name]) tool])
-                      (or tools [])))))
-
-(defn register-tool! [registry tool]
-  (let [name (get-in tool [:definition :name])]
-    (when (str/blank? name)
+(defn- validate-registered-tool! [tool]
+  (let [definition (:definition tool)
+        tool-name (:name definition)
+        parameters (:parameters definition)
+        schema-type (or (:type parameters) (get parameters "type"))]
+    (when (str/blank? tool-name)
       (throw (ex-info "Registered tool definition requires a name"
                       {:category :invalid-tool-definition})))
+    (when-not (= "object" (if (keyword? schema-type)
+                            (name schema-type)
+                            schema-type))
+      (throw
+        (ex-info "Registered tool parameters must use an object schema"
+                 {:category :invalid-tool-definition
+                  :tool_name tool-name})))
+    tool))
+
+(defn make-tool-registry [& [tools]]
+  (let [initial-tools (or tools [])]
+    (doseq [tool initial-tools]
+      (validate-registered-tool! tool))
+    (atom (into {} (map (fn [tool]
+                          [(get-in tool [:definition :name]) tool])
+                        initial-tools)))))
+
+(defn register-tool! [registry tool]
+  (let [validated (validate-registered-tool! tool)
+        name (get-in validated [:definition :name])]
     (swap! registry assoc name tool)
     tool))
 
