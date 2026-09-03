@@ -119,10 +119,15 @@
                                ["file_path" "old_string" "new_string"]))
         shell-def (definition "shell" "Execute a shell command"
                               {:command {:type "string"}
-                               :timeout_ms {:type "integer"}}
+                               :timeout_ms {:type "integer"}
+                               :description {:type "string"}}
                               ["command"])
         grep-def (definition "grep" "Search file contents"
-                             {:pattern {:type "string"} :path {:type "string"}}
+                             {:pattern {:type "string"}
+                              :path {:type "string"}
+                              :glob_filter {:type "string"}
+                              :case_insensitive {:type "boolean"}
+                              :max_results {:type "integer"}}
                              ["pattern"])
         glob-def (definition "glob" "Find files by pattern"
                              {:pattern {:type "string"} :path {:type "string"}}
@@ -201,10 +206,19 @@
                       {:paths {:type "array"}} ["paths"])
           (fn [args env]
             (mapv (fn [path] ((:read_file env) path nil nil))
-                  (arg args "paths"))))]
+                  (arg args "paths"))))
+        list-dir
+        (registered
+          (definition "list_dir" "List directory entries"
+                      {:path {:type "string"}
+                       :depth {:type "integer"}} [])
+          (fn [args env]
+            ((:list_directory env)
+             (or (arg args "path") ".")
+             (or (arg args "depth") 1))))]
     (make-profile
       {:id "gemini" :model (or model "gemini-3-pro")
-       :tool_registry (profile-registry "edit_file" [read-many])
+       :tool_registry (profile-registry "edit_file" [read-many list-dir])
        :build_system_prompt
        (provider-prompt "Google/Gemini"
                         "Use the available filesystem tools and honor GEMINI.md guidance.")})))

@@ -112,6 +112,169 @@
            (do (execution/make-local-environment {:env_policy :mystery}) nil)
            (catch Object error (:category (ex-data error)))))))
 
+(deftest test-local-grep-honors-filter-case-and-result-limit
+  (let [root (str (os/temp-dir) "/lettractor-grep-options-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "one.lg" "Needle one\nneedle two\n")
+    ((:write_file environment) "two.txt" "needle three\n")
+    (let [result ((:grep environment) "needle" "."
+                  {"glob_filter" "*.lg"
+                   "case_insensitive" true
+                   "max_results" 1})]
+      (is (str/includes? result "one.lg"))
+      (is (str/includes? result "Needle one"))
+      (is (not (str/includes? result "needle two")))
+      (is (not (str/includes? result "two.txt"))))))
+
+(deftest test-local-directory-list-respects-depth
+  (let [root (str (os/temp-dir) "/lettractor-list-depth-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "top.txt" "top")
+    ((:write_file environment) "nested/deep.txt" "deep")
+    (let [shallow ((:list_directory environment) "." 1)
+          recursive ((:list_directory environment) "." 2)
+          names (fn [entries] (set (map :name entries)))]
+      (is (= #{"nested" "top.txt"} (names shallow)))
+      (is (= #{"nested" "nested/deep.txt" "top.txt"}
+             (names recursive))))))
+
+(deftest test-local-glob-shell-quotes-hostile-pattern-and-path
+  (let [root (str (os/temp-dir) "/lettractor-glob-quote-"
+                  (System/currentTimeMillis))
+        pattern-marker (str root "/pattern-injected")
+        path-marker (str root "/path-injected")
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "safe.txt" "safe")
+    ((:glob environment)
+     (str "`printf injected > " pattern-marker "`") ".")
+    (is (= :glob-failed
+           (try
+             (do ((:glob environment)
+                  "*.txt" (str "`printf injected > " path-marker "`"))
+                 nil)
+             (catch Object error (:category (ex-data error))))))
+    (is (false? (some? (os/stat pattern-marker))))
+    (is (false? (some? (os/stat path-marker))))))
+
+(deftest test-local-grep-falls-back-when-ripgrep-is-unavailable
+  (let [root (str (os/temp-dir) "/lettractor-grep-fallback-"
+                  (System/currentTimeMillis))
+        environment
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})]
+    ((:write_file environment) "fallback.txt" "alpha\nNeedle\nomega\n")
+    (let [result ((:grep environment) "needle" "."
+                  {:case_insensitive true :max_results 10})]
+      (is (str/includes? result "fallback.txt:2:Needle")))))
+
+(deftest test-local-grep-fallback-does-not-follow-directory-symlinks
+  (let [root (str (os/temp-dir) "/lettractor-grep-symlink-"
+                  (System/currentTimeMillis))
+        environment
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})]
+    ((:write_file environment) "inside/match.txt" "Needle\n")
+    (let [link-result (os/sh "/bin/ln" "-s" ".." (str root "/inside/parent"))]
+      (is (= 0 (:exit link-result))))
+    (let [result ((:grep environment) "Needle" "." {:max_results 10})]
+      (is (= "inside/match.txt:1:Needle" result)))))
+
+(deftest test-local-grep-fallback-supports-ripgrep-style-globs
+  (let [root (str (os/temp-dir) "/lettractor-grep-globs-"
+                  (System/currentTimeMillis))
+        environment
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})]
+    ((:write_file environment) "top.lg" "Needle top\n")
+    ((:write_file environment) "src/nested/alpha.lg" "Needle alpha\n")
+    ((:write_file environment) "src/nested/beta.txt" "Needle beta\n")
+    ((:write_file environment) "literal*.lg" "Needle literal\n")
+    (let [nested ((:grep environment) "Needle" "."
+                  {:glob_filter "src/**/[a-z]*.lg" :max_results 10})
+          excluded ((:grep environment) "Needle" "."
+                    {:glob_filter "!*.txt" :max_results 10})
+          repeated ((:grep environment) "Needle" "."
+                    {:glob_filter "*************************.lg"
+                     :max_results 10})
+          escaped ((:grep environment) "Needle" "."
+                   {:glob_filter "literal\\*.lg" :max_results 10})]
+      (is (= "src/nested/alpha.lg:1:Needle alpha" nested))
+      (is (str/includes? excluded "top.lg:1:Needle top"))
+      (is (str/includes? excluded "src/nested/alpha.lg:1:Needle alpha"))
+      (is (not (str/includes? excluded "beta.txt")))
+      (is (str/includes? repeated "top.lg:1:Needle top"))
+      (is (str/includes? repeated "src/nested/alpha.lg:1:Needle alpha"))
+      (is (= "literal*.lg:1:Needle literal" escaped)))))
+
+(deftest test-local-grep-fallback-preserves-rooted-glob-semantics
+  (let [root (str (os/temp-dir) "/lettractor-grep-rooted-glob-"
+                  (System/currentTimeMillis))
+        environment
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})]
+    ((:write_file environment) "foo.lg" "Needle root\n")
+    ((:write_file environment) "nested/foo.lg" "Needle nested\n")
+    (is (= "foo.lg:1:Needle root"
+           ((:grep environment) "Needle" "."
+            {:glob_filter "/foo.lg" :max_results 10})))
+    (is (= "nested/foo.lg:1:Needle nested"
+           ((:grep environment) "Needle" "."
+            {:glob_filter "!/foo.lg" :max_results 10})))))
+
+(deftest test-local-glob-is-native-safe-and-newest-first
+  (let [root (str (os/temp-dir) "/lettractor-native-glob-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "old.lg" "old")
+    ((:write_file environment) "nested/new.lg" "new")
+    (is (= 0 (:exit (os/sh "/usr/bin/touch" "-t" "202001010101"
+                            (str root "/old.lg")))))
+    (is (= 0 (:exit (os/sh "/usr/bin/touch" "-t" "202201010101"
+                            (str root "/nested/new.lg")))))
+    (is (= ["nested/new.lg" "old.lg"]
+           ((:glob environment) "**/*.lg" ".")))
+    (is (= :glob-failed
+           (try
+             (do ((:glob environment) "*.lg" "-delete") nil)
+             (catch Object error (:category (ex-data error))))))
+    (is (some? (os/stat (str root "/old.lg"))))
+    (is (some? (os/stat (str root "/nested/new.lg"))))))
+
+(deftest test-local-glob-orders-within-one-epoch-second
+  (let [root (str (os/temp-dir) "/lettractor-subsecond-glob-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})
+        epoch-second
+        (fn [path]
+          (let [result (if (= "darwin" (os/os-name))
+                         (os/sh "/usr/bin/stat" "-f" "%m" "--" path)
+                         (os/sh "/usr/bin/stat" "-c" "%Y" "--" path))]
+            (parse-long (str/trim (:out result)))))]
+    ;; Avoid straddling a wall-clock second while creating the fixture.
+    (loop []
+      (when (> (mod (System/currentTimeMillis) 1000) 700)
+        (os/sh "/bin/sleep" "0.05")
+        (recur)))
+    ((:write_file environment) "z-older.lg" "old")
+    (os/sh "/bin/sleep" "0.05")
+    ((:write_file environment) "a-newer.lg" "new")
+    (is (= (epoch-second (str root "/z-older.lg"))
+           (epoch-second (str root "/a-newer.lg"))))
+    (is (= ["a-newer.lg" "z-older.lg"]
+           ((:glob environment) "*.lg" ".")))))
+
+(deftest test-local-grep-raises-provider-visible-errors
+  (let [root (str (os/temp-dir) "/lettractor-grep-error-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "sample.txt" "content")
+    (is (= :grep-failed
+           (try
+             (do ((:grep environment) "[" "." {}) nil)
+             (catch Object error (:category (ex-data error))))))))
+
 (deftest test-local-command-rejects-invalid-explicit-environment-name
   (let [environment (execution/make-local-environment {:env_policy :none})]
     (is (= :invalid-environment-variable

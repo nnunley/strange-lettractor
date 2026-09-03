@@ -33,6 +33,44 @@
     (is (= 120000 (:default_command_timeout_ms anthropic)))
     (is (true? (:supports_parallel_tool_calls openai)))))
 
+(deftest test-provider-profiles-expose-required-tool-schemas
+  (let [openai (profiles/create-openai-profile "gpt-5-codex")
+        anthropic (profiles/create-anthropic-profile "claude-sonnet")
+        gemini (profiles/create-gemini-profile "gemini-pro")
+        registry (fn [profile] (:tool_registry profile))
+        names (fn [profile] (set (profiles/registry-names (registry profile))))
+        properties
+        (fn [profile tool]
+          (get-in (profiles/registry-get (registry profile) tool)
+                  [:definition :parameters :properties]))]
+    (is (= #{"read_file" "apply_patch" "write_file" "shell" "grep" "glob"}
+           (names openai)))
+    (is (= #{"read_file" "edit_file" "write_file" "shell" "grep" "glob"}
+           (names anthropic)))
+    (is (= #{"read_file" "read_many_files" "edit_file" "write_file"
+             "shell" "grep" "glob" "list_dir"}
+           (names gemini)))
+    (doseq [profile [openai anthropic gemini]]
+      (is (= #{:command :timeout_ms :description}
+             (set (keys (properties profile "shell")))))
+      (is (= #{:pattern :path :glob_filter :case_insensitive :max_results}
+             (set (keys (properties profile "grep"))))))
+    (is (= #{:path :depth}
+           (set (keys (properties gemini "list_dir")))))))
+
+(deftest test-gemini-list-dir-delegates-to-execution-environment
+  (let [calls (atom [])
+        profile (profiles/create-gemini-profile "gemini")
+        tool (profiles/registry-get (:tool_registry profile) "list_dir")
+        environment
+        {:list_directory
+         (fn [path depth]
+           (swap! calls conj [path depth])
+           [{:name "src" :is_dir true}])}]
+    (is (= [{:name "src" :is_dir true}]
+           ((:executor tool) {"path" "." "depth" 2} environment)))
+    (is (= [["." 2]] @calls))))
+
 (deftest test-anthropic-edit-tool-delegates-to-environment
   (let [calls (atom [])
         profile (profiles/create-anthropic-profile "claude")

@@ -49,6 +49,193 @@
       (recur (+ index (count needle)) (inc total))
       total)))
 
+(defn- option [options key]
+  (if (contains? options key)
+    (get options key)
+    (get options (keyword key))))
+
+(defn- shell-quote [value]
+  (str "'" (str/replace (str value) "'" "'\"'\"'") "'"))
+
+(defn- child-path [parent child]
+  (str (str/replace parent #"/$" "") "/" child))
+
+(defn- list-directory-tree [root relative depth]
+  (mapcat
+    (fn [entry]
+      (let [absolute (child-path root entry)
+            name (if (str/blank? relative)
+                   entry
+                   (child-path relative entry))
+            stat (os/stat absolute)
+            item {:name name :is_dir (:dir? stat) :size (:size stat)}]
+        (if (and (:dir? stat) (> depth 1))
+          (cons item (list-directory-tree absolute name (dec depth)))
+          [item])))
+    (sort (os/ls root))))
+
+(defn- symbolic-link? [path]
+  (= 0 (:exit (os/sh "/bin/test" "-L" path))))
+
+(defn- walk-files [root relative]
+  (let [stat (when-not (symbolic-link? root) (os/stat root))]
+    (when (nil? stat)
+      (when (str/blank? relative)
+        (throw (ex-info (str "Search path does not exist: " root)
+                        {:category :path-not-found :path root}))))
+    (cond
+      (nil? stat) []
+      (:dir? stat)
+      (mapcat
+        (fn [entry]
+          (walk-files (child-path root entry)
+                      (if (str/blank? relative)
+                        entry
+                        (child-path relative entry))))
+        (sort (os/ls root)))
+      :else [[root (if (str/blank? relative) (:name stat) relative)]])))
+
+(defn- regex-quoted-character [character]
+  (if (str/includes? "\\.^$|(){}+*?[]" character)
+    (str "\\" character)
+    character))
+
+(defn- glob-regex-source [pattern]
+  (loop [index 0 source ""]
+    (if (>= index (count pattern))
+      (str "^" source "$")
+      (let [character (subs pattern index (inc index))]
+        (cond
+          (= character "\\")
+          (if (< (inc index) (count pattern))
+            (recur (+ index 2)
+                   (str source
+                        (regex-quoted-character
+                          (subs pattern (inc index) (+ index 2)))))
+            (recur (inc index) (str source "\\\\")))
+
+          (= character "[")
+          (if-let [end (str/index-of pattern "]" (inc index))]
+            (let [body (subs pattern (inc index) end)
+                  negated (or (str/starts-with? body "!")
+                              (str/starts-with? body "^"))
+                  body (if negated (subs body 1) body)]
+              (recur (inc end)
+                     (str source "[" (when negated "^") body "]")))
+            (recur (inc index) (str source "\\[")))
+
+          (= character "*")
+          (let [end (loop [cursor (inc index)]
+                      (if (and (< cursor (count pattern))
+                               (= "*" (subs pattern cursor (inc cursor))))
+                        (recur (inc cursor))
+                        cursor))
+                recursive? (> end (inc index))
+                slash? (and recursive?
+                            (< end (count pattern))
+                            (= "/" (subs pattern end (inc end))))]
+            (recur (if slash? (inc end) end)
+                   (str source
+                        (cond slash? "(.*/)?"
+                              recursive? ".*"
+                              :else "[^/]*"))))
+
+          (= character "?")
+          (recur (inc index) (str source "[^/]"))
+
+          :else
+          (recur (inc index)
+                 (str source (regex-quoted-character character))))))))
+
+(defn- compile-glob-filter [glob-filter]
+  (when-not (str/blank? glob-filter)
+    (let [negated (str/starts-with? glob-filter "!")
+          pattern (if negated (subs glob-filter 1) glob-filter)
+          rooted (str/starts-with? pattern "/")
+          pattern (if rooted
+                    (subs pattern 1)
+                    pattern)]
+      (try
+        {:negated negated
+         :match_path (or rooted (str/includes? pattern "/"))
+         :regex (re-pattern (glob-regex-source pattern))}
+        (catch Object error
+          (throw (ex-info (str "Invalid grep glob: " error)
+                          {:category :grep-failed
+                           :glob_filter glob-filter})))))))
+
+(defn- last-path-segment [path]
+  (last (str/split path #"/")))
+
+(defn- glob-includes? [compiled relative]
+  (if (nil? compiled)
+    true
+    (let [candidate (if (:match_path compiled)
+                      relative
+                      (last-path-segment relative))
+          matches (some? (re-matches (:regex compiled) candidate))]
+      (if (:negated compiled) (not matches) matches))))
+
+(defn- displayed-glob-path [requested-path relative]
+  (let [requested (or requested-path ".")]
+    (cond
+      (or (= requested ".") (str/blank? requested)) relative
+      :else (child-path requested relative))))
+
+(defn- numeric-modification-time [path]
+  (let [result (if (= "darwin" (os/os-name))
+                 (os/sh "/usr/bin/stat" "-f" "%m" "--" path)
+                 (os/sh "/usr/bin/stat" "-c" "%Y" "--" path))
+        value (when (= 0 (:exit result))
+                (parse-long (str/trim (:out result))))]
+    (when (nil? value)
+      (throw (ex-info (str "Could not read modification time for " path)
+                      {:category :file-stat-failed
+                       :path path
+                       :exit_code (:exit result)})))
+    value))
+
+(defn- native-glob [root requested-path pattern]
+  (let [compiled (compile-glob-filter pattern)]
+    (when (nil? compiled)
+      (throw (ex-info "Glob pattern must not be empty"
+                      {:category :invalid-glob :pattern pattern})))
+    (->> (walk-files root "")
+         (filter (fn [[_ relative]] (glob-includes? compiled relative)))
+         (map (fn [[absolute relative]]
+                (let [stat (os/stat absolute)]
+                  {:path (displayed-glob-path requested-path relative)
+                   ;; Epoch seconds keep ordering correct across UTC offset
+                   ;; changes; the formatted nanosecond timestamp breaks ties
+                   ;; for files modified within the same second.
+                   :mod_time [(numeric-modification-time absolute)
+                              (:mod-time stat)]})))
+         (sort-by (fn [entry] [(:mod_time entry) (:path entry)]))
+         reverse
+         (map :path)
+         vec)))
+
+(defn- native-grep [root pattern case-insensitive glob-filter max-results]
+  (let [regex
+        (try
+          (re-pattern (str (when case-insensitive "(?i)") pattern))
+          (catch Object error
+            (throw (ex-info (str "Invalid grep pattern: " error)
+                            {:category :grep-failed :pattern pattern}))))
+        compiled-glob (compile-glob-filter glob-filter)
+        matches
+        (mapcat
+          (fn [[absolute relative]]
+            (if (not (glob-includes? compiled-glob relative))
+              []
+              (keep-indexed
+                (fn [index line]
+                  (when (re-find regex line)
+                    (str relative ":" (inc index) ":" line)))
+                (str/split (io/slurp absolute) #"\r?\n"))))
+          (walk-files root ""))]
+    (str/join "\n" (take max-results matches))))
+
 (def command-wrapper
   (str
     "workdir=$1\n"
@@ -150,6 +337,7 @@
                 (str "Unknown environment inheritance policy: " raw-env-policy)
                 {:category :invalid-environment-policy
                  :env_policy raw-env-policy})))
+        rg-command (or (:rg_command options) "rg")
         lifecycle
         (or (:_lifecycle options)
             {:active_commands (atom {})
@@ -327,23 +515,56 @@
            (if replace-all matches 1)))
        :list_directory
        (fn [path depth]
-         (let [resolved (path-for (or path "."))]
-           (mapv (fn [entry]
-                   (let [stat (os/stat (str resolved "/" entry))]
-                     {:name entry :is_dir (:dir? stat) :size (:size stat)}))
-                 (os/ls resolved))))
+         (let [resolved (path-for (or path "."))
+               requested-depth (max 1 (or depth 1))]
+           (vec (list-directory-tree resolved "" requested-depth))))
        :exec_command exec-command
        :grep
        (fn [pattern path grep-options]
-         (let [result (exec-command
-                        (str "rg --line-number --color never -- "
-                             (pr-str pattern) " " (pr-str (or path ".")))
-                        10000 working-dir nil)]
-           (str (:stdout result) (:stderr result))))
+         (let [options (or grep-options {})
+               case-insensitive (boolean (option options "case_insensitive"))
+               glob-filter (option options "glob_filter")
+               requested-limit (or (option options "max_results") 100)
+               max-results (max 1 requested-limit)
+               flags (cond-> ["--line-number" "--color" "never"]
+                       case-insensitive (conj "--ignore-case")
+                       (not (str/blank? glob-filter))
+                       (conj "--glob" (shell-quote glob-filter)))
+               command (str/join
+                         " "
+                         (concat [(shell-quote rg-command)] flags
+                                 ["--" (shell-quote pattern)
+                                  (shell-quote (or path "."))]))
+               result (exec-command command 10000 working-dir nil)
+               exit-code (:exit_code result)]
+           (cond
+             (= 127 exit-code)
+             (native-grep (path-for (or path ".")) pattern case-insensitive
+                          glob-filter max-results)
+
+             (or (= 0 exit-code) (= 1 exit-code))
+             (str/join "\n"
+                       (take max-results
+                             (remove str/blank?
+                                     (str/split (:stdout result) #"\r?\n"))))
+
+             :else
+             (throw
+               (ex-info
+                 (str "grep failed with exit code " exit-code
+                      (when-not (str/blank? (:stderr result))
+                        (str ": " (str/trim (:stderr result)))))
+                 {:category :grep-failed
+                  :exit_code exit-code
+                  :timed_out (:timed_out result)
+                  :cancelled (:cancelled result)})))))
        :glob
        (fn [pattern path]
-         (let [result (exec-command
-                        (str "find " (pr-str (or path "."))
-                             " -type f -path " (pr-str pattern))
-                        10000 working-dir nil)]
-           (vec (remove str/blank? (str/split (:stdout result) #"\r?\n")))))})))
+         (try
+           (native-glob (path-for (or path ".")) path pattern)
+           (catch Object error
+             (throw
+               (ex-info
+                 (str "glob failed: " error)
+                 {:category :glob-failed
+                  :cause_category (:category (ex-data error))})))))})))
