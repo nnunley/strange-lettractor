@@ -1,5 +1,6 @@
 (ns attractor.llm
   (:require [clojure.string :as str]
+            [clojure.core :as core]
             [json :as json]
             [os :as os]
             [io :as io]
@@ -14,6 +15,13 @@
         (get headers lower-name)
         (get headers (keyword header-name))
         (get headers (keyword lower-name)))))
+
+(defn- transport-request-options [request options]
+  (cond-> options
+    (some? (:abort_signal request))
+    (assoc :abort_signal (:abort_signal request))
+    (some? (:adapter_timeout request))
+    (assoc :timeout (:adapter_timeout request))))
 
 (defn- parse-retry-after [response]
   (when-let [value (response-header response "Retry-After")]
@@ -924,8 +932,11 @@
                   (not (str/blank? key))
                   (assoc "Authorization" (str "Bearer " key)))
         transport (or (:transport request) http/request)
-        resp (transport {:method :post :url url :headers headers
-                         :body (json/write-json payload)})
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url url :headers headers
+                  :body (json/write-json payload)}))
         status (:status resp)
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
@@ -1021,8 +1032,11 @@
 (defn openai-complete [request & [api-key base-url]]
   (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport {:method :post :url url :headers headers
-                         :body (json/write-json (json-safe payload))})
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url url :headers headers
+                  :body (json/write-json (json-safe payload))}))
         status (:status resp)
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
@@ -1183,10 +1197,13 @@
         (anthropic-request-data request api-key base-url)]
     (try
         (let [transport (or (:transport request) http/request)
-              resp (transport {:method :post
-                               :url url
-                               :headers headers
-                               :body (json/write-json (json-safe payload))})
+              resp (transport
+                     (transport-request-options
+                       request
+                       {:method :post
+                        :url url
+                        :headers headers
+                        :body (json/write-json (json-safe payload))}))
               status (:status resp)
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
@@ -1422,8 +1439,11 @@
         (gemini-request-data request api-key base-url)]
     (try
         (let [transport (or (:transport request) http/request)
-              resp (transport {:method :post :url url :headers headers
-                               :body (json/write-json (json-safe payload))})
+              resp (transport
+                     (transport-request-options
+                       request
+                       {:method :post :url url :headers headers
+                        :body (json/write-json (json-safe payload))}))
               status (:status resp)
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
@@ -1498,6 +1518,12 @@
   (if (string? body)
     (str/split body #"\r?\n")
     (io/line-seq body)))
+
+(defn- register-provider-stream-close! [request body]
+  (when (and (not (string? body))
+             (fn? (:register_stream_close request)))
+    ((:register_stream_close request) (fn [] (io/close body))))
+  nil)
 
 (defn- mark-stream-part! [state key id]
   (let [seen? (contains? (get @state key #{}) id)]
@@ -1639,16 +1665,22 @@
 (defn openai-stream [request & [api-key base-url]]
   (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport {:method :post :url url :headers headers :as :stream
-                         :body (json/write-json (json-safe (assoc payload :stream true)))})
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url url :headers headers :as :stream
+                  :body (json/write-json
+                          (json-safe (assoc payload :stream true)))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-provider-error! "openai" resp)
-      (let [state (atom {:text_started #{} :text_ended #{}
-                         :reasoning_started #{} :reasoning_ended #{}
-                         :tools {}})]
-        (mapcat (fn [event] (openai-stream-events request state event))
-                (parse-sse-lines (stream-lines (:body resp))))))))
+      (do
+        (register-provider-stream-close! request (:body resp))
+        (let [state (atom {:text_started #{} :text_ended #{}
+                           :reasoning_started #{} :reasoning_ended #{}
+                           :tools {}})]
+          (mapcat (fn [event] (openai-stream-events request state event))
+                  (parse-sse-lines (stream-lines (:body resp)))))))))
 
 (defn- append-string [value delta]
   (str (or value "") (or delta "")))
@@ -1767,14 +1799,20 @@
   (let [{:keys [url headers payload]}
         (anthropic-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport {:method :post :url url :headers headers :as :stream
-                         :body (json/write-json (json-safe (assoc payload :stream true)))})
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url url :headers headers :as :stream
+                  :body (json/write-json
+                          (json-safe (assoc payload :stream true)))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-provider-error! "anthropic" resp)
-      (let [state (atom {:blocks {} :order [] :usage {}})]
-        (keep (fn [event] (anthropic-stream-event request state event))
-              (parse-sse-lines (stream-lines (:body resp))))))))
+      (do
+        (register-provider-stream-close! request (:body resp))
+        (let [state (atom {:blocks {} :order [] :usage {}})]
+          (keep (fn [event] (anthropic-stream-event request state event))
+                (parse-sse-lines (stream-lines (:body resp)))))))))
 
 (defn- gemini-stream-url [url]
   (str/replace url ":generateContent" ":streamGenerateContent?alt=sse"))
@@ -1880,17 +1918,22 @@
   (let [{:keys [url headers payload]}
         (gemini-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport {:method :post :url (gemini-stream-url url)
-                         :headers headers :as :stream
-                         :body (json/write-json (json-safe payload))})
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url (gemini-stream-url url)
+                  :headers headers :as :stream
+                  :body (json/write-json (json-safe payload))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-provider-error! "gemini" resp)
-      (let [state (atom {:started false :text_started false
-                         :reasoning_started false :text "" :reasoning ""
-                         :tool_calls [] :usage {}})]
-        (mapcat (fn [event] (gemini-stream-events request state event))
-                (parse-sse-lines (stream-lines (:body resp))))))))
+      (do
+        (register-provider-stream-close! request (:body resp))
+        (let [state (atom {:started false :text_started false
+                           :reasoning_started false :text "" :reasoning ""
+                           :tool_calls [] :usage {}})]
+          (mapcat (fn [event] (gemini-stream-events request state event))
+                  (parse-sse-lines (stream-lines (:body resp)))))))))
 
 (defn- provider-stream [request & [client-opts]]
   (let [opts (merge request client-opts)
@@ -2165,6 +2208,208 @@
    :backoff_multiplier 2.0
    :jitter true})
 
+(defn make-abort-controller []
+  (let [aborted (atom false)]
+    {:signal {:aborted? (fn [] @aborted)}
+     :abort (fn [] (reset! aborted true))}))
+
+(defn- signal-aborted? [signal]
+  (cond
+    (nil? signal) false
+    (map? signal)
+    (let [value (or (:aborted? signal)
+                    (:aborted signal)
+                    (get signal "aborted"))]
+      (if (fn? value) (boolean (value)) (boolean value)))
+    (fn? signal) (boolean (signal))
+    :else
+    (try
+      (boolean @signal)
+      (catch Object _ false))))
+
+(defn- abort-error []
+  (ex-info "The LLM operation was aborted"
+           {:category :abort :retryable false :local_control_error true}))
+
+(defn- timeout-error [scope]
+  (ex-info (str "The LLM operation exceeded its " (name scope) " timeout")
+           {:category :request-timeout :scope scope :retryable false
+            :local_control_error true}))
+
+(defn- seconds->milliseconds [seconds]
+  (when (some? seconds)
+    (max 0 (long (* 1000.0 (double seconds))))))
+
+(defn- operation-control [options]
+  (let [timeout (:timeout options)
+        total (if (map? timeout) (:total timeout) timeout)
+        per-step (when (map? timeout) (:per_step timeout))
+        started (System/currentTimeMillis)]
+    {:external_signal (:abort_signal options)
+     :timed_out (atom false)
+     :stream_closer (atom nil)
+     :terminal_reason (atom nil)
+     :step_deadline (atom nil)
+     :total_deadline (when (some? total)
+                       (+ started (seconds->milliseconds total)))
+     :per_step_ms (seconds->milliseconds per-step)}))
+
+(defn- control-aborted? [control]
+  (or @(:timed_out control)
+      (some? @(:terminal_reason control))
+      (signal-aborted? (:external_signal control))))
+
+(defn- combined-abort-signal [control]
+  {:aborted? (fn [] (control-aborted? control))})
+
+(defn- close-active-stream! [control]
+  (when-let [close-fn (first (swap-vals! (:stream_closer control)
+                                         (fn [_] nil)))]
+    (try
+      (close-fn)
+      (catch Object _ nil)))
+  nil)
+
+(defn- register-stream-close! [control close-fn]
+  (reset! (:stream_closer control) close-fn)
+  ;; Cancellation can win the race before a connecting adapter publishes its
+  ;; close handle. Close immediately if that happened.
+  (when (control-aborted? control)
+    (close-active-stream! control))
+  nil)
+
+(defn- close-stream! [control]
+  (when (nil? @(:terminal_reason control))
+    (reset! (:terminal_reason control) :closed))
+  (reset! (:step_deadline control) nil)
+  (close-active-stream! control))
+
+(defn- start-stream-control-monitor! [control]
+  (when (or (:external_signal control)
+            (:total_deadline control)
+            (:per_step_ms control))
+    (core/future
+      (loop []
+        (when (nil? @(:terminal_reason control))
+          (let [now (System/currentTimeMillis)
+                step-deadline @(:step_deadline control)]
+            (cond
+              (signal-aborted? (:external_signal control))
+              (do
+                (reset! (:terminal_reason control) :abort)
+                (close-active-stream! control))
+
+              (and (:total_deadline control)
+                   (>= now (:total_deadline control)))
+              (do
+                (reset! (:timed_out control) true)
+                (reset! (:terminal_reason control) :total)
+                (close-active-stream! control))
+
+              (and step-deadline (>= now step-deadline))
+              (do
+                (reset! (:timed_out control) true)
+                (reset! (:terminal_reason control) :per_step)
+                (close-active-stream! control))
+
+              :else
+              (do (core/sleep 5) (recur))))))))
+  control)
+
+(defn- check-operation! [control]
+  (when (signal-aborted? (:external_signal control))
+    (when (nil? @(:terminal_reason control))
+      (reset! (:terminal_reason control) :abort))
+    (close-active-stream! control)
+    (throw (abort-error)))
+  (when (and (:total_deadline control)
+             (>= (System/currentTimeMillis) (:total_deadline control)))
+    (reset! (:timed_out control) true)
+    (when (nil? @(:terminal_reason control))
+      (reset! (:terminal_reason control) :total))
+    (close-active-stream! control)
+    (throw (timeout-error :total)))
+  (case @(:terminal_reason control)
+    :abort (throw (abort-error))
+    :total (throw (timeout-error :total))
+    :per_step (throw (timeout-error :per_step))
+    nil))
+
+(defn- invocation-deadline [control per-step?]
+  (let [now (System/currentTimeMillis)
+        step-deadline (when (and per-step? (:per_step_ms control))
+                        (+ now (:per_step_ms control)))
+        total-deadline (:total_deadline control)]
+    (cond
+      (and step-deadline total-deadline) (min step-deadline total-deadline)
+      step-deadline step-deadline
+      :else total-deadline)))
+
+(defn- controlled-invoke [control per-step? operation & [fixed-deadline]]
+  (check-operation! control)
+  (let [deadline (or fixed-deadline
+                     (invocation-deadline control per-step?))
+        external (:external_signal control)]
+    (if (and (nil? deadline) (nil? external))
+      (operation)
+      (let [pending (Object.)
+            task (core/future
+                   (try
+                     {:ok true :value (operation)}
+                     (catch Object error {:ok false :error error})))]
+        (loop []
+          (when (signal-aborted? external)
+            (when (nil? @(:terminal_reason control))
+              (reset! (:terminal_reason control) :abort))
+            (close-active-stream! control)
+            (throw (abort-error)))
+          (let [now (System/currentTimeMillis)]
+            (when (and deadline (>= now deadline))
+              (let [scope (if (and (:total_deadline control)
+                                   (>= now (:total_deadline control)))
+                            :total
+                            :per_step)]
+                (reset! (:timed_out control) true)
+                (when (nil? @(:terminal_reason control))
+                  (reset! (:terminal_reason control) scope))
+                (close-active-stream! control)
+                (throw (timeout-error scope))))
+            (let [wait-ms (if deadline
+                            (max 1 (min 10 (- deadline now)))
+                            10)
+                  result (deref task wait-ms pending)]
+              (if (identical? pending result)
+                (recur)
+                (if (:ok result)
+                  (:value result)
+                  (throw (:error result)))))))))))
+
+(defn- controlled-sleep! [control seconds]
+  (let [finish (+ (System/currentTimeMillis)
+                  (seconds->milliseconds seconds))]
+    (loop []
+      (check-operation! control)
+      (let [remaining (- finish (System/currentTimeMillis))]
+        (when (> remaining 0)
+          (core/sleep (min 10 remaining))
+          (recur))))))
+
+(defn- controlled-retry-policy [control policy]
+  (let [custom-sleep (:sleep_fn policy)
+        custom-on-retry (:on_retry policy)]
+    (assoc
+      policy
+      :sleep_fn
+      (if custom-sleep
+        (fn [seconds]
+          (controlled-invoke control false #(custom-sleep seconds)))
+        (fn [seconds] (controlled-sleep! control seconds)))
+      :on_retry
+      (fn [error attempt delay]
+        (close-active-stream! control)
+        (when custom-on-retry
+          (custom-on-retry error attempt delay))))))
+
 (defn retry-delay [attempt policy]
   (let [base (double (or (:base_delay policy) 1.0))
         multiplier (double (or (:backoff_multiplier policy) 2.0))
@@ -2325,20 +2570,29 @@
             :stop_when)
           request (merge request-options {:model model :messages messages})
           client (generation-client options)
+          control (operation-control options)
           tools (or (:tools options) [])
           retry-policy (cond-> (or (:retry_policy options) {})
                          (contains? options :max_retries)
                          (assoc :max_retries (:max_retries options)))
+          retry-policy (controlled-retry-policy control retry-policy)
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
           stop-when (:stop_when options)]
       (loop [conversation messages
              round-number 0
              steps []
              total-usage {}]
+        (check-operation! control)
         (let [response (retry
                          (fn []
-                           (client-complete client
-                                            (assoc request :messages conversation)))
+                           (controlled-invoke
+                             control true
+                             #(client-complete
+                                client
+                                (assoc request
+                                       :messages conversation
+                                       :abort_signal
+                                       (combined-abort-signal control)))))
                          retry-policy)
               tool-calls (or (:tool_calls response) [])
               can-execute
@@ -2348,12 +2602,15 @@
                    (empty? (filter (fn [call] (passive-tool-call? tools call))
                                    tool-calls)))
               tool-results (if can-execute
-                             (execute-tool-calls tools tool-calls)
+                             (controlled-invoke
+                               control false
+                               #(execute-tool-calls tools tool-calls))
                              [])
               step (step-result response tool-results)
               next-steps (conj steps step)
               next-total (merge-with + total-usage (or (:usage response) {}))
               stop? (and can-execute (some? stop-when) (stop-when next-steps))]
+          (check-operation! control)
           (if (and can-execute (not stop?))
             (let [assistant-message
                   (assoc (or (:message response)
@@ -2650,42 +2907,87 @@
         (mapv (fn [result] {:role :tool :content [result]}) tool-results)]
     (vec (concat conversation [assistant-message] tool-messages))))
 
-(defn- safe-stream-tail [events]
-  (lazy-seq
-    (try
-      (when-let [remaining (seq events)]
-        (cons (first remaining)
-              (safe-stream-tail (rest remaining))))
-      (catch Object e
-        (list {:type :error :error e})))))
+(defn- cancellation-error? [error]
+  (true? (:local_control_error (ex-data error))))
 
-(defn- open-stream-events [client request retry-policy]
-  (let [opened
-        (retry
-          (fn []
-            (let [events (seq (client-stream client request))]
-              (if events
-                {:empty false
-                 :first (first events)
-                 :rest (rest events)}
-                {:empty true})))
-          retry-policy)]
-    (if (:empty opened)
-      []
-      (cons (:first opened) (safe-stream-tail (:rest opened))))))
+(defn- safe-stream-tail [events control step-deadline]
+  (lazy-seq
+    (when-not (= :closed @(:terminal_reason control))
+      (try
+        (let [remaining
+              (controlled-invoke
+                control false #(seq events) step-deadline)]
+          (if remaining
+            (cons (first remaining)
+                  (safe-stream-tail (rest remaining) control step-deadline))
+            (do
+              (reset! (:step_deadline control) nil)
+              (close-active-stream! control)
+              nil)))
+        (catch Object e
+          (reset! (:step_deadline control) nil)
+          (close-active-stream! control)
+          (if (cancellation-error? e)
+            (throw e)
+            (list {:type :error :error e})))))))
+
+(defn- open-stream-events
+  [client request retry-policy control step-deadline]
+  (let [result
+        (try
+          {:opened
+           (retry
+             (fn []
+               (controlled-invoke
+                 control false
+                 #(let [events (seq (client-stream client request))]
+                    (if events
+                      {:empty false
+                       :first (first events)
+                       :rest (rest events)}
+                      {:empty true}))
+                 step-deadline))
+             retry-policy)}
+          (catch Object error {:error error}))]
+    (if-let [error (:error result)]
+      (do
+        (reset! (:step_deadline control) nil)
+        (close-active-stream! control)
+        (when (nil? @(:terminal_reason control))
+          (reset! (:terminal_reason control) :error))
+        (throw error))
+      (let [opened (:opened result)]
+        (if (:empty opened)
+          (do
+            (reset! (:step_deadline control) nil)
+            (close-active-stream! control)
+            [])
+          (cons (:first opened)
+                (safe-stream-tail
+                  (:rest opened) control step-deadline)))))))
 
 (defn- high-level-stream-events
   [client request conversation tools round-number max-tool-rounds stop-when
-   steps retry-policy accumulator]
+   steps retry-policy accumulator control]
   (lazy-seq
-    (let [provider-events
+    (when-not (= :closed @(:terminal_reason control))
+      (check-operation! control)
+      (let [step-deadline (invocation-deadline control true)
+          provider-events
           (open-stream-events
-            client (assoc request :messages conversation) retry-policy)
+            client
+            (assoc request :messages conversation
+                           :abort_signal (combined-abort-signal control)
+                           :register_stream_close
+                           (fn [close-fn]
+                             (register-stream-close! control close-fn)))
+            retry-policy control step-deadline)
+          _ (reset! (:step_deadline control) step-deadline)
           observed-events
           (map (fn [event]
                  (stream-accumulator-process! accumulator event))
                provider-events)]
-      (concat
+        (concat
         observed-events
         (lazy-seq
           (let [response (stream-accumulator-response accumulator)
@@ -2699,14 +3001,19 @@
                        (filter (fn [call]
                                  (passive-tool-call? tools call))
                                tool-calls)))]
-            (when can-execute
-              (let [tool-results (execute-tool-calls tools tool-calls)
+            (if can-execute
+              (let [tool-results
+                    (controlled-invoke
+                      control false
+                      #(execute-tool-calls tools tool-calls))
                     step (step-result response tool-results)
                     next-steps (conj steps step)
                     stop? (and (some? stop-when) (stop-when next-steps))
                     step-event {:type :step_finish
                                 :step step
                                 :step_number (inc round-number)}]
+                (when stop?
+                  (reset! (:terminal_reason control) :complete))
                 (cons
                   step-event
                   (when-not stop?
@@ -2715,7 +3022,10 @@
                       (streamed-continuation-messages
                         conversation response tool-calls tool-results)
                       tools (inc round-number) max-tool-rounds stop-when
-                      next-steps retry-policy accumulator)))))))))))
+                      next-steps retry-policy accumulator control))))
+              (do
+                (reset! (:terminal_reason control) :complete)
+                nil)))))))))
 
 (defn high-level-stream [model prompt & [opts]]
   (let [options (or opts {})
@@ -2750,19 +3060,23 @@
             :max_retries)
           request (merge request-options {:model model :messages messages})
           client (generation-client options)
+          control (start-stream-control-monitor!
+                    (operation-control options))
           tools (or (:tools options) [])
           retry-policy (cond-> (or (:retry_policy options) {})
                          (contains? options :max_retries)
                          (assoc :max_retries (:max_retries options)))
+          retry-policy (controlled-retry-policy control retry-policy)
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
           accumulator (make-stream-accumulator)
           events
           (high-level-stream-events
             client request messages tools 0 max-tool-rounds
-            (:stop_when options) [] retry-policy accumulator)]
+            (:stop_when options) [] retry-policy accumulator control)]
       {:events events
        :text_stream
        (map :delta (filter (fn [event] (= :text_delta (:type event))) events))
+       :close (fn [] (close-stream! control))
        :response (fn [] (stream-accumulator-response accumulator))
        :partial_response (fn [] (stream-accumulator-response accumulator))})))
 

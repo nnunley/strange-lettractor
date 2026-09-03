@@ -1,6 +1,7 @@
 (ns attractor.llm-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [clojure.core :as core]
             [json :as json]
             [attractor.llm :as llm]))
 
@@ -1090,7 +1091,9 @@
             (lazy-seq
               (cons {:type :text_delta :delta "partial"}
                     (lazy-seq
-                      (throw (ex-info "stream broke" {:retryable true})))))))
+                      (throw (ex-info "stream read timed out"
+                                      {:category :request-timeout
+                                       :retryable false})))))))
         client (llm/make-client {:providers {"mock" adapter}
                                  :default_provider "mock"})
         result (llm/stream
@@ -1100,6 +1103,8 @@
         events (vec (:events result))]
     (is (= 1 @attempts))
     (is (= [:text_delta :error] (mapv :type events)))
+    (is (= :request-timeout
+           (:category (ex-data (:error (second events))))))
     (is (= "partial"
            (get-in ((:partial_response result)) [:message :text])))))
 
@@ -1206,6 +1211,316 @@
     (is (= 2 @calls))
     (is (= {"name" "Ad"} (first partials)))
     (is (= {"name" "Ada"} ((:object result))))))
+
+(deftest test-high-level-apis-honor-abort-signals
+  (let [complete-calls (atom 0)
+        stream-closed (atom false)
+        controller (llm/make-abort-controller)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (swap! complete-calls inc)
+            {:provider "mock" :message {:role :assistant :content "late"}
+             :tool_calls [] :usage {} :finish_reason :stop})
+          (fn [request]
+            ((:register_stream_close request)
+             (fn [] (reset! stream-closed true)))
+            [{:type :stream_start}
+             {:type :text_delta :delta "late"}
+             {:type :finish :finish_reason :stop :usage {}
+              :response {:message {:text "late"}
+                         :tool_calls [] :usage {} :finish_reason :stop}}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    ((:abort controller))
+    (is (true?
+          (try
+            (do (llm/generate "mock/model" "go"
+                              {:client client
+                               :abort_signal (:signal controller)})
+                false)
+            (catch Object error
+              (= :abort (:category (ex-data error)))))))
+    (is (= 0 @complete-calls))
+    (let [live-controller (llm/make-abort-controller)
+          result (llm/stream "mock/model" "go"
+                             {:client client
+                              :abort_signal (:signal live-controller)})
+          events (:events result)]
+      (is (= :stream_start (:type (first events))))
+      ((:abort live-controller))
+      (core/sleep 20)
+      (is (true? @stream-closed))
+      (is (true?
+            (try
+              (do (doall (rest events)) false)
+              (catch Object error
+                (= :abort (:category (ex-data error))))))))))
+
+(deftest test-stream-close-is-terminal-before-first-realization
+  (let [calls (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [_]
+            (swap! calls inc)
+            [{:type :stream_start}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream "mock/model" "go" {:client client})]
+    ((:close result))
+    (is (= [] (vec (:events result))))
+    (is (= 0 @calls))))
+
+(deftest test-total-timeout-closes-an-idle-stream
+  (let [closed (atom false)
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [request]
+            ((:register_stream_close request)
+             (fn [] (reset! closed true)))
+            [{:type :stream_start} {:type :text_delta :delta "later"}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        events (:events
+                 (llm/stream "mock/model" "go"
+                             {:client client :timeout 0.01}))]
+    (is (= :stream_start (:type (first events))))
+    (core/sleep 25)
+    (is (true? @closed))
+    (is (= :request-timeout
+           (try
+             (do (doall (rest events)) nil)
+             (catch Object error (:category (ex-data error))))))))
+
+(deftest test-high-level-apis-enforce-per-step-timeouts
+  (let [adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (core/sleep 50)
+            {:provider "mock" :message {:role :assistant :content "late"}
+             :tool_calls [] :usage {} :finish_reason :stop})
+          (fn [_]
+            (core/sleep 50)
+            [{:type :stream_start}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (doseq [operation
+            [(fn [] (llm/generate "mock/model" "go"
+                                  {:client client
+                                   :timeout {:per_step 0.005}}))
+             (fn [] (doall (:events
+                             (llm/stream "mock/model" "go"
+                                         {:client client
+                                          :timeout {:per_step 0.005}}))))]]
+      (is (true?
+            (try
+              (do (operation) false)
+               (catch Object error
+                 (= :request-timeout (:category (ex-data error))))))))))
+
+(deftest test-stream-per-step-timeout-covers-the-whole-provider-call
+  (letfn [(delayed-events [events]
+            (lazy-seq
+              (when-let [remaining (seq events)]
+                (core/sleep 20)
+                (cons (first remaining) (delayed-events (rest remaining))))))]
+    (let [adapter
+          (llm/make-adapter
+            "mock" (fn [_] nil)
+            (fn [_]
+              (delayed-events
+                [{:type :stream_start}
+                 {:type :text_delta :delta "late"}
+                 {:type :finish :finish_reason :stop :usage {}
+                  :response {:message {:text "late"}
+                             :tool_calls [] :usage {}
+                             :finish_reason :stop}}])))
+          client (llm/make-client {:providers {"mock" adapter}
+                                   :default_provider "mock"})]
+      (is (= :request-timeout
+             (try
+               (do (doall (:events
+                            (llm/stream "mock/model" "go"
+                                        {:client client
+                                         :timeout {:per_step 0.03}})))
+                   nil)
+               (catch Object error (:category (ex-data error)))))))))
+
+(deftest test-total-timeout-bounds-tool-execution-and-retry-delay
+  (let [calls (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (swap! calls inc)
+            {:provider "mock" :message {:role :assistant :content ""}
+             :tool_calls [{:id "slow" :name "slow_tool" :arguments {}}]
+             :usage {} :finish_reason :tool_calls})
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        started (System/currentTimeMillis)
+        error
+        (try
+          (do
+            (llm/generate
+              "mock/model" "go"
+              {:client client :timeout 0.01 :max_tool_rounds 1
+               :tools [{:name "slow_tool" :parameters {:type "object"}
+                        :execute (fn [_] (core/sleep 100) "done")}]})
+            nil)
+          (catch Object error error))]
+    (is (= :request-timeout (:category (ex-data error))))
+    (is (= :total (:scope (ex-data error))))
+    (is (< (- (System/currentTimeMillis) started) 80)))
+  (let [attempts (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (swap! attempts inc)
+            (throw (ex-info "again" {:retryable true})))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (is (= :request-timeout
+           (try
+             (do (llm/generate "mock/model" "go"
+                               {:client client :timeout {:total 0.01}
+                                :retry_policy {:base_delay 1.0 :jitter false}})
+                 nil)
+             (catch Object error (:category (ex-data error))))))
+    (is (= 1 @attempts))))
+
+(deftest test-cancellation-is-forwarded-to-the-active-adapter
+  (let [controller (llm/make-abort-controller)
+        captured-signal (atom nil)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [request]
+            (reset! captured-signal (:abort_signal request))
+            (core/sleep 100)
+            {:provider "mock" :message {:role :assistant :content "late"}
+             :tool_calls [] :usage {} :finish_reason :stop})
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        canceler (core/future
+                   (core/sleep 5)
+                   ((:abort controller)))]
+    (is (= :abort
+           (try
+             (do (llm/generate "mock/model" "go"
+                               {:client client
+                                :abort_signal (:signal controller)})
+                 nil)
+             (catch Object error (:category (ex-data error))))))
+    @canceler
+    (is (fn? (:aborted? @captured-signal)))
+    (is (true? ((:aborted? @captured-signal))))))
+
+(deftest test-native-provider-forwards-control-options-to-transport
+  (let [captured (atom nil)
+        signal {:aborted? (fn [] false)}
+        response
+        (json/write-json
+          {"id" "resp"
+           "status" "completed"
+           "model" "gpt-test"
+           "output" []
+           "usage" {"input_tokens" 0 "output_tokens" 0
+                    "total_tokens" 0}})]
+    (llm/openai-complete
+      {:model "gpt-test" :messages [{:role :user :content "go"}]
+       :api_key "test-key" :abort_signal signal
+       :adapter_timeout {:connect 1.0 :request 2.0}
+       :transport (fn [request]
+                    (reset! captured request)
+                    {:status 200 :body response})})
+    (is (= signal (:abort_signal @captured)))
+    (is (= {:connect 1.0 :request 2.0} (:timeout @captured)))))
+
+(deftest test-stream-closes-late-registration-after-timeout
+  (let [closed (atom false)
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [request]
+            (core/sleep 30)
+            ((:register_stream_close request)
+             (fn [] (reset! closed true)))
+            [{:type :stream_start}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (is (= :request-timeout
+           (try
+             (do (doall (:events
+                          (llm/stream "mock/model" "go"
+                                      {:client client
+                                       :timeout {:per_step 0.005}})))
+                 nil)
+             (catch Object error (:category (ex-data error))))))
+    (core/sleep 40)
+    (is (true? @closed))))
+
+(deftest test-stream-closes-failed-attempt-before-retry
+  (let [attempts (atom 0)
+        closed (atom [])
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [request]
+            (let [attempt (swap! attempts inc)]
+              ((:register_stream_close request)
+               (fn [] (swap! closed conj attempt)))
+              (if (= attempt 1)
+                (lazy-seq
+                  (throw (ex-info "connect failed" {:retryable true})))
+                [{:type :stream_start}]))))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (is (= [:stream_start]
+           (mapv :type
+                 (:events
+                   (llm/stream
+                     "mock/model" "go"
+                     {:client client
+                      :retry_policy {:sleep_fn (fn [_] nil)}})))))
+    (is (= 2 @attempts))
+    (is (= [1 2] @closed))))
+
+(deftest test-stream-closes-terminal-pre-first-event-failures
+  (doseq [[max-retries retryable expected-attempts]
+          [[2 false 1] [1 true 2]]]
+    (let [attempts (atom 0)
+          closed (atom [])
+          adapter
+          (llm/make-adapter
+            "mock" (fn [_] nil)
+            (fn [request]
+              (let [attempt (swap! attempts inc)]
+                ((:register_stream_close request)
+                 (fn [] (swap! closed conj attempt)))
+                (lazy-seq
+                  (throw (ex-info "open failed" {:retryable retryable}))))))
+          client (llm/make-client {:providers {"mock" adapter}
+                                   :default_provider "mock"})]
+      (is (= "open failed"
+             (try
+               (do (doall (:events
+                            (llm/stream
+                              "mock/model" "go"
+                              {:client client :max_retries max-retries
+                               :retry_policy {:sleep_fn (fn [_] nil)}})))
+                   nil)
+               (catch Object error (ex-message error)))))
+      (is (= expected-attempts @attempts))
+      (is (= (vec (range 1 (inc expected-attempts))) @closed)))))
 
 (deftest test-json-schema-validation-distinguishes-presence-and-enforces-constraints
   (let [object-schema
