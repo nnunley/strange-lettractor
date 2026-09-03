@@ -4,6 +4,117 @@
             [json :as json]
             [attractor.llm :as llm]))
 
+(deftest test-model-catalog-supports-provider-capability-and-alias-lookups
+  (is (= "claude-opus-4-6" (:id (llm/get-model-info "opus"))))
+  (is (= "gpt-5.2" (:id (llm/get-latest-model "openai" "reasoning"))))
+  (is (every? #(= "gemini" (:provider %)) (llm/list-models "gemini")))
+  (is (> (count (llm/list-models)) 5))
+  (is (nil? (llm/get-model-info "future-model-not-yet-cataloged"))))
+
+(deftest test-provider-errors-have-portable-taxonomy-and-retry-after
+  (let [error
+        (try
+          (llm/openai-complete
+            {:model "gpt-test" :api_key "bad" :messages []
+             :transport
+             (fn [_]
+               {:status 429 :headers {"retry-after" "2.5"}
+                :body "{\"error\":{\"code\":\"rate_limit\",\"message\":\"slow down\"}}"})})
+          nil
+          (catch Object e e))
+        data (ex-data error)]
+    (is (= :rate-limit (:category data)))
+    (is (true? (:retryable data)))
+    (is (= 429 (:status_code data)))
+    (is (= "rate_limit" (:error_code data)))
+    (is (= 2.5 (:retry_after data))))
+  (let [error
+        (try
+          (llm/gemini-complete
+            {:model "gemini-test" :api_key "bad" :messages []
+             :transport
+             (fn [_]
+               {:status 400
+                :body "{\"error\":{\"status\":\"UNAUTHENTICATED\",\"message\":\"bad\"}}"})})
+          nil
+          (catch Object e e))]
+    (is (= :authentication (:category (ex-data error))))
+    (is (false? (:retryable (ex-data error))))))
+
+(deftest test-retry-policy-honors-backoff-and-retry-after
+  (let [calls (atom 0)
+        delays (atom [])
+        callbacks (atom [])
+        result
+        (llm/retry
+          (fn []
+            (if (< (swap! calls inc) 3)
+              (throw (ex-info "temporary" {:retryable true}))
+              :ok))
+          {:max_retries 2 :base_delay 1.0 :backoff_multiplier 2.0
+           :max_delay 10.0 :jitter false
+           :sleep_fn (fn [delay] (swap! delays conj delay))
+           :on_retry (fn [_ attempt delay]
+                       (swap! callbacks conj [attempt delay]))})]
+    (is (= :ok result))
+    (is (= [1.0 2.0] @delays))
+    (is (= [[1 1.0] [2 2.0]] @callbacks)))
+  (let [calls (atom 0)
+        error (try
+                (llm/retry
+                  (fn []
+                    (swap! calls inc)
+                    (throw (ex-info "wait too long"
+                                    {:retryable true :retry_after 90.0})))
+                  {:max_retries 2 :max_delay 60.0
+                   :sleep_fn (fn [_] nil)})
+                nil
+                (catch Object e e))]
+    (is (= 1 @calls))
+    (is (= 90.0 (:retry_after (ex-data error))))))
+
+(deftest test-generate-retries-each-llm-step-without-reexecuting-tools
+  (let [llm-calls (atom 0)
+        tool-calls (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (let [call (swap! llm-calls inc)]
+              (case call
+                1 (throw (ex-info "first transient" {:retryable true}))
+                2 {:provider "mock" :message {:role :assistant :content ""}
+                   :tool_calls [{:id "call-1" :name "work" :arguments {}}]
+                   :usage {} :finish_reason :tool_calls}
+                3 (throw (ex-info "second transient" {:retryable true}))
+                {:provider "mock" :message {:role :assistant :content "done"}
+                 :tool_calls [] :usage {} :finish_reason :stop})))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result
+        (llm/generate
+          "model" "prompt"
+          {:client client :max_tool_rounds 1
+           :retry_policy {:max_retries 1 :base_delay 0.0 :jitter false
+                          :sleep_fn (fn [_] nil)}
+           :tools [{:name "work" :parameters {:type "object"}
+                    :execute (fn [_] (swap! tool-calls inc) "ok")}]})]
+    (is (= "done" (:text result)))
+    (is (= 4 @llm-calls))
+    (is (= 1 @tool-calls)))
+  (let [calls (atom 0)
+        error (try
+                (llm/retry
+                  (fn []
+                    (swap! calls inc)
+                    (throw (ex-info "bad request" {:retryable false})))
+                  {:max_retries 3 :sleep_fn (fn [_] nil)})
+                nil
+                (catch Object e e))]
+    (is (= 1 @calls))
+    (is (= "bad request" (ex-message error)))))
+
 (deftest test-openai-url-resolution
   (testing "Resolves default OpenAI URL when unset"
     (is (= "https://api.openai.com/v1/responses"

@@ -3,7 +3,85 @@
             [json :as json]
             [os :as os]
             [io :as io]
-            [http :as http]))
+            [math :as math]
+            [http :as http]
+            [attractor.models :as models]))
+
+(defn- response-header [response header-name]
+  (let [headers (or (:headers response) {})
+        lower-name (str/lower-case header-name)]
+    (or (get headers header-name)
+        (get headers lower-name)
+        (get headers (keyword header-name))
+        (get headers (keyword lower-name)))))
+
+(defn- parse-retry-after [response]
+  (when-let [value (response-header response "Retry-After")]
+    (try
+      (double (parse-double (str/trim (str value))))
+      (catch Object _ nil))))
+
+(defn- error-body-map [body]
+  (try
+    (if (map? body) body (json/read-json (str body)))
+    (catch Object _ nil)))
+
+(defn- error-field [body-map key]
+  (or (get-in body-map ["error" key])
+      (get body-map key)))
+
+(defn- classify-provider-error [status body-map body-text]
+  (let [message (str/lower-case
+                  (str (or (error-field body-map "message") body-text "")))
+        grpc-code (error-field body-map "status")]
+    (cond
+      (or (str/includes? message "context length")
+          (str/includes? message "too many tokens")) :context-length
+      (or (str/includes? message "content filter")
+          (str/includes? message "safety")) :content-filter
+      (and (str/includes? message "quota")
+           (not (str/includes? message "rate"))) :quota-exceeded
+      (or (= grpc-code "UNAUTHENTICATED") (= status 401)
+          (str/includes? message "unauthorized")
+          (str/includes? message "invalid key")) :authentication
+      (or (= grpc-code "PERMISSION_DENIED") (= status 403)) :access-denied
+      (or (= grpc-code "NOT_FOUND") (= status 404)
+          (str/includes? message "not found")
+          (str/includes? message "does not exist")) :not-found
+      (or (= grpc-code "INVALID_ARGUMENT") (= status 400) (= status 422)) :invalid-request
+      (or (= grpc-code "DEADLINE_EXCEEDED") (= status 408)) :request-timeout
+      (= status 413) :context-length
+      (or (= grpc-code "RESOURCE_EXHAUSTED") (= status 429)) :rate-limit
+      (or (= grpc-code "UNAVAILABLE") (= grpc-code "INTERNAL")
+          (and (number? status) (>= status 500))) :server
+      :else :provider)))
+
+(def non-retryable-error-categories
+  #{:authentication :access-denied :not-found :invalid-request
+    :context-length :quota-exceeded :content-filter :request-timeout
+    :configuration})
+
+(defn provider-error [provider response]
+  (let [status (:status response)
+        body-text (str (:body response))
+        raw (error-body-map (:body response))
+        category (classify-provider-error status raw body-text)
+        retryable (if (contains? non-retryable-error-categories category)
+                    false
+                    true)]
+    (ex-info
+      (str provider " API HTTP " status ": " body-text)
+      {:category category
+       :provider provider
+       :status_code status
+       :status status
+       :error_code (error-field raw "code")
+       :retryable retryable
+       :retry_after (parse-retry-after response)
+       :raw raw})))
+
+(defn raise-provider-error! [provider response]
+  (throw (provider-error provider response)))
 
 ;; Resolve base URL for a given provider
 (defn resolve-base-url [provider & [custom-base]]
@@ -86,13 +164,19 @@
         (println (str "Error querying models from " p " (" url "): " e))
         []))))
 
-;; List models with local caching
-(defn list-models [provider & [opts]]
+;; Discover model identifiers from a live provider endpoint.
+(defn discover-models [provider & [opts]]
   (let [p (str/lower-case (or provider "openai"))
         cached (get @provider-models-cache p)]
     (if (and cached (not (:refresh opts)))
       cached
       (fetch-models p opts))))
+
+;; Advisory built-in model catalog.
+(defn list-models [& [provider]] (models/list-models provider))
+(defn get-model-info [model-id] (models/get-model-info model-id))
+(defn get-latest-model [provider & [capability]]
+  (models/get-latest-model provider capability))
 
 ;; Detect provider for a model by querying active provider endpoints
 (defn detect-provider [model]
@@ -523,10 +607,7 @@
         status (:status resp)
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
-      (throw (ex-info (str "OpenAI-compatible API HTTP " status ": " body-str)
-                      {:provider provider :status status
-                       :retryable (or (= status 429) (>= status 500))
-                       :body body-str}))
+      (raise-provider-error! provider resp)
       (let [body (json/read-json body-str)
             choice (first (get body "choices"))
             message (or (get choice "message") {})
@@ -608,10 +689,7 @@
         status (:status resp)
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
-      (throw (ex-info (str "OpenAI API HTTP " status ": " body-str)
-                      {:provider "openai" :status status
-                       :retryable (or (= status 429) (>= status 500))
-                       :body body-str}))
+      (raise-provider-error! "openai" resp)
       (normalize-openai-response request (json/read-json body-str)))))
 
 ;; Anthropic Adapter
@@ -739,10 +817,7 @@
               status (:status resp)
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
-            (throw (ex-info (str "Anthropic API HTTP " status ": " body-str)
-                            {:provider "anthropic" :status status
-                             :retryable (or (= status 429) (>= status 500))
-                             :body body-str}))
+            (raise-provider-error! "anthropic" resp)
             (normalize-anthropic-response request (json/read-json body-str))))
         (catch Object e (throw e)))))
 
@@ -857,10 +932,7 @@
               status (:status resp)
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
-            (throw (ex-info (str "Gemini API HTTP " status ": " body-str)
-                            {:provider "gemini" :status status
-                             :retryable (or (= status 429) (>= status 500))
-                             :body body-str}))
+            (raise-provider-error! "gemini" resp)
             (normalize-gemini-response request (json/read-json body-str))))
         (catch Object e (throw e)))))
 
@@ -1076,9 +1148,7 @@
                          :body (json/write-json (json-safe (assoc payload :stream true)))})
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (throw (ex-info (str "OpenAI streaming API HTTP " status)
-                      {:provider "openai" :status status
-                       :retryable (or (= status 429) (>= status 500))}))
+      (raise-provider-error! "openai" resp)
       (let [state (atom {:text_started #{} :text_ended #{}
                          :reasoning_started #{} :reasoning_ended #{}
                          :tools {}})]
@@ -1206,9 +1276,7 @@
                          :body (json/write-json (json-safe (assoc payload :stream true)))})
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (throw (ex-info (str "Anthropic streaming API HTTP " status)
-                      {:provider "anthropic" :status status
-                       :retryable (or (= status 429) (>= status 500))}))
+      (raise-provider-error! "anthropic" resp)
       (let [state (atom {:blocks {} :order [] :usage {}})]
         (keep (fn [event] (anthropic-stream-event request state event))
               (parse-sse-lines (stream-lines (:body resp))))))))
@@ -1308,9 +1376,7 @@
                          :body (json/write-json (json-safe payload))})
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (throw (ex-info (str "Gemini streaming API HTTP " status)
-                      {:provider "gemini" :status status
-                       :retryable (or (= status 429) (>= status 500))}))
+      (raise-provider-error! "gemini" resp)
       (let [state (atom {:started false :text_started false
                          :reasoning_started false :text "" :reasoning ""
                          :tool_calls [] :usage {}})]
@@ -1488,6 +1554,57 @@
         (reset! default-client client)
         client)))
 
+(def default-retry-policy
+  {:max_retries 2
+   :base_delay 1.0
+   :max_delay 60.0
+   :backoff_multiplier 2.0
+   :jitter true})
+
+(defn retry-delay [attempt policy]
+  (let [base (double (or (:base_delay policy) 1.0))
+        multiplier (double (or (:backoff_multiplier policy) 2.0))
+        max-delay (double (or (:max_delay policy) 60.0))
+        calculated (min (* base (math/pow multiplier (double attempt)))
+                        max-delay)
+        jitter-factor (if (= false (:jitter policy))
+                        1.0
+                        (+ 0.5 (math/random)))]
+    (* calculated jitter-factor)))
+
+(defn retry [operation & [policy-options]]
+  (let [policy (merge default-retry-policy (or policy-options {}))
+        max-retries (max 0 (:max_retries policy))
+        max-delay (double (:max_delay policy))
+        sleep-fn (or (:sleep_fn policy)
+                     (fn [delay-seconds]
+                       (core/sleep (long (* delay-seconds 1000.0)))))
+        on-retry (or (:on_retry policy) (fn [_ _ _] nil))]
+    (loop [attempt 0]
+      (let [result (try
+                     {:value (operation)}
+                     (catch Object e {:error e}))]
+        (if-let [error (:error result)]
+          (let [data (or (ex-data error) {})
+                retryable (if (contains? data :retryable)
+                            (:retryable data)
+                            true)
+                retry-after (:retry_after data)
+                delay (if (some? retry-after)
+                        (double retry-after)
+                        (retry-delay attempt policy))
+                retry-after-too-long (and (some? retry-after)
+                                          (> delay max-delay))]
+            (if (and retryable
+                     (< attempt max-retries)
+                     (not retry-after-too-long))
+              (do
+                (on-retry error (inc attempt) delay)
+                (sleep-fn delay)
+                (recur (inc attempt)))
+              (throw error)))
+          (:value result))))))
+
 (defn- generation-client [options]
   (or (:client options)
       (when (contains? options :mock_handler)
@@ -1605,13 +1722,20 @@
           request (merge request-options {:model model :messages messages})
           client (generation-client options)
           tools (or (:tools options) [])
+          retry-policy (cond-> (or (:retry_policy options) {})
+                         (contains? options :max_retries)
+                         (assoc :max_retries (:max_retries options)))
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
           stop-when (:stop_when options)]
       (loop [conversation messages
              round-number 0
              steps []
              total-usage {}]
-        (let [response (client-complete client (assoc request :messages conversation))
+        (let [response (retry
+                         (fn []
+                           (client-complete client
+                                            (assoc request :messages conversation)))
+                         retry-policy)
               tool-calls (or (:tool_calls response) [])
               can-execute
               (and (seq tool-calls)

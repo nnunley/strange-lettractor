@@ -1,0 +1,65 @@
+(ns attractor.models)
+
+;; Ordered best-first within each provider. The catalog is advisory: callers
+;; may still pass model identifiers that are not listed here.
+(def catalog
+  [{:id "claude-opus-4-6" :provider "anthropic"
+    :display_name "Claude Opus 4.6" :context_window 200000
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["opus" "claude-opus"]}
+   {:id "claude-sonnet-4-5" :provider "anthropic"
+    :display_name "Claude Sonnet 4.5" :context_window 200000
+    :max_output 64000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["sonnet" "claude-sonnet"]}
+   {:id "claude-haiku-4-5" :provider "anthropic"
+    :display_name "Claude Haiku 4.5" :context_window 200000
+    :max_output 64000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["haiku" "claude-haiku"]}
+
+   {:id "gpt-5.2" :provider "openai"
+    :display_name "GPT-5.2" :context_window 1047576
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["gpt-5"]}
+   {:id "gpt-5.2-codex" :provider "openai"
+    :display_name "GPT-5.2 Codex" :context_window 1047576
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["codex" "gpt-codex"]}
+   {:id "gpt-5.2-mini" :provider "openai"
+    :display_name "GPT-5.2 Mini" :context_window 1047576
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["gpt-mini"]}
+
+   {:id "gemini-3.1-pro-preview" :provider "gemini"
+    :display_name "Gemini 3.1 Pro Preview" :context_window 1048576
+    :max_output 65536 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["gemini-pro"]}
+   {:id "gemini-3-flash-preview" :provider "gemini"
+    :display_name "Gemini 3 Flash Preview" :context_window 1048576
+    :max_output 65536 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["gemini-flash"]}])
+
+(defn get-model-info [model-id]
+  (first
+    (filter
+      (fn [model]
+        (or (= model-id (:id model))
+            (some #{model-id} (:aliases model))))
+      catalog)))
+
+(defn list-models [& [provider]]
+  (if provider
+    (vec (filter (fn [model] (= provider (:provider model))) catalog))
+    catalog))
+
+(defn get-latest-model [provider & [capability]]
+  (let [capability-key (case capability
+                         "reasoning" :supports_reasoning
+                         "vision" :supports_vision
+                         "tools" :supports_tools
+                         nil)]
+    (first
+      (filter
+        (fn [model]
+          (and (= provider (:provider model))
+               (or (nil? capability-key) (true? (get model capability-key)))))
+        catalog))))
