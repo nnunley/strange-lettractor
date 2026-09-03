@@ -271,7 +271,8 @@
        :message {:role :assistant
                  :content parts :parts parts :text response-text}
        :usage {:input_tokens 50 :output_tokens 50 :total_tokens 100}
-       :finish_reason :stop})))
+       :finish_reason :stop
+       :warnings []})))
 
 ;; Resolve and normalize OpenAI API endpoint URL
 (defn resolve-openai-url [base-url]
@@ -624,17 +625,67 @@
                        (get result "image_media_type")
                        "image/png")})))
 
+(defn- canonical-option-map [options]
+  (into {}
+        (map (fn [[key value]]
+               [(if (string? key) (keyword key) key) value])
+             (or options {}))))
+
 (defn- provider-options [request provider]
   (let [options (or (:provider_options request) {})]
-    (or (get options (keyword provider))
-        (get options provider)
-        {})))
+    (canonical-option-map
+      (or (get options (keyword provider))
+          (get options provider)
+          {}))))
+
+(defn- merge-gemini-provider-options [payload options]
+  (let [generation-options (:generationConfig options)
+        body-options (dissoc options :generationConfig)
+        merged (merge payload body-options)]
+    (if (map? generation-options)
+      (assoc merged :generationConfig
+             (merge (or (:generationConfig payload) {})
+                    (canonical-option-map generation-options)))
+      (if (some? generation-options)
+        (assoc merged :generationConfig generation-options)
+        merged))))
 
 (defn- field [m k]
   (cond
     (and (map? m) (contains? m k)) (get m k)
     (and (map? m) (contains? m (name k))) (get m (name k))
     :else nil))
+
+(defn- portable-warning [provider parameter]
+  {:message (str provider " does not support the portable " parameter
+                 " request parameter; it was omitted")
+   :code "unsupported_parameter"
+   :parameter parameter})
+
+(defn- metadata-has-non-user-id? [metadata]
+  (some (fn [[key _]]
+          (not= "user_id" (if (keyword? key) (name key) (str key))))
+        metadata))
+
+(defn- adapter-warnings [provider request]
+  (let [metadata (:metadata request)]
+    (cond-> []
+      (and (= provider "openai") (seq (:stop_sequences request)))
+      (conj (portable-warning provider "stop_sequences"))
+
+      (and (= provider "anthropic") (map? metadata)
+           (metadata-has-non-user-id? metadata))
+      (conj (portable-warning provider "metadata keys other than user_id"))
+
+      (and (= provider "gemini") (seq metadata))
+      (conj (portable-warning provider "metadata"))
+
+      (and (= provider "openai-compatible") (seq metadata))
+      (conj (portable-warning provider "metadata")))))
+
+(defn- anthropic-metadata [request]
+  (when-let [user-id (field (:metadata request) :user_id)]
+    {:user_id user-id}))
 
 (defn make-tool [tool-name description parameters & [execute]]
   (when (or (not (string? tool-name))
@@ -712,6 +763,14 @@
   (let [format (:response_format request)
         format-type (field format :type)]
     (cond-> {}
+      (some? (:temperature request))
+      (assoc :temperature (:temperature request))
+      (some? (:top_p request))
+      (assoc :topP (:top_p request))
+      (some? (:max_tokens request))
+      (assoc :maxOutputTokens (:max_tokens request))
+      (some? (:stop_sequences request))
+      (assoc :stopSequences (:stop_sequences request))
       (or (= format-type "json") (= format-type "json_schema"))
       (assoc :responseMimeType "application/json")
       (= format-type "json_schema")
@@ -911,7 +970,7 @@
                             calls)))]))))
       messages)))
 
-(defn openai-compatible-complete [request & [api-key base-url]]
+(defn- openai-compatible-request-data [request api-key base-url]
   (let [provider (or (:provider request) "openai-compatible")
         key (if (contains? request :api_key)
               (:api_key request)
@@ -923,14 +982,33 @@
                                   :description (:description tool)
                                   :parameters (:parameters tool)}})
                     (or (:tools request) []))
-        payload (cond-> {:model (:model request)
-                         :messages (openai-compatible-messages (:messages request))}
-                  (seq tools) (assoc :tools tools)
-                  (:temperature request) (assoc :temperature (:temperature request))
-                  (:max_tokens request) (assoc :max_tokens (:max_tokens request)))
+        payload (merge
+                  (cond-> {:model (:model request)
+                           :messages
+                           (openai-compatible-messages (:messages request))}
+                    (seq tools) (assoc :tools tools)
+                    (some? (:temperature request))
+                    (assoc :temperature (:temperature request))
+                    (some? (:top_p request))
+                    (assoc :top_p (:top_p request))
+                    (some? (:max_tokens request))
+                    (assoc :max_tokens (:max_tokens request))
+                    (some? (:stop_sequences request))
+                    (assoc :stop (:stop_sequences request)))
+                  (provider-options request provider))
         headers (cond-> {"Content-Type" "application/json"}
                   (not (str/blank? key))
-                  (assoc "Authorization" (str "Bearer " key)))
+                  (assoc "Authorization" (str "Bearer " key)))]
+    {:provider provider :url url :headers headers :payload payload}))
+
+(defn- openai-compatible-usage [usage]
+  {:input_tokens (or (get usage "prompt_tokens") 0)
+   :output_tokens (or (get usage "completion_tokens") 0)
+   :total_tokens (or (get usage "total_tokens") 0)})
+
+(defn openai-compatible-complete [request & [api-key base-url]]
+  (let [{:keys [provider url headers payload]}
+        (openai-compatible-request-data request api-key base-url)
         transport (or (:transport request) http/request)
         resp (transport
                (transport-request-options
@@ -963,10 +1041,9 @@
          :provider provider
          :message {:role :assistant :content parts :parts parts :text text}
          :tool_calls tool-calls
-         :usage {:input_tokens (or (get usage "prompt_tokens") 0)
-                 :output_tokens (or (get usage "completion_tokens") 0)
-                 :total_tokens (or (get usage "total_tokens") 0)}
+         :usage (openai-compatible-usage usage)
          :finish_reason (finish-reason (get choice "finish_reason"))
+         :warnings (adapter-warnings "openai-compatible" request)
          :raw body}))))
 
 (defn- openai-request-data [request api-key base-url]
@@ -994,7 +1071,14 @@
                     (not (str/blank? instructions)) (assoc :instructions instructions)
                     (seq openai-tools) (assoc :tools openai-tools)
                     (some? tool-choice) (assoc :tool_choice tool-choice)
-                    (:max_tokens request) (assoc :max_output_tokens (:max_tokens request))
+                    (some? (:temperature request))
+                    (assoc :temperature (:temperature request))
+                    (some? (:top_p request))
+                    (assoc :top_p (:top_p request))
+                    (some? (:max_tokens request))
+                    (assoc :max_output_tokens (:max_tokens request))
+                    (some? (:metadata request))
+                    (assoc :metadata (:metadata request))
                     (not (str/blank? (:reasoning_effort request)))
                     (assoc :reasoning {:effort (:reasoning_effort request)}))
                   (openai-format request)
@@ -1027,6 +1111,7 @@
      :finish_reason (if (seq tool-calls)
                       :tool_calls
                       (if (= (get body "status") "completed") :stop :length))
+     :warnings (adapter-warnings "openai" request)
      :raw body}))
 
 (defn openai-complete [request & [api-key base-url]]
@@ -1105,7 +1190,15 @@
                            :max_tokens (or (:max_tokens request) 4096)}
                     (not (str/blank? system-text)) (assoc :system system-value)
                     (seq anthropic-tools) (assoc :tools anthropic-tools)
-                    (some? tool-choice) (assoc :tool_choice tool-choice))
+                    (some? tool-choice) (assoc :tool_choice tool-choice)
+                    (some? (:temperature request))
+                    (assoc :temperature (:temperature request))
+                    (some? (:top_p request))
+                    (assoc :top_p (:top_p request))
+                    (some? (:stop_sequences request))
+                    (assoc :stop_sequences (:stop_sequences request))
+                    (some? (anthropic-metadata request))
+                    (assoc :metadata (anthropic-metadata request)))
                   body-options)
         headers (cond-> {"x-api-key" key
                          "anthropic-version" "2023-06-01"
@@ -1190,6 +1283,7 @@
      :finish_reason (if (seq tool-calls)
                       :tool_calls
                       (finish-reason (get body-map "stop_reason")))
+     :warnings (adapter-warnings "anthropic" request)
      :raw body-map}))
 
 (defn anthropic-complete [request & [api-key base-url]]
@@ -1332,20 +1426,21 @@
         tools (or (:tools request) [])
         generation-config (gemini-generation-config request)
         tool-choice (gemini-tool-choice request)
-        payload (merge
-                  (cond-> {:contents contents}
-                    (not (str/blank? system-text))
-                    (assoc :systemInstruction {:parts [{:text system-text}]})
-                    (seq tools) (assoc :tools
-                                       [{:functionDeclarations
-                                         (mapv (fn [tool]
-                                                 {:name (:name tool)
-                                                  :description (:description tool)
-                                                  :parameters (:parameters tool)})
-                                               tools)}])
-                    (some? tool-choice) (assoc :toolConfig tool-choice)
-                    (seq generation-config) (assoc :generationConfig generation-config))
-                  (provider-options request "gemini"))
+        payload
+        (merge-gemini-provider-options
+          (cond-> {:contents contents}
+            (not (str/blank? system-text))
+            (assoc :systemInstruction {:parts [{:text system-text}]})
+            (seq tools) (assoc :tools
+                               [{:functionDeclarations
+                                 (mapv (fn [tool]
+                                         {:name (:name tool)
+                                          :description (:description tool)
+                                          :parameters (:parameters tool)})
+                                       tools)}])
+            (some? tool-choice) (assoc :toolConfig tool-choice)
+            (seq generation-config) (assoc :generationConfig generation-config))
+          (provider-options request "gemini"))
         headers {"x-goog-api-key" key "Content-Type" "application/json"}]
     (require-api-key! "gemini" key)
     {:url url :headers headers :payload payload}))
@@ -1432,6 +1527,7 @@
      :finish_reason (if (seq tool-calls)
                       :tool_calls
                       (finish-reason (get candidate "finishReason")))
+     :warnings (adapter-warnings "gemini" request)
      :raw body}))
 
 (defn gemini-complete [request & [api-key base-url]]
@@ -1685,6 +1781,153 @@
 (defn- append-string [value delta]
   (str (or value "") (or delta "")))
 
+(defn- compatible-stream-tool-delta! [state native raw]
+  (let [index (or (get native "index") (count (:tool_order @state)))
+        existing (get-in @state [:tools index])
+        function-data (or (get native "function") {})
+        argument-delta (or (get function-data "arguments") "")
+        call {:id (or (get native "id") (:id existing) (str "call_" index))
+              :name (or (get function-data "name") (:name existing) "")
+              :arguments (append-string (:arguments existing) argument-delta)}
+        first-delta? (nil? existing)]
+    (when first-delta?
+      (swap! state update :tool_order conj index))
+    (swap! state assoc-in [:tools index] call)
+    {:type (if first-delta? :tool_call_start :tool_call_delta)
+     :tool_call (assoc call :arguments argument-delta)
+     :raw raw}))
+
+(defn- compatible-stream-tool-call [call]
+  (let [arguments (:arguments call)]
+    (assoc call :arguments
+           (if (str/blank? arguments)
+             {}
+             (try
+               (json/read-json arguments)
+               (catch Object _ {}))))))
+
+(defn- compatible-stream-response [request state]
+  (let [snapshot @state
+        text (:text snapshot)
+        tool-calls (mapv
+                     (fn [index]
+                       (compatible-stream-tool-call
+                         (get-in snapshot [:tools index])))
+                     (:tool_order snapshot))
+        parts (vec
+                (concat
+                  (when (not= "" text) [{:kind :text :text text}])
+                  (map (fn [call] {:kind :tool_call :tool_call call})
+                       tool-calls)))
+        native-reason (:finish_reason snapshot)
+        reason (if (some? native-reason)
+                 (finish-reason native-reason)
+                 (if (seq tool-calls) :tool_calls :other))]
+    {:id (:id snapshot)
+     :model (or (:model snapshot) (:model request))
+     :provider (or (:provider request) "openai-compatible")
+     :message {:role :assistant :content parts :parts parts :text text}
+     :tool_calls tool-calls
+     :usage (openai-compatible-usage (:usage snapshot))
+     :finish_reason reason
+     :warnings (adapter-warnings "openai-compatible" request)
+     :raw (:raw snapshot)}))
+
+(defn- compatible-stream-finish-events [request state]
+  (let [snapshot @state
+        response (compatible-stream-response request state)
+        raw (:raw snapshot)]
+    (vec
+      (concat
+        (when (:text_started snapshot)
+          [{:type :text_end :text_id "text" :raw raw}])
+        (map (fn [index]
+               {:type :tool_call_end
+                :tool_call (compatible-stream-tool-call
+                             (get-in snapshot [:tools index]))
+                :raw raw})
+             (:tool_order snapshot))
+        [{:type :finish
+          :finish_reason (:finish_reason response)
+          :usage (:usage response)
+          :response response
+          :raw raw}]))))
+
+(defn- compatible-stream-events [request state event]
+  (let [data (str/trim (:data event))]
+    (if (:failed @state)
+      []
+      (if (= data "[DONE]")
+        (compatible-stream-finish-events request state)
+        (let [body (json/read-json data)
+            error (get body "error")
+            first-event? (not (:started @state))]
+        (if (some? error)
+          (do
+            (swap! state assoc :started true :failed true :raw body)
+            (vec
+              (concat
+                (when first-event?
+                  [{:type :stream_start
+                    :warnings (adapter-warnings "openai-compatible" request)
+                    :raw body}])
+                [{:type :error :error error :raw body}])))
+          (let [choice (first (or (get body "choices") []))
+                delta (or (get choice "delta") {})
+                content (get delta "content")
+                native-tools (or (get delta "tool_calls") [])
+                first-text? (and (some? content)
+                                 (not (:text_started @state)))]
+            (swap! state assoc :started true :raw body)
+            (when-let [id (get body "id")] (swap! state assoc :id id))
+            (when-let [model (get body "model")] (swap! state assoc :model model))
+            (when-let [usage (get body "usage")]
+              (swap! state update :usage merge usage))
+            (when-let [reason (get choice "finish_reason")]
+              (swap! state assoc :finish_reason reason))
+            (when first-text? (swap! state assoc :text_started true))
+            (when (some? content)
+              (swap! state update :text append-string content))
+            (vec
+              (concat
+                (when first-event?
+                  [{:type :stream_start
+                    :warnings (adapter-warnings "openai-compatible" request)
+                    :raw body}])
+                (when first-text?
+                  [{:type :text_start :text_id "text" :raw body}])
+                (when (some? content)
+                  [{:type :text_delta :delta content
+                    :text_id "text" :raw body}])
+                (map (fn [native]
+                       (compatible-stream-tool-delta! state native body))
+                     native-tools))))))))))
+
+(defn openai-compatible-stream [request & [api-key base-url]]
+  (let [{:keys [provider url headers payload]}
+        (openai-compatible-request-data request api-key base-url)
+        transport (or (:transport request) http/request)
+        stream-payload (assoc payload
+                              :stream true
+                              :stream_options
+                              (merge {:include_usage true}
+                                     (canonical-option-map
+                                       (:stream_options payload))))
+        resp (transport
+               (transport-request-options
+                 request
+                 {:method :post :url url :headers headers :as :stream
+                  :body (json/write-json (json-safe stream-payload))}))
+        status (:status resp)]
+    (if (and (number? status) (not= status 200))
+      (raise-provider-error! provider resp)
+      (do
+        (register-provider-stream-close! request (:body resp))
+        (let [state (atom {:started false :text_started false :text ""
+                           :tools {} :tool_order [] :usage {}})]
+          (mapcat (fn [event] (compatible-stream-events request state event))
+                  (parse-sse-lines (stream-lines (:body resp)))))))))
+
 (defn- anthropic-stream-event [request state event]
   (let [body (json/read-json (:data event))
         event-type (or (get body "type") (:event event))]
@@ -1841,6 +2084,7 @@
      :finish_reason (if (seq tool-calls)
                       :tool_calls
                       (finish-reason (:finish_reason snapshot)))
+     :warnings (adapter-warnings "gemini" request)
      :raw raw}))
 
 (defn- gemini-stream-events [request state event]
@@ -1942,6 +2186,7 @@
         req (assoc request :provider provider :model (:model parsed))]
     (case provider
       "openai" (openai-stream req (:api_key opts) (:base_url opts))
+      "ollama" (openai-compatible-stream req (:api_key opts) (:base_url opts))
       "anthropic" (anthropic-stream req (:api_key opts) (:base_url opts))
       "gemini" (gemini-stream req (:api_key opts) (:base_url opts))
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
@@ -2078,6 +2323,7 @@
           (let [req (request-with-options request)]
             (case name
               "openai" (openai-stream req (:api_key req) (:base_url req))
+              "ollama" (openai-compatible-stream req (:api_key req) (:base_url req))
               "anthropic" (anthropic-stream req (:api_key req) (:base_url req))
               "gemini" (gemini-stream req (:api_key req) (:base_url req))
               (throw (ex-info (str "Streaming is not implemented for provider: " name)
@@ -2526,7 +2772,7 @@
    :finish_reason (:finish_reason response)
    :usage (or (:usage response) {})
    :response response
-   :warnings []})
+   :warnings (or (:warnings response) [])})
 
 (defn- generate-result [response tool-results steps total-usage]
   {:text (response-text response)

@@ -180,6 +180,235 @@
     (is (nil? (:max_tokens request)))
     (is (nil? (:reasoning_effort request)))))
 
+(deftest test-portable-generation-settings-translate-across-providers
+  (let [captures (atom {})
+        settings {:temperature 0.25
+                  :top_p 0.8
+                  :max_tokens 321
+                  :stop_sequences ["END" "STOP"]}
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))
+        _ (llm/openai-complete
+            (merge settings
+                   {:model "gpt-test" :api_key "key" :messages []
+                    :transport
+                    (transport :openai
+                               {:id "o" :status "completed"
+                                :output [] :usage {}})}))
+        _ (llm/anthropic-complete
+            (merge settings
+                   {:model "claude-test" :api_key "key" :messages []
+                    :transport
+                    (transport :anthropic
+                               {:id "a" :content [] :stop_reason "end_turn"
+                                :usage {}})}))
+        _ (llm/gemini-complete
+            (merge settings
+                   {:model "gemini-test" :api_key "key" :messages []
+                    :transport
+                    (transport :gemini
+                               {:responseId "g" :candidates []
+                                :usageMetadata {}})}))
+        _ (llm/openai-compatible-complete
+            (merge settings
+                   {:provider "ollama" :model "local-test" :messages []
+                    :transport
+                    (transport :compatible
+                               {:id "c" :model "local-test"
+                                :choices [{:message {:content "ok"}
+                                           :finish_reason "stop"}]
+                                :usage {}})}))
+        openai (json/read-json (:body (:openai @captures)))
+        anthropic (json/read-json (:body (:anthropic @captures)))
+        gemini (json/read-json (:body (:gemini @captures)))
+        compatible (json/read-json (:body (:compatible @captures)))]
+    (is (= 0.25 (get openai "temperature")))
+    (is (= 0.8 (get openai "top_p")))
+    (is (= 321 (get openai "max_output_tokens")))
+    (is (= 0.25 (get anthropic "temperature")))
+    (is (= 0.8 (get anthropic "top_p")))
+    (is (= 321 (get anthropic "max_tokens")))
+    (is (= ["END" "STOP"] (get anthropic "stop_sequences")))
+    (is (= 0.25 (get-in gemini ["generationConfig" "temperature"])))
+    (is (= 0.8 (get-in gemini ["generationConfig" "topP"])))
+    (is (= 321 (get-in gemini ["generationConfig" "maxOutputTokens"])))
+    (is (= ["END" "STOP"]
+           (get-in gemini ["generationConfig" "stopSequences"])))
+    (is (= 0.25 (get compatible "temperature")))
+    (is (= 0.8 (get compatible "top_p")))
+    (is (= 321 (get compatible "max_tokens")))
+    (is (= ["END" "STOP"] (get compatible "stop")))))
+
+(deftest test-adapters-omit-unset-generation-settings
+  (let [captures (atom {})
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))
+        _ (llm/openai-complete
+            {:model "gpt-test" :api_key "key" :messages []
+             :transport
+             (transport :openai {:id "o" :status "completed"
+                                 :output [] :usage {}})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key" :messages []
+             :transport
+             (transport :anthropic {:id "a" :content []
+                                    :stop_reason "end_turn" :usage {}})})
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key" :messages []
+             :transport
+             (transport :gemini {:responseId "g" :candidates []
+                                 :usageMetadata {}})})
+        _ (llm/openai-compatible-complete
+            {:provider "ollama" :model "local-test" :messages []
+             :transport
+             (transport :compatible
+                        {:id "c" :choices [{:message {:content "ok"}
+                                            :finish_reason "stop"}]
+                         :usage {}})})
+        openai (json/read-json (:body (:openai @captures)))
+        anthropic (json/read-json (:body (:anthropic @captures)))
+        gemini (json/read-json (:body (:gemini @captures)))
+        compatible (json/read-json (:body (:compatible @captures)))]
+    (doseq [field-name ["temperature" "top_p" "max_output_tokens"
+                        "metadata"]]
+      (is (nil? (get openai field-name))))
+    (is (= 4096 (get anthropic "max_tokens")))
+    (doseq [field-name ["temperature" "top_p" "stop_sequences" "metadata"]]
+      (is (nil? (get anthropic field-name))))
+    (is (nil? (get gemini "generationConfig")))
+    (doseq [field-name ["temperature" "top_p" "max_tokens" "stop"]]
+      (is (nil? (get compatible field-name))))))
+
+(deftest test-high-level-generate-forwards-portable-generation-settings
+  (let [captured (atom nil)
+        adapter
+        (llm/make-adapter
+          "openai"
+          (fn [request]
+            (reset! captured request)
+            {:id "r" :model (:model request) :provider "openai"
+             :message {:role :assistant :content [] :text "ok"}
+             :tool_calls [] :usage {} :finish_reason :stop
+             :warnings []})
+          nil)
+        client (llm/make-client {:providers {"openai" adapter}})
+        settings {:temperature 0.1 :top_p 0.7 :max_tokens 222
+                  :stop_sequences ["DONE"]}
+        _ (llm/generate "gpt-test" "hello"
+                        (merge settings {:provider "openai" :client client}))]
+    (is (= settings
+           (select-keys @captured
+                        [:temperature :top_p :max_tokens :stop_sequences])))))
+
+(deftest test-provider-options-override-portable-generation-settings
+  (let [captures (atom {})
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))
+        _ (llm/openai-complete
+            {:model "gpt-test" :api_key "key" :messages []
+             :temperature 0.1
+             :provider_options {"openai" {"temperature" 0.9}}
+             :transport
+             (transport :openai {:id "o" :status "completed"
+                                 :output [] :usage {}})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key" :messages []
+             :temperature 0.1
+             :provider_options {"anthropic" {"temperature" 0.9}}
+             :transport
+             (transport :anthropic {:id "a" :content []
+                                    :stop_reason "end_turn" :usage {}})})
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key" :messages []
+             :temperature 0.1 :top_p 0.7 :max_tokens 222
+             :response_format {:type "json_schema"
+                               :json_schema {:type "object"}}
+             :provider_options
+             {"gemini" {"generationConfig" {"temperature" 0.9}}}
+             :transport
+             (transport :gemini {:responseId "g" :candidates []
+                                 :usageMetadata {}})})
+        _ (llm/openai-compatible-complete
+            {:provider "ollama" :model "local-test" :messages []
+             :temperature 0.1
+             :provider_options {"ollama" {"temperature" 0.9}}
+             :transport
+             (transport :compatible
+                        {:id "c" :choices [{:message {:content "ok"}
+                                            :finish_reason "stop"}]
+                         :usage {}})})
+        openai (json/read-json (:body (:openai @captures)))
+        anthropic (json/read-json (:body (:anthropic @captures)))
+        gemini (json/read-json (:body (:gemini @captures)))
+        compatible (json/read-json (:body (:compatible @captures)))]
+    (is (= 0.9 (get openai "temperature")))
+    (is (= 1 (count (re-seq #"\"temperature\":"
+                             (:body (:openai @captures))))))
+    (is (= 0.9 (get anthropic "temperature")))
+    (is (= 1 (count (re-seq #"\"temperature\":"
+                             (:body (:anthropic @captures))))))
+    (is (= 0.9 (get-in gemini ["generationConfig" "temperature"])))
+    (is (= 0.7 (get-in gemini ["generationConfig" "topP"])))
+    (is (= 222 (get-in gemini ["generationConfig" "maxOutputTokens"])))
+    (is (= "application/json"
+           (get-in gemini ["generationConfig" "responseMimeType"])))
+    (is (= "object"
+           (get-in gemini ["generationConfig" "responseSchema" "type"])))
+    (is (= 0.9 (get compatible "temperature")))))
+
+(deftest test-unsupported-portable-fields-produce-response-warnings
+  (let [captures (atom {})
+        transport
+        (fn [provider response]
+          (fn [request]
+            (swap! captures assoc provider request)
+            {:status 200 :body (json/write-json response)}))
+        openai-response
+        (llm/openai-complete
+          {:model "gpt-test" :api_key "key" :messages []
+           :stop_sequences ["END"] :metadata {:trace_id "trace-1"}
+           :transport
+           (transport :openai {:id "o" :status "completed"
+                               :output [] :usage {}})})
+        anthropic-response
+        (llm/anthropic-complete
+          {:model "claude-test" :api_key "key" :messages []
+           :metadata {:user_id "opaque-user" :trace_id "trace-1"}
+           :transport
+           (transport :anthropic {:id "a" :content []
+                                  :stop_reason "end_turn" :usage {}})})
+        gemini-response
+        (llm/gemini-complete
+          {:model "gemini-test" :api_key "key" :messages []
+           :metadata {:trace_id "trace-1"}
+           :transport
+           (transport :gemini {:responseId "g" :candidates []
+                               :usageMetadata {}})})
+        openai-body (json/read-json (:body (:openai @captures)))
+        anthropic-body (json/read-json (:body (:anthropic @captures)))
+        gemini-body (json/read-json (:body (:gemini @captures)))]
+    (is (= "trace-1" (get-in openai-body ["metadata" "trace_id"])))
+    (is (nil? (get openai-body "stop")))
+    (is (= "unsupported_parameter"
+           (get-in openai-response [:warnings 0 :code])))
+    (is (= "opaque-user"
+           (get-in anthropic-body ["metadata" "user_id"])))
+    (is (nil? (get-in anthropic-body ["metadata" "trace_id"])))
+    (is (= "unsupported_parameter"
+           (get-in anthropic-response [:warnings 0 :code])))
+    (is (nil? (get gemini-body "metadata")))
+    (is (= "unsupported_parameter"
+           (get-in gemini-response [:warnings 0 :code])))))
+
 (deftest test-mock-provider-uses-canonical-content-parts
   (let [response
         (llm/complete
@@ -1840,6 +2069,74 @@
            (mapv :delta (filter (fn [event] (= (:type event) :text_delta)) events))))
     (is (= "Hello" (get-in (last events) [:response :message :text])))
     (is (= 3 (get-in (last events) [:usage :total_tokens])))))
+
+(deftest test-openai-compatible-stream-normalizes-chat-completions-sse
+  (let [captured (atom nil)
+        sse (str
+              "data: {\"id\":\"chat-stream\",\"model\":\"local-test\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+              "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n"
+              "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n"
+              "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n"
+              "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+              "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n"
+              "data: [DONE]\n\n")
+        events
+        (vec
+          (llm/stream
+            {:provider "ollama" :model "local-test" :messages []
+             :temperature 0.2 :top_p 0.6 :max_tokens 111
+             :stop_sequences ["END"]
+             :transport (fn [request]
+                          (reset! captured request)
+                          {:status 200 :body sse})}))
+        payload (json/read-json (:body @captured))
+        finish (last events)
+        configured-captured (atom nil)
+        adapter
+        (llm/make-provider-adapter
+          "ollama"
+          {:transport (fn [request]
+                        (reset! configured-captured request)
+                        {:status 200 :body sse})})
+        client (llm/make-client {:providers {"ollama" adapter}})
+        configured-events
+        (vec (llm/client-stream client
+                                {:provider "ollama" :model "local-test"
+                                 :messages []}))]
+    (is (= :stream (:as @captured)))
+    (is (= true (get payload "stream")))
+    (is (= 0.2 (get payload "temperature")))
+    (is (= 0.6 (get payload "top_p")))
+    (is (= 111 (get payload "max_tokens")))
+    (is (= ["END"] (get payload "stop")))
+    (is (= [:stream_start :text_start :text_delta :text_delta
+            :tool_call_start :tool_call_delta :text_end :tool_call_end :finish]
+           (mapv :type events)))
+    (is (= "Hello" (get-in finish [:response :message :text])))
+    (is (= {"q" "x"}
+           (get-in finish [:response :tool_calls 0 :arguments])))
+    (is (= 5 (get-in finish [:usage :total_tokens])))
+    (is (= :tool_calls (:finish_reason finish)))
+    (is (= :stream (:as @configured-captured)))
+    (is (= :finish (:type (last configured-events))))))
+
+(deftest test-openai-compatible-stream-surfaces-midstream-errors
+  (let [sse (str
+              "data: {\"id\":\"chat-stream\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+              "data: {\"error\":{\"code\":\"server_error\",\"message\":\"failed\"}}\n\n"
+              "data: {\"choices\":[{\"delta\":{\"content\":\"ignored\"},\"finish_reason\":null}]}\n\n"
+              "data: {\"error\":{\"code\":\"server_error\",\"message\":\"duplicate\"}}\n\n"
+              "data: [DONE]\n\n")
+        events
+        (vec
+          (llm/openai-compatible-stream
+            {:provider "ollama" :model "local-test" :messages []
+             :transport (fn [_] {:status 200 :body sse})}))]
+    (is (= [:stream_start :text_start :text_delta :error]
+           (mapv :type events)))
+    (is (= "partial" (:delta (nth events 2))))
+    (is (= "server_error" (get-in (last events) [:error "code"])))
+    (is (empty? (filter (fn [event] (= :finish (:type event))) events)))))
 
 (deftest test-sse-parser-handles-multiline-retry-comments-and-eof
   (let [events (vec
