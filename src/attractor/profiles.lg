@@ -134,11 +134,10 @@
                  (fn [args env]
                    ((:read_file env) (arg args "file_path")
                     (arg args "offset") (arg args "limit"))))
-         (when-not (= edit-kind "apply_patch")
-           (registered write-def
+         (registered write-def
                  (fn [args env]
                    ((:write_file env) (arg args "file_path") (arg args "content"))
-                   "File written")))
+                   "File written"))
          (registered edit-def
                  (if (= edit-kind "apply_patch")
                    (fn [args env]

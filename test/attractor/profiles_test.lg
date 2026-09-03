@@ -27,7 +27,6 @@
                 (set (profiles/registry-names (:tool_registry profile))))]
     (is (contains? (names openai) "apply_patch"))
     (is (not (contains? (names openai) "edit_file")))
-    (is (not (contains? (names openai) "write_file")))
     (is (contains? (names anthropic) "edit_file"))
     (is (not (contains? (names anthropic) "apply_patch")))
     (is (contains? (names gemini) "read_many_files"))
