@@ -1439,6 +1439,83 @@
            :default_provider "mock"}))
       (get-default-client)))
 
+(defn- high-level-tool-name [value]
+  (str (or (:name value) (get value "name") "")))
+
+(defn- find-tool [tools tool-name]
+  (first (filter (fn [tool] (= (high-level-tool-name tool) tool-name)) tools)))
+
+(defn- tool-error-result [tool-call message]
+  {:tool_call_id (or (:id tool-call) (get tool-call "id") "")
+   :tool_name (high-level-tool-name tool-call)
+   :content message
+   :is_error true})
+
+(defn- parse-tool-arguments [tool-call]
+  (let [arguments (or (:arguments tool-call)
+                      (get tool-call "arguments")
+                      {})]
+    (if (string? arguments)
+      (json/read-json arguments)
+      arguments)))
+
+(declare validate-json-schema)
+
+(defn- execute-tool-call [tools tool-call]
+  (let [tool-name (high-level-tool-name tool-call)
+        tool (find-tool tools tool-name)]
+    (if (nil? tool)
+      (tool-error-result tool-call (str "Unknown tool: " tool-name))
+      (try
+        (let [arguments (parse-tool-arguments tool-call)
+              schema (:parameters tool)
+              [valid? reason] (if (some? schema)
+                                (validate-json-schema arguments schema)
+                                [true ""])]
+          (when-not valid?
+            (throw (ex-info reason {:category :invalid-tool-arguments
+                                    :tool_name tool-name})))
+          {:tool_call_id (or (:id tool-call) (get tool-call "id") "")
+           :tool_name tool-name
+           :content ((:execute tool) arguments)
+           :is_error false})
+        (catch Object e
+          (tool-error-result tool-call (str "Tool error (" tool-name "): " e)))))))
+
+(defn- execute-tool-calls [tools tool-calls]
+  ;; pmap preserves input order while allowing independent calls to overlap.
+  (vec (pmap (fn [tool-call] (execute-tool-call tools tool-call)) tool-calls)))
+
+(defn- passive-tool-call? [tools tool-call]
+  (let [tool (find-tool tools (high-level-tool-name tool-call))]
+    (and (some? tool) (nil? (:execute tool)))))
+
+(defn- tool-call-finish? [response]
+  (let [reason (:finish_reason response)]
+    (= :tool_calls (if (map? reason) (:reason reason) reason))))
+
+(defn- step-result [response tool-results]
+  {:text (or (get-in response [:message :content]) "")
+   :reasoning (:reasoning response)
+   :tool_calls (or (:tool_calls response) [])
+   :tool_results tool-results
+   :finish_reason (:finish_reason response)
+   :usage (or (:usage response) {})
+   :response response
+   :warnings []})
+
+(defn- generate-result [response tool-results steps total-usage]
+  {:text (or (get-in response [:message :content]) "")
+   :reasoning (:reasoning response)
+   :tool_calls (or (:tool_calls response) [])
+   :tool_results tool-results
+   :finish_reason (:finish_reason response)
+   :usage (or (:usage response) {})
+   :total_usage total-usage
+   :steps steps
+   :response response
+   :output nil})
+
 ;; High-level generate API
 (defn generate [model prompt & [opts]]
   (let [options (or opts {})
@@ -1455,33 +1532,58 @@
                      (vec (cons {:role :system :content (:system options)}
                                 input-messages))
                      (vec input-messages))
-          request-options (dissoc
-                            (dissoc
-                              (dissoc
-                                (dissoc options :client)
-                                :prompt)
-                              :system)
-                            :messages)
+          request-options
+          (dissoc
+            (dissoc
+              (dissoc
+                (dissoc
+                  (dissoc
+                    (dissoc options :client)
+                    :prompt)
+                  :system)
+                :messages)
+              :max_tool_rounds)
+            :stop_when)
           request (merge request-options {:model model :messages messages})
-          response (client-complete (generation-client options) request)
-          text (or (get-in response [:message :content]) "")
-          reasoning (:reasoning response)
-          tool-calls (or (:tool_calls response) [])
-          usage (or (:usage response) {})
-          finish-reason (:finish_reason response)
-          step {:text text :reasoning reasoning :tool_calls tool-calls
-                :tool_results [] :finish_reason finish-reason
-                :usage usage :response response :warnings []}]
-      {:text text
-       :reasoning reasoning
-       :tool_calls tool-calls
-       :tool_results []
-       :finish_reason finish-reason
-       :usage usage
-       :total_usage usage
-       :steps [step]
-       :response response
-       :output nil})))
+          client (generation-client options)
+          tools (or (:tools options) [])
+          max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
+          stop-when (:stop_when options)]
+      (loop [conversation messages
+             round-number 0
+             steps []
+             total-usage {}]
+        (let [response (client-complete client (assoc request :messages conversation))
+              tool-calls (or (:tool_calls response) [])
+              can-execute
+              (and (seq tool-calls)
+                   (tool-call-finish? response)
+                   (< round-number max-tool-rounds)
+                   (empty? (filter (fn [call] (passive-tool-call? tools call))
+                                   tool-calls)))
+              tool-results (if can-execute
+                             (execute-tool-calls tools tool-calls)
+                             [])
+              step (step-result response tool-results)
+              next-steps (conj steps step)
+              next-total (merge-with + total-usage (or (:usage response) {}))
+              stop? (and can-execute (some? stop-when) (stop-when next-steps))]
+          (if (and can-execute (not stop?))
+            (let [assistant-message
+                  (assoc (or (:message response)
+                             {:role :assistant :content ""})
+                         :role :assistant
+                         :tool_calls tool-calls)
+                  tool-messages
+                  (mapv (fn [result] {:role :tool :content [result]})
+                        tool-results)]
+              (recur (vec (concat conversation
+                                  [assistant-message]
+                                  tool-messages))
+                     (inc round-number)
+                     next-steps
+                     next-total))
+            (generate-result response tool-results next-steps next-total)))))))
 
 (defn- schema-value [m key]
   (or (get m key) (get m (keyword (str key)))))

@@ -334,6 +334,168 @@
                 false)
             (catch Object _ true))))))
 
+(deftest test-generate-executes-active-tools-and-aggregates-steps
+  (let [requests (atom [])
+        tool-arguments (atom [])
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [request]
+            (swap! requests conj request)
+            (if (= 1 (count @requests))
+              {:id "step-1" :provider "mock" :model (:model request)
+               :message {:role :assistant :content "Checking"}
+               :tool_calls [{:id "call-1" :name "lookup"
+                             :arguments {"query" "weather"}}]
+               :usage {:input_tokens 2 :output_tokens 1 :total_tokens 3}
+               :finish_reason :tool_calls}
+              {:id "step-2" :provider "mock" :model (:model request)
+               :message {:role :assistant :content "Sunny"}
+               :tool_calls []
+               :usage {:input_tokens 4 :output_tokens 2 :total_tokens 6}
+               :finish_reason :stop}))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result
+        (llm/generate
+          "native-model" "What is the weather?"
+          {:client client :max_tool_rounds 2
+           :tools [{:name "lookup" :description "Look up weather"
+                    :parameters {:type "object"}
+                    :execute (fn [arguments]
+                               (swap! tool-arguments conj arguments)
+                               {:forecast "sunny"})}]})]
+    (is (= [{"query" "weather"}] @tool-arguments))
+    (is (= 2 (count @requests)))
+    (is (= "Sunny" (:text result)))
+    (is (= 9 (get-in result [:total_usage :total_tokens])))
+    (is (= 2 (count (:steps result))))
+    (is (= {:forecast "sunny"}
+           (get-in result [:steps 0 :tool_results 0 :content])))
+    (is (= :assistant (get-in @requests [1 :messages 1 :role])))
+    (is (= :tool (get-in @requests [1 :messages 2 :role])))
+    (is (= "call-1"
+           (get-in @requests [1 :messages 2 :content 0 :tool_call_id])))))
+
+(deftest test-generate-does-not-execute-passive-tools-or-exceed-budget
+  (let [calls (atom 0)
+        executions (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [request]
+            (swap! calls inc)
+            {:provider "mock" :model (:model request)
+             :message {:role :assistant :content ""}
+             :tool_calls [{:id "call-1" :name "lookup" :arguments {}}]
+             :usage {} :finish_reason :tool_calls})
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (llm/generate "model" "prompt"
+                  {:client client :max_tool_rounds 3
+                   :tools [{:name "lookup" :parameters {:type "object"}}]})
+    (is (= 1 @calls))
+    (llm/generate "model" "prompt"
+                  {:client client :max_tool_rounds 0
+                   :tools [{:name "lookup" :parameters {:type "object"}
+                            :execute (fn [_] (swap! executions inc))}]})
+    (is (= 2 @calls))
+    (is (= 0 @executions))))
+
+(deftest test-generate-returns-tool-errors-to-model
+  (let [requests (atom [])
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [request]
+            (swap! requests conj request)
+            (if (= 1 (count @requests))
+              {:provider "mock" :message {:role :assistant :content ""}
+               :tool_calls [{:id "bad-1" :name "missing" :arguments {}}]
+               :usage {} :finish_reason :tool_calls}
+              {:provider "mock" :message {:role :assistant :content "recovered"}
+               :tool_calls [] :usage {} :finish_reason :stop}))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/generate "model" "prompt"
+                             {:client client :max_tool_rounds 1 :tools []})]
+    (is (= "recovered" (:text result)))
+    (is (true? (get-in result [:steps 0 :tool_results 0 :is_error])))
+    (is (str/includes?
+          (get-in result [:steps 0 :tool_results 0 :content])
+          "Unknown tool"))))
+
+(deftest test-generate-validates-tool-arguments-before-execution
+  (let [executed (atom false)
+        requests (atom 0)
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (swap! requests inc)
+            (if (= 1 @requests)
+              {:provider "mock" :message {:role :assistant :content ""}
+               :tool_calls [{:id "bad-args" :name "lookup" :arguments {}}]
+               :usage {} :finish_reason :tool_calls}
+              {:provider "mock" :message {:role :assistant :content "fixed"}
+               :tool_calls [] :usage {} :finish_reason :stop}))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result
+        (llm/generate
+          "model" "prompt"
+          {:client client :max_tool_rounds 1
+           :tools [{:name "lookup"
+                    :parameters {:type "object"
+                                 :properties {:query {:type "string"}}
+                                 :required ["query"]}
+                    :execute (fn [_] (reset! executed true))}]})]
+    (is (false? @executed))
+    (is (true? (get-in result [:steps 0 :tool_results 0 :is_error])))
+    (is (str/includes? (get-in result [:steps 0 :tool_results 0 :content])
+                       "Missing required property"))))
+
+(deftest test-generate-executes-parallel-tools-concurrently-in-order
+  (let [started (atom 0)
+        gate (promise)
+        requests (atom 0)
+        handler (fn [arguments]
+                  (let [count-started (swap! started inc)]
+                    (when (= count-started 2) (deliver gate :go))
+                    (if (= :go (deref gate 1000 :timeout))
+                      (get arguments "value")
+                      :did-not-overlap)))
+        adapter
+        (llm/make-adapter
+          "mock"
+          (fn [_]
+            (swap! requests inc)
+            (if (= 1 @requests)
+              {:provider "mock" :message {:role :assistant :content ""}
+               :tool_calls [{:id "a" :name "first"
+                             :arguments {"value" "one"}}
+                            {:id "b" :name "second"
+                             :arguments {"value" "two"}}]
+               :usage {} :finish_reason :tool_calls}
+              {:provider "mock" :message {:role :assistant :content "done"}
+               :tool_calls [] :usage {} :finish_reason :stop}))
+          (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result
+        (llm/generate
+          "model" "prompt"
+          {:client client :max_tool_rounds 1
+           :tools [{:name "first" :parameters {:type "object"} :execute handler}
+                   {:name "second" :parameters {:type "object"} :execute handler}]})]
+    (is (= 2 @started))
+    (is (= ["one" "two"]
+           (mapv :content (get-in result [:steps 0 :tool_results]))))))
+
 (deftest test-openai-stream-normalizes-responses-sse
   (let [captured (atom nil)
         sse (str
