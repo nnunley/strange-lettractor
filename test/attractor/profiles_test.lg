@@ -1,23 +1,53 @@
 (ns attractor.profiles-test
   (:require [clojure.test :refer [deftest is]]
-            [clojure.string :as str]
             [attractor.profiles :as profiles]))
 
-(deftest test-create-openai-profile
-  (let [profile (profiles/create-openai-profile)]
-    (is (= (:id profile) "openai"))))
+(deftest test-tool-registry-is-latest-wins
+  (let [registry (profiles/make-tool-registry)
+        first-tool {:definition {:name "lookup" :description "first"
+                                 :parameters {:type "object"}}
+                    :executor (fn [_ _] "first")}
+        replacement {:definition {:name "lookup" :description "replacement"
+                                  :parameters {:type "object"}}
+                     :executor (fn [_ _] "replacement")}]
+    (profiles/register-tool! registry first-tool)
+    (profiles/register-tool! registry replacement)
+    (is (= replacement (profiles/registry-get registry "lookup")))
+    (is (= ["lookup"] (profiles/registry-names registry)))
+    (is (= "replacement"
+           (:description (first (profiles/registry-definitions registry)))))
+    (profiles/unregister-tool! registry "lookup")
+    (is (nil? (profiles/registry-get registry "lookup")))))
 
-(deftest test-create-anthropic-profile
-  (let [profile (profiles/create-anthropic-profile)]
-    (is (= (:id profile) "anthropic"))))
+(deftest test-provider-profiles-have-provider-aligned-editing-tools
+  (let [openai (profiles/create-openai-profile "gpt-5-codex")
+        anthropic (profiles/create-anthropic-profile "claude-sonnet")
+        gemini (profiles/create-gemini-profile "gemini-pro")
+        names (fn [profile]
+                (set (profiles/registry-names (:tool_registry profile))))]
+    (is (contains? (names openai) "apply_patch"))
+    (is (not (contains? (names openai) "edit_file")))
+    (is (contains? (names anthropic) "edit_file"))
+    (is (not (contains? (names anthropic) "apply_patch")))
+    (is (contains? (names gemini) "read_many_files"))
+    (is (= 120000 (:default_command_timeout_ms anthropic)))
+    (is (true? (:supports_parallel_tool_calls openai)))))
 
-(deftest test-create-gemini-profile
-  (let [profile (profiles/create-gemini-profile)]
-    (is (= (:id profile) "gemini"))))
+(deftest test-anthropic-edit-tool-delegates-to-environment
+  (let [calls (atom [])
+        profile (profiles/create-anthropic-profile "claude")
+        registered (profiles/registry-get (:tool_registry profile) "edit_file")
+        environment {:edit_file
+                     (fn [path old new replace-all]
+                       (swap! calls conj [path old new replace-all])
+                       1)}]
+    (is (= 1 ((:executor registered)
+              {"file_path" "a.txt" "old_string" "x"
+               "new_string" "y" "replace_all" false}
+              environment)))
+    (is (= [["a.txt" "x" "y" false]] @calls))))
 
-(deftest test-tool-registry
-  (let [registry (profiles/make-tool-registry)]
-    (is (empty? (profiles/tool-names registry)))))
-
-(deftest test-available-providers
-  (is (= (count profiles/available-providers) 3)))
+(deftest test-profile-compatibility-api
+  (is (= "openai" (:id (profiles/create-openai-profile))))
+  (is (= "anthropic" (:id (profiles/get-profile-by-id "claude"))))
+  (is (= 3 (count profiles/available-providers))))

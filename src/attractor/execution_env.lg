@@ -1,109 +1,48 @@
 (ns attractor.execution-env
-  (:require [clojure.string :as str]
-            [os :as os]
-            [io :as io]))
+  (:require [attractor.execution :as execution]))
 
-;; Execution Result Map-based representation
+;; Compatibility facade for the initial function-oriented environment API.
 (defn make-exec-result [stdout stderr exit-code timed-out duration-ms]
-  {:stdout stdout :stderr stderr :exit-code exit-code :timed-out timed-out :duration-ms duration-ms})
+  {:stdout stdout :stderr stderr :exit-code exit-code
+   :timed-out timed-out :duration-ms duration-ms})
 
-;; Directory Entry Map-based representation
 (defn make-dir-entry [name is-dir size]
   {:name name :is-dir is-dir :size size})
 
-;; Local Execution Environment - the default implementation
-;; Runs commands on the local machine
-(defn make-local-execution-env [& [work-dir]]
-  {:working-dir (or work-dir ".")})
+(defn make-local-execution-env [& [working-dir]]
+  (execution/make-local-environment
+    (when working-dir {:working_dir working-dir})))
 
-(defn env-read-file 
-  ([env path] (env-read-file env path nil nil))
-  ([env path offset] (env-read-file env path offset nil))
-  ([env path offset limit]
-   (try
-     (let [content (io/slurp path)
-           lines (str/split content #"\n" -1)
-           start (if (nil? offset) 0 (dec (max 0 offset)))
-           end (if (nil? limit) (count lines) (+ start limit))
-           selected (subvec lines start (min end (count lines)))]
-       (str/join "\n" 
-         (map-indexed (fn [i line]
-                        (str (+ i start 1) " | " line))
-                      selected)))
-     (catch Object e
-       (str "Error reading file: " e)))))
+(defn env-read-file
+  ([env path] ((:read_file env) path nil nil))
+  ([env path offset] ((:read_file env) path offset nil))
+  ([env path offset limit] ((:read_file env) path offset limit)))
 
 (defn env-write-file [env path content]
-  (try
-    (io/spit path content)
-    (str "Wrote " (count content) " bytes to " path)
-    (catch Object e
-      (str "Error writing file: " e))))
+  ((:write_file env) path content))
 
 (defn env-file-exists [env path]
-  (try
-    (os/stat path)
-    true
-    (catch Object _ false)))
+  ((:file_exists env) path))
 
 (defn env-list-directory [env path & [depth]]
-  (try
-    (let [d (or depth 1)
-          cmd (str "find \"" path "\" -maxdepth " d " -type f")
-          files (os/sh "sh" "-c" cmd)]
-      (if (zero? (:exit files))
-        (str/split (str/trim (:out files)) #"\n")
-        []))
-    (catch Object e
-      [])))
+  ((:list_directory env) path (or depth 1)))
 
 (defn env-exec-command [env command & [timeout-ms working-dir env-vars]]
-  (try
-    (let [cmd-result (try
-                       (os/sh "sh" "-c" command)
-                       (catch Object e
-                         {:exit 1 :out "" :err (str e)}))]
-      (make-exec-result
-        (or (:out cmd-result) "")
-        (or (:err cmd-result) "")
-        (or (:exit cmd-result) 1)
-        false
-        0))
-    (catch Object e
-      (make-exec-result "" (str e) 1 false 0))))
+  (let [result ((:exec_command env) command timeout-ms working-dir env-vars)]
+    (make-exec-result (:stdout result) (:stderr result) (:exit_code result)
+                      (:timed_out result) (:duration_ms result))))
 
 (defn env-grep [env pattern path & [options]]
-  (try
-    (let [cmd (str "grep -r " (if (:case-insensitive options) "-i " "") 
-                   "-E '" pattern "' " path)]
-      (env-exec-command env cmd))
-    (catch Object e
-      (make-exec-result "" (str e) 1 false 0))))
+  ((:grep env) pattern path (or options {})))
 
 (defn env-glob [env pattern & [path]]
-  (try
-    (let [base (or path (:working-dir env))
-          cmd (str "find \"" base "\" -path \"" pattern "\" 2>/dev/null | sort -r")]
-      (env-exec-command env cmd))
-    (catch Object e
-      (make-exec-result "" (str e) 1 false 0))))
+  ((:glob env) pattern path))
 
 (defn env-working-directory [env]
-  (:working-dir env))
+  ((:working_directory env)))
 
 (defn env-platform [env]
-  (let [os-name (os/getenv "OSTYPE")]
-    (cond
-      (and (string? os-name) (str/includes? os-name "darwin")) "darwin"
-      (and (string? os-name) (str/includes? os-name "linux")) "linux"
-      (and (string? os-name) (str/includes? os-name "msys")) "windows"
-      (and (string? os-name) (str/includes? os-name "win32")) "windows"
-      :else "unknown")))
+  ((:platform env)))
 
 (defn env-os-version [env]
-  (try
-    (let [result (os/sh "uname" "-r")]
-      (if (zero? (:exit result))
-        (str/trim (:out result))
-        "unknown"))
-    (catch Object _ "unknown")))
+  ((:os_version env)))

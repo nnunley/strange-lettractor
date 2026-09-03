@@ -3,7 +3,9 @@
             [os :as os]
             [io :as io]
             [json :as json]
-            [attractor.llm :as llm]))
+            [attractor.llm :as llm]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
 
 ;; Provider-profile tool output limits from Coding Agent Loop §5.
 (def default-tool-output-limits
@@ -133,9 +135,23 @@
 
 ;; Create an Agent Session
 (defn make-session [& [opts]]
-  (let [options (or opts {})]
+  (let [options (or opts {})
+        parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
+        profile (or (:provider_profile options)
+                    (profiles/create-profile (:provider parsed-model)
+                                             (:model parsed-model)))
+        environment (assoc (or (:execution_env options)
+                               (execution/make-local-environment))
+                           :default_command_timeout_ms
+                           (or (:default_command_timeout_ms options)
+                               (:default_command_timeout_ms profile)
+                               10000))]
+    ((:initialize environment))
     (atom {:id (str "agent-" (System/currentTimeMillis))
-           :model (or (:model options) "mock/default")
+           :model (:model profile)
+           :provider_profile profile
+           :execution_env environment
+           :llm_client (:llm_client options)
            :state :idle
            :history []
            :steering-queue []
@@ -209,16 +225,24 @@
   (let [tool-name (or (:name tool-call) (get tool-call "name") "")
         call-id (or (:id tool-call) (get tool-call "id") "")
         args (normalize-tool-arguments
-               (or (:arguments tool-call) (get tool-call "arguments") {}))]
+               (or (:arguments tool-call) (get tool-call "arguments") {}))
+        registered (profiles/registry-get
+                     (get-in @session [:provider_profile :tool_registry])
+                     tool-name)]
     (event-fn {:type :tool_call_start :tool_name tool-name :call_id call-id})
-    (if-not (contains? built-in-tool-names tool-name)
+    (if (nil? registered)
       (let [error-msg (str "Unknown tool: " tool-name)
             result {:tool_call_id call-id :tool_name tool-name
                     :content error-msg :is_error true}]
         (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
         result)
       (try
-        (let [raw-output (execute-tool tool-name args)
+        (let [[valid? reason]
+              (llm/validate-json-schema
+                args (get-in registered [:definition :parameters]))
+              _ (when-not valid?
+                  (throw (ex-info reason {:category :invalid-tool-arguments})))
+              raw-output ((:executor registered) args (:execution_env @session))
               raw-text (if (string? raw-output) raw-output (pr-str raw-output))
               truncated (truncate-tool-output raw-text tool-name (:config @session))
               result {:tool_call_id call-id :tool_name tool-name
@@ -247,7 +271,11 @@
 (defn process-input! [session prompt & [on-event]]
   (let [event-fn (or on-event (fn [_] nil))
         config (:config @session)
+        profile (:provider_profile @session)
+        environment (:execution_env @session)
         complete-fn (or (:complete_fn config)
+                        (when-let [client (:llm_client @session)]
+                          (fn [request] (llm/client-complete client request)))
                         (fn [request] (llm/complete request)))
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)]
@@ -266,10 +294,18 @@
                   (event-fn {:type :turn_limit :round round-count
                              :total_turns assistant-count})
                   last-text)
-                (let [request {:model (:model @session)
-                               :messages (history-to-messages (:history @session))
-                               :tools built-in-tool-definitions
-                               :reasoning_effort (:reasoning_effort config)}
+                (let [system-prompt
+                      (profiles/build-system-prompt
+                        profile environment (or (:project_docs config) []))
+                      request {:model (:model profile)
+                               :provider (:id profile)
+                               :messages
+                               (vec (cons {:role :system :content system-prompt}
+                                          (history-to-messages (:history @session))))
+                               :tools (profiles/profile-tools profile)
+                               :tool_choice {:mode "auto"}
+                               :reasoning_effort (:reasoning_effort config)
+                               :provider_options (:provider_options profile)}
                       response (complete-fn request)
                       text (response-content response)
                       tool-calls (response-tool-calls response)
@@ -283,9 +319,14 @@
                   (event-fn {:type :assistant_text_end :text text})
                   (if (empty? tool-calls)
                     text
-                    (let [results (mapv (fn [tool-call]
-                                          (execute-single-tool session tool-call event-fn))
-                                        tool-calls)]
+                    (let [execute-call
+                          (fn [tool-call]
+                            (execute-single-tool session tool-call event-fn))
+                          results
+                          (if (and (:supports_parallel_tool_calls profile)
+                                   (> (count tool-calls) 1))
+                            (vec (pmap execute-call tool-calls))
+                            (mapv execute-call tool-calls))]
                       (swap! session update :history conj
                              {:type :tool_results :role :tool :results results})
                       (drain-steering! session event-fn)

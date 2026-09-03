@@ -1,0 +1,122 @@
+(ns attractor.execution
+  (:require [clojure.string :as str]
+            [io :as io]
+            [os :as os]))
+
+(defn make-environment [operations]
+  (merge {:initialize (fn [] nil)
+          :cleanup (fn [] nil)
+          :working_directory (fn [] (os/cwd))
+          :platform (fn [] (os/os-name))
+          :os_version (fn [] "")}
+         operations))
+
+(defn- absolute-path? [path]
+  (or (str/starts-with? path "/")
+      (and (> (count path) 2) (= ":" (subs path 1 2)))))
+
+(defn- resolve-path [working-dir path]
+  (let [value (str (or path ""))]
+    (if (absolute-path? value)
+      value
+      (str working-dir "/" value))))
+
+(defn- parent-path [path]
+  (let [index (str/last-index-of path "/")]
+    (when (and (some? index) (> index 0))
+      (subs path 0 index))))
+
+(defn- numbered-lines [content offset limit]
+  (let [lines (vec (str/split content #"\n"))
+        start (max 0 (dec (or offset 1)))
+        end (min (count lines) (+ start (or limit 2000)))]
+    (if (>= start (count lines))
+      ""
+      (str/join
+        "\n"
+        (map-indexed (fn [index line]
+                       (str (+ start index 1) " | " line))
+                     (subvec lines start end))))))
+
+(defn- occurrence-count [content needle]
+  (when (str/blank? needle)
+    (throw (ex-info "old_string must not be empty"
+                    {:category :invalid-edit})))
+  (loop [start 0 total 0]
+    (if-let [index (str/index-of content needle start)]
+      (recur (+ index (count needle)) (inc total))
+      total)))
+
+(defn make-local-environment [& [opts]]
+  (let [options (or opts {})
+        working-dir (or (:working_dir options) (os/cwd))
+        path-for (fn [path] (resolve-path working-dir path))
+        exec-command
+        (fn [command timeout-ms requested-dir env-vars]
+          (let [dir (or requested-dir working-dir)
+                started (System/currentTimeMillis)
+                task (future
+                       (os/sh "/bin/bash" "-c"
+                              "cd \"$1\" && shift && eval \"$1\""
+                              "lettractor" dir command))
+                timeout (max 1 (or timeout-ms 10000))
+                result (deref task timeout :timed-out)
+                duration (- (System/currentTimeMillis) started)]
+            (if (= result :timed-out)
+              {:stdout "" :stderr (str "Command timed out after " timeout "ms")
+               :exit_code 124 :timed_out true :duration_ms duration}
+              {:stdout (:out result) :stderr (:err result)
+               :exit_code (:exit result) :timed_out false :duration_ms duration})))]
+    (make-environment
+      {:working_directory (fn [] working-dir)
+       :platform (fn [] (os/os-name))
+       :os_version (fn [] (str (os/os-name) "/" (os/arch)))
+       :read_file
+       (fn [path offset limit]
+         (numbered-lines (io/slurp (path-for path)) offset limit))
+       :write_file
+       (fn [path content]
+         (let [resolved (path-for path)]
+           (when-let [parent (parent-path resolved)] (io/mkdir parent))
+           (io/spit resolved content)
+           nil))
+       :file_exists (fn [path] (some? (os/stat (path-for path))))
+       :edit_file
+       (fn [path old-string new-string replace-all]
+         (let [resolved (path-for path)
+               content (io/slurp resolved)
+               matches (occurrence-count content old-string)]
+           (when (= matches 0)
+             (throw (ex-info "old_string was not found"
+                             {:category :edit-not-found :path resolved})))
+           (when (and (> matches 1) (not replace-all))
+             (throw (ex-info "old_string is not unique; provide more context or set replace_all"
+                             {:category :edit-not-unique :matches matches
+                              :path resolved})))
+           (io/spit resolved
+                    (if replace-all
+                      (str/replace content old-string new-string)
+                      (str/replace-first content old-string new-string)))
+           (if replace-all matches 1)))
+       :list_directory
+       (fn [path depth]
+         (let [resolved (path-for (or path "."))]
+           (mapv (fn [entry]
+                   (let [stat (os/stat (str resolved "/" entry))]
+                     {:name entry :is_dir (:dir? stat) :size (:size stat)}))
+                 (os/ls resolved))))
+       :exec_command exec-command
+       :grep
+       (fn [pattern path grep-options]
+         (let [result (exec-command
+                        (str "rg --line-number --color never -- "
+                             (pr-str pattern) " " (pr-str (or path ".")))
+                        10000 working-dir nil)]
+           (str (:stdout result) (:stderr result))))
+       :glob
+       (fn [pattern path]
+         (let [result (exec-command
+                        (str "find " (pr-str (or path "."))
+                             " -type f -path " (pr-str pattern))
+                        10000 working-dir nil)]
+           (vec (remove str/blank? (str/split (:stdout result) #"\r?\n")))))})))
