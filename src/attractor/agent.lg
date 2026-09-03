@@ -394,6 +394,7 @@
                  :delivery_queue (atom [])
                  :delivery_active (atom false)
                  :listener_errors (atom [])
+                 :context_warning_emitted (atom false)
                  :project_docs project-docs
                  :environment_snapshot snapshot
                  :state :idle
@@ -556,6 +557,44 @@
                      (seq (:tool_calls turn)) (assoc :tool_calls (:tool_calls turn)))
         {:role :user :content (:content turn)}))
     history))
+
+(defn- value-character-count [value]
+  (cond
+    (nil? value) 0
+    (string? value) (count value)
+    (map? value)
+    (reduce + 0
+            (map (fn [[key item]]
+                   (+ (value-character-count key)
+                      (value-character-count item)))
+                 value))
+    (sequential? value) (reduce + 0 (map value-character-count value))
+    :else (count (str value))))
+
+(defn- turn-character-count [turn]
+  (case (:type turn)
+    :assistant (+ (value-character-count (:content turn))
+                  (value-character-count (:reasoning turn))
+                  (value-character-count (:tool_calls turn)))
+    :tool_results (value-character-count (:results turn))
+    (value-character-count (:content turn))))
+
+(defn- check-context-usage! [session event-fn]
+  (let [window (or (get-in @session [:provider_profile :context_window_size]) 0)
+        characters (reduce + 0 (map turn-character-count (:history @session)))]
+    (when (and (> window 0)
+               (> (* characters 5) (* window 16))
+               (compare-and-set! (:context_warning_emitted @session)
+                                 false true))
+      (let [approx-tokens (quot (+ characters 3) 4)
+            percent (quot (+ (* characters 25) (quot window 2)) window)]
+        (event-fn {:type :warning
+                   :category :context_usage
+                   :message (str "Context usage at ~" percent
+                                 "% of context window")
+                   :approx_tokens approx-tokens
+                   :context_window_size window
+                   :percent percent})))))
 
 (def built-in-tool-names
   #{"read_file" "write_file" "edit_file" "execute_command" "directory_list"})
@@ -767,6 +806,7 @@
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))]
+              (check-context-usage! session event-fn)
               (cond
                 (session-stopped? session) last-text
 
@@ -825,6 +865,7 @@
                       (if-not (append-history-if-open! session assistant-turn)
                         last-text
                         (do
+                          (check-context-usage! session event-fn)
                           (event-fn {:type :assistant_text_end :text text
                                      :reasoning (:reasoning response)})
                           (if (empty? tool-calls)
@@ -849,6 +890,7 @@
                                   text
                                   (do
                                     (drain-steering! session event-fn)
+                                    (check-context-usage! session event-fn)
                                     (when (and (:enable_loop_detection config)
                                                (detect-loop
                                                  (:history @session)

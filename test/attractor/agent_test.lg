@@ -340,6 +340,82 @@
            (:reasoning
              (last (filter #(= :assistant_text_end (:type %)) @events)))))))
 
+(deftest test-session-warns-once-after-context-usage-exceeds-eighty-percent
+  (let [events (atom [])
+        profile (profiles/make-profile {:id "mock" :model "context-test"
+                                        :context_window_size 10})
+        session
+        (agent/make-session
+          {:provider_profile profile
+           :project_docs []
+           :complete_fn
+           (fn [_]
+             {:message {:role :assistant :content ""}
+              :tool_calls []})})
+        listen (fn [event] (swap! events conj event))]
+    (agent/process-input! session "12345678901234567890123456789012" listen)
+    (is (empty? (filter #(= :warning (:type %)) @events)))
+    (agent/process-input! session "x" listen)
+    (agent/process-input! session "more context" listen)
+    (let [warnings (filter #(= :warning (:type %)) @events)]
+      (is (= 1 (count warnings)))
+      (is (= :context_usage (:category (first warnings))))
+      (is (= 9 (:approx_tokens (first warnings))))
+      (is (= 10 (:context_window_size (first warnings))))
+      (is (str/includes? (:message (first warnings))
+                         "Context usage at ~83%")))))
+
+(deftest test-context-usage-counts-structured-map-keys
+  (let [events (atom [])
+        long-key (apply str (repeat 80 "k"))
+        profile (profiles/make-profile {:id "mock" :model "context-test"
+                                        :context_window_size 25})
+        session
+        (agent/make-session
+          {:provider_profile profile
+           :project_docs []
+           :max_tool_rounds_per_input 1
+           :complete_fn
+           (fn [_]
+             {:message {:role :assistant :content ""}
+              :tool_calls [{:id "c" :name "m"
+                            :arguments {long-key "x"}}]})})]
+    (agent/process-input! session "x"
+                          (fn [event] (swap! events conj event)))
+    (let [types (mapv :type @events)]
+      (is (= 1 (count (filter #(= :warning %) types))))
+      (is (< (count (take-while #(not= :warning %) types))
+             (count (take-while #(not= :tool_call_start %) types)))))))
+
+(deftest test-loop-warning-context-is-checked-before-next-request
+  (let [events (atom [])
+        calls (atom 0)
+        warning-before-third (atom false)
+        profile (profiles/make-profile {:id "mock" :model "context-test"
+                                        :context_window_size 60})
+        session
+        (agent/make-session
+          {:provider_profile profile
+           :project_docs []
+           :max_tool_rounds_per_input 3
+           :loop_detection_window 2
+           :complete_fn
+           (fn [_]
+             (let [call-number (swap! calls inc)]
+               (when (= call-number 3)
+                 (reset! warning-before-third
+                         (some #(= :context_usage (:category %)) @events)))
+               (if (< call-number 3)
+                 {:message {:role :assistant :content ""}
+                  :tool_calls [{:id (str call-number)
+                                :name "m" :arguments {}}]}
+                 {:message {:role :assistant :content ""}
+                  :tool_calls []})))})]
+    (agent/process-input! session "x"
+                          (fn [event] (swap! events conj event)))
+    (is (= 3 @calls))
+    (is (true? @warning-before-third))))
+
 (deftest test-abort-from-delta-listener-is-terminal
   (let [stream-closes (atom 0)
         session
