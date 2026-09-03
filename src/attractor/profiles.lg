@@ -1,0 +1,190 @@
+(ns attractor.profiles
+  (:require [clojure.string :as str]
+            [json :as json]))
+
+;; Tool Definition - map-based representation
+(defn make-tool-definition [name description parameters]
+  {:name name :description description :parameters parameters})
+
+;; Tool Registry - map-based with helper functions
+(defn make-tool-registry []
+  {:tools {}})
+
+(defn register-tool [registry tool-def executor]
+  (update registry :tools assoc (:name tool-def) 
+          {:definition tool-def :executor executor}))
+
+(defn get-tool [registry name]
+  (get (:tools registry) name))
+
+(defn tool-definitions [registry]
+  (mapv (fn [[_ tool]] (:definition tool)) (sort-by first (:tools registry))))
+
+(defn tool-names [registry]
+  (sort (keys (:tools registry))))
+
+;; Provider Profile - map-based
+(defn make-provider-profile [id model tool-registry system-prompt build-system-prompt 
+                             supports-reasoning supports-streaming supports-parallel-tools 
+                             context-window-size provider-options]
+  {:id id
+   :model model
+   :tool-registry tool-registry
+   :system-prompt system-prompt
+   :build-system-prompt build-system-prompt
+   :supports-reasoning supports-reasoning
+   :supports-streaming supports-streaming
+   :supports-parallel-tools supports-parallel-tools
+   :context-window-size context-window-size
+   :provider-options provider-options})
+
+;; Shared Core Tools Definitions
+
+(def read-file-tool
+  (make-tool-definition
+    "read_file"
+    "Read a file from the filesystem. Returns line-numbered content."
+    {:type "object"
+     :properties {
+       :file_path {:type "string" :description "Absolute path to the file"}
+       :offset {:type "integer" :description "1-based line number to start reading from (optional)"}
+       :limit {:type "integer" :description "Max lines to read, default 2000 (optional)"}}
+     :required ["file_path"]}))
+
+(def write-file-tool
+  (make-tool-definition
+    "write_file"
+    "Write content to a file. Creates the file and parent directories if needed."
+    {:type "object"
+     :properties {
+       :file_path {:type "string" :description "Absolute path to the file"}
+       :content {:type "string" :description "The full file content"}}
+     :required ["file_path" "content"]}))
+
+(def edit-file-tool
+  (make-tool-definition
+    "edit_file"
+    "Replace an exact string occurrence in a file."
+    {:type "object"
+     :properties {
+       :file_path {:type "string" :description "Absolute path to the file"}
+       :old_string {:type "string" :description "Exact text to find"}
+       :new_string {:type "string" :description "Replacement text"}
+       :replace_all {:type "boolean" :description "Replace all occurrences, default false (optional)"}}
+     :required ["file_path" "old_string" "new_string"]}))
+
+(def shell-tool
+  (make-tool-definition
+    "shell"
+    "Execute a shell command. Returns stdout, stderr, and exit code."
+    {:type "object"
+     :properties {
+       :command {:type "string" :description "The command to run"}
+       :timeout_ms {:type "integer" :description "Override default timeout in milliseconds (optional)"}
+       :description {:type "string" :description "Human-readable description of what this does (optional)"}}
+     :required ["command"]}))
+
+(def grep-tool
+  (make-tool-definition
+    "grep"
+    "Search file contents using regex patterns."
+    {:type "object"
+     :properties {
+       :pattern {:type "string" :description "Regex pattern to search for"}
+       :path {:type "string" :description "Directory or file to search, default current dir (optional)"}
+       :glob_filter {:type "string" :description "File pattern filter, e.g. '*.py' (optional)"}
+       :case_insensitive {:type "boolean" :description "Case insensitive search, default false (optional)"}
+       :max_results {:type "integer" :description "Max results to return, default 100 (optional)"}}
+     :required ["pattern"]}))
+
+(def glob-tool
+  (make-tool-definition
+    "glob"
+    "Find files matching a glob pattern."
+    {:type "object"
+     :properties {
+       :pattern {:type "string" :description "Glob pattern, e.g. '**/*.ts'"}
+       :path {:type "string" :description "Base directory, default current dir (optional)"}}
+     :required ["pattern"]}))
+
+;; OpenAI-specific apply_patch tool
+(def apply-patch-tool
+  (make-tool-definition
+    "apply_patch"
+    "Apply code changes using the patch format. Supports creating, deleting, and modifying files."
+    {:type "object"
+     :properties {
+       :patch {:type "string" :description "The patch content in v4a format"}}
+     :required ["patch"]}))
+
+;; Build OpenAI profile (codex-rs aligned)
+(defn create-openai-profile [& [model]]
+  (let [m (or model "gpt-5.2-codex")
+        registry (-> (make-tool-registry)
+                     (register-tool read-file-tool (fn [args env] "[read_file not implemented]"))
+                     (register-tool apply-patch-tool (fn [args env] "[apply_patch not implemented]"))
+                     (register-tool write-file-tool (fn [args env] "[write_file not implemented]"))
+                     (register-tool shell-tool (fn [args env] "[shell not implemented]"))
+                     (register-tool grep-tool (fn [args env] "[grep not implemented]"))
+                     (register-tool glob-tool (fn [args env] "[glob not implemented]")))
+        system-prompt "You are an expert coding assistant with deep knowledge of software development across multiple programming languages. You solve coding tasks by reading files, making targeted edits using the apply_patch tool, running shell commands to test your work, and iterating based on results. Follow these guidelines:\n\n1. Use `read_file` to understand the codebase structure and context.\n2. Use `apply_patch` to apply code changes. The patch must be in unified diff format.\n3. Use `shell` to run commands, compile code, and run tests.\n4. Use `grep` and `glob` to explore the codebase efficiently.\n5. Always verify your changes by running tests or compiling code before declaring success.\n6. If a task fails, analyze the error, understand why it failed, and try a different approach.\n7. Be thorough and meticulous. Small mistakes can break builds or introduce bugs."]
+  (make-provider-profile
+    "openai" m registry system-prompt
+    (fn [env proj-docs] (str system-prompt "\n\nProject context:\n" proj-docs))
+    true true true 128000
+    {:reasoning_effort "medium"})))
+
+;; Build Anthropic profile (Claude Code aligned)
+(defn create-anthropic-profile [& [model]]
+  (let [m (or model "claude-opus-4.6")
+        registry (-> (make-tool-registry)
+                     (register-tool read-file-tool (fn [args env] "[read_file not implemented]"))
+                     (register-tool edit-file-tool (fn [args env] "[edit_file not implemented]"))
+                     (register-tool write-file-tool (fn [args env] "[write_file not implemented]"))
+                     (register-tool shell-tool (fn [args env] "[shell not implemented]"))
+                     (register-tool grep-tool (fn [args env] "[grep not implemented]"))
+                     (register-tool glob-tool (fn [args env] "[glob not implemented]")))
+        system-prompt "You are Claude Code, an expert AI coding assistant. You solve software tasks by:\n\n1. Reading files to understand the codebase structure.\n2. Using `edit_file` for targeted edits (search-and-replace with exact old_string matching).\n3. Using `write_file` for new files or full rewrites when edit_file is not suitable.\n4. Running `shell` commands to compile, test, and verify your work.\n5. Using `grep` and `glob` to explore efficiently.\n\nGuidelines:\n- `edit_file` requires an exact `old_string` match. If no match, provide more context.\n- Prefer `edit_file` over creating new files. Modifications to existing code are usually better than rewrites.\n- Always verify changes by running tests before declaring success.\n- Break complex tasks into smaller steps, verifying after each step.\n- If a step fails, understand why, adjust your approach, and try again.\n- Think carefully about edge cases and potential side effects."]
+  (make-provider-profile
+    "anthropic" m registry system-prompt
+    (fn [env proj-docs] (str system-prompt "\n\nProject context:\n" proj-docs))
+    true true false 200000
+    {:timeout_ms 120000})))
+
+;; Build Gemini profile (gemini-cli aligned)
+(defn create-gemini-profile [& [model]]
+  (let [m (or model "gemini-3-pro")
+        registry (-> (make-tool-registry)
+                     (register-tool read-file-tool (fn [args env] "[read_file not implemented]"))
+                     (register-tool edit-file-tool (fn [args env] "[edit_file not implemented]"))
+                     (register-tool write-file-tool (fn [args env] "[write_file not implemented]"))
+                     (register-tool shell-tool (fn [args env] "[shell not implemented]"))
+                     (register-tool grep-tool (fn [args env] "[grep not implemented]"))
+                     (register-tool glob-tool (fn [args env] "[glob not implemented]")))
+        system-prompt "You are an expert coding assistant powered by Gemini. You solve programming tasks efficiently by:\n\n1. Reading files to understand context and requirements.\n2. Using `edit_file` for precise code modifications.\n3. Using `write_file` to create new files.\n4. Running `shell` commands to validate your work.\n5. Using `grep` and `glob` to explore codebases quickly.\n\nApproach:\n- Think through the problem systematically before making changes.\n- Make minimal, focused edits to achieve the goal.\n- Test your changes thoroughly.\n- Handle edge cases and errors gracefully.\n- Provide clear explanations of what you're doing and why."]
+  (make-provider-profile
+    "gemini" m registry system-prompt
+    (fn [env proj-docs] (str system-prompt "\n\nProject context:\n" proj-docs))
+    true true true 1000000
+    {:timeout_ms 10000})))
+
+;; Provider profile factory
+(defn create-profile [provider & [model]]
+  (case (str/lower-case (or provider "anthropic"))
+    "openai" (create-openai-profile model)
+    "anthropic" (create-anthropic-profile model)
+    "claude" (create-anthropic-profile model)
+    "gemini" (create-gemini-profile model)
+    (create-anthropic-profile model)))
+
+;; Get profile by ID
+(defn get-profile-by-id [id]
+  (case (str/lower-case (or id "anthropic"))
+    "openai" (create-openai-profile)
+    "anthropic" (create-anthropic-profile)
+    "claude" (create-anthropic-profile)
+    "gemini" (create-gemini-profile)
+    nil))
+
+;; List available providers
+(def available-providers ["openai" "anthropic" "gemini"])

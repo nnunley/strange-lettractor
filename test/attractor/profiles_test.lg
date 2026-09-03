@@ -1,0 +1,23 @@
+(ns attractor.profiles-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.profiles :as profiles]))
+
+(deftest test-create-openai-profile
+  (let [profile (profiles/create-openai-profile)]
+    (is (= (:id profile) "openai"))))
+
+(deftest test-create-anthropic-profile
+  (let [profile (profiles/create-anthropic-profile)]
+    (is (= (:id profile) "anthropic"))))
+
+(deftest test-create-gemini-profile
+  (let [profile (profiles/create-gemini-profile)]
+    (is (= (:id profile) "gemini"))))
+
+(deftest test-tool-registry
+  (let [registry (profiles/make-tool-registry)]
+    (is (empty? (profiles/tool-names registry)))))
+
+(deftest test-available-providers
+  (is (= (count profiles/available-providers) 3)))

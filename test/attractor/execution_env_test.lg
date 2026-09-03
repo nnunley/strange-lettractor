@@ -1,0 +1,31 @@
+(ns attractor.execution-env-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.execution-env :as env]))
+
+(deftest test-make-local-execution-env
+  (let [local-env (env/make-local-execution-env)]
+    (is (not (nil? local-env)))
+    (is (string? (env/env-working-directory local-env)))))
+
+(deftest test-env-working-directory
+  (let [local-env (env/make-local-execution-env "/tmp")]
+    (is (= (env/env-working-directory local-env) "/tmp"))))
+
+(deftest test-make-exec-result
+  (let [result (env/make-exec-result "output" "error" 0 false 100)]
+    (is (= (:stdout result) "output"))
+    (is (= (:stderr result) "error"))
+    (is (= (:exit-code result) 0))
+    (is (= (:timed-out result) false))
+    (is (= (:duration-ms result) 100))))
+
+(deftest test-env-read-file
+  (let [local-env (env/make-local-execution-env)
+        ;; Try to read a file that should exist
+        result (env/env-read-file local-env "README.md")]
+    (is (string? result))))
+
+(deftest test-env-platform
+  (let [local-env (env/make-local-execution-env)
+        platform (env/env-platform local-env)]
+    (is (or (= platform "darwin") (= platform "linux") (= platform "windows") (= platform "unknown")))))
