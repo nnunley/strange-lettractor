@@ -1,0 +1,175 @@
+(ns attractor.handlers-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]))
+
+(deftest test-manager-loop-starts-observes-and-completes-child
+  (let [started (atom [])
+        observations (atom [{:status :running :active_stage "build"
+                             :retry_counts {"build" 1}}
+                            {:status :completed :outcome :success}])
+        sleeps (atom [])
+        runtime {:start-child
+                 (fn [dotfile logs-root _node]
+                   (swap! started conj [dotfile logs-root])
+                   {:id "child-1"})
+                 :observe-child
+                 (fn [_]
+                   (let [observation (first @observations)]
+                     (swap! observations #(vec (rest %)))
+                     observation))
+                 :sleep-fn (fn [delay] (swap! sleeps conj delay))}
+        handler (handlers/make-manager-loop-handler runtime)
+        ctx (context/make-context)
+        node {:id "manager"
+              :attrs {:manager.poll_interval "10ms"
+                      :manager.max_cycles 4
+                      :manager.actions "observe,wait"}}
+        graph {:attrs {:stack.child_dotfile "child.dot"}}
+        result (handler node ctx graph "run")]
+    (is (= :success (:status result)))
+    (is (= [["child.dot" "run/manager/child"]] @started))
+    (is (= [10] @sleeps))
+    (is (= "completed"
+           (context/ctx-get ctx "context.stack.child.status")))
+    (is (= "build"
+           (context/ctx-get ctx "context.stack.child.active_stage")))
+    (is (= {"build" 1}
+           (context/ctx-get ctx "context.stack.child.retry_counts")))))
+
+(deftest test-manager-loop-propagates-child-failure
+  (let [handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child (fn [_] {:status :failed :outcome :fail
+                                    :failure_reason "worker crashed"})
+           :sleep-fn (fn [_] nil)})
+        result (handler
+                 {:id "manager" :attrs {:manager.actions "observe,wait"}}
+                 (context/make-context)
+                 {:attrs {:stack.child_dotfile "child.dot"}}
+                 "run")]
+    (is (= :fail (:status result)))
+    (is (= "worker crashed" (:failure_reason result)))))
+
+(deftest test-manager-loop-stop-condition-precedes-steering
+  (let [steers (atom 0)
+        sleeps (atom 0)
+        handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child (fn [_] {:status :running
+                                    :context_updates {"progress" "done"}})
+           :steer-child (fn [_ _ _] (swap! steers inc))
+           :sleep-fn (fn [_] (swap! sleeps inc))})
+        result
+        (handler
+          {:id "manager"
+           :attrs {:manager.actions "observe,steer,wait"
+                   :manager.stop_condition "context.progress=done"
+                   :manager.max_cycles 5}}
+          (context/make-context)
+          {:attrs {:stack.child_dotfile "child.dot"}}
+          "run")]
+    (is (= :success (:status result)))
+    (is (= 0 @steers))
+    (is (= 0 @sleeps))))
+
+(deftest test-manager-loop-fails-after-max-cycles
+  (let [observed (atom 0)
+        slept (atom [])
+        handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child (fn [_]
+                            (swap! observed inc)
+                            {:status :running})
+           :sleep-fn (fn [delay] (swap! slept conj delay))})
+        result
+        (handler
+          {:id "manager"
+           :attrs {:manager.actions "observe,wait"
+                   :manager.poll_interval "2ms"
+                   :manager.max_cycles 3}}
+          (context/make-context)
+          {:attrs {:stack.child_dotfile "child.dot"}}
+          "run")]
+    (is (= :fail (:status result)))
+    (is (= "Max cycles exceeded" (:failure_reason result)))
+    (is (= 3 @observed))
+    (is (= [2 2] @slept))))
+
+(deftest test-manager-loop-does-not-steer-a-terminal-child
+  (let [steers (atom 0)
+        handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child (fn [_] {:status :completed :outcome :success})
+           :steer-child (fn [_ _ _] (swap! steers inc))})
+        result
+        (handler {:id "manager" :attrs {:manager.actions "observe,steer"}}
+                 (context/make-context)
+                 {:attrs {:stack.child_dotfile "child.dot"}}
+                 "run")]
+    (is (= :success (:status result)))
+    (is (= 0 @steers))))
+
+(deftest test-manager-loop-throttles-steering
+  (let [steers (atom 0)
+        times (atom [0 5 10])
+        observations (atom [{:status :running}
+                            {:status :running}
+                            {:status :completed :outcome :success}])
+        handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child
+           (fn [_]
+             (let [observation (first @observations)]
+               (swap! observations #(vec (rest %)))
+               observation))
+           :steer-child (fn [_ _ _] (swap! steers inc))
+           :now-fn
+           (fn []
+             (let [now (first @times)]
+               (swap! times #(vec (rest %)))
+               now))})
+        result
+        (handler
+          {:id "manager"
+           :attrs {:manager.actions "observe,steer"
+                   :manager.poll_interval "10ms"
+                   :manager.max_cycles 3}}
+          (context/make-context)
+          {:attrs {:stack.child_dotfile "child.dot"}}
+          "run")]
+    (is (= :success (:status result)))
+    (is (= 1 @steers))))
+
+(deftest test-manager-loop-cancels-owned-child-when-parent-cancels
+  (let [cancelled (atom false)
+        stops (atom 0)
+        handler
+        (handlers/make-manager-loop-handler
+          {:start-child (fn [_ _ _] :child)
+           :observe-child (fn [_] {:status :running})
+           :cancelled? (fn [] @cancelled)
+           :stop-child (fn [_] (swap! stops inc))
+           :sleep-fn (fn [_] (reset! cancelled true))})
+        result
+        (handler
+          {:id "manager"
+           :attrs {:manager.actions "observe,wait"
+                   :manager.poll_interval "1ms"}}
+          (context/make-context)
+          {:attrs {:stack.child_dotfile "child.dot"}}
+          "run")]
+    (is (= :cancelled (:status result)))
+    (is (= 1 @stops))))
+
+(deftest test-manager-loop-requires-child-runtime-and-dotfile
+  (let [handler (handlers/make-manager-loop-handler {})]
+    (is (= :fail
+           (:status
+             (handler {:id "manager" :attrs {}}
+                      (context/make-context) {:attrs {}} "run"))))))

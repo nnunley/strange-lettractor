@@ -101,6 +101,30 @@ digraph Gate {
     (is (some #(= :pipeline.cancelled (:type %)) @events))
     (os/sh "rm" "-rf" logs)))
 
+(deftest test-handler-cancellation-terminates-the-pipeline
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   work [type=cancel.test]
+                   exit [shape=Msquare]
+                   start -> work -> exit
+                 }")
+        registry (h/make-handler-registry)
+        events (atom [])
+        logs "test_engine_handler_cancelled"
+        _ (h/register-handler!
+            registry "cancel.test"
+            (fn [_ _ _ _]
+              {:status :cancelled :failure_reason "Pipeline cancelled"}))
+        result (e/run-pipeline
+                 graph {:registry registry
+                        :logs-root logs
+                        :on-event #(swap! events conj %)})]
+    (is (= :cancelled (:status result)))
+    (is (= ["start"] (:completed_nodes result)))
+    (is (some #(= :pipeline.cancelled (:type %)) @events))
+    (os/sh "rm" "-rf" logs)))
+
 (deftest test-pipeline-retry-policy-controls-backoff-without-real-sleep
   (let [graph (p/parse-dot
                 "digraph G {
@@ -400,3 +424,103 @@ digraph Gate {
     (is (= :success (:status result)))
     (is (= "join" (:boundary_node_id result)))
     (os/sh "rm" "-rf" "test_engine_subgraph_retry_target")))
+
+(deftest test-manager-node-autostarts-a-real-child-pipeline
+  (let [child-dotfile "test_engine_manager_child.dot"
+        logs "test_engine_manager_parent"
+        events (atom [])
+        _ (io/spit child-dotfile
+                   "digraph Child {
+                      start [shape=Mdiamond]
+                      work [shape=box]
+                      exit [shape=Msquare]
+                      start -> work -> exit
+                    }")
+        parent (p/parse-dot
+                 (str "digraph Parent {
+                         graph [stack.child_dotfile=\"" child-dotfile "\"]
+                         start [shape=Mdiamond]
+                         manager [shape=house,
+                                  manager.poll_interval=\"1ms\",
+                                  manager.max_cycles=100]
+                         exit [shape=Msquare]
+                         start -> manager -> exit
+                       }"))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer)
+                   (fn [_ _ _]
+                     {:status :success
+                      :context_updates {"child.progress" "done"}
+                      :artifacts ["report.edn"]}))
+        result (e/run-pipeline parent {:registry registry
+                                       :logs-root logs
+                                       :on-event #(swap! events conj %)})]
+    (is (= :success (:status result)))
+    (is (os/stat (str logs "/manager/child/checkpoint.edn")))
+    (let [child-event (first (filter #(= :manager.child_event (:type %))
+                                     @events))]
+      (is (= "manager" (:manager_node_id child-event)))
+      (is (= (str logs "/manager/child") (:child_logs child-event))))
+    (is (= ["report.edn"]
+           (get (:context result) "context.stack.child.artifacts")))
+    (os/sh "rm" "-rf" logs)
+    (os/sh "rm" "-f" child-dotfile)))
+
+(deftest test-manager-node-can-observe-an-existing-child
+  (let [parent
+        (p/parse-dot
+          "digraph Parent {
+             start [shape=Mdiamond]
+             manager [shape=house,
+                      stack.child_autostart=false,
+                      manager.actions=observe]
+             exit [shape=Msquare]
+             start -> manager -> exit
+           }")
+        child {:state (atom {:status :completed :outcome :success
+                             :active_stage "done"})
+               :context (c/make-context)
+               :logs-root "test_engine_existing_child"}
+        logs "test_engine_manager_existing"
+        result (e/run-pipeline parent {:logs-root logs
+                                       :manager-child child})]
+    (is (= :success (:status result)))
+    (is (= "done"
+           (get (:context result) "context.stack.child.active_stage")))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-run-pipeline-does-not-mutate-template-handler-runtimes
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   exit [shape=Msquare]
+                   start -> exit
+                 }")
+        registry (h/make-handler-registry)
+        manager-runtime (get @registry h/manager-runtime-key)
+        parallel-runtime (get @registry h/parallel-executor-key)
+        logs "test_engine_registry_isolation"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= {} @manager-runtime))
+    (is (nil? @parallel-runtime))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-run-pipeline-preserves-registered-manager-overrides
+  (let [graph (p/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   manager [shape=house]
+                   exit [shape=Msquare]
+                   start -> manager -> exit
+                 }")
+        registry (h/make-handler-registry)
+        _ (h/register-handler!
+            registry "stack.manager_loop"
+            (fn [_ _ _ _]
+              {:status :success :context_updates {"manager.custom" true}}))
+        logs "test_engine_manager_override"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= true (get (:context result) "manager.custom")))
+    (os/sh "rm" "-rf" logs)))

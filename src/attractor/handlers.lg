@@ -4,6 +4,8 @@
             [io :as io]
             [os :as os]
             [attractor.context :as context]
+            [attractor.conditions :as conditions]
+            [attractor.parser :as parser]
             [attractor.interviewer :as interviewer]))
 
 ;; Shape to handler type mapping (Section 2.8)
@@ -19,6 +21,9 @@
    "house" "stack.manager_loop"})
 
 (def parallel-executor-key :attractor.handlers/parallel-executor)
+(def manager-runtime-key :attractor.handlers/manager-runtime)
+(def parallel-default-handler-key :attractor.handlers/parallel-default-handler)
+(def manager-default-handler-key :attractor.handlers/manager-default-handler)
 
 ;; Start Handler (Section 4.3)
 (defn handle-start [_node _context _graph _logs-root]
@@ -218,35 +223,204 @@
                                "parallel.fan_in.best_outcome" (str (:status best))}
              :notes (str "Selected best candidate: " best-id)}))))))
 
-;; Manager Loop Handler (Section 4.11)
-(defn handle-manager-loop [node ctx graph _logs-root]
-  (let [actions (or (get-in node [:attrs :manager.actions]) "observe,wait")
-        actions-set (set (str/split actions #","))]
-    {:status :success
-     :notes "Manager loop supervisor completed"
-     :context_updates {"context.stack.child.status" "completed"
-                       "context.stack.child.outcome" "success"}}))
+;; Manager Loop Handler (Section 4.11). Runtime callbacks keep child
+;; orchestration injectable and avoid a handlers -> engine dependency cycle.
+(defn- runtime-value [runtime]
+  (if (map? runtime) runtime @runtime))
+
+(defn- setting-true? [value default-value]
+  (if (nil? value)
+    default-value
+    (or (= true value)
+        (= "true" (str/lower-case (str value))))))
+
+(defn- manager-setting [node graph key default-value]
+  (let [node-attrs (or (:attrs node) {})
+        graph-attrs (or (:attrs graph) {})]
+    (cond
+      (contains? node-attrs key) (get node-attrs key)
+      (contains? graph-attrs key) (get graph-attrs key)
+      :else default-value)))
+
+(defn- manager-actions [value]
+  (set (map (fn [action] (str/lower-case (str/trim action)))
+            (str/split (str value) #","))))
+
+(defn- manager-int [value default-value]
+  (cond
+    (number? value) (long value)
+    (string? value) (or (parse-long value) default-value)
+    :else default-value))
+
+(defn- telemetry-string [value]
+  (if (keyword? value) (name value) (str value)))
+
+(defn- ingest-child-telemetry! [ctx telemetry]
+  (doseq [[key value] (or (:context_updates telemetry) {})]
+    (context/ctx-set! ctx key value))
+  (doseq [[source-key suffix]
+          [[:status "status"]
+           [:outcome "outcome"]
+           [:active_stage "active_stage"]
+           [:node_outcomes "node_outcomes"]
+           [:retry_counts "retry_counts"]
+           [:artifacts "artifacts"]]]
+    (when (contains? telemetry source-key)
+      (let [value (get telemetry source-key)]
+        (context/ctx-set!
+          ctx (str "context.stack.child." suffix)
+          (if (#{:status :outcome} source-key)
+            (telemetry-string value)
+            value)))))
+  telemetry)
+
+(defn make-manager-loop-handler [runtime]
+  (fn [node ctx graph logs-root]
+    (try
+      (let [callbacks (runtime-value runtime)
+            child-dotfile (manager-setting node graph :stack.child_dotfile nil)
+            autostart? (setting-true?
+                         (manager-setting node graph :stack.child_autostart true)
+                         true)
+            poll-value (manager-setting node graph :manager.poll_interval "45s")
+            parsed-poll (parser/parse-duration-ms poll-value)
+            poll-ms (if (number? parsed-poll) parsed-poll 45000)
+            cooldown-value (manager-setting node graph
+                                            :manager.steer_cooldown poll-value)
+            parsed-cooldown (parser/parse-duration-ms cooldown-value)
+            cooldown-ms (if (number? parsed-cooldown)
+                          parsed-cooldown poll-ms)
+            max-cycles (max 1 (manager-int
+                                (manager-setting node graph
+                                                 :manager.max_cycles 1000)
+                                1000))
+            stop-condition (str
+                             (manager-setting node graph
+                                              :manager.stop_condition ""))
+            actions (manager-actions
+                      (manager-setting node graph :manager.actions
+                                       "observe,wait"))
+            start-child (:start-child callbacks)
+            cancelled? (or (:cancelled? callbacks) (fn [] false))
+            stop-child (:stop-child callbacks)
+            now-fn (or (:now-fn callbacks) #(System/currentTimeMillis))
+            existing-child (or (:child callbacks)
+                               (when-let [get-child (:get-child callbacks)]
+                                 (get-child)))
+            validation-error
+            (cond
+              (and autostart? (str/blank? (str child-dotfile)))
+              "Manager child dotfile is required"
+              (and autostart? (nil? start-child))
+              "Manager child runtime is not configured"
+              (and (not autostart?) (nil? existing-child))
+              "Manager child is not available"
+              :else nil)]
+        (if validation-error
+          {:status :fail :failure_reason validation-error}
+          (let [child-logs (str logs-root "/" (:id node) "/child")
+                child (if autostart?
+                        (start-child child-dotfile child-logs node)
+                        existing-child)
+                stop-owned-child
+                (fn []
+                  (when (and autostart? stop-child)
+                    (stop-child child)))]
+            (loop [cycle 1
+                   last-steered-at nil]
+              (if (cancelled?)
+                (do
+                  (stop-owned-child)
+                  {:status :cancelled
+                   :failure_reason "Pipeline cancelled"})
+                (let [observation
+                      (if (contains? actions "observe")
+                        (if-let [observe-child (:observe-child callbacks)]
+                          (or (observe-child child) {})
+                          {})
+                        {})
+                      _ (ingest-child-telemetry! ctx observation)
+                      child-status
+                      (context/ctx-get-string
+                        ctx "context.stack.child.status" "")
+                      child-outcome
+                      (context/ctx-get-string
+                        ctx "context.stack.child.outcome" "")
+                      stop-satisfied?
+                      (and (not (str/blank? stop-condition))
+                           (conditions/evaluate-condition
+                             stop-condition {:status :success} ctx))]
+                  (cond
+                    (and (= child-status "completed")
+                         (= child-outcome "success"))
+                    {:status :success :notes "Child completed"}
+
+                    (or (= child-status "failed")
+                        (and (= child-status "completed")
+                             (not= child-outcome "success")))
+                    {:status :fail
+                     :failure_reason (or (:failure_reason observation)
+                                         "Child failed")}
+
+                    stop-satisfied?
+                    (do
+                      (stop-owned-child)
+                      {:status :success :notes "Stop condition satisfied"})
+
+                    (>= cycle max-cycles)
+                    (do
+                      (stop-owned-child)
+                      {:status :fail :failure_reason "Max cycles exceeded"})
+
+                    :else
+                    (let [now (when (contains? actions "steer") (now-fn))
+                          steer-ready?
+                          (and now
+                               (or (nil? last-steered-at)
+                                   (>= (- now last-steered-at) cooldown-ms)))
+                          next-last-steered-at
+                          (if steer-ready?
+                            (do
+                              (when-let [steer-child (:steer-child callbacks)]
+                                (steer-child child node ctx))
+                              now)
+                            last-steered-at)]
+                      (when (contains? actions "wait")
+                        ((or (:sleep-fn callbacks) core/sleep) poll-ms))
+                      (recur (inc cycle) next-last-steered-at)))))))))
+      (catch Object e
+        {:status :fail
+         :failure_reason (str "Manager loop failed: " e)}))))
+
+(def handle-manager-loop (make-manager-loop-handler {}))
 
 ;; Handler Registry (Section 4.2)
 (defn make-handler-registry
   ([] (make-handler-registry (interviewer/make-auto-approve-interviewer) nil))
   ([interviewer codergen-backend]
-   (let [branch-executor (atom nil)]
+   (let [branch-executor (atom nil)
+         manager-runtime (atom {})
+         parallel-handler
+         (make-parallel-handler
+           (fn [target-id branch-ctx graph logs-root]
+             (if-let [execute-fn @branch-executor]
+               (execute-fn target-id branch-ctx graph logs-root)
+               {:status :fail
+                :failure_reason "Parallel branch executor is not initialized"})))
+         manager-handler (make-manager-loop-handler manager-runtime)]
      (atom {"start" handle-start
             "exit" handle-exit
             "codergen" (make-codergen-handler codergen-backend)
             "wait.human" (make-wait-human-handler interviewer)
             "conditional" handle-conditional
             "tool" handle-tool
-            "parallel" (make-parallel-handler
-                         (fn [target-id branch-ctx graph logs-root]
-                           (if-let [execute-fn @branch-executor]
-                             (execute-fn target-id branch-ctx graph logs-root)
-                             {:status :fail
-                              :failure_reason "Parallel branch executor is not initialized"})))
+            "parallel" parallel-handler
             "parallel.fan_in" handle-fan-in
-            "stack.manager_loop" handle-manager-loop
-            parallel-executor-key branch-executor}))))
+            "stack.manager_loop" manager-handler
+            parallel-executor-key branch-executor
+            manager-runtime-key manager-runtime
+            parallel-default-handler-key parallel-handler
+            manager-default-handler-key manager-handler}))))
 
 ;; Register a custom handler
 (defn register-handler! [registry type-str handler-fn]

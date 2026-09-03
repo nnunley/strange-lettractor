@@ -340,6 +340,155 @@
                    outcome
                    (inc step-count))))))))
 
+(declare run-pipeline)
+
+(defn- clone-handler-registry [registry]
+  (let [original @registry
+        branch-executor (atom nil)
+        manager-runtime (atom {})
+        parallel-handler
+        (handlers/make-parallel-handler
+          (fn [target-id branch-ctx graph logs-root]
+            (if-let [execute-fn @branch-executor]
+              (execute-fn target-id branch-ctx graph logs-root)
+              {:status :fail
+               :failure_reason
+               "Parallel branch executor is not initialized"})))
+        manager-handler (handlers/make-manager-loop-handler manager-runtime)
+        default-parallel? (identical?
+                            (get original "parallel")
+                            (get original handlers/parallel-default-handler-key))
+        default-manager? (identical?
+                           (get original "stack.manager_loop")
+                           (get original handlers/manager-default-handler-key))]
+    (atom
+      (cond->
+        (assoc original
+               handlers/parallel-executor-key branch-executor
+               handlers/manager-runtime-key manager-runtime)
+        default-parallel?
+        (assoc "parallel" parallel-handler
+               handlers/parallel-default-handler-key parallel-handler)
+        default-manager?
+        (assoc "stack.manager_loop" manager-handler
+               handlers/manager-default-handler-key manager-handler)))))
+
+(defn- child-outcome-status [result]
+  (cond
+    (#{:success :partial_success} (:status result))
+    {:status :completed :outcome :success}
+
+    (= :cancelled (:status result))
+    {:status :cancelled :outcome :cancelled
+     :failure_reason (or (:failure_reason result)
+                         "Child pipeline cancelled")}
+
+    :else
+    {:status :failed :outcome :fail
+     :failure_reason (or (:failure_reason result)
+                         "Child pipeline failed")}))
+
+(defn- run-child-pipeline! [child-graph child-registry child-logs child-context
+                            cancelled? child-event retry-policy state]
+  (try
+    (let [result
+          (run-pipeline
+            child-graph
+            (cond-> {:registry child-registry
+                     :logs-root child-logs
+                     :context child-context
+                     :cancelled? cancelled?
+                     :on-event child-event}
+              retry-policy (assoc :retry-policy retry-policy)))]
+      (swap! state merge (child-outcome-status result) {:result result})
+      result)
+    (catch Object e
+      (swap! state assoc
+             :status :failed :outcome :fail
+             :failure_reason (str e))
+      {:status :fail :failure_reason (str e)})))
+
+(defn- make-child-runtime [registry on-event cancelled? options]
+  {:child (:manager-child options)
+
+   :start-child
+   (fn [dotfile child-logs manager-node]
+     (let [child-graph (parser/parse-dot (io/slurp dotfile))
+           child-registry (clone-handler-registry registry)
+           child-context (context/make-context)
+           child-stop (atom false)
+           child-cancelled? (fn [] (or @child-stop (cancelled?)))
+           manager-node-id (:id manager-node)
+           state (atom {:status :running :outcome :running
+                        :active_stage "" :node_outcomes {}
+                        :retry_counts {} :artifacts []})
+           child-event
+           (fn [event]
+             (case (:type event)
+               :stage.started
+               (swap! state assoc :active_stage (:node_id event))
+               :stage.completed
+               (do
+                 (swap! state assoc-in [:node_outcomes (:node_id event)]
+                        (:outcome event))
+                 (when-let [artifacts (get-in event [:outcome :artifacts])]
+                   (swap! state update :artifacts into artifacts)))
+               :stage.failed
+               (do
+                 (swap! state assoc-in [:node_outcomes (:node_id event)]
+                        (:outcome event))
+                 (when-let [artifacts (get-in event [:outcome :artifacts])]
+                   (swap! state update :artifacts into artifacts)))
+               :stage.retrying
+               (swap! state assoc-in [:retry_counts (:node_id event)]
+                      (:attempt event))
+               nil)
+             (on-event {:type :manager.child_event
+                        :manager_node_id manager-node-id
+                        :child_logs child-logs
+                        :event event}))
+           task
+           (core/future
+             (run-child-pipeline! child-graph child-registry child-logs
+                                  child-context child-cancelled? child-event
+                                  (:retry-policy options) state))]
+       {:state state :future task :logs-root child-logs
+        :context child-context :cancelled? child-stop}))
+
+   :observe-child
+   (fn [child]
+     (if (:state child) @(:state child) child))
+
+   :stop-child
+   (fn [child]
+     (when-let [child-cancelled? (:cancelled? child)]
+       (reset! child-cancelled? true))
+     (when-let [task (:future child)]
+       @task))
+
+   :cancelled? cancelled?
+
+   :steer-child
+   (fn [child node ctx]
+     (let [state @(:state child)
+           active-stage (:active_stage state)
+           target-dir (if (str/blank? active-stage)
+                        (:logs-root child)
+                        (str (:logs-root child) "/" active-stage))
+           instruction (or (get-in node [:attrs :manager.steer_prompt])
+                           (context/ctx-get-string
+                             ctx "manager.steering" "Continue toward the goal."))]
+       (os/sh "mkdir" "-p" target-dir)
+       (io/spit (str target-dir "/steering.md") instruction)))
+
+   :sleep-fn
+   (fn [delay-ms]
+     (loop [remaining delay-ms]
+       (when (and (> remaining 0) (not (cancelled?)))
+         (let [chunk (min remaining 100)]
+           (core/sleep chunk)
+           (recur (- remaining chunk))))))})
+
 ;; Main execution loop (Section 3.2)
 (defn run-pipeline
   ([graph] (run-pipeline graph {}))
@@ -348,11 +497,17 @@
          logs-root (context/init-run-dir (:logs-root options) graph)
          on-event (or (:on-event options) (fn [_] nil))
          cancelled? (or (:cancelled? options) (fn [] false))
-         registry (or (:registry options) (handlers/make-handler-registry))
+         registry-template (or (:registry options)
+                               (handlers/make-handler-registry))
+         registry (if (or (get @registry-template handlers/parallel-executor-key)
+                          (get @registry-template handlers/manager-runtime-key))
+                    (clone-handler-registry registry-template)
+                    registry-template)
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
          retry-options (assoc options :retry-counts retry-counts)
          parallel-executor (get @registry handlers/parallel-executor-key)
+         manager-runtime (get @registry handlers/manager-runtime-key)
          _parallel-init (when parallel-executor
                           (reset! parallel-executor
                                   (fn [target-id branch-ctx branch-graph branch-logs]
@@ -361,6 +516,11 @@
                                                       (assoc retry-options
                                                              :retry-counts
                                                              (atom {}))))))
+         _manager-init (when manager-runtime
+                         (reset! manager-runtime
+                                 (or (:manager-runtime options)
+                                     (make-child-runtime registry on-event
+                                                         cancelled? options))))
          initial-start-node (if (:start-at options)
                               (parser/find-node graph (:start-at options))
                               (val (parser/find-start-node graph)))]
@@ -441,9 +601,20 @@
                ;; including no-op, human, tool, and custom handlers.
                (write-stage-status! logs-root node-id outcome)
 
-               ;; Step 3: Record completion
-               (let [new-completed (conj completed-nodes node-id)
-                     new-outcomes (assoc node-outcomes node-id outcome)]
+               (if (= st :cancelled)
+                 (let [cancelled-result
+                       {:status :cancelled
+                        :failure_reason (or (:failure_reason outcome)
+                                            "Pipeline cancelled")
+                        :completed_nodes completed-nodes
+                        :context (context/ctx-snapshot ctx)}]
+                   (on-event {:type :pipeline.cancelled
+                              :completed_nodes completed-nodes})
+                   cancelled-result)
+
+                 ;; Step 3: Record completion
+                 (let [new-completed (conj completed-nodes node-id)
+                       new-outcomes (assoc node-outcomes node-id outcome)]
 
                  ;; Step 4: Apply context updates from outcome
                  (context/ctx-apply-updates! ctx (:context_updates outcome))
@@ -510,7 +681,7 @@
                            (recur next-node
                                   new-completed
                                   new-outcomes
-                                  (inc step-count))))))))))))))))
+                                  (inc step-count)))))))))))))))))
 
 ;; Resume pipeline execution from a saved checkpoint (Section 5.3)
 (defn resume-pipeline [checkpoint-path graph options]
