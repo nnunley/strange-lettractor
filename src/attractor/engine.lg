@@ -1,0 +1,387 @@
+(ns attractor.engine
+  (:require [clojure.string :as str]
+            [os :as os]
+            [io :as io]
+            [json :as json]
+            [math :as math]
+            [attractor.parser :as parser]
+            [attractor.conditions :as conditions]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+
+(defn- write-stage-status! [logs-root node-id outcome]
+  (let [stage-dir (str logs-root "/" node-id)
+        status (:status outcome)
+        status-name (if (keyword? status) (name status) (str status))]
+    (os/sh "mkdir" "-p" stage-dir)
+    (io/spit (str stage-dir "/status.json")
+             (json/write-json
+               {:outcome status-name
+                :status status-name
+                :preferred_label (or (:preferred_label outcome) "")
+                :suggested_next_ids (or (:suggested_next_ids outcome) [])
+                :context_updates (or (:context_updates outcome) {})
+                :notes (or (:notes outcome) "")
+                :failure_reason (or (:failure_reason outcome) "")}))))
+
+(defn- normalize-node-outcomes [outcomes]
+  (into {}
+        (map (fn [[node-id outcome]]
+               (let [status (or (:status outcome) (get outcome "status"))]
+                 [(str node-id)
+                  {:status (if (keyword? status) status (keyword (str status)))
+                   :preferred_label (or (:preferred_label outcome)
+                                        (get outcome "preferred_label") "")
+                   :suggested_next_ids (or (:suggested_next_ids outcome)
+                                           (get outcome "suggested_next_ids") [])
+                   :context_updates (or (:context_updates outcome)
+                                        (get outcome "context_updates") {})
+                   :notes (or (:notes outcome) (get outcome "notes") "")
+                   :failure_reason (or (:failure_reason outcome)
+                                       (get outcome "failure_reason") "")}]))
+             (or outcomes {}))))
+
+;; Best edge by weight descending, then target node id ascending (lexical tiebreak)
+(defn best-by-weight-then-lexical [edges]
+  (first
+    (sort (fn [a b]
+            (let [wa (or (:weight a) 0)
+                  wb (or (:weight b) 0)]
+              (if (not= wa wb)
+                (compare wb wa) ; Higher weight wins
+                (compare (str (:to a)) (str (:to b)))))) ; Lexical tiebreak
+          edges)))
+
+;; Edge Selection Algorithm (Section 3.3)
+(defn select-edge [node outcome ctx graph]
+  (let [edges (parser/outgoing-edges graph (:id node))]
+    (if (empty? edges)
+      nil
+      ;; Step 1: Condition matching
+      (let [cond-matched (filter (fn [e]
+                                   (and (not (str/blank? (:condition e)))
+                                        (conditions/evaluate-condition (:condition e) outcome ctx)))
+                                 edges)]
+        (if (seq cond-matched)
+          (best-by-weight-then-lexical cond-matched)
+
+          ;; Step 2: Preferred label match (unconditional edges only)
+          (let [pref (or (:preferred_label outcome) (context/ctx-get ctx "preferred_label" ""))]
+            (if-let [matched (when (not (str/blank? pref))
+                               (first (filter (fn [e]
+                                                (and (str/blank? (:condition e))
+                                                     (= (interviewer/normalize-label (:label e))
+                                                        (interviewer/normalize-label pref))))
+                                              edges)))]
+              matched
+
+              ;; Step 3: Suggested next IDs (unconditional edges only)
+              (let [suggested (or (:suggested_next_ids outcome) [])]
+                (if-let [matched (when (seq suggested)
+                                   (first (for [s suggested
+                                                e edges
+                                                :when (and (str/blank? (:condition e))
+                                                           (= (:to e) s))]
+                                            e)))]
+                  matched
+
+                  ;; Step 4 & 5: Unconditional edges by weight then lexical
+                  (let [unconditional (filter (fn [e] (str/blank? (:condition e))) edges)]
+                    (when (seq unconditional)
+                      (best-by-weight-then-lexical unconditional))))))))))))
+
+;; Check if a node is terminal (shape=Msquare or id matches exit/end/done)
+(defn terminal-node? [node]
+  (or (= (:shape node) "Msquare")
+      (#{"exit" "end" "Exit" "End" "done"} (:id node))))
+
+;; Goal Gate Enforcement (Section 3.4)
+(defn check-goal-gates [graph node-outcomes]
+  (let [failed-gate (first (filter (fn [[nid out]]
+                                     (let [n (parser/find-node graph nid)]
+                                       (and (:goal_gate n)
+                                            (not (#{:success :partial_success} (:status out))))))
+                                   node-outcomes))]
+    (if failed-gate
+      [false (parser/find-node graph (first failed-gate))]
+      [true nil])))
+
+;; Resolve retry target on goal gate failure or node failure
+(defn resolve-retry-target [node graph]
+  (let [t1 (when node (let [t (:retry_target node)] (when-not (str/blank? t) t)))
+        t2 (when node (let [t (:fallback_retry_target node)] (when-not (str/blank? t) t)))
+        t3 (let [t (:retry_target graph)] (when-not (str/blank? t) t))
+        t4 (let [t (:fallback_retry_target graph)] (when-not (str/blank? t) t))]
+    (or t1 t2 t3 t4)))
+
+;; Backoff delay calculation in milliseconds
+(defn delay-for-attempt [attempt initial-delay-ms backoff-factor max-delay-ms]
+  (let [initial (or initial-delay-ms 200)
+        factor (or backoff-factor 2.0)
+        cap (or max-delay-ms 60000)
+        computed (* initial (math/pow factor (double (dec attempt))))]
+    (long (min computed (double cap)))))
+
+;; Execute node with retry logic (Section 3.5 & 3.6)
+(defn execute-with-retry [handler node ctx graph logs-root on-event]
+  (let [node-max-retries (:max_retries node)
+        graph-max-retries (:default_max_retries graph)
+        max-retries (or node-max-retries graph-max-retries 0)
+        max-attempts (inc max-retries)
+        node-id (:id node)]
+
+    (loop [attempt 1]
+      (on-event {:type :stage.started :node_id node-id :attempt attempt :max_attempts max-attempts})
+      (let [outcome (try
+                      (handler node ctx graph logs-root)
+                      (catch Object e
+                        {:status :fail :failure_reason (str e)}))
+            st (:status outcome)]
+
+        (cond
+          ;; Success or Partial Success
+          (#{:success :partial_success} st)
+          (do
+            (context/ctx-set! ctx (str "internal.retry_count." node-id) 0)
+            (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
+            outcome)
+
+          ;; Retry requested
+          (= st :retry)
+          (if (< attempt max-attempts)
+            (let [delay-ms (delay-for-attempt attempt 200 2.0 60000)]
+              (context/ctx-set! ctx (str "internal.retry_count." node-id) attempt)
+              (on-event {:type :stage.retrying :node_id node-id :attempt attempt :delay_ms delay-ms})
+              (core/sleep (min delay-ms 1000)) ; small sleep
+              (recur (inc attempt)))
+            (if (:allow_partial node)
+              (let [res {:status :partial_success :notes "retries exhausted, partial accepted"}]
+                (on-event {:type :stage.completed :node_id node-id :status :partial_success :outcome res})
+                res)
+              (let [res {:status :fail :failure_reason (or (:failure_reason outcome) "max retries exceeded")}]
+                (on-event {:type :stage.failed :node_id node-id :outcome res :will_retry false})
+                res)))
+
+          ;; Permanent Failure
+          (= st :fail)
+          (if (< attempt max-attempts)
+            (let [delay-ms (delay-for-attempt attempt 200 2.0 60000)]
+              (context/ctx-set! ctx (str "internal.retry_count." node-id) attempt)
+              (on-event {:type :stage.retrying :node_id node-id :attempt attempt :delay_ms delay-ms})
+              (core/sleep (min delay-ms 1000))
+              (recur (inc attempt)))
+            (do
+              (on-event {:type :stage.failed :node_id node-id :outcome outcome :will_retry false})
+              outcome))
+
+          :else
+          (do
+            (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
+            outcome))))))
+
+(defn execute-subgraph [start-node-id ctx graph logs-root registry on-event]
+  (loop [current-node (parser/find-node graph start-node-id)
+         last-outcome {:status :success}
+         step-count 0]
+    (cond
+      (nil? current-node)
+      {:status :fail
+       :failure_reason (str "Parallel branch target '" start-node-id "' does not exist")}
+
+      (> step-count 500)
+      {:status :fail
+       :failure_reason "Parallel branch step limit exceeded (500 steps)"}
+
+      (or (= (:shape current-node) "tripleoctagon")
+          (terminal-node? current-node))
+      (assoc last-outcome :boundary_node_id (:id current-node))
+
+      :else
+      (let [handler (handlers/resolve-handler registry current-node)
+            outcome (execute-with-retry handler current-node ctx graph logs-root on-event)
+            node-id (:id current-node)]
+        (write-stage-status! logs-root node-id outcome)
+        (context/ctx-apply-updates! ctx (:context_updates outcome))
+        (context/ctx-set! ctx "outcome"
+                          (if (keyword? (:status outcome))
+                            (name (:status outcome))
+                            (str (:status outcome))))
+        (let [next-edge (select-edge current-node outcome ctx graph)]
+          (if (nil? next-edge)
+            outcome
+            (recur (parser/find-node graph (:to next-edge))
+                   outcome
+                   (inc step-count))))))))
+
+;; Main execution loop (Section 3.2)
+(defn run-pipeline
+  ([graph] (run-pipeline graph {}))
+  ([graph options]
+   (let [ctx (or (:context options) (context/make-context))
+         logs-root (context/init-run-dir (:logs-root options) graph)
+         on-event (or (:on-event options) (fn [_] nil))
+         registry (or (:registry options) (handlers/make-handler-registry))
+         parallel-executor (get @registry handlers/parallel-executor-key)
+         _parallel-init (when parallel-executor
+                          (reset! parallel-executor
+                                  (fn [target-id branch-ctx branch-graph branch-logs]
+                                    (execute-subgraph target-id branch-ctx branch-graph
+                                                      branch-logs registry on-event))))
+         initial-start-node (if (:start-at options)
+                              (parser/find-node graph (:start-at options))
+                              (val (parser/find-start-node graph)))]
+
+     (when (nil? initial-start-node)
+       (throw (ex-info "Pipeline start node could not be resolved" {})))
+
+     (context/mirror-graph-attributes! graph ctx)
+     (on-event {:type :pipeline.started :id (:id graph) :goal (:goal graph) :logs_root logs-root})
+
+     (loop [current-node initial-start-node
+            completed-nodes (or (:completed-nodes options) [])
+            node-outcomes (normalize-node-outcomes (:node-outcomes options))
+            step-count 0]
+
+       ;; Safety limit on steps to avoid infinite loops (10,000 steps max)
+       (if (> step-count 10000)
+         (let [res {:status :fail :failure_reason "Pipeline step limit exceeded (10000 steps)" :completed_nodes completed-nodes}]
+           (on-event {:type :pipeline.failed :error (:failure_reason res)})
+           res)
+
+         (let [node-id (:id current-node)]
+           (context/ctx-set! ctx "current_node" node-id)
+
+           ;; Step 1: Check for terminal node
+           (if (terminal-node? current-node)
+             (let [[gates-ok? failed-gate] (check-goal-gates graph node-outcomes)]
+               (if (not gates-ok?)
+                 (let [retry-id (resolve-retry-target failed-gate graph)]
+                   (if (and retry-id (parser/find-node graph retry-id))
+                     (do
+                       (on-event {:type :goal_gate.retrying :unsatisfied_node (:id failed-gate) :target retry-id})
+                       (recur (parser/find-node graph retry-id)
+                              completed-nodes
+                              node-outcomes
+                              (inc step-count)))
+                     (let [fail-res {:status :fail
+                                     :failure_reason "Goal gate unsatisfied and no retry target"
+                                     :unsatisfied_gate (:id failed-gate)
+                                     :completed_nodes completed-nodes}]
+                       (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                       fail-res)))
+                 ;; Terminal node reached, goal gates satisfied!
+                 (let [success-res {:status :success
+                                    :notes "Pipeline completed"
+                                    :completed_nodes (conj completed-nodes node-id)
+                                    :context (context/ctx-snapshot ctx)}]
+                   ;; Write final checkpoint
+                   (let [cp {:timestamp (str (System/currentTimeMillis))
+                             :current_node node-id
+                             :completed_nodes (conj completed-nodes node-id)
+                             :node_retries {}
+                             :node_outcomes node-outcomes
+                             :context_values (context/ctx-snapshot ctx)
+                             :logs (:logs @ctx)}]
+                     (context/save-checkpoint cp (str logs-root "/checkpoint.edn")))
+                   (on-event {:type :pipeline.completed :duration_steps step-count :completed_nodes (:completed_nodes success-res)})
+                   success-res)))
+
+             ;; Step 2: Execute node handler with retry policy
+             (let [handler (handlers/resolve-handler registry current-node)
+                   outcome (execute-with-retry handler current-node ctx graph logs-root on-event)
+                   st (:status outcome)]
+
+               ;; The engine owns the status-file contract for every handler,
+               ;; including no-op, human, tool, and custom handlers.
+               (write-stage-status! logs-root node-id outcome)
+
+               ;; Step 3: Record completion
+               (let [new-completed (conj completed-nodes node-id)
+                     new-outcomes (assoc node-outcomes node-id outcome)]
+
+                 ;; Step 4: Apply context updates from outcome
+                 (context/ctx-apply-updates! ctx (:context_updates outcome))
+                 (context/ctx-set! ctx "outcome" (if (keyword? st) (name st) (str st)))
+                 (when-not (str/blank? (:preferred_label outcome))
+                   (context/ctx-set! ctx "preferred_label" (:preferred_label outcome)))
+
+                 ;; Step 5: Save checkpoint
+                 (let [cp {:timestamp (str (System/currentTimeMillis))
+                           :current_node node-id
+                           :completed_nodes new-completed
+                           :node_retries {}
+                           :node_outcomes new-outcomes
+                           :context_values (context/ctx-snapshot ctx)
+                           :logs (:logs @ctx)}]
+                   (context/save-checkpoint cp (str logs-root "/checkpoint.edn"))
+                   (on-event {:type :checkpoint.saved :node_id node-id}))
+
+                 ;; Step 6: Select next edge
+                 (let [next-edge (if-let [next-node-id (:next_node_id outcome)]
+                                   {:to next-node-id}
+                                   (select-edge current-node outcome ctx graph))]
+                   (if (nil? next-edge)
+                     ;; No edge selected: handle failure routing or exit
+                     (if (= st :fail)
+                       ;; Try failure routing (Section 3.7)
+                       (let [retry-target (resolve-retry-target current-node graph)]
+                         (if (and retry-target (parser/find-node graph retry-target))
+                           (recur (parser/find-node graph retry-target)
+                                  new-completed
+                                  new-outcomes
+                                  (inc step-count))
+                           (let [fail-res {:status :fail
+                                           :failure_reason (or (:failure_reason outcome) "Stage failed and no route found")
+                                           :completed_nodes new-completed}]
+                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                             fail-res)))
+                       ;; Succeeded with no outgoing edges
+                       (let [succ-res {:status :success
+                                       :notes "Pipeline completed (no outgoing edges)"
+                                       :completed_nodes new-completed
+                                       :context (context/ctx-snapshot ctx)}]
+                         (on-event {:type :pipeline.completed :duration_steps step-count})
+                         succ-res))
+
+                     ;; Step 7: Handle loop_restart
+                     (if (:loop_restart next-edge)
+                       (let [fresh-logs (str logs-root "_restart_" (System/currentTimeMillis))]
+                         (on-event {:type :pipeline.restarting :target (:to next-edge) :new_logs fresh-logs})
+                         (run-pipeline graph (assoc options :start-at (:to next-edge) :logs-root fresh-logs)))
+
+                       ;; Step 8: Advance to next node
+                       (let [next-node (parser/find-node graph (:to next-edge))]
+                         (if (nil? next-node)
+                           (let [fail-res {:status :fail
+                                           :failure_reason (str "Target node '" (:to next-edge) "' does not exist")
+                                           :completed_nodes new-completed}]
+                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                             fail-res)
+                           (recur next-node
+                                  new-completed
+                                  new-outcomes
+                                  (inc step-count))))))))))))))))
+
+;; Resume pipeline execution from a saved checkpoint (Section 5.3)
+(defn resume-pipeline [checkpoint-path graph options]
+  (let [cp (context/load-checkpoint checkpoint-path)
+        last-node-id (:current_node cp)
+        ctx (context/make-context (:context_values cp))
+        completed-nodes (:completed_nodes cp)
+        last-node (parser/find-node graph last-node-id)
+        outcome {:status (keyword (context/ctx-get-string ctx "outcome" "success"))
+                 :preferred_label (context/ctx-get-string ctx "preferred_label" "")}
+        next-edge (when last-node (select-edge last-node outcome ctx graph))]
+
+    (if (and next-edge (parser/find-node graph (:to next-edge)))
+      (run-pipeline graph (assoc options
+                            :context ctx
+                            :start-at (:to next-edge)
+                            :completed-nodes completed-nodes
+                            :node-outcomes (:node_outcomes cp)))
+      (run-pipeline graph (assoc options
+                            :context ctx
+                            :start-at last-node-id
+                            :completed-nodes completed-nodes
+                            :node-outcomes (:node_outcomes cp))))))

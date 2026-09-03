@@ -1,0 +1,194 @@
+(ns attractor.server
+  (:require [clojure.string :as str]
+            [json :as json]
+            [attractor.parser :as parser]
+            [attractor.engine :as engine]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [http :as http]))
+
+;; In-memory pipeline registry: id -> pipeline state map
+(def active-pipelines (atom {}))
+
+;; Helper to make JSON response
+(defn json-response [data & [status]]
+  {:status (or status 200)
+   :headers {"Content-Type" "application/json"
+             "Access-Control-Allow-Origin" "*"}
+   :body (json/write-json data)})
+
+;; Helper to make plain text response
+(defn text-response [text & [status]]
+  {:status (or status 200)
+   :headers {"Content-Type" "text/plain"
+             "Access-Control-Allow-Origin" "*"}
+   :body (str text)})
+
+;; Handle POST /pipelines (start pipeline)
+(defn handle-start-pipeline [req]
+  (try
+    (let [body (:body req)
+          body-data (if (string? body)
+                      (if (str/starts-with? (str/trim body) "{")
+                        (json/read-json body)
+                        {"dot" body})
+                      body)
+          dot-source (or (get body-data "dot") (get body-data :dot) "")
+          graph (parser/parse-dot dot-source)
+          pipeline-id (str "pipe-" (System/currentTimeMillis))
+          events-atom (atom [])
+          questions-atom (atom {})
+          pending-answers (atom {})
+          ctx (context/make-context)
+          logs-dir (str "attractor_runs/" pipeline-id)]
+
+      ;; Custom interviewer for web human-gates
+      (let [web-interviewer (reify interviewer/IInterviewer
+                              (ask [_ q]
+                                (let [qid (str "q-" (System/currentTimeMillis))]
+                                  (swap! questions-atom assoc qid q)
+                                  ;; Wait for answer to be posted or timeout
+                                  (loop [wait-ms 0]
+                                    (if-let [ans (get @pending-answers qid)]
+                                      (do
+                                        (swap! questions-atom dissoc qid)
+                                        (swap! pending-answers dissoc qid)
+                                        ans)
+                                      (if (> wait-ms 30000) ; 30s timeout
+                                        (do
+                                          (swap! questions-atom dissoc qid)
+                                          (or (:default q) {:value :timeout :text "timeout"}))
+                                        (do
+                                          (core/sleep 200)
+                                          (recur (+ wait-ms 200))))))))
+                              (ask-multiple [this questions]
+                                (vec (map (fn [q] (interviewer/ask this q)) questions)))
+                              (inform [_ _ _] nil))
+
+            registry (handlers/make-handler-registry web-interviewer nil)
+
+            on-event (fn [ev]
+                       (swap! events-atom conj ev))]
+
+        ;; Register pipeline
+        (swap! active-pipelines assoc pipeline-id
+               {:id pipeline-id
+                :graph graph
+                :dot dot-source
+                :status :running
+                :events events-atom
+                :questions questions-atom
+                :pending-answers pending-answers
+                :context ctx
+                :logs_root logs-dir})
+
+        ;; Run in background future
+        (core/future
+          (try
+            (let [outcome (engine/run-pipeline graph {:context ctx
+                                                      :logs-root logs-dir
+                                                      :registry registry
+                                                      :on-event on-event})]
+              (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
+            (catch Object e
+              (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e)))))
+
+        (json-response {:id pipeline-id :status "started" :graph_id (:id graph)} 201)))
+    (catch Object e
+      (json-response {:error (str "Failed to start pipeline: " e)} 400))))
+
+;; Route HTTP requests (Section 9.5)
+(defn app-handler [req]
+  (let [path (or (:path req) "")
+        method (keyword (str/lower-case (or (:request-method req) "get")))]
+    (cond
+      ;; CORS preflight
+      (= method :options)
+      {:status 200
+       :headers {"Access-Control-Allow-Origin" "*"
+                 "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+                 "Access-Control-Allow-Headers" "Content-Type"}
+       :body ""}
+
+      ;; POST /pipelines
+      (and (= method :post) (= path "/pipelines"))
+      (handle-start-pipeline req)
+
+      ;; GET /pipelines
+      (and (= method :get) (= path "/pipelines"))
+      (json-response (map (fn [[id p]] {:id id :status (str (:status p)) :graph_id (:id (:graph p))})
+                          @active-pipelines))
+
+      ;; Routes with pipeline ID: /pipelines/:id/...
+      (str/starts-with? path "/pipelines/")
+      (let [parts (str/split (subs path 11) #"/")
+            pipe-id (first parts)
+            sub-route (second parts)
+            pipe (get @active-pipelines pipe-id)]
+        (if-not pipe
+          (json-response {:error "Pipeline not found"} 404)
+          (cond
+            ;; GET /pipelines/:id
+            (and (= method :get) (nil? sub-route))
+            (json-response {:id pipe-id
+                            :status (str (:status pipe))
+                            :completed_nodes (or (:completed_nodes (:outcome pipe)) [])
+                            :event_count (count @(:events pipe))})
+
+            ;; GET /pipelines/:id/events
+            (and (= method :get) (= sub-route "events"))
+            (let [sse-body (str/join ""
+                                     (map (fn [ev] (str "data: " (json/write-json ev) "\n\n"))
+                                          @(:events pipe)))]
+              {:status 200
+               :headers {"Content-Type" "text/event-stream"
+                         "Cache-Control" "no-cache"
+                         "Access-Control-Allow-Origin" "*"}
+               :body sse-body})
+
+            ;; POST /pipelines/:id/cancel
+            (and (= method :post) (= sub-route "cancel"))
+            (do
+              (swap! active-pipelines update pipe-id assoc :status :cancelled)
+              (json-response {:id pipe-id :status "cancelled"}))
+
+            ;; GET /pipelines/:id/graph
+            (and (= method :get) (= sub-route "graph"))
+            (text-response (:dot pipe))
+
+            ;; GET /pipelines/:id/questions
+            (and (= method :get) (= sub-route "questions"))
+            (json-response (into {} (map (fn [[qid q]] [qid {:text (:text q) :type (name (:type q)) :options (:options q)}])
+                                         @(:questions pipe))))
+
+            ;; POST /pipelines/:id/questions/:qid/answer
+            (and (= method :post) (= sub-route "questions") (= (count parts) 4) (= (nth parts 3) "answer"))
+            (let [qid (nth parts 2)
+                  ans-data (json/read-json (or (:body req) "{}"))
+                  ans-val (get ans-data "answer")]
+              (swap! (:pending-answers pipe) assoc qid {:value ans-val :text (str ans-val)})
+              (json-response {:status "answer_submitted" :question_id qid}))
+
+            ;; GET /pipelines/:id/checkpoint
+            (and (= method :get) (= sub-route "checkpoint"))
+            (let [cp-path (str (:logs_root pipe) "/checkpoint.edn")]
+              (if (os/stat cp-path)
+                (json-response (json/read-json (io/slurp cp-path)))
+                (json-response {:status "no_checkpoint_yet"})))
+
+            ;; GET /pipelines/:id/context
+            (and (= method :get) (= sub-route "context"))
+            (json-response (context/ctx-snapshot (:context pipe)))
+
+            :else
+            (json-response {:error "Unknown sub-route"} 404))))
+
+      :else
+      (json-response {:error "Endpoint not found"} 404))))
+
+;; Start HTTP server on specified port (e.g. ":7070")
+(defn start-server [& [port]]
+  (let [p (str (or port ":7070"))]
+    (println (str "Attractor HTTP server listening on http://localhost" p))
+    (http/serve app-handler p)))

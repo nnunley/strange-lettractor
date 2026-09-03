@@ -1,0 +1,45 @@
+(ns attractor.validation-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.parser :as p]
+            [attractor.validation :as v]))
+
+(deftest test-valid-graph
+  (let [dot "
+digraph Valid {
+    start [shape=Mdiamond]
+    mid   [shape=box, prompt=\"Work\"]
+    exit  [shape=Msquare]
+
+    start -> mid -> exit
+}
+"
+        g (p/parse-dot dot)
+        diags (v/validate g)]
+    (is (empty? diags))))
+
+(deftest test-missing-start-and-terminal
+  (let [dot "
+digraph Invalid {
+    orphan [shape=box, prompt=\"No start, no exit\"]
+}
+"
+        g (p/parse-dot dot)
+        diags (v/validate g)
+        rules (set (map :rule diags))]
+    (is (contains? rules "start_node"))
+    (is (contains? rules "terminal_node"))))
+
+(deftest test-unreachable-node
+  (let [dot "
+digraph Unreachable {
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    island [shape=box, prompt=\"Isolated\"]
+
+    start -> exit
+}
+"
+        g (p/parse-dot dot)
+        diags (v/validate g)
+        rules (set (map :rule diags))]
+    (is (contains? rules "reachability"))))

@@ -1,0 +1,41 @@
+(ns attractor.transforms
+  (:require [clojure.string :as str]
+            [attractor.stylesheet :as stylesheet]))
+
+;; Variable expansion transform (Section 9.2)
+;; Expands $goal in node prompt attributes to the graph goal attribute value
+(defn variable-expansion-transform [graph]
+  (let [goal (or (:goal graph) "")]
+    (update graph :nodes
+            (fn [nodes]
+              (into {}
+                    (map (fn [[nid node]]
+                           (let [p (:prompt node)]
+                             (if (and (string? p) (str/includes? p "$goal"))
+                               [nid (assoc node :prompt (str/replace p "$goal" goal))]
+                               [nid node])))
+                         nodes))))))
+
+;; Stylesheet application transform (Section 9.2 & Section 8)
+;; Applies model_stylesheet rules to nodes
+(defn stylesheet-application-transform [graph]
+  (let [rules (stylesheet/parse-stylesheet (:model_stylesheet graph))]
+    (update graph :nodes
+            (fn [nodes]
+              (into {}
+                    (map (fn [[nid node]]
+                           (let [resolved (stylesheet/resolve-node-model-props node rules (:attrs graph))]
+                             [nid (merge node resolved)]))
+                         nodes))))))
+
+;; List of built-in transforms
+(def default-transforms
+  [variable-expansion-transform
+   stylesheet-application-transform])
+
+;; Apply transform pipeline to a parsed graph
+(defn apply-transforms
+  ([graph] (apply-transforms graph []))
+  ([graph custom-transforms]
+   (let [all-transforms (concat default-transforms custom-transforms)]
+     (reduce (fn [g t] (t g)) graph all-transforms))))

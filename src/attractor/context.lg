@@ -1,0 +1,250 @@
+(ns attractor.context
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            [json :as json]
+            [io :as io]
+            [os :as os]))
+
+;; Default file-backing threshold: 100KB
+(def file-backing-threshold (* 100 1024))
+
+;; Create a new Context
+(defn make-context
+  ([] (make-context {}))
+  ([initial-values]
+   (atom {:values (or initial-values {})
+          :logs []})))
+
+;; Get a context value
+(defn ctx-get
+  ([ctx key] (ctx-get ctx key nil))
+  ([ctx key default-val]
+   (let [vals (:values @ctx)
+         k-str (str key)
+         k-kw (keyword k-str)]
+     (or (get vals k-str) (get vals k-kw) default-val))))
+
+;; Get a context value as string
+(defn ctx-get-string
+  ([ctx key] (ctx-get-string ctx key ""))
+  ([ctx key default-val]
+   (let [v (ctx-get ctx key nil)]
+     (if (nil? v) default-val (str v)))))
+
+;; Set a context value
+(defn ctx-set! [ctx key val]
+  (let [k-str (str key)]
+    (swap! ctx update :values assoc k-str val)
+    val))
+
+;; Apply a map of updates to the context
+(defn ctx-apply-updates! [ctx updates]
+  (when (seq updates)
+    (swap! ctx update :values
+           (fn [vals]
+             (reduce (fn [acc [k v]] (assoc acc (str k) v)) vals updates))))
+  ctx)
+
+;; Append a log entry
+(defn ctx-append-log! [ctx entry]
+  (swap! ctx update :logs conj (str entry))
+  ctx)
+
+;; Deep snapshot of context values
+(defn ctx-snapshot [ctx]
+  (:values @ctx))
+
+;; Deep clone of context (for parallel branch isolation)
+(defn ctx-clone [ctx]
+  (let [cur @ctx]
+    (atom {:values (:values cur)
+           :logs (vec (:logs cur))})))
+
+;; Mirror graph attributes into context at initialization (Section 3.2 & 5.1)
+(defn mirror-graph-attributes! [graph ctx]
+  (when (:goal graph)
+    (ctx-set! ctx "graph.goal" (:goal graph)))
+  (when (:id graph)
+    (ctx-set! ctx "graph.id" (:id graph)))
+  (when (:label graph)
+    (ctx-set! ctx "graph.label" (:label graph)))
+  (when (:attrs graph)
+    (doseq [[k v] (:attrs graph)]
+      (ctx-set! ctx (str "graph." (name k)) v)))
+  ctx)
+
+;; Fidelity resolution order (Section 5.4):
+;; 1. Edge fidelity attribute
+;; 2. Target node fidelity attribute
+;; 3. Graph default_fidelity attribute
+;; 4. Default fallback: "compact"
+(defn resolve-fidelity [incoming-edge target-node graph]
+  (or (when (and incoming-edge (not (str/blank? (:fidelity incoming-edge))))
+        (:fidelity incoming-edge))
+      (when (and target-node (not (str/blank? (:fidelity target-node))))
+        (:fidelity target-node))
+      (when (not (str/blank? (:default_fidelity graph)))
+        (:default_fidelity graph))
+      "compact"))
+
+;; Thread key resolution for "full" fidelity session reuse (Section 5.4):
+;; 1. Target node thread_id attribute
+;; 2. Incoming edge thread_id attribute
+;; 3. Graph-level thread_id
+;; 4. Enclosing subgraph derived class
+;; 5. Fallback: previous node ID
+(defn resolve-thread-id [incoming-edge target-node graph prev-node-id]
+  (or (when (and target-node (not (str/blank? (:thread_id target-node))))
+        (:thread_id target-node))
+      (when (and incoming-edge (not (str/blank? (:thread_id incoming-edge))))
+        (:thread_id incoming-edge))
+      (when (not (str/blank? (get-in graph [:attrs :thread_id])))
+        (get-in graph [:attrs :thread_id]))
+      (when (and target-node (not (str/blank? (:class target-node))))
+        (:class target-node))
+      (str prev-node-id)))
+
+;; Synthesize context carryover text based on fidelity mode
+(defn synthesize-context-preamble [fidelity-mode graph ctx completed-nodes node-outcomes]
+  (let [goal (or (:goal graph) (ctx-get-string ctx "graph.goal" ""))
+        completed-count (count completed-nodes)]
+    (case fidelity-mode
+      "truncate"
+      (str "Pipeline Goal: " goal "\nStages completed: " completed-count "\n")
+
+      "summary:low"
+      (let [stages-str (str/join ", " completed-nodes)]
+        (str "Pipeline Goal: " goal "\nCompleted stages: " stages-str "\nTotal completed: " completed-count "\n"))
+
+      "summary:medium"
+      (let [lines (map (fn [nid]
+                         (let [out (get node-outcomes nid)]
+                           (str "- Stage '" nid "': outcome=" (:status out)
+                                (when (:notes out) (str ", notes=" (:notes out))))))
+                       completed-nodes)]
+        (str "Pipeline Goal: " goal "\nRecent stage outcomes:\n"
+             (str/join "\n" lines) "\n"
+             "Key Context:\n"
+             (str/join "\n" (map (fn [[k v]] (str "  " k ": " (subs (str v) 0 (min (count (str v)) 100))))
+                                 (take 10 (:values @ctx)))) "\n"))
+
+      "summary:high"
+      (let [lines (map (fn [nid]
+                         (let [out (get node-outcomes nid)]
+                           (str "- Stage '" nid "': outcome=" (:status out)
+                                (when (:preferred_label out) (str ", preferred_label=" (:preferred_label out)))
+                                (when (:notes out) (str ", notes=" (:notes out))))))
+                       completed-nodes)]
+        (str "Pipeline Goal: " goal "\nComprehensive stage history:\n"
+             (str/join "\n" lines) "\n"
+             "Context Values:\n"
+             (str/join "\n" (map (fn [[k v]] (str "  " k " = " v)) (:values @ctx))) "\n"))
+
+      ;; "compact" (default)
+      (let [lines (map (fn [nid]
+                         (let [out (get node-outcomes nid)]
+                           (str "* Stage [" nid "] -> " (:status out))))
+                       completed-nodes)]
+        (str "Goal: " goal "\nCompleted Stages:\n"
+             (str/join "\n" lines) "\n"
+             "Last stage: " (ctx-get-string ctx "last_stage" "none") "\n")))))
+
+;; Create an ArtifactStore
+(defn make-artifact-store [base-dir]
+  (atom {:base-dir base-dir
+         :artifacts {}}))
+
+;; Store an artifact (in memory if <= 100KB, file-backed if > 100KB)
+(defn store-artifact! [store artifact-id name data]
+  (let [base-dir (:base-dir @store)
+        data-str (if (string? data) data (json/write-json data))
+        size (count data-str)
+        is-file-backed (and (> size file-backing-threshold) (not (str/blank? base-dir)))
+        stored-data (if is-file-backed
+                      (let [art-dir (str base-dir "/artifacts")
+                            _ (os/sh "mkdir" "-p" art-dir)
+                            file-path (str art-dir "/" artifact-id ".json")]
+                        (io/spit file-path data-str)
+                        file-path)
+                      data)
+        info {:id (str artifact-id)
+              :name (str name)
+              :size_bytes size
+              :stored_at (str (System/currentTimeMillis))
+              :is_file_backed is-file-backed}]
+    (swap! store update :artifacts assoc (str artifact-id) {:info info :data stored-data})
+    info))
+
+;; Retrieve an artifact
+(defn retrieve-artifact [store artifact-id]
+  (let [entry (get-in @store [:artifacts (str artifact-id)])]
+    (when entry
+      (let [{:keys [info data]} entry]
+        (if (:is_file_backed info)
+          (json/read-json (io/slurp data))
+          data)))))
+
+;; Check if artifact exists
+(defn has-artifact? [store artifact-id]
+  (contains? (:artifacts @store) (str artifact-id)))
+
+;; List all artifacts
+(defn list-artifacts [store]
+  (map :info (vals (:artifacts @store))))
+
+;; Initialize the run directory structure (Section 5.6)
+(defn init-run-dir [logs-root graph]
+  (let [root (or logs-root "attractor_runs/run_latest")
+        art-dir (str root "/artifacts")]
+    (os/sh "mkdir" "-p" root)
+    (os/sh "mkdir" "-p" art-dir)
+    (let [manifest {:id (:id graph)
+                    :goal (:goal graph)
+                    :start_time (str (System/currentTimeMillis))}]
+      (io/spit (str root "/manifest.json") (json/write-json manifest)))
+    root))
+
+;; Write stage artifacts (Section 5.6)
+(defn write-stage-artifacts [logs-root stage-id prompt response outcome]
+  (let [stage-dir (str logs-root "/" stage-id)]
+    (os/sh "mkdir" "-p" stage-dir)
+    (when prompt
+      (io/spit (str stage-dir "/prompt.md") (str prompt)))
+    (when response
+      (io/spit (str stage-dir "/response.md") (str response)))
+    (let [st (if (keyword? (:status outcome)) (name (:status outcome)) (str (:status outcome)))
+          status-data {:outcome st
+                       :preferred_label (or (:preferred_label outcome) "")
+                       :suggested_next_ids (or (:suggested_next_ids outcome) [])
+                       :context_updates (or (:context_updates outcome) {})
+                       :notes (or (:notes outcome) "")}]
+      (io/spit (str stage-dir "/status.json") (json/write-json status-data)))
+    stage-dir))
+
+;; Save a checkpoint (Section 5.3)
+(defn save-checkpoint [checkpoint path]
+  (let [checkpoint-data {:timestamp (:timestamp checkpoint)
+                         :current_node (:current_node checkpoint)
+                         :completed_nodes (or (:completed_nodes checkpoint) [])
+                         :node_retries (or (:node_retries checkpoint) {})
+                         :node_outcomes (or (:node_outcomes checkpoint) {})
+                         :context_values (or (:context_values checkpoint) {})
+                         :logs (or (:logs checkpoint) [])}]
+    (io/spit path (pr-str checkpoint-data))
+    checkpoint))
+
+;; Load a checkpoint (Section 5.3)
+(defn load-checkpoint [path]
+  (let [raw (io/slurp path)
+        data (try
+               (edn/read-string raw)
+               (catch Object _ (json/read-json raw)))]
+    {:timestamp (or (:timestamp data) (get data "timestamp"))
+     :current_node (or (:current_node data) (get data "current_node"))
+     :completed_nodes (or (:completed_nodes data) (get data "completed_nodes") [])
+     :node_retries (or (:node_retries data) (get data "node_retries") {})
+     :node_outcomes (or (:node_outcomes data) (get data "node_outcomes") {})
+     :context_values (or (:context_values data)
+                         (get data "context_values")
+                         (get data "context") {})
+     :logs (or (:logs data) (get data "logs") [])}))

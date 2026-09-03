@@ -1,0 +1,71 @@
+(ns attractor.agent-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [attractor.agent :as agent]))
+
+(deftest test-character-truncation-preserves-head-and-tail
+  (let [output "abcdefghijklmnopqrstuvwxyz"
+        result (agent/truncate-output output 10 "head_tail")]
+    (is (str/starts-with? result "abcde"))
+    (is (str/ends-with? result "vwxyz"))
+    (is (str/includes? result "16 characters were removed"))))
+
+(deftest test-line-truncation-preserves-head-and-tail
+  (let [output "one\ntwo\nthree\nfour\nfive\nsix"
+        result (agent/truncate-lines output 4)]
+    (is (str/starts-with? result "one\ntwo"))
+    (is (str/ends-with? result "five\nsix"))
+    (is (str/includes? result "2 lines omitted"))))
+
+(deftest test-tool-truncation-is-character-first
+  (testing "A huge single line cannot bypass output limits"
+    (let [output (apply str (repeat 100 "x"))
+          result (agent/truncate-tool-output output "read_file"
+                   {:tool_output_limits {"read_file" 20}})]
+      (is (not= output result))
+      (is (str/includes? result "80 characters were removed"))
+      (is (str/includes? result "Tool output was truncated")))))
+
+(deftest test-agent-runs-tool-loop-until-text-response
+  (let [calls (atom 0)
+        requests (atom [])
+        events (atom [])
+        complete-fn
+        (fn [request]
+          (swap! requests conj request)
+          (if (= 1 (swap! calls inc))
+            {:id "response-1"
+             :message {:role :assistant :content ""}
+             :tool_calls [{:id "call-1"
+                           :name "missing_tool"
+                           :arguments {}}]}
+            {:id "response-2"
+             :message {:role :assistant :content "Recovered"}
+             :tool_calls []}))
+        session (agent/make-session {:model "mock/test"
+                                     :complete_fn complete-fn
+                                     :max_tool_rounds_per_input 3})
+        result (agent/process-input! session "Do the work"
+                 (fn [event] (swap! events conj event)))]
+    (is (= "Recovered" result))
+    (is (= 2 @calls))
+    (is (= :idle (:state @session)))
+    (is (= [:user :assistant :tool_results :assistant]
+           (mapv :type (:history @session))))
+    (is (true? (get-in @session [:history 2 :results 0 :is_error])))
+    (is (= "call-1" (get-in @session [:history 2 :results 0 :tool_call_id])))
+    (is (some (fn [event] (= :tool_call_end (:type event))) @events))
+    (is (= :tool (get-in @requests [1 :messages 2 :role])))))
+
+(deftest test-agent-honors-tool-round-limit
+  (let [calls (atom 0)
+        complete-fn (fn [_]
+                      (swap! calls inc)
+                      {:message {:role :assistant :content ""}
+                       :tool_calls [{:id "loop" :name "missing_tool" :arguments {}}]})
+        session (agent/make-session {:complete_fn complete-fn
+                                     :max_tool_rounds_per_input 1})
+        result (agent/process-input! session "loop" nil)]
+    (is (= "" result))
+    (is (= 1 @calls))
+    (is (= :idle (:state @session)))))

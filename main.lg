@@ -1,0 +1,8 @@
+(ns main
+  (:require [attractor.cli :as cli]))
+
+(defn -main [& args]
+  (apply cli/-main args))
+
+(when *command-line-args*
+  (apply -main *command-line-args*))

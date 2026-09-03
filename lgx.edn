@@ -1,0 +1,20 @@
+{:paths ["src"]
+ :main "main.lg"
+ :lg-version "1.12.2"
+ :targets {:bin {:out "bin/attractor"}}
+
+ :contexts
+ {:dev  {:extra-paths ["dev"]}
+  :test {:extra-paths ["test"]}}
+
+ :tasks
+ {suite {:doc "Run Attractor test suite"
+         :do  {:run "test/attractor/runner.lg"}}
+  validate {:doc "Validate a DOT pipeline"
+            :args [{:name :file :type :string}]
+            :do  {:run ["main.lg" "validate" :arg/file]}}
+  run-pipeline {:doc "Run a DOT pipeline"
+                :args [{:name :file :type :string}]
+                :do  {:run ["main.lg" "run" :arg/file "--auto-approve"]}}
+  clean {:doc "Clean pipeline execution artifacts and logs"
+         :do  {:run ["main.lg" "clean"]}}}}

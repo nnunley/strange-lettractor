@@ -1,0 +1,255 @@
+(ns attractor.cli
+  (:require [clojure.string :as str]
+            [os :as os]
+            [io :as io]
+            [attractor.parser :as parser]
+            [attractor.transforms :as transforms]
+            [attractor.validation :as validation]
+            [attractor.engine :as engine]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.server :as server]
+            [attractor.llm :as llm]
+            [attractor.agent :as agent]
+            [attractor.dotenv :as dotenv]))
+
+(defn- find-arg-val [args flag]
+  (loop [rem args]
+    (cond
+      (empty? rem) nil
+      (= (first rem) flag) (second rem)
+      :else (recur (rest rem)))))
+
+(defn- make-codergen-backend-from-args [args]
+  (let [force-mock? (some #{"--mock"} args)
+        has-keys? (or (not (str/blank? (os/getenv "ANTHROPIC_API_KEY")))
+                      (not (str/blank? (os/getenv "OPENAI_API_KEY")))
+                      (not (str/blank? (os/getenv "OLLAMA_API_KEY")))
+                      (not (str/blank? (os/getenv "OLLAMA_BASE_URL"))))
+        use-live-llm? (and (not force-mock?) (or (some #{"--llm"} args) has-keys?))
+        override-model (find-arg-val args "--model")
+        override-provider (find-arg-val args "--provider")]
+    (if use-live-llm?
+      (fn [node prompt ctx]
+        (let [raw-model (or override-model (:llm_model node) "claude-3-7-sonnet")
+              parsed (llm/parse-model-spec raw-model (or override-provider (:llm_provider node)))
+              model (:model parsed)
+              provider (:provider parsed)
+              model-spec (str provider "/" model)
+              session (agent/make-session {:model model-spec
+                                           :reasoning_effort (:reasoning_effort node)})]
+          (agent/process-input! session prompt)))
+      nil)))
+
+(defn print-usage []
+  (println "Attractor - Workflow Orchestration Engine for Multi-Stage LLM Pipelines")
+  (println "")
+  (println "Usage: attractor <command> [options] [args]")
+  (println "")
+  (println "Commands:")
+  (println "  run <dotfile> [--logs-root <dir>] [--auto-approve]   Execute a DOT pipeline")
+  (println "  validate <dotfile>                                  Validate pipeline structure & syntax")
+  (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
+  (println "  resume <dotfile> --checkpoint <path>                Resume pipeline from checkpoint")
+  (println "  serve [--port <port>]                               Start HTTP management server")
+  (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
+  (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
+  (println "  help                                                Show this help message")
+  (println ""))
+
+(defn cmd-validate [args]
+  (let [dot-file (first args)]
+    (if (str/blank? dot-file)
+      (do
+        (println "Error: Please provide a DOT file to validate.")
+        (print-usage)
+        (os/exit 1))
+      (if-not (os/stat dot-file)
+        (do
+          (println (str "Error: File '" dot-file "' does not exist."))
+          (os/exit 1))
+        (try
+          (let [dot-content (io/slurp dot-file)
+                graph (-> (parser/parse-dot dot-content)
+                          transforms/apply-transforms)
+                diags (validation/validate graph)]
+            (if (empty? diags)
+              (do
+                (println (str "✓ Pipeline '" (:id graph) "' is valid (0 errors, 0 warnings)."))
+                (println (str "  Nodes: " (count (:nodes graph)) ", Edges: " (count (:edges graph)))))
+              (let [errors (filter (fn [d] (= (:severity d) :error)) diags)
+                    warnings (filter (fn [d] (= (:severity d) :warning)) diags)]
+                (println (str "Validation results for '" (:id graph) "': "
+                              (count errors) " error(s), " (count warnings) " warning(s)"))
+                (doseq [d diags]
+                  (let [prefix (if (= (:severity d) :error) "[ERROR]" "[WARN]")
+                        target (or (:node-id d) (when (:edge d) (str/join " -> " (:edge d))) "")]
+                    (println (str "  " prefix " [" (:rule d) "] "
+                                  (when (seq target) (str target ": "))
+                                  (:message d)))))
+                (if (seq errors)
+                  (os/exit 1)
+                  (os/exit 0)))))
+          (catch Object e
+            (println (str "Error parsing or validating pipeline: " e))
+            (os/exit 1)))))))
+
+(defn cmd-graph [args]
+  (let [dot-file (first args)]
+    (if (or (str/blank? dot-file) (not (os/stat dot-file)))
+      (do
+        (println "Error: Valid DOT file required.")
+        (os/exit 1))
+      (let [graph (-> (io/slurp dot-file)
+                      parser/parse-dot
+                      transforms/apply-transforms)
+            start-node (parser/find-start-node graph)
+            exit-node (parser/find-exit-node graph)]
+        (println (str "Pipeline Graph: " (:id graph)))
+        (println (str "  Goal: " (or (:goal graph) "(none)")))
+        (println (str "  Start Node: " (if start-node (first start-node) "NONE")))
+        (println (str "  Exit Node:  " (if exit-node (first exit-node) "NONE")))
+        (println (str "  Total Nodes: " (count (:nodes graph))))
+        (println (str "  Total Edges: " (count (:edges graph))))
+        (println "\nNodes:")
+        (doseq [[nid n] (:nodes graph)]
+          (println (str "  * " nid " [shape=" (:shape n)
+                        (when (:type n) (str " type=" (:type n)))
+                        (when (:label n) (str " label=\"" (:label n) "\""))
+                        (when (:goal_gate n) " (goal_gate)")
+                        "]")))
+        (println "\nEdges:")
+        (doseq [e (:edges graph)]
+          (println (str "  * " (:from e) " -> " (:to e)
+                        (when (seq (:condition e)) (str " [condition=\"" (:condition e) "\"]"))
+                        (when (seq (:label e)) (str " [label=\"" (:label e) "\"]"))
+                        (when (> (:weight e) 0) (str " [weight=" (:weight e) "]")))))))))
+
+(defn cmd-run [args]
+  (let [dot-file (first args)]
+    (if (or (str/blank? dot-file) (not (os/stat dot-file)))
+      (do
+        (println "Error: Valid DOT file required.")
+        (os/exit 1))
+      (let [auto-approve? (some #{"--auto-approve"} args)
+            custom-root (find-arg-val args "--logs-root")
+            logs-root (or custom-root (str "attractor_runs/run_" (System/currentTimeMillis)))
+            interviewer (if auto-approve?
+                          (interviewer/make-auto-approve-interviewer)
+                          (interviewer/make-console-interviewer))
+            codergen-backend (make-codergen-backend-from-args args)
+            registry (handlers/make-handler-registry interviewer codergen-backend)
+            graph (-> (io/slurp dot-file)
+                      parser/parse-dot
+                      transforms/apply-transforms)
+            _ (validation/validate-or-raise graph)
+            on-event (fn [ev]
+                       (case (:type ev)
+                         :pipeline.started
+                         (println (str "▶ Pipeline started: " (:id ev) " | Goal: " (:goal ev)))
+                         :stage.started
+                         (println (str "  • Stage '" (:node_id ev) "' started (attempt " (:attempt ev) ")"))
+                         :stage.completed
+                         (println (str "  ✓ Stage '" (:node_id ev) "' completed -> " (:status ev)))
+                         :stage.failed
+                         (println (str "  ✗ Stage '" (:node_id ev) "' failed!"))
+                         :stage.retrying
+                         (println (str "  ⟳ Retrying stage '" (:node_id ev) "' after " (:delay_ms ev) "ms..."))
+                         :checkpoint.saved
+                         (println (str "    [checkpoint saved]"))
+                         :goal_gate.retrying
+                         (println (str "  ⚠ Goal gate unsatisfied for '" (:unsatisfied_node ev) "', jumping to retry target '" (:target ev) "'"))
+                         :pipeline.completed
+                         (println (str "✔ Pipeline successfully completed in " (:duration_steps ev) " steps!"))
+                         :pipeline.failed
+                         (println (str "✖ Pipeline failed: " (:error ev)))
+                         nil))
+            outcome (engine/run-pipeline graph {:logs-root logs-root
+                                                :registry registry
+                                                :on-event on-event})]
+        (println (str "\nExecution finished with status: " (:status outcome)))
+        (println (str "Artifacts and checkpoints saved in: " logs-root))
+        (if (= (:status outcome) :success)
+          (os/exit 0)
+          (os/exit 1))))))
+
+(defn cmd-resume [args]
+  (let [dot-file (first args)
+        cp-path (find-arg-val args "--checkpoint")]
+    (if (or (str/blank? dot-file) (str/blank? cp-path) (not (os/stat cp-path)))
+      (do
+        (println "Error: Both valid DOT file and --checkpoint path required.")
+        (os/exit 1))
+      (let [graph (-> (io/slurp dot-file)
+                      parser/parse-dot
+                      transforms/apply-transforms)
+            interviewer (interviewer/make-console-interviewer)
+            registry (handlers/make-handler-registry interviewer nil)
+            outcome (engine/resume-pipeline cp-path graph {:registry registry})]
+        (println (str "Resumed execution finished with status: " (:status outcome)))
+        (if (= (:status outcome) :success)
+          (os/exit 0)
+          (os/exit 1))))))
+
+(defn cmd-serve [args]
+  (let [port (or (find-arg-val args "--port") ":7070")]
+    (server/start-server port)))
+
+(defn cmd-clean [args]
+  (let [all? (some #{"--all" "-a"} args)
+        dirs-to-clean ["attractor_runs" "smoke_test_run_dir"]
+        extra-dirs (if all? ["bin"] [])
+        targets (concat dirs-to-clean extra-dirs)]
+    (println "Cleaning pipeline execution artifacts and logs...")
+    (doseq [d targets]
+      (when (os/stat d)
+        (os/sh "rm" "-rf" d)
+        (println (str "  ✓ Removed " d "/"))))
+    (when (os/stat ".nrepl-port")
+      (os/sh "rm" "-f" ".nrepl-port")
+      (println "  ✓ Removed .nrepl-port"))
+    (println "Cleanup complete.")
+    (os/exit 0)))
+
+(defn cmd-models [args]
+  (let [provider (or (find-arg-val args "--provider")
+                     (if-not (str/blank? (os/getenv "OLLAMA_API_KEY")) "ollama"
+                       (if-not (str/blank? (os/getenv "OPENAI_API_KEY")) "openai"
+                         (if-not (str/blank? (os/getenv "ANTHROPIC_API_KEY")) "anthropic" "ollama"))))
+        base-url (find-arg-val args "--base-url")
+        api-key (find-arg-val args "--api-key")]
+    (println (str "Querying models from " (str/upper-case provider) " (" (llm/resolve-base-url provider base-url) ")..."))
+    (let [models (llm/fetch-models provider {:base_url base-url :api_key api-key})]
+      (if (seq models)
+        (do
+          (println (str "Found " (count models) " available model(s):"))
+          (doseq [m (sort models)]
+            (println (str "  • " m))))
+        (println "No models found or request failed. Check your API key and base URL."))
+      (os/exit 0))))
+
+;; CLI Entry Point
+(defn -main [& args]
+  (let [raw (or (seq args) (seq *command-line-args*) [])
+        clean-args (if (= (first raw) "--") (vec (rest raw)) (vec raw))
+        env-path (find-arg-val clean-args "--env-file")
+        _ (dotenv/load-dotenv! env-path)
+        cmd (first clean-args)
+        rest-args (vec (rest clean-args))]
+    (case cmd
+      "run" (cmd-run rest-args)
+      "validate" (cmd-validate rest-args)
+      "lint" (cmd-validate rest-args)
+      "graph" (cmd-graph rest-args)
+      "resume" (cmd-resume rest-args)
+      "serve" (cmd-serve rest-args)
+      "clean" (cmd-clean rest-args)
+      "cleanup" (cmd-clean rest-args)
+      "models" (cmd-models rest-args)
+      "help" (print-usage)
+      nil (print-usage)
+      (do
+        (println (str "Unknown command: " cmd))
+        (print-usage)
+        (os/exit 1)))))

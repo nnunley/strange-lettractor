@@ -1,0 +1,426 @@
+(ns attractor.parity-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [os :as os]
+            [io :as io]
+            [attractor.parser :as p]
+            [attractor.validation :as v]
+            [attractor.transforms :as t]
+            [attractor.conditions :as c]
+            [attractor.stylesheet :as s]
+            [attractor.context :as ctx]
+            [attractor.interviewer :as i]
+            [attractor.handlers :as h]
+            [attractor.engine :as e]))
+
+;; Parity Matrix Case 1: Parse a simple linear pipeline (start -> A -> B -> done)
+(deftest test-parity-01-linear-parse
+  (let [dot "digraph G { start -> A -> B -> done }"
+        g (p/parse-dot dot)]
+    (is (= 4 (count (:nodes g))))
+    (is (= 3 (count (:edges g))))))
+
+;; Parity Matrix Case 2: Parse a pipeline with graph-level attributes (goal, label)
+(deftest test-parity-02-graph-attrs
+  (let [dot "digraph G { graph [goal=\"Build auth\", label=\"Auth Service\"] start -> exit }"
+        g (p/parse-dot dot)]
+    (is (= "Build auth" (:goal g)))
+    (is (= "Auth Service" (:label g)))))
+
+;; Parity Matrix Case 3: Parse multi-line node attributes
+(deftest test-parity-03-multiline-attrs
+  (let [dot "digraph G {
+    node_a [
+        prompt=\"This is line 1\nThis is line 2\",
+        label=\"Multiline Node\"
+    ]
+    start -> node_a -> exit
+}"
+        g (p/parse-dot dot)
+        n (p/find-node g "node_a")]
+    (is (str/includes? (:prompt n) "This is line 1"))
+    (is (str/includes? (:prompt n) "This is line 2"))
+    (is (= "Multiline Node" (:label n)))))
+
+;; Parity Matrix Case 4: Validate missing start node -> error
+(deftest test-parity-04-missing-start
+  (let [dot "digraph G { mid [shape=box] exit [shape=Msquare] mid -> exit }"
+        g (p/parse-dot dot)
+        diags (v/validate g)]
+    (is (some (fn [d] (and (= (:rule d) "start_node") (= (:severity d) :error))) diags))))
+
+;; Parity Matrix Case 5: Validate missing exit node -> error
+(deftest test-parity-05-missing-exit
+  (let [dot "digraph G { start [shape=Mdiamond] mid [shape=box] start -> mid }"
+        g (p/parse-dot dot)
+        diags (v/validate g)]
+    (is (some (fn [d] (and (= (:rule d) "terminal_node") (= (:severity d) :error))) diags))))
+
+;; Parity Matrix Case 6: Validate orphan / unreachable node -> error
+(deftest test-parity-06-orphan-node
+  (let [dot "digraph G { start [shape=Mdiamond] exit [shape=Msquare] orphan [shape=box] start -> exit }"
+        g (p/parse-dot dot)
+        diags (v/validate g)]
+    (is (some (fn [d] (and (= (:rule d) "reachability") (= (:severity d) :error))) diags))))
+
+;; Parity Matrix Case 7: Execute a linear 3-node pipeline end-to-end
+(deftest test-parity-07-execute-linear
+  (let [dot "digraph G { start [shape=Mdiamond] mid [shape=box] exit [shape=Msquare] start -> mid -> exit }"
+        g (p/parse-dot dot)
+        logs "test_parity_07"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "mid" "exit"] (:completed_nodes res)))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 8: Execute with conditional branching (success/fail paths)
+(deftest test-parity-08-conditional-branching
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    cond  [shape=diamond]
+    succ  [shape=box]
+    fail  [shape=box]
+    exit  [shape=Msquare]
+
+    start -> cond
+    cond -> succ [condition=\"outcome=success\"]
+    cond -> fail [condition=\"outcome=fail\"]
+    succ -> exit
+    fail -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_parity_08"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    (is (some #{"succ"} (:completed_nodes res)))
+    (is (not (some #{"fail"} (:completed_nodes res))))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 9: Execute with retry on failure (max_retries=2)
+(deftest test-parity-09-retry-on-failure
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    flaky [shape=box, max_retries=2]
+    exit  [shape=Msquare]
+    start -> flaky -> exit
+}"
+        g (p/parse-dot dot)
+        attempts (atom 0)
+        flaky-backend (fn [node _ _]
+                        (let [a (swap! attempts inc)]
+                          (if (< a 3)
+                            {:status :retry :failure_reason (str "Attempt " a " failed")}
+                            {:status :success})))
+        reg (h/make-handler-registry (i/make-auto-approve-interviewer) flaky-backend)
+        logs "test_parity_09"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= 3 @attempts))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 10 & 11: Goal gate blocks exit when unsatisfied and allows when satisfied
+(deftest test-parity-10-11-goal-gates
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    work  [shape=box, goal_gate=true, retry_target=\"fix\"]
+    fix   [shape=box]
+    exit  [shape=Msquare]
+
+    start -> work -> exit
+    fix -> work
+}"
+        g (p/parse-dot dot)
+        visits (atom 0)
+        backend (fn [node _ _]
+                  (if (= (:id node) "work")
+                    (let [v (swap! visits inc)]
+                      (if (= v 1) {:status :fail} {:status :success}))
+                    {:status :success}))
+        reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
+        logs "test_parity_10_11"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "work" "fix" "work" "exit"] (:completed_nodes res)))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 12: Wait.human presents choices and routes on selection
+(deftest test-parity-12-wait-human
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    gate  [shape=hexagon, type=\"wait.human\", label=\"Approval\"]
+    a     [shape=box]
+    b     [shape=box]
+    exit  [shape=Msquare]
+
+    start -> gate
+    gate -> a [label=\"[A] Choice A\"]
+    gate -> b [label=\"[B] Choice B\"]
+    a -> exit
+    b -> exit
+}"
+        g (p/parse-dot dot)
+        q (i/make-queue-interviewer [{:value "A" :text "Choice A"}])
+        reg (h/make-handler-registry q nil)
+        logs "test_parity_12"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "gate" "a" "exit"] (:completed_nodes res)))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 13: Edge selection: condition match wins over weight
+(deftest test-parity-13-condition-wins-over-weight
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    cond  [shape=box]
+    t1    [shape=box]
+    t2    [shape=box]
+    exit  [shape=Msquare]
+
+    start -> cond
+    cond -> t1 [weight=100]
+    cond -> t2 [condition=\"outcome=success\", weight=1]
+    t1 -> exit
+    t2 -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_parity_13"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    ;; t2 had weight 1 but matched condition; t1 had weight 100 but was unconditional
+    (is (some #{"t2"} (:completed_nodes res)))
+    (is (not (some #{"t1"} (:completed_nodes res))))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 14: Edge selection: weight breaks ties for unconditional edges
+(deftest test-parity-14-weight-breaks-unconditional-ties
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    cond  [shape=box]
+    heavy [shape=box]
+    light [shape=box]
+    exit  [shape=Msquare]
+
+    start -> cond
+    cond -> light [weight=5]
+    cond -> heavy [weight=50]
+    heavy -> exit
+    light -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_parity_14"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    (is (some #{"heavy"} (:completed_nodes res)))
+    (is (not (some #{"light"} (:completed_nodes res))))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 15: Edge selection: lexical tiebreak as final fallback
+(deftest test-parity-15-lexical-tiebreak
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    split [shape=box]
+    beta  [shape=box]
+    alpha [shape=box]
+    exit  [shape=Msquare]
+
+    start -> split
+    split -> beta  [weight=0]
+    split -> alpha [weight=0]
+    alpha -> exit
+    beta -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_parity_15"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    ;; Lexical tiebreak: "alpha" < "beta"
+    (is (some #{"alpha"} (:completed_nodes res)))
+    (is (not (some #{"beta"} (:completed_nodes res))))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 16: Context updates from one node are visible to the next
+(deftest test-parity-16-context-propagation
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    n1    [shape=box]
+    n2    [shape=box]
+    exit  [shape=Msquare]
+
+    start -> n1 -> n2 -> exit
+}"
+        g (p/parse-dot dot)
+        seen-val (atom nil)
+        backend (fn [node _ ctx]
+                  (if (= (:id node) "n1")
+                    {:status :success :context_updates {"shared_key" "hello_from_n1"}}
+                    (do
+                      (reset! seen-val (ctx/ctx-get ctx "shared_key"))
+                      {:status :success})))
+        reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
+        logs "test_parity_16"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= "hello_from_n1" @seen-val))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 17: Checkpoint save and resume produces same result
+(deftest test-parity-17-checkpoint-resume
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    step1 [shape=box]
+    step2 [shape=box]
+    exit  [shape=Msquare]
+
+    start -> step1 -> step2 -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_parity_17"
+        res (e/run-pipeline g {:logs-root logs})
+        cp-path (str logs "/checkpoint.edn")]
+    (is (= :success (:status res)))
+    (is (os/stat cp-path))
+    (let [loaded (ctx/load-checkpoint cp-path)]
+      (is (= "exit" (:current_node loaded)))
+      (is (= ["start" "step1" "step2" "exit"] (:completed_nodes loaded)))
+      (is (= :success (get-in loaded [:node_outcomes "step1" :status]))))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-resume-preserves-prior-goal-gate-outcomes
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    gate  [shape=box, prompt=\"Gate\", goal_gate=true]
+    exit  [shape=Msquare]
+    start -> gate -> exit
+}"
+        g (p/parse-dot dot)
+        logs "test_resume_goal_gate"
+        cp-path (str logs "/checkpoint.edn")
+        _ (os/sh "mkdir" "-p" logs)
+        _ (ctx/save-checkpoint
+            {:timestamp "1"
+             :current_node "gate"
+             :completed_nodes ["start" "gate"]
+             :node_retries {"gate" 0}
+             :node_outcomes {"start" {:status :success}
+                             "gate" {:status :fail
+                                     :failure_reason "quality gate failed"}}
+             :context_values {"outcome" "fail"}
+             :logs []}
+            cp-path)
+        res (e/resume-pipeline cp-path g {:logs-root logs})]
+    (is (= :fail (:status res)))
+    (is (= "gate" (:unsatisfied_gate res)))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 18: Stylesheet applies model override to nodes by shape
+(deftest test-parity-18-stylesheet-by-shape
+  (let [dot "digraph G {
+    graph [model_stylesheet=\"box { llm_model: claude-3-7-sonnet; llm_provider: anthropic; }\"]
+    start [shape=Mdiamond]
+    task  [shape=box]
+    exit  [shape=Msquare]
+    start -> task -> exit
+}"
+        g (-> (p/parse-dot dot) t/apply-transforms)
+        task (p/find-node g "task")]
+    (is (= "claude-3-7-sonnet" (:llm_model task)))
+    (is (= "anthropic" (:llm_provider task)))))
+
+;; Parity Matrix Case 19: Prompt variable expansion ($goal) works
+(deftest test-parity-19-prompt-goal-expansion
+  (let [dot "digraph G {
+    graph [goal=\"Refactor authentication\"]
+    start [shape=Mdiamond]
+    plan  [shape=box, prompt=\"Plan: $goal\"]
+    exit  [shape=Msquare]
+    start -> plan -> exit
+}"
+        g (-> (p/parse-dot dot) t/apply-transforms)
+        plan (p/find-node g "plan")]
+    (is (= "Plan: Refactor authentication" (:prompt plan)))))
+
+;; Parity Matrix Case 20: Parallel fan-out and fan-in complete correctly
+(deftest test-parity-20-parallel-fan-in
+  (let [c (ctx/make-context)
+        _ (ctx/ctx-set! c "parallel.results" [{:id "cand1" :status :fail}
+                                              {:id "cand2" :status :success}
+                                              {:id "cand3" :status :partial_success}])
+        res (h/handle-fan-in {:id "fan_in"} c {} "logs")]
+    (is (= :success (:status res)))
+    (is (= "cand2" (get-in res [:context_updates "parallel.fan_in.best_id"])))))
+
+(deftest test-fan-in-fails-when-every-branch-failed
+  (let [c (ctx/make-context)
+        _ (ctx/ctx-set! c "parallel.results"
+                        [{:id "cand1" :status :fail}
+                         {:id "cand2" :status :fail}])
+        res (h/handle-fan-in {:id "fan_in"} c {} "logs")]
+    (is (= :fail (:status res)))))
+
+(deftest test-parallel-pipeline-executes-each-branch-once-before-fan-in
+  (let [dot "digraph G {
+    start [shape=Mdiamond]
+    fork  [shape=component, max_parallel=2]
+    a     [shape=box, prompt=\"A\"]
+    b     [shape=box, prompt=\"B\"]
+    c     [shape=box, prompt=\"C\"]
+    join  [shape=tripleoctagon]
+    exit  [shape=Msquare]
+    start -> fork
+    fork -> a -> join
+    fork -> b -> join
+    fork -> c -> join
+    join -> exit
+}"
+        g (p/parse-dot dot)
+        calls (atom {})
+        backend (fn [node _ _]
+                  (swap! calls update (:id node) (fnil inc 0))
+                  {:status :success
+                   :context_updates {(str "branch." (:id node)) true}})
+        reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
+        logs "test_parallel_pipeline"
+        res (e/run-pipeline g {:registry reg :logs-root logs})
+        results (get-in res [:context "parallel.results"])]
+    (is (= :success (:status res)))
+    (is (= {"a" 1 "b" 1 "c" 1} @calls))
+    (is (= ["start" "fork" "join" "exit"] (:completed_nodes res)))
+    (is (= 3 (count results)))
+    (is (= "a" (get-in res [:context "parallel.fan_in.best_id"])))
+    (is (nil? (get-in res [:context "branch.a"])))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 21: Custom handler registration and execution works
+(deftest test-parity-21-custom-handler
+  (let [dot "digraph G {
+    start  [shape=Mdiamond]
+    custom [type=\"my.custom.handler\"]
+    exit   [shape=Msquare]
+    start -> custom -> exit
+}"
+        g (p/parse-dot dot)
+        custom-ran (atom false)
+        reg (h/make-handler-registry)
+        _ (h/register-handler! reg "my.custom.handler"
+            (fn [_ ctx _ _]
+              (reset! custom-ran true)
+              {:status :success}))
+        logs "test_parity_21"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (true? @custom-ran))
+    (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 22: Pipeline with 10+ nodes completes without errors
+(deftest test-parity-22-large-pipeline
+  (let [nodes (str/join "\n" (map (fn [i] (str "node_" i " [shape=box, prompt=\"Stage " i "\"]")) (range 1 11)))
+        edges (str "start -> node_1\n"
+                   (str/join "\n" (map (fn [i] (str "node_" i " -> node_" (inc i))) (range 1 10)))
+                   "\nnode_10 -> exit")
+        dot (str "digraph Large {\nstart [shape=Mdiamond]\nexit [shape=Msquare]\n" nodes "\n" edges "\n}")
+        g (p/parse-dot dot)
+        logs "test_parity_22"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= 12 (count (:completed_nodes res))))
+    (os/sh "rm" "-rf" logs)))

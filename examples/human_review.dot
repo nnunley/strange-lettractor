@@ -1,0 +1,18 @@
+digraph HumanReviewPipeline {
+    graph [
+        goal="Demonstrate human approval gate with accelerator keys in Attractor"
+    ]
+
+    start   [shape=Mdiamond, label="Start"]
+    plan    [shape=box, label="Generate Proposal", prompt="Draft architecture proposal"]
+    gate    [shape=hexagon, label="Approve Proposal?", type="wait.human"]
+    deploy  [shape=box, label="Deploy", prompt="Deploy changes to production"]
+    revise  [shape=box, label="Revise", prompt="Revise architecture proposal"]
+    exit    [shape=Msquare, label="Exit"]
+
+    start -> plan -> gate
+    gate -> deploy [label="[A] Approve and deploy"]
+    gate -> revise [label="[R] Request revisions"]
+    revise -> gate
+    deploy -> exit
+}

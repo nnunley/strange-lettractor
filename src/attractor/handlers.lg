@@ -1,0 +1,269 @@
+(ns attractor.handlers
+  (:require [clojure.string :as str]
+            [json :as json]
+            [io :as io]
+            [os :as os]
+            [attractor.context :as context]
+            [attractor.interviewer :as interviewer]))
+
+;; Shape to handler type mapping (Section 2.8)
+(def shape-to-type
+  {"Mdiamond" "start"
+   "Msquare" "exit"
+   "box" "codergen"
+   "hexagon" "wait.human"
+   "diamond" "conditional"
+   "component" "parallel"
+   "tripleoctagon" "parallel.fan_in"
+   "parallelogram" "tool"
+   "house" "stack.manager_loop"})
+
+(def parallel-executor-key :attractor.handlers/parallel-executor)
+
+;; Start Handler (Section 4.3)
+(defn handle-start [_node _context _graph _logs-root]
+  {:status :success :notes "Start node"})
+
+;; Exit Handler (Section 4.4)
+(defn handle-exit [_node _context _graph _logs-root]
+  {:status :success :notes "Exit node"})
+
+;; Conditional Handler (Section 4.7)
+(defn handle-conditional [node _context _graph _logs-root]
+  {:status :success :notes (str "Conditional node evaluated: " (:id node))})
+
+;; Tool Handler (Section 4.10)
+(defn handle-tool [node context _graph _logs-root]
+  (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")]
+    (if (str/blank? cmd)
+      {:status :fail :failure_reason "No tool_command specified"}
+      (try
+        (let [args (str/split (str/trim cmd) #"\s+")
+              res (apply os/sh args)]
+          (if (zero? (:exit res))
+            {:status :success
+             :context_updates {"tool.output" (:out res)}
+             :notes (str "Tool completed: " cmd)}
+            {:status :fail
+             :failure_reason (str "Tool exited with code " (:exit res) ": " (:err res))
+             :context_updates {"tool.output" (:out res)
+                               "tool.error" (:err res)}}))
+        (catch Object e
+          {:status :fail :failure_reason (str "Tool execution exception: " e)})))))
+
+(defn- outcome-to-status-json [outcome]
+  (let [st (or (:status outcome) (get outcome "status") :success)
+        st-str (if (keyword? st) (name st) (str st))]
+    {:outcome st-str
+     :status st-str
+     :preferred_label (or (:preferred_label outcome) (get outcome "preferred_label") "")
+     :suggested_next_ids (or (:suggested_next_ids outcome) (get outcome "suggested_next_ids") [])
+     :context_updates (or (:context_updates outcome) (get outcome "context_updates") {})
+     :notes (or (:notes outcome) (get outcome "notes") "")}))
+
+;; Codergen Handler (Section 4.5)
+(defn make-codergen-handler
+  ([] (make-codergen-handler nil))
+  ([backend]
+   (fn [node ctx graph logs-root]
+     (let [node-id (:id node)
+           goal (or (:goal graph) (context/ctx-get-string ctx "graph.goal" ""))
+           raw-prompt (let [p (:prompt node)]
+                        (if (str/blank? p)
+                          (or (:label node) node-id)
+                          p))
+           prompt (str/replace raw-prompt "$goal" goal)
+           stage-dir (str (or logs-root "attractor_runs/run_latest") "/" node-id)]
+
+       (os/sh "mkdir" "-p" stage-dir)
+       (io/spit (str stage-dir "/prompt.md") prompt)
+
+       (try
+         (let [backend-result (if backend
+                                (backend node prompt ctx)
+                                (str "[Simulated] Response for stage: " node-id))]
+           (if (and (map? backend-result) (:status backend-result))
+             ;; Backend returned an Outcome directly
+             (do
+               (when-not (os/stat (str stage-dir "/response.md"))
+                 (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
+               (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json backend-result)))
+               backend-result)
+
+             ;; Backend returned a response string
+             (let [resp-str (str backend-result)
+                   truncated-resp (subs resp-str 0 (min (count resp-str) 200))
+                   outcome {:status :success
+                            :notes (str "Stage completed: " node-id)
+                            :context_updates {"last_stage" node-id
+                                              "last_response" truncated-resp}}]
+               (io/spit (str stage-dir "/response.md") resp-str)
+               (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json outcome)))
+               outcome)))
+         (catch Object e
+           (let [fail-outcome {:status :fail :failure_reason (str e)}]
+             (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json fail-outcome)))
+             fail-outcome)))))))
+
+;; Wait.human Handler (Section 4.6)
+(defn make-wait-human-handler [interviewer]
+  (fn [node ctx graph _logs-root]
+    (let [outgoing (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
+          choices (map (fn [e]
+                         (let [label (if (str/blank? (:label e)) (:to e) (:label e))
+                               key (interviewer/parse-accelerator-key label)]
+                           {:key key :label label :to (:to e)}))
+                       outgoing)]
+      (if (empty? choices)
+        {:status :fail :failure_reason "No outgoing edges for human gate"}
+        (let [opts (map (fn [c] {:key (:key c) :label (:label c)}) choices)
+              question {:text (or (:label node) "Select an option:")
+                        :type :multiple_choice
+                        :options opts
+                        :stage (:id node)}
+              answer (interviewer/ask interviewer question)]
+
+          (cond
+            (= (:value answer) :timeout)
+            (let [def-choice (get-in node [:attrs :human.default_choice])]
+              (if def-choice
+                (let [matched (or (first (filter (fn [c] (= (:to c) def-choice)) choices))
+                                  (first choices))]
+                  {:status :success
+                   :suggested_next_ids [(:to matched)]
+                   :preferred_label (:label matched)
+                   :context_updates {"human.gate.selected" (:key matched)
+                                     "human.gate.label" (:label matched)}})
+                {:status :retry :failure_reason "human gate timeout, no default"}))
+
+            (= (:value answer) :skipped)
+            {:status :fail :failure_reason "human skipped interaction"}
+
+            :else
+            (let [ans-val (str (:value answer))
+                  ans-text (str (:text answer))
+                  matched (or (first (filter (fn [c] (or (= (str/lower-case (:key c)) (str/lower-case ans-val))
+                                                         (= (str/lower-case (:label c)) (str/lower-case ans-val))
+                                                         (= (str/lower-case (:label c)) (str/lower-case ans-text))))
+                                             choices))
+                              (first choices))]
+              {:status :success
+               :suggested_next_ids [(:to matched)]
+               :preferred_label (:label matched)
+               :context_updates {"human.gate.selected" (:key matched)
+                                 "human.gate.label" (:label matched)}})))))))
+
+;; Parallel Handler (Section 4.8)
+;; Executes multiple branches concurrently with bounded parallelism
+(defn make-parallel-handler [execute-branch-fn]
+  (fn [node ctx graph logs-root]
+    (let [branches (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
+          join-policy (or (get-in node [:attrs :join_policy]) "wait_all")
+          max-parallel (let [mp (get-in node [:attrs :max_parallel])]
+                         (if (and (number? mp) (> mp 0)) mp 4))]
+      (if (empty? branches)
+        {:status :fail :failure_reason "Parallel node has no outgoing branches"}
+        (let [branch-targets (mapv :to branches)
+              results
+              (loop [remaining branch-targets
+                     accumulated []]
+                (if (empty? remaining)
+                  accumulated
+                  (let [batch (vec (take max-parallel remaining))
+                        batch-results
+                        (doall
+                          (pmap (fn [target-id]
+                                  (let [branch-ctx (context/ctx-clone ctx)
+                                        branch-logs (str logs-root "/branches/" target-id)
+                                        result (execute-branch-fn target-id branch-ctx graph branch-logs)]
+                                    (assoc result :id target-id :node_id target-id)))
+                                batch))]
+                    (recur (drop max-parallel remaining)
+                           (into accumulated batch-results)))))
+              boundary-ids (vec (distinct (keep :boundary_node_id results)))
+              next-node-id (when (= 1 (count boundary-ids)) (first boundary-ids))
+              success-count (count (filter (fn [r] (= (:status r) :success)) results))
+              fail-count (count (filter (fn [r] (= (:status r) :fail)) results))
+              base {:context_updates {"parallel.results" (vec results)}}
+              base (if next-node-id (assoc base :next_node_id next-node-id) base)]
+          (if (= join-policy "first_success")
+            (if (> success-count 0)
+              (merge base {:status :success :notes "Parallel first_success satisfied"})
+              (merge base {:status :fail :failure_reason "All parallel branches failed"}))
+            (if (= fail-count 0)
+              (merge base {:status :success :notes "All parallel branches succeeded"})
+              (merge base {:status :partial_success
+                           :notes (str fail-count " parallel branch(es) failed")}))))))))
+
+;; Fan-In Handler (Section 4.9)
+(defn handle-fan-in [node ctx _graph _logs-root]
+  (let [results (context/ctx-get ctx "parallel.results" [])]
+    (if (empty? results)
+      {:status :fail :failure_reason "No parallel results to evaluate"}
+      (let [eligible (filter (fn [r] (#{:success :partial_success} (:status r))) results)]
+        (if (empty? eligible)
+          {:status :fail :failure_reason "All parallel branches failed"}
+          ;; Prefer SUCCESS over PARTIAL_SUCCESS; use candidate ID as the
+          ;; deterministic tiebreak when no explicit scoring backend exists.
+          (let [status-rank {:success 0 :partial_success 1}
+                sorted-candidates
+                (sort-by (fn [r]
+                           [(get status-rank (:status r) 9)
+                            (str (or (:id r) (:node_id r) ""))])
+                         eligible)
+                best (first sorted-candidates)
+                best-id (or (:id best) (:node_id best) "winner")]
+            {:status :success
+             :context_updates {"parallel.fan_in.best_id" best-id
+                               "parallel.fan_in.best_outcome" (str (:status best))}
+             :notes (str "Selected best candidate: " best-id)}))))))
+
+;; Manager Loop Handler (Section 4.11)
+(defn handle-manager-loop [node ctx graph _logs-root]
+  (let [actions (or (get-in node [:attrs :manager.actions]) "observe,wait")
+        actions-set (set (str/split actions #","))]
+    {:status :success
+     :notes "Manager loop supervisor completed"
+     :context_updates {"context.stack.child.status" "completed"
+                       "context.stack.child.outcome" "success"}}))
+
+;; Handler Registry (Section 4.2)
+(defn make-handler-registry
+  ([] (make-handler-registry (interviewer/make-auto-approve-interviewer) nil))
+  ([interviewer codergen-backend]
+   (let [branch-executor (atom nil)]
+     (atom {"start" handle-start
+            "exit" handle-exit
+            "codergen" (make-codergen-handler codergen-backend)
+            "wait.human" (make-wait-human-handler interviewer)
+            "conditional" handle-conditional
+            "tool" handle-tool
+            "parallel" (make-parallel-handler
+                         (fn [target-id branch-ctx graph logs-root]
+                           (if-let [execute-fn @branch-executor]
+                             (execute-fn target-id branch-ctx graph logs-root)
+                             {:status :fail
+                              :failure_reason "Parallel branch executor is not initialized"})))
+            "parallel.fan_in" handle-fan-in
+            "stack.manager_loop" handle-manager-loop
+            parallel-executor-key branch-executor}))))
+
+;; Register a custom handler
+(defn register-handler! [registry type-str handler-fn]
+  (swap! registry assoc (str type-str) handler-fn)
+  registry)
+
+;; Resolve handler for a node (Section 4.2):
+;; 1. Explicit type attribute
+;; 2. Shape-based mapping
+;; 3. Default handler (codergen)
+(defn resolve-handler [registry node]
+  (let [reg @registry
+        explicit-type (:type node)
+        shape-type (get shape-to-type (or (:shape node) "box"))
+        default-handler (get reg "codergen")]
+    (or (when (and (not (str/blank? explicit-type)) (contains? reg explicit-type))
+          (get reg explicit-type))
+        (when (and (not (str/blank? shape-type)) (contains? reg shape-type))
+          (get reg shape-type))
+        default-handler)))

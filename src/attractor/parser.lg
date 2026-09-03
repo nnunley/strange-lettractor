@@ -1,0 +1,393 @@
+(ns attractor.parser
+  (:require [clojure.string :as str]))
+
+;; Unescape string literals
+(defn unescape-string [s]
+  (-> s
+      (str/replace "\\\"" "\"")
+      (str/replace "\\n" "\n")
+      (str/replace "\\t" "\t")
+      (str/replace "\\\\" "\\")))
+
+;; Helper to read a quoted string token
+(defn- read-quoted-str [src start n]
+  (loop [j (inc start)
+         chars []]
+    (if (>= j n)
+      [(apply str chars) j]
+      (let [ch (subs src j (inc j))]
+        (cond
+          (= ch "\\")
+          (if (< (inc j) n)
+            (let [escaped (subs src (inc j) (+ j 2))]
+              (recur (+ j 2) (conj chars "\\" escaped)))
+            (recur (inc j) (conj chars ch)))
+          (= ch "\"")
+          [(apply str chars) (inc j)]
+          :else
+          (recur (inc j) (conj chars ch)))))))
+
+;; Parse a duration string like "900s", "15m", "2h", "250ms", "1d" into milliseconds
+(defn parse-duration-ms [d-val]
+  (if (number? d-val)
+    d-val
+    (let [m (re-matches #"^([0-9]+)(ms|s|m|h|d)$" (str d-val))]
+      (if m
+        (let [num (parse-long (nth m 1))
+              unit (nth m 2)]
+          (case unit
+            "ms" num
+            "s" (* num 1000)
+            "m" (* num 60 1000)
+            "h" (* num 60 60 1000)
+            "d" (* num 24 60 60 1000)
+            num))
+        d-val))))
+
+;; Derive CSS-like class name from a subgraph label (Section 2.10)
+;; Lowercase, replace spaces with hyphens, strip non-alphanumerics except hyphens.
+(defn derive-class [label]
+  (if (str/blank? label)
+    ""
+    (-> label
+        str/lower-case
+        str/trim
+        (str/replace #"\s+" "-")
+        (str/replace #"[^a-z0-9-]" ""))))
+
+;; Tokenize DOT source code
+(defn tokenize-dot [src]
+  (let [n (count src)]
+    (loop [i 0
+           tokens []]
+      (if (>= i n)
+        tokens
+        (let [c (subs src i (inc i))]
+          (cond
+            ;; Whitespace
+            (re-matches #"\s" c)
+            (recur (inc i) tokens)
+
+            ;; Line comment // ...
+            (and (< (inc i) n) (= (subs src i (+ i 2)) "//"))
+            (let [nl (str/index-of src "\n" (+ i 2))
+                  next-i (if nl (inc nl) n)]
+              (recur next-i tokens))
+
+            ;; Block comment /* ... */
+            (and (< (inc i) n) (= (subs src i (+ i 2)) "/*"))
+            (let [end-pos (str/index-of src "*/" (+ i 2))
+                  next-i (if end-pos (+ end-pos 2) n)]
+              (recur next-i tokens))
+
+            ;; Arrow ->
+            (and (< (inc i) n) (= (subs src i (+ i 2)) "->"))
+            (recur (+ i 2) (conj tokens {:type :arrow :val "->"}))
+
+            ;; Quoted string "..."
+            (= c "\"")
+            (let [[raw-str next-i] (read-quoted-str src i n)]
+              (recur next-i (conj tokens {:type :string :val (unescape-string raw-str)})))
+
+            ;; Punctuation
+            (#{"{" "}" "[" "]" "=" "," ";"} c)
+            (recur (inc i) (conj tokens {:type :punct :val c}))
+
+            ;; Word / Identifier / Number / Duration / BareValue
+            :else
+            (let [rest-s (subs src i)
+                  m (re-find #"^[A-Za-z0-9_.:-]+" rest-s)]
+              (if m
+                (let [val-len (count m)]
+                  (recur (+ i val-len) (conj tokens {:type :word :val m})))
+                (recur (inc i) tokens)))))))))
+
+;; Convert raw token value to typed value
+(defn- convert-val [token]
+  (if (= (:type token) :string)
+    (:val token)
+    (let [v (:val token)]
+      (cond
+        (= v "true") true
+        (= v "false") false
+        (re-matches #"^-?[0-9]+$" v) (parse-long v)
+        (re-matches #"^-?[0-9]*\.[0-9]+$" v) (parse-double v)
+        :else v))))
+
+;; Parse an attribute block starting at token idx: [ key=val, key2=val2 ... ]
+;; Returns [attrs next-idx]
+(defn- parse-attr-block-tokens [tokens start-idx]
+  (if (or (>= start-idx (count tokens))
+          (not= (get-in tokens [start-idx :val]) "["))
+    [{} start-idx]
+    (loop [i (inc start-idx)
+           attrs {}]
+      (if (>= i (count tokens))
+        [attrs i]
+        (let [t (nth tokens i)]
+          (cond
+            (= (:val t) "]")
+            [attrs (inc i)]
+
+            (= (:val t) ",")
+            (recur (inc i) attrs)
+
+            (= (:val t) ";")
+            (recur (inc i) attrs)
+
+            ;; key = val
+            (= (:type t) :word)
+            (let [k-name (:val t)
+                  next-t (get tokens (inc i))]
+              (if (and next-t (= (:val next-t) "="))
+                (let [v-token (get tokens (+ i 2))]
+                  (if v-token
+                    (let [val (convert-val v-token)]
+                      (recur (+ i 3) (assoc attrs (keyword k-name) val)))
+                    [attrs (+ i 2)]))
+                ;; Bare key without value (e.g. flag)
+                (recur (inc i) (assoc attrs (keyword k-name) true))))
+
+            :else
+            (recur (inc i) attrs)))))))
+
+;; Helper to collect chained edge node IDs: A -> B -> C ...
+;; Returns [chain-vector next-idx]
+(defn- collect-edge-chain [tokens start-idx n first-id]
+  (loop [curr-idx (inc start-idx)
+         chain [first-id]]
+    (if (and (< curr-idx n) (= (get-in tokens [curr-idx :val]) "->"))
+      (let [target-id (get-in tokens [(inc curr-idx) :val])]
+        (recur (+ curr-idx 2) (conj chain target-id)))
+      [chain curr-idx])))
+
+;; Step function for parser state
+(defn- step-parse [tokens n state]
+  (let [idx (:idx state)
+        tok (nth tokens idx)
+        val (:val tok)]
+    (cond
+      ;; End of graph or subgraph
+      (= val "}")
+      (if (:current-subgraph state)
+        ;; Exit subgraph back to parent scope
+        (-> state
+            (update :idx inc)
+            (update :subgraphs conj (:current-subgraph state))
+            (assoc :current-subgraph nil))
+        ;; Exit graph
+        (assoc state :done? true))
+
+      (= val ";")
+      (update state :idx inc)
+
+      ;; graph [ ... ]
+      (= val "graph")
+      (let [[attrs next-idx] (parse-attr-block-tokens tokens (inc idx))]
+        (-> state
+            (assoc :idx next-idx)
+            (update :graph-attrs merge attrs)))
+
+      ;; node [ ... ]
+      (= val "node")
+      (let [[attrs next-idx] (parse-attr-block-tokens tokens (inc idx))]
+        (if (:current-subgraph state)
+          (-> state
+              (assoc :idx next-idx)
+              (update-in [:current-subgraph :scoped-node-defaults] merge attrs))
+          (-> state
+              (assoc :idx next-idx)
+              (update :node-defaults merge attrs))))
+
+      ;; edge [ ... ]
+      (= val "edge")
+      (let [[attrs next-idx] (parse-attr-block-tokens tokens (inc idx))]
+        (-> state
+            (assoc :idx next-idx)
+            (update :edge-defaults merge attrs)))
+
+      ;; subgraph [name] { ... }
+      (= val "subgraph")
+      (let [has-name? (and (< (inc idx) n) (not= (get-in tokens [(inc idx) :val]) "{"))
+            sub-name (if has-name? (get-in tokens [(inc idx) :val]) (str "subgraph_" (count (:subgraphs state))))
+            brace-idx (if has-name? (+ idx 2) (inc idx))]
+        (-> state
+            (assoc :idx (inc brace-idx))
+            (assoc :current-subgraph {:id sub-name
+                                      :scoped-node-defaults (:node-defaults state)
+                                      :label ""
+                                      :derived-class ""})))
+
+      ;; Top-level key = val statement (e.g. rankdir=LR or goal="...")
+      (and (< (+ idx 2) n)
+           (= (get-in tokens [(inc idx) :val]) "="))
+      (let [k-name val
+            v-tok (nth tokens (+ idx 2))
+            v (convert-val v-tok)
+            next-i (+ idx 3)]
+        (if (:current-subgraph state)
+          (let [updated-sub (cond-> (assoc-in (:current-subgraph state) [:attrs (keyword k-name)] v)
+                              (= k-name "label") (assoc :label v :derived-class (derive-class v)))]
+            (-> state
+                (assoc :idx next-i)
+                (assoc :current-subgraph updated-sub)))
+          (-> state
+              (assoc :idx next-i)
+              (assoc-in [:graph-attrs (keyword k-name)] v))))
+
+      ;; Node or Edge statement
+      (= (:type tok) :word)
+      (let [first-id val]
+        (if (and (< (inc idx) n) (= (get-in tokens [(inc idx) :val]) "->"))
+          ;; Edge chain
+          (let [[chain curr-idx] (collect-edge-chain tokens idx n first-id)
+                [attrs next-idx] (parse-attr-block-tokens tokens curr-idx)
+                merged-edge-attrs (merge (:edge-defaults state) attrs)
+                merged-edge-attrs (update merged-edge-attrs :weight (fn [w] (if (number? w) w 0)))
+                new-edges (map (fn [[from to]]
+                                 {:from from
+                                  :to to
+                                  :label (or (:label merged-edge-attrs) "")
+                                  :condition (or (:condition merged-edge-attrs) "")
+                                  :weight (or (:weight merged-edge-attrs) 0)
+                                  :fidelity (:fidelity merged-edge-attrs)
+                                  :thread_id (:thread_id merged-edge-attrs)
+                                  :loop_restart (boolean (:loop_restart merged-edge-attrs))
+                                  :attrs merged-edge-attrs})
+                               (partition 2 1 chain))
+                defaults (:node-defaults state)
+                registered-nodes (reduce (fn [acc-nodes nid]
+                                           (if (contains? acc-nodes nid)
+                                             acc-nodes
+                                             (assoc acc-nodes nid
+                                                    {:id nid
+                                                     :label nid
+                                                     :shape (or (:shape defaults) "box")
+                                                     :type (or (:type defaults) "")
+                                                     :prompt ""
+                                                     :max_retries (:max_retries defaults)
+                                                     :goal_gate false
+                                                     :retry_target ""
+                                                     :fallback_retry_target ""
+                                                     :fidelity (:fidelity defaults)
+                                                     :thread_id (:thread_id defaults)
+                                                     :class ""
+                                                     :attrs defaults})))
+                                         (:nodes state)
+                                         chain)]
+            (-> state
+                (assoc :idx next-idx)
+                (assoc :nodes registered-nodes)
+                (update :edges into new-edges)))
+
+          ;; Node statement
+          (let [[explicit-attrs next-idx] (parse-attr-block-tokens tokens (inc idx))
+                effective-defaults (if (:current-subgraph state)
+                                     (:scoped-node-defaults (:current-subgraph state))
+                                     (:node-defaults state))
+                sub-class (if (:current-subgraph state) (:derived-class (:current-subgraph state)) "")
+                explicit-class (or (:class explicit-attrs) "")
+                combined-class (cond
+                                 (and (not (str/blank? explicit-class)) (not (str/blank? sub-class)))
+                                 (str explicit-class "," sub-class)
+                                 (not (str/blank? explicit-class)) explicit-class
+                                 (not (str/blank? sub-class)) sub-class
+                                 :else "")
+                merged-attrs (merge effective-defaults explicit-attrs)
+                node-rec {:id first-id
+                          :label (or (:label explicit-attrs) (:label effective-defaults) first-id)
+                          :shape (or (:shape explicit-attrs) (:shape effective-defaults) "box")
+                          :type (or (:type explicit-attrs) (:type effective-defaults) "")
+                          :prompt (or (:prompt explicit-attrs) (:prompt effective-defaults) "")
+                          :max_retries (or (:max_retries explicit-attrs) (:max_retries effective-defaults))
+                          :goal_gate (boolean (or (:goal_gate explicit-attrs) (:goal_gate effective-defaults) false))
+                          :retry_target (or (:retry_target explicit-attrs) (:retry_target effective-defaults) "")
+                          :fallback_retry_target (or (:fallback_retry_target explicit-attrs) (:fallback_retry_target effective-defaults) "")
+                          :fidelity (or (:fidelity explicit-attrs) (:fidelity effective-defaults))
+                          :thread_id (or (:thread_id explicit-attrs) (:thread_id effective-defaults))
+                          :class combined-class
+                          :timeout (or (:timeout explicit-attrs) (:timeout effective-defaults))
+                          :llm_model (or (:llm_model explicit-attrs) (:llm_model effective-defaults))
+                          :llm_provider (or (:llm_provider explicit-attrs) (:llm_provider effective-defaults))
+                          ;; Keep unset distinct from the system default so a
+                          ;; stylesheet can supply this property.
+                          :reasoning_effort (or (:reasoning_effort explicit-attrs) (:reasoning_effort effective-defaults))
+                          :auto_status (boolean (or (:auto_status explicit-attrs) (:auto_status effective-defaults) false))
+                          :allow_partial (boolean (or (:allow_partial explicit-attrs) (:allow_partial effective-defaults) false))
+                          :attrs (assoc merged-attrs :class combined-class)}]
+            (-> state
+                (assoc :idx next-idx)
+                (assoc-in [:nodes first-id] node-rec)))))
+
+      :else
+      (update state :idx inc))))
+
+;; Main parser for DOT digraph
+(defn parse-dot [src]
+  (let [tokens (tokenize-dot src)
+        n (count tokens)]
+    (when (empty? tokens)
+      (throw (ex-info "Empty DOT source" {})))
+
+    (let [t0 (first tokens)]
+      (when (not= (:val t0) "digraph")
+        (throw (ex-info (str "Expected 'digraph', found: " (:val t0)) {}))))
+
+    (let [graph-id (if (> n 1) (get-in tokens [1 :val]) "G")
+          open-brace-idx (loop [i 0]
+                           (cond
+                             (>= i n) (throw (ex-info "Missing opening '{'" {}))
+                             (= (get-in tokens [i :val]) "{") i
+                             :else (recur (inc i))))
+          initial-state {:idx (inc open-brace-idx)
+                         :done? false
+                         :graph-attrs {:id graph-id
+                                       :goal ""
+                                       :label ""
+                                       :model_stylesheet ""
+                                       :default_max_retries 0
+                                       :default_fidelity ""}
+                         :node-defaults {:shape "box"}
+                         :edge-defaults {:weight 0}
+                         :nodes {}
+                         :edges []
+                         :subgraphs []
+                         :current-subgraph nil}]
+
+      (loop [state initial-state]
+        (if (or (:done? state) (>= (:idx state) n))
+          ;; Construct final graph map
+          (let [ga (:graph-attrs state)]
+            {:id graph-id
+             :goal (or (:goal ga) "")
+             :label (or (:label ga) "")
+             :model_stylesheet (or (:model_stylesheet ga) "")
+             :default_max_retries (or (:default_max_retries ga) (:default_max_retry ga) 0)
+             :default_fidelity (or (:default_fidelity ga) "")
+             :retry_target (or (:retry_target ga) "")
+             :fallback_retry_target (or (:fallback_retry_target ga) "")
+             :attrs ga
+             :nodes (:nodes state)
+             :edges (:edges state)
+             :subgraphs (:subgraphs state)})
+          (recur (step-parse tokens n state)))))))
+
+;; Graph query functions
+(defn find-node [graph node-id]
+  (get-in graph [:nodes (str node-id)]))
+
+(defn outgoing-edges [graph node-id]
+  (filter (fn [e] (= (:from e) (str node-id))) (:edges graph)))
+
+(defn incoming-edges [graph node-id]
+  (filter (fn [e] (= (:to e) (str node-id))) (:edges graph)))
+
+(defn find-start-node [graph]
+  ;; Resolves by: (1) shape=Mdiamond, (2) id="start" or "Start"
+  (or (first (filter (fn [[_ n]] (= (:shape n) "Mdiamond")) (:nodes graph)))
+      (first (filter (fn [[_ n]] (#{"start" "Start"} (:id n))) (:nodes graph)))))
+
+(defn find-exit-node [graph]
+  ;; Resolves by: (1) shape=Msquare, (2) id="exit" or "end" or "Exit" or "End"
+  (or (first (filter (fn [[_ n]] (= (:shape n) "Msquare")) (:nodes graph)))
+      (first (filter (fn [[_ n]] (#{"exit" "end" "Exit" "End" "done"} (:id n))) (:nodes graph)))))

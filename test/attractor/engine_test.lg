@@ -1,0 +1,82 @@
+(ns attractor.engine-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.parser :as p]
+            [attractor.engine :as e]
+            [attractor.handlers :as h]
+            [attractor.interviewer :as i]
+            [json :as json]
+            [io :as io]
+            [os :as os]))
+
+(deftest test-linear-pipeline-execution
+  (let [dot "
+digraph Linear {
+    start [shape=Mdiamond]
+    step1 [shape=box, prompt=\"Step 1\"]
+    exit  [shape=Msquare]
+
+    start -> step1 -> exit
+}
+"
+        g (p/parse-dot dot)
+        logs "test_engine_linear"
+        res (e/run-pipeline g {:logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "step1" "exit"] (:completed_nodes res)))
+    (is (= "success"
+           (get (json/read-json (io/slurp (str logs "/start/status.json")))
+                "outcome")))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-human-gate-selection
+  (let [dot "
+digraph Review {
+    start  [shape=Mdiamond]
+    gate   [shape=hexagon, label=\"Choose path\", type=\"wait.human\"]
+    opt_a  [shape=box, prompt=\"Option A\"]
+    opt_b  [shape=box, prompt=\"Option B\"]
+    exit   [shape=Msquare]
+
+    start -> gate
+    gate -> opt_a [label=\"[A] Option A\"]
+    gate -> opt_b [label=\"[B] Option B\"]
+    opt_a -> exit
+    opt_b -> exit
+}
+"
+        g (p/parse-dot dot)
+        queue (i/make-queue-interviewer [{:value "B" :text "Option B"}])
+        reg (h/make-handler-registry queue nil)
+        logs "test_engine_human"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "gate" "opt_b" "exit"] (:completed_nodes res)))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-goal-gate-enforcement
+  (let [dot "
+digraph Gate {
+    start [shape=Mdiamond]
+    flaky [shape=box, prompt=\"Flaky\", goal_gate=true, retry_target=\"fix\"]
+    fix   [shape=box, prompt=\"Fix\"]
+    exit  [shape=Msquare]
+
+    start -> flaky -> exit
+    fix -> flaky
+}
+"
+        g (p/parse-dot dot)
+        visits (atom 0)
+        flaky-backend (fn [node _prompt _ctx]
+                        (if (= (:id node) "flaky")
+                          (let [v (swap! visits inc)]
+                            (if (= v 1)
+                              {:status :fail :failure_reason "First attempt fails"}
+                              {:status :success}))
+                          {:status :success}))
+        reg (h/make-handler-registry (i/make-auto-approve-interviewer) flaky-backend)
+        logs "test_engine_gate"
+        res (e/run-pipeline g {:registry reg :logs-root logs})]
+    (is (= :success (:status res)))
+    (is (= ["start" "flaky" "fix" "flaky" "exit"] (:completed_nodes res)))
+    (os/sh "rm" "-rf" logs)))

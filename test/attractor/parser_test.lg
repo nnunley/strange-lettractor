@@ -1,0 +1,64 @@
+(ns attractor.parser-test
+  (:require [clojure.test :refer [deftest is testing run-tests]]
+            [attractor.parser :as p]))
+
+(deftest test-linear-dot-parsing
+  (testing "Parses a simple linear pipeline"
+    (let [dot "
+digraph Simple {
+    graph [goal=\"Test Goal\"]
+    start [shape=Mdiamond]
+    step1 [shape=box, prompt=\"Step 1\"]
+    exit  [shape=Msquare]
+
+    start -> step1 -> exit
+}
+"
+          g (p/parse-dot dot)]
+      (is (= "Test Goal" (:goal g)))
+      (is (= 3 (count (:nodes g))))
+      (is (= 2 (count (:edges g))))
+      (is (= "start" (first (p/find-start-node g))))
+      (is (= "exit" (first (p/find-exit-node g)))))))
+
+(deftest test-subgraph-inheritance
+  (testing "Inherits subgraph label and node defaults"
+    (let [dot "
+digraph Subgraphs {
+    subgraph cluster_loop {
+        label = \"Loop A\"
+        node [thread_id=\"loop-a\", timeout=\"900s\"]
+
+        Plan      [label=\"Plan step\"]
+        Implement [label=\"Implement\", timeout=\"1800s\", class=\"coder\"]
+    }
+}
+"
+          g (p/parse-dot dot)
+          plan (p/find-node g "Plan")
+          impl (p/find-node g "Implement")]
+      (is (= "loop-a" (:class plan)))
+      (is (= "loop-a" (:thread_id plan)))
+      (is (= "900s" (:timeout plan)))
+      (is (= "coder,loop-a" (:class impl)))
+      (is (= "1800s" (:timeout impl))))))
+
+(deftest test-edge-chaining
+  (testing "Expands A -> B -> C into two edges"
+    (let [dot "
+digraph Chaining {
+    start [shape=Mdiamond]
+    mid   [shape=box]
+    exit  [shape=Msquare]
+
+    start -> mid -> exit [weight=10]
+}
+"
+          g (p/parse-dot dot)]
+      (is (= 2 (count (:edges g))))
+      (let [e1 (first (p/outgoing-edges g "start"))
+            e2 (first (p/outgoing-edges g "mid"))]
+        (is (= "mid" (:to e1)))
+        (is (= 10 (:weight e1)))
+        (is (= "exit" (:to e2)))
+        (is (= 10 (:weight e2)))))))

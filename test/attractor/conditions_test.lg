@@ -1,0 +1,37 @@
+(ns attractor.conditions-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.conditions :as c]
+            [attractor.context :as ctx]))
+
+(deftest test-condition-evaluation
+  (testing "Outcome matching"
+    (let [outcome {:status :success :preferred_label "Yes"}
+          ctx {"tests_passed" "true" "count" "3"}]
+      (is (true? (c/evaluate-condition "outcome=success" outcome ctx)))
+      (is (false? (c/evaluate-condition "outcome=fail" outcome ctx)))
+      (is (true? (c/evaluate-condition "outcome!=fail" outcome ctx)))
+      (is (true? (c/evaluate-condition "preferred_label=Yes" outcome ctx)))))
+
+  (testing "Context key resolution"
+    (let [outcome {:status :success}
+          ctx {"tests_passed" "true" "count" "3"}]
+      (is (true? (c/evaluate-condition "context.tests_passed=true" outcome ctx)))
+      (is (true? (c/evaluate-condition "tests_passed=true" outcome ctx)))
+      (is (true? (c/evaluate-condition "context.count!=0" outcome ctx)))
+      (is (true? (c/evaluate-condition "context.tests_passed=true && context.count!=0" outcome ctx)))))
+
+  (testing "Empty condition"
+    (is (true? (c/evaluate-condition "" {:status :fail} {}))))
+
+  (testing "Runtime Context values"
+    (let [context (ctx/make-context {"tests_passed" "true" "count" 3})]
+      (is (true? (c/evaluate-condition "context.tests_passed=true"
+                                      {:status :success} context)))
+      (is (true? (c/evaluate-condition "count=3"
+                                      {:status :success} context)))))
+
+  (testing "Syntax validation"
+    (is (nil? (c/validate-condition-syntax "outcome=success && context.x!=1")))
+    (is (some? (c/validate-condition-syntax "outcome==success")))
+    (is (some? (c/validate-condition-syntax "x<=1")))
+    (is (some? (c/validate-condition-syntax "outcome=")))))

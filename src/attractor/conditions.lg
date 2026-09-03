@@ -1,0 +1,120 @@
+(ns attractor.conditions
+  (:require [clojure.string :as str]))
+
+;; Split string once by separator
+(defn- split-once [s sep]
+  (let [idx (str/index-of s sep)]
+    (if idx
+      [(subs s 0 idx) (subs s (+ idx (count sep)))]
+      [s ""])))
+
+;; Parse a condition literal (strips surrounding quotes if present)
+(defn parse-literal [v]
+  (let [v (str/trim (str v))]
+    (if (and (str/starts-with? v "\"") (str/ends-with? v "\"") (>= (count v) 2))
+      (subs v 1 (dec (count v)))
+      v)))
+
+;; Resolve a condition key against outcome and context
+;; outcome is a map: {:status :success :preferred_label "..."}
+;; context is a map or atom: key -> value
+(defn resolve-key [key outcome context]
+  (let [k (str/trim (str key))
+        raw-context (if (map? context) context (if (nil? context) {} @context))
+        ;; Runtime Context atoms wrap user values under :values; callers may
+        ;; also pass a plain map for lightweight evaluation.
+        ctx-vals (or (:values raw-context) raw-context)]
+    (cond
+      (= k "outcome")
+      (let [st (or (:status outcome) (get outcome "status") "")]
+        (if (keyword? st) (name st) (str st)))
+
+      (= k "preferred_label")
+      (str (or (:preferred_label outcome) (get outcome "preferred_label") ""))
+
+      (str/starts-with? k "context.")
+      (let [short-k (subs k 8)
+            v1 (or (get ctx-vals k) (get ctx-vals (keyword k)))
+            v2 (or (get ctx-vals short-k) (get ctx-vals (keyword short-k)))]
+        (str (or v1 v2 "")))
+
+      :else
+      (let [v (or (get ctx-vals k) (get ctx-vals (keyword k)))]
+        (str (or v ""))))))
+
+;; Evaluate a single clause (e.g. "outcome=success" or "context.count!=0" or "is_ready")
+(defn evaluate-clause [clause outcome context]
+  (let [c (str/trim clause)]
+    (cond
+      (str/includes? c "!=")
+      (let [[k v] (split-once c "!=")
+            resolved (resolve-key k outcome context)
+            expected (parse-literal v)]
+        (not= (str/trim resolved) (str/trim expected)))
+
+      (str/includes? c "=")
+      (let [[k v] (split-once c "=")
+            resolved (resolve-key k outcome context)
+            expected (parse-literal v)]
+        (= (str/trim resolved) (str/trim expected)))
+
+      :else
+      ;; Bare key: check if truthy (non-empty string, not "false", not "0")
+      (let [val (str/trim (resolve-key c outcome context))]
+        (and (not (str/blank? val))
+             (not= val "false")
+             (not= val "0"))))))
+
+;; Evaluate a full condition expression against an outcome and context
+(defn evaluate-condition [cond-str outcome context]
+  (if (str/blank? cond-str)
+    true
+    (let [clauses (str/split cond-str #"&&")]
+      (every? (fn [clause]
+                (let [c (str/trim clause)]
+                  (if (str/blank? c)
+                    true
+                    (evaluate-clause c outcome context))))
+              clauses))))
+
+;; Validate condition expression syntax
+;; Returns nil if valid, or an error string if invalid
+(defn validate-condition-syntax [cond-str]
+  (if (str/blank? cond-str)
+    nil
+    (let [clauses (str/split cond-str #"&&")]
+      (loop [remaining clauses]
+        (if (empty? remaining)
+          nil
+          (let [c (str/trim (first remaining))]
+            (cond
+              (str/blank? c)
+              (recur (rest remaining))
+
+              ;; Check for invalid operators like ==, <=, >=, <, >
+              (or (str/includes? c "==") (str/includes? c "<=") (str/includes? c ">=")
+                  (str/includes? c "<") (str/includes? c ">"))
+              (str "Unsupported operator in condition: '" c "'")
+
+              (str/includes? c "!=")
+              (let [[k v] (split-once c "!=")
+                    k (str/trim k)
+                    v (str/trim v)]
+                (if (or (str/blank? k) (str/blank? v))
+                  (str "Malformed clause in condition: '" c "'")
+                  (recur (rest remaining))))
+
+              (str/includes? c "=")
+              (let [[k v] (split-once c "=")
+                    k (str/trim k)
+                    v (str/trim v)]
+                (if (or (str/blank? k) (str/blank? v))
+                  (str "Malformed clause in condition: '" c "'")
+                  (recur (rest remaining))))
+
+              ;; Bare key should be valid identifier / path
+              (re-matches #"^[A-Za-z_][A-Za-z0-9_.]*$" c)
+              (recur (rest remaining))
+
+              :else
+              (str "Invalid clause in condition: '" c "'"))))))))

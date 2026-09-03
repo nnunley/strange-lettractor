@@ -1,0 +1,46 @@
+(ns attractor.stylesheet-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.stylesheet :as s]
+            [attractor.parser :as parser]
+            [attractor.transforms :as transforms]))
+
+(deftest test-stylesheet-specificity
+  (testing "Resolves properties by selector specificity"
+    (let [css "
+        * { llm_model: claude-3-5-haiku; llm_provider: anthropic; }
+        .code { llm_model: claude-3-7-sonnet; }
+        #critical { llm_model: o3-mini; llm_provider: openai; }
+    "
+          rules (s/parse-stylesheet css)
+          node-gen {:id "gen" :shape "box" :class "general"}
+          node-code {:id "worker" :shape "box" :class "code"}
+          node-crit {:id "critical" :shape "box" :class "code"}
+          node-override {:id "worker" :shape "box" :class "code" :llm_model "custom-model"}]
+
+      (let [r-gen (s/resolve-node-model-props node-gen rules {})]
+        (is (= "claude-3-5-haiku" (:llm_model r-gen)))
+        (is (= "anthropic" (:llm_provider r-gen))))
+
+      (let [r-code (s/resolve-node-model-props node-code rules {})]
+        (is (= "claude-3-7-sonnet" (:llm_model r-code)))
+        (is (= "anthropic" (:llm_provider r-code))))
+
+      (let [r-crit (s/resolve-node-model-props node-crit rules {})]
+        (is (= "o3-mini" (:llm_model r-crit)))
+        (is (= "openai" (:llm_provider r-crit))))
+
+      (let [r-over (s/resolve-node-model-props node-override rules {})]
+        (is (= "custom-model" (:llm_model r-over)))))))
+
+(deftest test-invalid-stylesheet-has-no-rules
+  (testing "Text without a selector block is rejected"
+    (is (empty? (s/parse-stylesheet "this is not a stylesheet")))
+    (is (some? (s/validate-stylesheet-syntax "this is not a stylesheet")))))
+
+(deftest test-stylesheet-can-set-reasoning-effort
+  (let [dot "digraph G {
+               graph [model_stylesheet=\"box { reasoning_effort: low; }\"]
+               task [shape=box]
+             }"
+        graph (-> (parser/parse-dot dot) transforms/apply-transforms)]
+    (is (= "low" (:reasoning_effort (parser/find-node graph "task"))))))

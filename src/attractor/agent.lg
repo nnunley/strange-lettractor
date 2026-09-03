@@ -1,0 +1,306 @@
+(ns attractor.agent
+  (:require [clojure.string :as str]
+            [os :as os]
+            [io :as io]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+;; Provider-profile tool output limits from Coding Agent Loop §5.
+(def default-tool-output-limits
+  {"read_file" 50000
+   "shell" 30000
+   "execute_command" 30000
+   "grep" 20000
+   "glob" 20000
+   "directory_list" 20000
+   "edit_file" 10000
+   "apply_patch" 10000
+   "write_file" 1000
+   "spawn_agent" 20000})
+
+(def default-tool-line-limits
+  {"shell" 256
+   "execute_command" 256
+   "grep" 200
+   "glob" 500
+   "directory_list" 500})
+
+(def head-tail-tools
+  #{"read_file" "shell" "execute_command" "spawn_agent"})
+
+(defn truncate-output [output max-chars mode]
+  (let [text (str (or output ""))
+        limit (max 0 (or max-chars (count text)))]
+    (if (<= (count text) limit)
+      text
+      (let [removed (- (count text) limit)]
+        (if (= mode "head_tail")
+          (let [head-size (quot limit 2)
+                tail-size (- limit head-size)]
+            (str (subs text 0 head-size)
+                 "\n\n[WARNING: Tool output was truncated. " removed
+                 " characters were removed from the middle. "
+                 "The full output is available in the event stream. "
+                 "If you need to see specific parts, re-run the tool with more targeted parameters.]\n\n"
+                 (subs text (- (count text) tail-size))))
+          (str "[WARNING: Tool output was truncated. First " removed
+               " characters were removed. The full output is available in the event stream.]\n\n"
+               (subs text (- (count text) limit))))))))
+
+(defn truncate-lines [output max-lines]
+  (let [text (str (or output ""))
+        lines (vec (str/split text #"\n"))
+        limit (or max-lines (count lines))]
+    (if (or (nil? max-lines) (<= (count lines) limit))
+      text
+      (let [head-count (quot limit 2)
+            tail-count (- limit head-count)
+            omitted (- (count lines) limit)]
+        (str (str/join "\n" (subvec lines 0 head-count))
+             "\n[... " omitted " lines omitted ...]\n"
+             (str/join "\n" (subvec lines (- (count lines) tail-count))))))))
+
+(defn truncate-tool-output [output tool-name config]
+  (let [configured-char-limits (or (:tool_output_limits config) {})
+        configured-line-limits (or (:tool_line_limits config) {})
+        max-chars (or (get configured-char-limits tool-name)
+                      (get default-tool-output-limits tool-name)
+                      20000)
+        max-lines (if (contains? configured-line-limits tool-name)
+                    (get configured-line-limits tool-name)
+                    (get default-tool-line-limits tool-name))
+        mode (if (contains? head-tail-tools tool-name) "head_tail" "tail")]
+    (truncate-lines (truncate-output output max-chars mode) max-lines)))
+
+;; Tool definitions
+(defn tool-read-file [path & [start-line end-line]]
+  (try
+    (let [content (io/slurp path)]
+      (if (or start-line end-line)
+        (let [lines (str/split content #"\n")
+              s (max 0 (dec (or start-line 1)))
+              e (min (count lines) (or end-line (count lines)))
+              sliced (subvec (vec lines) s e)]
+          (str/join "\n" sliced))
+        content))
+    (catch Object e
+      (str "Error reading file " path ": " e))))
+
+(defn tool-write-file [path content]
+  (try
+    (io/spit path content)
+    (str "Successfully wrote to " path)
+    (catch Object e
+      (str "Error writing file " path ": " e))))
+
+(defn tool-edit-file [path old-string new-string]
+  (try
+    (let [content (io/slurp path)]
+      (if (str/includes? content old-string)
+        (let [updated (str/replace-first content old-string new-string)]
+          (io/spit path updated)
+          (str "Successfully edited " path))
+        (str "Error: old_string not found in " path)))
+    (catch Object e
+      (str "Error editing file " path ": " e))))
+
+(defn tool-execute-command [cmd & [timeout-ms]]
+  (try
+    (let [args (str/split (str/trim cmd) #"\s+")
+          res (apply os/sh args)]
+      {:exit (:exit res)
+       :stdout (:out res)
+       :stderr (:err res)})
+    (catch Object e
+      {:exit 1 :stdout "" :stderr (str "Execution error: " e)})))
+
+(defn tool-directory-list [dir]
+  (try
+    (let [entries (os/ls (or dir "."))]
+      (str/join "\n" (map (fn [e] (str (if (:dir? e) "[DIR]  " "[FILE] ") (:name e))) entries)))
+    (catch Object e
+      (str "Error listing directory " dir ": " e))))
+
+;; Tool Dispatcher
+(defn execute-tool [tool-name args]
+  (case tool-name
+    "read_file" (tool-read-file (get args "path") (get args "start_line") (get args "end_line"))
+    "write_file" (tool-write-file (get args "path") (get args "content"))
+    "edit_file" (tool-edit-file (get args "path") (get args "old_string") (get args "new_string"))
+    "execute_command" (tool-execute-command (get args "command") (get args "timeout_ms"))
+    "directory_list" (tool-directory-list (get args "path"))
+    (str "Unknown tool: " tool-name)))
+
+;; Create an Agent Session
+(defn make-session [& [opts]]
+  (let [options (or opts {})]
+    (atom {:id (str "agent-" (System/currentTimeMillis))
+           :model (or (:model options) "mock/default")
+           :state :idle
+           :history []
+           :steering-queue []
+           :followup-queue []
+           :config (merge {:max_turns 0
+                           :max_tool_rounds_per_input 0
+                           :default_command_timeout_ms 10000
+                           :max_command_timeout_ms 600000
+                           :reasoning_effort nil
+                           :enable_loop_detection true
+                           :loop_detection_window 10}
+                          options)})))
+
+;; Inject a steering message into the session
+(defn steer-session! [session msg]
+  (swap! session update :steering-queue conj msg)
+  session)
+
+(defn follow-up-session! [session msg]
+  (swap! session update :followup-queue conj msg)
+  session)
+
+(defn- drain-steering! [session event-fn]
+  (let [queued (:steering-queue @session)]
+    (doseq [msg queued]
+      (swap! session update :history conj {:type :steering :role :user :content msg})
+      (event-fn {:type :steering_injected :content msg}))
+    (swap! session assoc :steering-queue [])))
+
+(defn- history-to-messages [history]
+  (mapv
+    (fn [turn]
+      (case (:type turn)
+        :tool_results {:role :tool :content (:results turn)}
+        :assistant (cond-> {:role :assistant :content (:content turn)}
+                     (seq (:tool_calls turn)) (assoc :tool_calls (:tool_calls turn)))
+        {:role :user :content (:content turn)}))
+    history))
+
+(def built-in-tool-names
+  #{"read_file" "write_file" "edit_file" "execute_command" "directory_list"})
+
+(def built-in-tool-definitions
+  [{:name "read_file" :description "Read a file"
+    :parameters {:type "object" :properties {:path {:type "string"}} :required ["path"]}}
+   {:name "write_file" :description "Write a complete file"
+    :parameters {:type "object"
+                 :properties {:path {:type "string"} :content {:type "string"}}
+                 :required ["path" "content"]}}
+   {:name "edit_file" :description "Replace one exact string in a file"
+    :parameters {:type "object"
+                 :properties {:path {:type "string"}
+                              :old_string {:type "string"}
+                              :new_string {:type "string"}}
+                 :required ["path" "old_string" "new_string"]}}
+   {:name "execute_command" :description "Execute a command"
+    :parameters {:type "object"
+                 :properties {:command {:type "string"} :timeout_ms {:type "integer"}}
+                 :required ["command"]}}
+   {:name "directory_list" :description "List a directory"
+    :parameters {:type "object" :properties {:path {:type "string"}}}}])
+
+(defn- normalize-tool-arguments [arguments]
+  (if (string? arguments)
+    (try
+      (json/read-json arguments)
+      (catch Object _ {}))
+    (or arguments {})))
+
+(defn- execute-single-tool [session tool-call event-fn]
+  (let [tool-name (or (:name tool-call) (get tool-call "name") "")
+        call-id (or (:id tool-call) (get tool-call "id") "")
+        args (normalize-tool-arguments
+               (or (:arguments tool-call) (get tool-call "arguments") {}))]
+    (event-fn {:type :tool_call_start :tool_name tool-name :call_id call-id})
+    (if-not (contains? built-in-tool-names tool-name)
+      (let [error-msg (str "Unknown tool: " tool-name)
+            result {:tool_call_id call-id :tool_name tool-name
+                    :content error-msg :is_error true}]
+        (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
+        result)
+      (try
+        (let [raw-output (execute-tool tool-name args)
+              raw-text (if (string? raw-output) raw-output (pr-str raw-output))
+              truncated (truncate-tool-output raw-text tool-name (:config @session))
+              result {:tool_call_id call-id :tool_name tool-name
+                      :content truncated :is_error false}]
+          (event-fn {:type :tool_call_end :call_id call-id :output raw-text})
+          result)
+        (catch Object e
+          (let [error-msg (str "Tool error (" tool-name "): " e)
+                result {:tool_call_id call-id :tool_name tool-name
+                        :content error-msg :is_error true}]
+            (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
+            result))))))
+
+(defn- response-content [response]
+  (or (get-in response [:message :content])
+      (:text response)
+      (:content response)
+      ""))
+
+(defn- response-tool-calls [response]
+  (or (:tool_calls response)
+      (get-in response [:message :tool_calls])
+      []))
+
+;; Process one user input through LLM -> tools -> LLM until natural completion.
+(defn process-input! [session prompt & [on-event]]
+  (let [event-fn (or on-event (fn [_] nil))
+        config (:config @session)
+        complete-fn (or (:complete_fn config)
+                        (fn [request] (llm/complete request)))
+        round-limit (or (:max_tool_rounds_per_input config) 0)
+        turn-limit (or (:max_turns config) 0)]
+    (swap! session assoc :state :processing)
+    (swap! session update :history conj {:type :user :role :user :content prompt})
+    (event-fn {:type :user_input :content prompt})
+    (drain-steering! session event-fn)
+    (let [result
+          (loop [round-count 0
+                 last-text ""]
+            (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
+                                                 (:history @session)))]
+              (if (or (and (> round-limit 0) (>= round-count round-limit))
+                      (and (> turn-limit 0) (>= assistant-count turn-limit)))
+                (do
+                  (event-fn {:type :turn_limit :round round-count
+                             :total_turns assistant-count})
+                  last-text)
+                (let [request {:model (:model @session)
+                               :messages (history-to-messages (:history @session))
+                               :tools built-in-tool-definitions
+                               :reasoning_effort (:reasoning_effort config)}
+                      response (complete-fn request)
+                      text (response-content response)
+                      tool-calls (response-tool-calls response)
+                      assistant-turn {:type :assistant
+                                      :role :assistant
+                                      :content text
+                                      :tool_calls tool-calls
+                                      :usage (:usage response)
+                                      :response_id (:id response)}]
+                  (swap! session update :history conj assistant-turn)
+                  (event-fn {:type :assistant_text_end :text text})
+                  (if (empty? tool-calls)
+                    text
+                    (let [results (mapv (fn [tool-call]
+                                          (execute-single-tool session tool-call event-fn))
+                                        tool-calls)]
+                      (swap! session update :history conj
+                             {:type :tool_results :role :tool :results results})
+                      (drain-steering! session event-fn)
+                      (recur (inc round-count) text)))))))]
+      (swap! session assoc :state :idle)
+      (event-fn {:type :processing_end})
+      result)))
+
+;; Compatibility name used by the Attractor codergen backend.
+(defn run-agent-turn! [session prompt & [on-event]]
+  (process-input! session prompt on-event))
+
+;; CodergenBackend implementation backed by the Coding Agent Loop
+(defn make-agent-codergen-backend [& [session-opts]]
+  (fn [node prompt ctx]
+    (let [session (make-session (merge session-opts {:model (or (:llm_model node) "default")}))
+          response (run-agent-turn! session prompt)]
+      response)))

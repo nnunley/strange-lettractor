@@ -1,0 +1,34 @@
+(ns attractor.dotenv-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [os :as os]
+            [io :as io]
+            [attractor.dotenv :as dotenv]))
+
+(deftest test-parse-dotenv-lines
+  (testing "Parses simple key-value"
+    (is (= ["FOO" "bar"] (dotenv/parse-dotenv-line "FOO=bar"))))
+
+  (testing "Strips quotes"
+    (is (= ["KEY" "quoted string"] (dotenv/parse-dotenv-line "KEY=\"quoted string\"")))
+    (is (= ["KEY" "single quoted"] (dotenv/parse-dotenv-line "KEY='single quoted'"))))
+
+  (testing "Handles export prefix"
+    (is (= ["EXPORTED_KEY" "123"] (dotenv/parse-dotenv-line "export EXPORTED_KEY=123"))))
+
+  (testing "Ignores comments and empty lines"
+    (is (nil? (dotenv/parse-dotenv-line "# this is a comment")))
+    (is (nil? (dotenv/parse-dotenv-line "   ")))
+    (is (nil? (dotenv/parse-dotenv-line ""))))
+
+  (testing "Strips inline comments on unquoted values"
+    (is (= ["HOST" "localhost"] (dotenv/parse-dotenv-line "HOST=localhost # default host")))))
+
+(deftest test-load-dotenv-file
+  (let [tmp-env ".test-tmp.env"]
+    (io/spit tmp-env "MY_TEST_KEY_1=hello\nMY_TEST_KEY_2=\"world 123\"\n")
+    (try
+      (dotenv/load-dotenv! tmp-env)
+      (is (= "hello" (os/getenv "MY_TEST_KEY_1")))
+      (is (= "world 123" (os/getenv "MY_TEST_KEY_2")))
+      (finally
+        (os/sh "rm" "-f" tmp-env)))))

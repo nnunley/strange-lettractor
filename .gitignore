@@ -1,0 +1,7 @@
+attractor_runs/
+smoke_test_run_dir/
+bin/
+.nrepl-port
+*.log
+.env
+!.env.sample

@@ -1,0 +1,189 @@
+(ns attractor.interviewer
+  (:require [clojure.string :as str]
+            [io :as io]))
+
+;; Question types
+(def question-types
+  #{:yes_no :multiple_choice :freeform :confirmation})
+
+;; Accelerator key parsing (Section 4.6)
+;; Extracts shortcut keys from edge labels:
+;; [K] Label -> K
+;; K) Label  -> K
+;; K - Label -> K
+;; First char -> K
+(defn parse-accelerator-key [label]
+  (let [l (str/trim (or label ""))]
+    (cond
+      ;; [K] Label
+      (re-find #"^\[([A-Za-z0-9])\]\s*(.*)$" l)
+      (let [[_ k _] (re-find #"^\[([A-Za-z0-9])\]\s*(.*)$" l)]
+        (str/upper-case k))
+
+      ;; K) Label
+      (re-find #"^([A-Za-z0-9])\)\s*(.*)$" l)
+      (let [[_ k _] (re-find #"^([A-Za-z0-9])\)\s*(.*)$" l)]
+        (str/upper-case k))
+
+      ;; K - Label
+      (re-find #"^([A-Za-z0-9])\s*-\s*(.*)$" l)
+      (let [[_ k _] (re-find #"^([A-Za-z0-9])\s*-\s*(.*)$" l)]
+        (str/upper-case k))
+
+      ;; First character
+      (seq l)
+      (str/upper-case (subs l 0 1))
+
+      :else "")))
+
+;; Normalize label for edge matching (strips accelerator prefixes and downcases)
+(defn normalize-label [label]
+  (if (str/blank? label)
+    ""
+    (-> label
+        str/trim
+        str/lower-case
+        (str/replace #"^\[[a-z0-9]\]\s*" "")
+        (str/replace #"^[a-z0-9]\)\s*" "")
+        (str/replace #"^[a-z0-9]\s*-\s*" ""))))
+
+;; Protocol for Interviewer
+(defprotocol IInterviewer
+  (ask [this question])
+  (ask-multiple [this questions])
+  (inform [this message stage]))
+
+;; AutoApproveInterviewer (Section 6.4)
+;; Always selects YES for binary questions and the first option for multiple choice
+(deftype AutoApproveInterviewer []
+  IInterviewer
+  (ask [_ question]
+    (cond
+      (#{:yes_no :confirmation} (:type question))
+      {:value :yes :text "yes"}
+
+      (= (:type question) :multiple_choice)
+      (let [opts (or (:options question) [])]
+        (if (seq opts)
+          (let [first-opt (first opts)]
+            {:value (:key first-opt)
+             :selected_option first-opt
+             :text (:label first-opt)})
+          {:value :skipped :text "no options available"}))
+
+      :else
+      {:value "auto-approved" :text "auto-approved"}))
+
+  (ask-multiple [this questions]
+    (vec (map (fn [q] (ask this q)) questions)))
+
+  (inform [_ _ _]
+    nil))
+
+(defn make-auto-approve-interviewer []
+  (->AutoApproveInterviewer))
+
+;; CallbackInterviewer (Section 6.4)
+;; Delegates question answering to a provided callback function (fn [question] -> Answer)
+(deftype CallbackInterviewer [callback-fn]
+  IInterviewer
+  (ask [_ question]
+    (callback-fn question))
+
+  (ask-multiple [this questions]
+    (vec (map (fn [q] (ask this q)) questions)))
+
+  (inform [_ message stage]
+    (println (str "[" stage "] " message))))
+
+(defn make-callback-interviewer [callback-fn]
+  (->CallbackInterviewer callback-fn))
+
+;; QueueInterviewer (Section 6.4)
+;; Reads answers from a pre-filled answer queue (atom wrapping a vector)
+(deftype QueueInterviewer [answers-atom]
+  IInterviewer
+  (ask [_ question]
+    (let [ans (first @answers-atom)]
+      (if ans
+        (do
+          (swap! answers-atom (fn [q] (subvec q 1)))
+          (if (map? ans) ans {:value ans :text (str ans)}))
+        (or (:default question) {:value :skipped :text "queue exhausted"}))))
+
+  (ask-multiple [this questions]
+    (vec (map (fn [q] (ask this q)) questions)))
+
+  (inform [_ _ _]
+    nil))
+
+(defn make-queue-interviewer [answers]
+  (->QueueInterviewer (atom (vec answers))))
+
+;; RecordingInterviewer (Section 6.4)
+;; Wraps an inner interviewer and records all (question, answer) pairs into an atom
+(deftype RecordingInterviewer [inner-interviewer recordings-atom]
+  IInterviewer
+  (ask [_ question]
+    (let [answer (ask inner-interviewer question)]
+      (swap! recordings-atom conj {:question question :answer answer})
+      answer))
+
+  (ask-multiple [this questions]
+    (vec (map (fn [q] (ask this q)) questions)))
+
+  (inform [_ message stage]
+    (inform inner-interviewer message stage)))
+
+(defn make-recording-interviewer [inner-interviewer]
+  (let [recs (atom [])]
+    {:interviewer (->RecordingInterviewer inner-interviewer recs)
+     :recordings recs}))
+
+;; ConsoleInterviewer (Section 6.4)
+(deftype ConsoleInterviewer []
+  IInterviewer
+  (ask [_ question]
+    (println (str "\n[?] " (:text question)))
+    (cond
+      (= (:type question) :multiple_choice)
+      (do
+        (doseq [opt (:options question)]
+          (println (str "  [" (:key opt) "] " (:label opt))))
+        (print "Select option: ")
+        (io/flush)
+        (let [line (str/trim (or (read-line) ""))
+              choice (first (filter (fn [o] (or (= (str/lower-case (:key o)) (str/lower-case line))
+                                                (= (str/lower-case (:label o)) (str/lower-case line))))
+                                    (:options question)))]
+          (if choice
+            {:value (:key choice) :selected_option choice :text (:label choice)}
+            (if (seq (:options question))
+              (let [first-opt (first (:options question))]
+                {:value (:key first-opt) :selected_option first-opt :text (:label first-opt)})
+              {:value :skipped :text line}))))
+
+      (#{:yes_no :confirmation} (:type question))
+      (do
+        (print "[Y/N]: ")
+        (io/flush)
+        (let [line (str/lower-case (str/trim (or (read-line) "")))]
+          (if (or (= line "y") (= line "yes"))
+            {:value :yes :text "yes"}
+            {:value :no :text "no"})))
+
+      :else
+      (do
+        (print "> ")
+        (io/flush)
+        (let [line (str/trim (or (read-line) ""))]
+          {:value line :text line}))))
+
+  (ask-multiple [this questions]
+    (vec (map (fn [q] (ask this q)) questions)))
+
+  (inform [_ message stage]
+    (println (str "[" stage "] " message))))
+
+(defn make-console-interviewer []
+  (->ConsoleInterviewer))

@@ -1,0 +1,93 @@
+(ns attractor.smoke-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [os :as os]
+            [io :as io]
+            [json :as json]
+            [attractor.parser :as p]
+            [attractor.validation :as v]
+            [attractor.transforms :as t]
+            [attractor.engine :as e]
+            [attractor.handlers :as h]
+            [attractor.interviewer :as i]
+            [attractor.context :as ctx]))
+
+;; Section 11.13 Integration Smoke Test
+(deftest test-integration-smoke
+  (let [dot "
+digraph test_pipeline {
+    graph [goal=\"Create a hello world Python script\"]
+
+    start       [shape=Mdiamond]
+    plan        [shape=box, prompt=\"Plan how to create a hello world script for: $goal\"]
+    implement   [shape=box, prompt=\"Write the code based on the plan\", goal_gate=true]
+    review      [shape=box, prompt=\"Review the code for correctness\"]
+    done        [shape=Msquare]
+
+    start -> plan
+    plan -> implement
+    implement -> review [condition=\"outcome=success\"]
+    implement -> plan   [condition=\"outcome=fail\", label=\"Retry\"]
+    review -> done      [condition=\"outcome=success\"]
+    review -> implement [condition=\"outcome=fail\", label=\"Fix\"]
+}
+"
+        logs-root "smoke_test_run_dir"]
+
+    ;; 1. Parse
+    (let [graph (-> (p/parse-dot dot) t/apply-transforms)]
+      (is (= "Create a hello world Python script" (:goal graph)))
+      (is (= 5 (count (:nodes graph))))
+      (is (= 6 (count (:edges graph))))
+      (is (= "Plan how to create a hello world script for: Create a hello world Python script"
+             (:prompt (p/find-node graph "plan"))))
+
+      ;; 2. Validate
+      (let [diags (v/validate graph)]
+        (is (empty? (filter (fn [d] (= (:severity d) :error)) diags))))
+
+      ;; 3. Execute with simulated LLM callback
+      (let [mock-llm-backend
+            (fn [node prompt ctx]
+              (let [nid (:id node)]
+                (case nid
+                  "plan"
+                  "1. Create hello.py\n2. Add print('hello world')\n3. Execute python3 hello.py"
+
+                  "implement"
+                  "print('hello world')"
+
+                  "review"
+                  "Code is valid and conforms to requirements"
+
+                  (str "Processed " nid))))
+
+            reg (h/make-handler-registry (i/make-auto-approve-interviewer) mock-llm-backend)
+            context (ctx/make-context)
+            outcome (e/run-pipeline graph {:context context
+                                           :logs-root logs-root
+                                           :registry reg})]
+
+        ;; 4. Verify outcome and completion
+        (is (= :success (:status outcome)))
+        (is (some #{"implement"} (:completed_nodes outcome)))
+
+        ;; Verify stage artifacts
+        (doseq [stage ["plan" "implement" "review"]]
+          (let [stage-dir (str logs-root "/" stage)]
+            (is (some? (os/stat (str stage-dir "/prompt.md"))))
+            (is (some? (os/stat (str stage-dir "/response.md"))))
+            (is (some? (os/stat (str stage-dir "/status.json"))))
+            (let [status-data (json/read-json (io/slurp (str stage-dir "/status.json")))]
+              (is (= "success" (get status-data "outcome"))))))
+
+        ;; 5. Verify checkpoint
+        (let [checkpoint (ctx/load-checkpoint (str logs-root "/checkpoint.edn"))]
+          (is (= "done" (:current_node checkpoint)))
+          (let [completed (set (:completed_nodes checkpoint))]
+            (is (contains? completed "plan"))
+            (is (contains? completed "implement"))
+            (is (contains? completed "review"))
+            (is (contains? completed "done"))))))
+
+    (os/sh "rm" "-rf" logs-root)))

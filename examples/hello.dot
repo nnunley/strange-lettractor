@@ -1,0 +1,14 @@
+digraph HelloPipeline {
+    graph [
+        goal="Demonstrate Attractor workflow orchestration in let-go",
+        model_stylesheet="* { llm_model: claude-3-7-sonnet; llm_provider: anthropic; }"
+    ]
+
+    start     [shape=Mdiamond, label="Start"]
+    plan      [shape=box, label="Plan", prompt="Plan the workflow for: $goal"]
+    implement [shape=box, label="Implement", prompt="Implement the workflow for: $goal", goal_gate=true, retry_target="plan"]
+    verify    [shape=box, label="Verify", prompt="Verify implementation of: $goal"]
+    exit      [shape=Msquare, label="Exit"]
+
+    start -> plan -> implement -> verify -> exit
+}

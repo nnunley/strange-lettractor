@@ -1,0 +1,1166 @@
+(ns attractor.llm
+  (:require [clojure.string :as str]
+            [json :as json]
+            [os :as os]
+            [io :as io]
+            [http :as http]))
+
+;; Resolve base URL for a given provider
+(defn resolve-base-url [provider & [custom-base]]
+  (let [p (str/lower-case (or provider "openai"))]
+    (cond
+      (not (str/blank? custom-base))
+      (let [b (str/trim custom-base)]
+        (if (str/ends-with? b "/") (subs b 0 (dec (count b))) b))
+
+      (= p "ollama")
+      (let [u (os/getenv "OLLAMA_BASE_URL")]
+        (if-not (str/blank? u)
+          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
+          "https://ollama.com/v1"))
+
+      (= p "anthropic")
+      (let [u (os/getenv "ANTHROPIC_BASE_URL")]
+        (if-not (str/blank? u)
+          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
+          "https://api.anthropic.com/v1"))
+
+      (= p "gemini")
+      (let [u (os/getenv "GEMINI_BASE_URL")]
+        (if-not (str/blank? u)
+          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
+          "https://generativelanguage.googleapis.com/v1beta"))
+
+      :else
+      (let [u (os/getenv "OPENAI_BASE_URL")]
+        (if-not (str/blank? u)
+          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
+          "https://api.openai.com/v1")))))
+
+;; Resolve API key for a given provider
+(defn resolve-api-key [provider & [custom-key]]
+  (let [p (str/lower-case (or provider "openai"))]
+    (or (when-not (str/blank? custom-key) custom-key)
+        (case p
+          "ollama" (or (let [k (os/getenv "OLLAMA_API_KEY")] (when-not (str/blank? k) k))
+                       (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
+                       "ollama")
+          "anthropic" (let [k (os/getenv "ANTHROPIC_API_KEY")] (when-not (str/blank? k) k))
+          "gemini" (let [k (os/getenv "GEMINI_API_KEY")] (when-not (str/blank? k) k))
+          "openai" (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
+          nil))))
+
+;; Cache for discovered provider models
+(defonce provider-models-cache (atom {}))
+
+;; Query models list from provider API (GET /v1/models)
+(defn fetch-models [provider & [opts]]
+  (let [p (str/lower-case (or provider "openai"))
+        base (resolve-base-url p (:base_url opts))
+        key (resolve-api-key p (:api_key opts))
+        url (str base "/models")
+        headers (case p
+                  "anthropic" (cond-> {"anthropic-version" "2023-06-01"}
+                                (seq key) (assoc "x-api-key" key))
+                  ;; openai and ollama
+                  (cond-> {"Content-Type" "application/json"}
+                    (seq key) (assoc "Authorization" (str "Bearer " key))))]
+    (try
+      (let [resp (http/request {:method :get :url url :headers headers})
+            status (:status resp)
+            body-str (str (:body resp))]
+        (if (= status 200)
+          (let [body-map (json/read-json body-str)
+                data (or (get body-map "data") (get body-map "models") [])
+                models (mapv (fn [m]
+                               (if (map? m)
+                                 (or (get m "id") (get m "name") (str m))
+                                 (str m)))
+                             data)]
+            (swap! provider-models-cache assoc p models)
+            models)
+          (do
+            (println (str "Failed to fetch models from " p " (" url "): HTTP " status))
+            [])))
+      (catch Object e
+        (println (str "Error querying models from " p " (" url "): " e))
+        []))))
+
+;; List models with local caching
+(defn list-models [provider & [opts]]
+  (let [p (str/lower-case (or provider "openai"))
+        cached (get @provider-models-cache p)]
+    (if (and cached (not (:refresh opts)))
+      cached
+      (fetch-models p opts))))
+
+;; Detect provider for a model by querying active provider endpoints
+(defn detect-provider [model]
+  (let [m (str (or model ""))]
+    (cond
+      (str/blank? m) "mock"
+
+      ;; Check known provider model lists if available
+      (some #{m} (get @provider-models-cache "ollama" []))
+      "ollama"
+
+      (some #{m} (get @provider-models-cache "openai" []))
+      "openai"
+
+      (some #{m} (get @provider-models-cache "anthropic" []))
+      "anthropic"
+
+      ;; Fallback heuristics when offline or uncached
+      (or (str/starts-with? m "gpt-") (str/starts-with? m "o1") (str/starts-with? m "o3"))
+      "openai"
+
+      (str/starts-with? m "claude-")
+      "anthropic"
+
+      (str/starts-with? m "gemini-")
+      "gemini"
+
+      (or (not (str/blank? (os/getenv "OLLAMA_API_KEY")))
+          (not (str/blank? (os/getenv "OLLAMA_BASE_URL"))))
+      "ollama"
+
+      :else
+      "mock")))
+
+;; Split string once by separator
+(defn- split-once [s sep]
+  (let [idx (str/index-of s sep)]
+    (if idx
+      [(subs s 0 idx) (subs s (+ idx (count sep)))]
+      [s ""])))
+
+;; Parse LiteLLM-style provider/model convention
+;; e.g. "ollama/qwen3.5:397b" -> {:provider "ollama" :model "qwen3.5:397b"}
+;;      "anthropic/claude-3-7-sonnet" -> {:provider "anthropic" :model "claude-3-7-sonnet"}
+;;      "openai/gpt-4o" -> {:provider "openai" :model "gpt-4o"}
+;;      "gpt-4o" -> {:provider "openai" :model "gpt-4o"}
+(defn parse-model-spec [model-str & [explicit-provider]]
+  (let [s (str (or model-str ""))]
+    (if (and (str/includes? s "/") (not (str/starts-with? s "/")))
+      (let [[provider-prefix actual-model] (split-once s "/")]
+        {:provider (str/lower-case (str/trim provider-prefix))
+         :model (str/trim actual-model)})
+      {:provider (or explicit-provider (detect-provider s))
+       :model s})))
+
+;; Unified request construction
+(defn make-request [model messages & [opts]]
+  (let [parsed (parse-model-spec model (:provider opts))
+        resolved-provider (or (:provider opts) (:provider parsed))
+        resolved-model (:model parsed)]
+    (merge (or opts {})
+           {:provider resolved-provider
+            :model resolved-model
+            :messages messages
+            :tools (or (:tools opts) [])})))
+
+;; Mock Provider for reproducible offline execution & testing
+(defn mock-complete [request & [mock-handler]]
+  (if mock-handler
+    (mock-handler request)
+    (let [last-msg (last (:messages request))
+          text (if (map? last-msg)
+                 (or (:content last-msg) "")
+                 (str last-msg))]
+      {:id (str "mock-" (System/currentTimeMillis))
+       :model (:model request)
+       :provider "mock"
+       :message {:role :assistant
+                 :content (str "[Mock LLM (" (:model request) ")]: Response to: " (subs text 0 (min (count text) 100)))}
+       :usage {:input_tokens 50 :output_tokens 50 :total_tokens 100}
+       :finish_reason :stop})))
+
+;; Resolve and normalize OpenAI API endpoint URL
+(defn resolve-openai-url [base-url]
+  (let [env-url (let [u (os/getenv "OPENAI_BASE_URL")] (when-not (str/blank? u) u))
+        b (str/trim (or (when-not (str/blank? base-url) base-url) env-url "https://api.openai.com/v1"))]
+    (cond
+      (str/ends-with? b "/responses") b
+      (str/ends-with? b "/") (str b "responses")
+      :else (str b "/responses"))))
+
+(defn resolve-openai-compatible-url [base-url & [provider]]
+  (let [b (resolve-base-url (or provider "ollama") base-url)]
+    (cond
+      (str/ends-with? b "/chat/completions") b
+      (str/ends-with? b "/") (str b "chat/completions")
+      :else (str b "/chat/completions"))))
+
+;; Resolve and normalize Anthropic API endpoint URL
+(defn resolve-anthropic-url [base-url]
+  (let [env-url (let [u (os/getenv "ANTHROPIC_BASE_URL")] (when-not (str/blank? u) u))
+        b (str/trim (or (when-not (str/blank? base-url) base-url) env-url "https://api.anthropic.com/v1"))]
+    (cond
+      (str/ends-with? b "/messages") b
+      (str/ends-with? b "/") (str b "messages")
+      :else (str b "/messages"))))
+
+(defn resolve-gemini-url [base-url model]
+  (let [base (resolve-base-url "gemini" base-url)
+        clean-model (if (str/starts-with? (str model) "models/")
+                      (subs (str model) 7)
+                      (str model))]
+    (str base "/models/" clean-model ":generateContent")))
+
+;; OpenAI Adapter
+(defn normalize-openai-tool-calls [tool-calls]
+  (mapv
+    (fn [tool-call]
+      (let [function-data (or (get tool-call "function") tool-call)
+            raw-arguments (or (get function-data "arguments") "{}")
+            arguments (if (string? raw-arguments)
+                        (try (json/read-json raw-arguments)
+                             (catch Object _ {}))
+                        raw-arguments)]
+        {:id (or (get tool-call "call_id") (get tool-call "id") "")
+         :name (or (get function-data "name") "")
+         :arguments arguments}))
+    (or tool-calls [])))
+
+(defn normalize-anthropic-tool-calls [content-blocks]
+  (mapv (fn [block]
+          {:id (or (get block "id") "")
+           :name (or (get block "name") "")
+           :arguments (or (get block "input") {})})
+        (filter (fn [block] (= (get block "type") "tool_use"))
+                (or content-blocks []))))
+
+(defn- finish-reason [provider-reason]
+  (case (str/lower-case (str (or provider-reason "")))
+    ("stop" "end_turn" "stop_sequence") :stop
+    ("max_tokens" "max_tokens_reached") :length
+    ("tool_use" "tool_calls") :tool_calls
+    ("safety" "content_filter") :content_filter
+    :other))
+
+(defn- request-api-key [request positional-key env-name]
+  (if (contains? request :api_key)
+    (:api_key request)
+    (or positional-key (os/getenv env-name) "")))
+
+(defn- require-api-key! [provider key]
+  (when (str/blank? key)
+    (throw (ex-info (str "Missing API key for provider: " provider)
+                    {:provider provider :category :configuration})))
+  key)
+
+(defn- anthropic-message [message]
+  (let [role (:role message)
+        content (:content message)
+        tool-calls (:tool_calls message)]
+    (cond
+      (= role :tool)
+      {:role "user"
+       :content (mapv (fn [result]
+                        {:type "tool_result"
+                         :tool_use_id (:tool_call_id result)
+                         :content (str (:content result))
+                         :is_error (boolean (:is_error result))})
+                      content)}
+
+      (= role :assistant)
+      {:role "assistant"
+       :content (vec
+                  (concat
+                    (when-not (str/blank? (str content))
+                      [{:type "text" :text (str content)}])
+                    (map (fn [call]
+                           {:type "tool_use"
+                            :id (:id call)
+                            :name (:name call)
+                            :input (:arguments call)})
+                         (or tool-calls []))))}
+
+      :else
+      {:role "user" :content (str content)})))
+
+(defn- json-safe [value]
+  (cond
+    (map? value)
+    (into {} (map (fn [[k v]]
+                    [(keyword (if (keyword? k) (name k) (str k)))
+                     (json-safe v)])
+                  value))
+    (vector? value) (mapv json-safe value)
+    (seq? value) (mapv json-safe value)
+    :else value))
+
+(defn- provider-options [request provider]
+  (let [options (or (:provider_options request) {})]
+    (or (get options (keyword provider))
+        (get options provider)
+        {})))
+
+(defn- field [m k]
+  (or (get m k) (get m (name k))))
+
+(defn- structured-schema [request]
+  (let [format (:response_format request)]
+    (when (= (field format :type) "json_schema")
+      (field format :json_schema))))
+
+(defn- openai-format [request]
+  (let [format (:response_format request)
+        format-type (field format :type)]
+    (case format-type
+      "json_schema"
+      {:text {:format {:type "json_schema"
+                       :name (or (field format :name) "response")
+                       :schema (field format :json_schema)
+                       :strict (boolean (field format :strict))}}}
+      "json" {:text {:format {:type "json_object"}}}
+      {})))
+
+(defn- schema-instruction [request]
+  (when-let [schema (structured-schema request)]
+    (str "Return only valid JSON matching this JSON Schema: "
+         (json/write-json (json-safe schema)))))
+
+(defn- gemini-generation-config [request]
+  (let [format (:response_format request)
+        format-type (field format :type)]
+    (cond-> {}
+      (or (= format-type "json") (= format-type "json_schema"))
+      (assoc :responseMimeType "application/json")
+      (= format-type "json_schema")
+      (assoc :responseSchema (field format :json_schema)))))
+
+(defn- openai-input-items [messages]
+  (vec
+    (mapcat
+      (fn [message]
+        (let [role (:role message)
+              content (:content message)]
+          (cond
+            (or (= role :system) (= role :developer)) []
+
+            (= role :tool)
+            (map (fn [result]
+                   {:type "function_call_output"
+                    :call_id (:tool_call_id result)
+                    :output (str (:content result))})
+                 content)
+
+            (= role :assistant)
+            (concat
+              (when-not (str/blank? (str content))
+                [{:type "message" :role "assistant"
+                  :content [{:type "output_text" :text (str content)}]}])
+              (map (fn [call]
+                     {:type "function_call"
+                      :call_id (:id call)
+                      :name (:name call)
+                      :arguments (json/write-json (json-safe (:arguments call)))})
+                   (or (:tool_calls message) [])))
+
+            :else
+            [{:type "message" :role "user"
+              :content [{:type "input_text" :text (str content)}]}])))
+      messages)))
+
+(defn- openai-output-text [output]
+  (str/join ""
+            (mapcat
+              (fn [item]
+                (map (fn [part]
+                       (if (= (get part "type") "output_text")
+                         (or (get part "text") "")
+                         ""))
+                     (or (get item "content") [])))
+              (filter (fn [item] (= (get item "type") "message"))
+                      (or output [])))))
+
+(defn- openai-compatible-messages [messages]
+  (vec
+    (mapcat
+      (fn [message]
+        (let [role (:role message)
+              content (:content message)]
+          (if (= role :tool)
+            (map (fn [result]
+                   {:role "tool"
+                    :tool_call_id (:tool_call_id result)
+                    :content (str (:content result))})
+                 content)
+            [(cond-> {:role (name role) :content (str content)}
+               (seq (:tool_calls message))
+               (assoc :tool_calls
+                      (mapv (fn [call]
+                              {:id (:id call)
+                               :type "function"
+                               :function
+                               {:name (:name call)
+                                :arguments
+                                (json/write-json (json-safe (:arguments call)))}})
+                            (:tool_calls message))))])))
+      messages)))
+
+(defn openai-compatible-complete [request & [api-key base-url]]
+  (let [provider (or (:provider request) "openai-compatible")
+        key (if (contains? request :api_key)
+              (:api_key request)
+              (resolve-api-key provider api-key))
+        url (resolve-openai-compatible-url (or base-url (:base_url request)) provider)
+        tools (mapv (fn [tool]
+                      {:type "function"
+                       :function {:name (:name tool)
+                                  :description (:description tool)
+                                  :parameters (:parameters tool)}})
+                    (or (:tools request) []))
+        payload (cond-> {:model (:model request)
+                         :messages (openai-compatible-messages (:messages request))}
+                  (seq tools) (assoc :tools tools)
+                  (:temperature request) (assoc :temperature (:temperature request))
+                  (:max_tokens request) (assoc :max_tokens (:max_tokens request)))
+        headers (cond-> {"Content-Type" "application/json"}
+                  (not (str/blank? key))
+                  (assoc "Authorization" (str "Bearer " key)))
+        transport (or (:transport request) http/request)
+        resp (transport {:method :post :url url :headers headers
+                         :body (json/write-json payload)})
+        status (:status resp)
+        body-str (str (:body resp))]
+    (if (and (number? status) (not= status 200))
+      (throw (ex-info (str "OpenAI-compatible API HTTP " status ": " body-str)
+                      {:provider provider :status status
+                       :retryable (or (= status 429) (>= status 500))
+                       :body body-str}))
+      (let [body (json/read-json body-str)
+            choice (first (get body "choices"))
+            message (or (get choice "message") {})
+            usage (or (get body "usage") {})]
+        {:id (get body "id")
+         :model (or (get body "model") (:model request))
+         :provider provider
+         :message {:role :assistant :content (or (get message "content") "")}
+         :tool_calls (normalize-openai-tool-calls (get message "tool_calls"))
+         :usage {:input_tokens (or (get usage "prompt_tokens") 0)
+                 :output_tokens (or (get usage "completion_tokens") 0)
+                 :total_tokens (or (get usage "total_tokens") 0)}
+         :finish_reason (finish-reason (get choice "finish_reason"))
+         :raw body}))))
+
+(defn- openai-request-data [request api-key base-url]
+  (let [key (request-api-key request api-key "OPENAI_API_KEY")
+        url (resolve-openai-url (or base-url (:base_url request)))
+        messages (or (:messages request) [])
+        instructions (str/join "\n\n"
+                               (map (fn [m] (str (:content m)))
+                                    (filter (fn [m]
+                                              (or (= (:role m) :system)
+                                                  (= (:role m) :developer)))
+                                            messages)))
+        openai-tools (mapv (fn [tool]
+                             {:type "function"
+                              :name (:name tool)
+                              :description (:description tool)
+                              :parameters (:parameters tool)
+                              :strict true})
+                           (or (:tools request) []))
+        payload (merge
+                  (cond-> {:model (:model request)
+                           :input (openai-input-items messages)
+                           :store false}
+                    (not (str/blank? instructions)) (assoc :instructions instructions)
+                    (seq openai-tools) (assoc :tools openai-tools)
+                    (:max_tokens request) (assoc :max_output_tokens (:max_tokens request))
+                    (not (str/blank? (:reasoning_effort request)))
+                    (assoc :reasoning {:effort (:reasoning_effort request)}))
+                  (openai-format request)
+                  (provider-options request "openai"))
+        headers {"Authorization" (str "Bearer " key)
+                 "Content-Type" "application/json"}]
+    (require-api-key! "openai" key)
+    {:url url :headers headers :payload payload}))
+
+(defn- normalize-openai-response [request body]
+  (let [output (or (get body "output") [])
+        call-items (filter (fn [item] (= (get item "type") "function_call"))
+                           output)
+        tool-calls (normalize-openai-tool-calls call-items)
+        usage (or (get body "usage") {})
+        input-details (or (get usage "input_tokens_details") {})
+        output-details (or (get usage "output_tokens_details") {})]
+    {:id (get body "id")
+     :model (or (get body "model") (:model request))
+     :provider "openai"
+     :message {:role :assistant :content (openai-output-text output)}
+     :tool_calls tool-calls
+     :usage {:input_tokens (or (get usage "input_tokens") 0)
+             :output_tokens (or (get usage "output_tokens") 0)
+             :reasoning_tokens (or (get output-details "reasoning_tokens") 0)
+             :cache_read_tokens (or (get input-details "cached_tokens") 0)
+             :total_tokens (or (get usage "total_tokens") 0)}
+     :finish_reason (if (seq tool-calls)
+                      :tool_calls
+                      (if (= (get body "status") "completed") :stop :length))
+     :raw body}))
+
+(defn openai-complete [request & [api-key base-url]]
+  (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
+        transport (or (:transport request) http/request)
+        resp (transport {:method :post :url url :headers headers
+                         :body (json/write-json (json-safe payload))})
+        status (:status resp)
+        body-str (str (:body resp))]
+    (if (and (number? status) (not= status 200))
+      (throw (ex-info (str "OpenAI API HTTP " status ": " body-str)
+                      {:provider "openai" :status status
+                       :retryable (or (= status 429) (>= status 500))
+                       :body body-str}))
+      (normalize-openai-response request (json/read-json body-str)))))
+
+;; Anthropic Adapter
+(defn- anthropic-request-data [request api-key base-url]
+  (let [key (request-api-key request api-key "ANTHROPIC_API_KEY")
+        url (resolve-anthropic-url (or base-url (:base_url request)))
+        system-messages (filter (fn [m]
+                                  (or (= (:role m) :system)
+                                      (= (:role m) :developer)))
+                                (:messages request))
+        schema-prompt (schema-instruction request)
+        system-text (str/join "\n\n"
+                              (filter (fn [text] (not (str/blank? (str text))))
+                                      (concat (map :content system-messages)
+                                              [schema-prompt])))
+        non-system (remove (fn [m]
+                             (or (= (:role m) :system)
+                                 (= (:role m) :developer)))
+                           (:messages request))
+        msgs (map anthropic-message non-system)
+        anthropic-tools (mapv (fn [tool]
+                                {:name (:name tool)
+                                 :description (:description tool)
+                                 :input_schema (:parameters tool)})
+                              (or (:tools request) []))
+        options (provider-options request "anthropic")
+        beta-headers (or (:beta_headers options) (get options "beta_headers") [])
+        body-options (dissoc (dissoc options :beta_headers) "beta_headers")
+        payload (merge
+                  (cond-> {:model (:model request)
+                           :messages msgs
+                           :max_tokens (or (:max_tokens request) 4096)}
+                    (not (str/blank? system-text)) (assoc :system system-text)
+                    (seq anthropic-tools) (assoc :tools anthropic-tools))
+                  body-options)
+        headers (cond-> {"x-api-key" key
+                         "anthropic-version" "2023-06-01"
+                         "Content-Type" "application/json"}
+                  (seq beta-headers)
+                  (assoc "anthropic-beta" (str/join "," beta-headers)))]
+    (require-api-key! "anthropic" key)
+    {:url url :headers headers :payload payload}))
+
+(defn- anthropic-usage [usage]
+  (let [input (or (get usage "input_tokens") 0)
+        output (or (get usage "output_tokens") 0)]
+    {:input_tokens input
+     :output_tokens output
+     :cache_read_tokens (or (get usage "cache_read_input_tokens") 0)
+     :cache_write_tokens (or (get usage "cache_creation_input_tokens") 0)
+     :total_tokens (+ input output)}))
+
+(defn- normalize-anthropic-response [request body-map]
+  (let [content-blocks (or (get body-map "content") [])
+        text (str/join ""
+                       (map (fn [block]
+                              (if (= (get block "type") "text")
+                                (or (get block "text") "")
+                                ""))
+                            content-blocks))
+        tool-calls (normalize-anthropic-tool-calls content-blocks)
+        usage (anthropic-usage (or (get body-map "usage") {}))]
+    {:id (get body-map "id")
+     :model (or (get body-map "model") (:model request))
+     :provider "anthropic"
+     :message {:role :assistant :content text :parts content-blocks}
+     :tool_calls tool-calls
+     :usage usage
+     :finish_reason (if (seq tool-calls)
+                      :tool_calls
+                      (finish-reason (get body-map "stop_reason")))
+     :raw body-map}))
+
+(defn anthropic-complete [request & [api-key base-url]]
+  (let [{:keys [url headers payload]}
+        (anthropic-request-data request api-key base-url)]
+    (try
+        (let [transport (or (:transport request) http/request)
+              resp (transport {:method :post
+                               :url url
+                               :headers headers
+                               :body (json/write-json (json-safe payload))})
+              status (:status resp)
+              body-str (str (:body resp))]
+          (if (and (number? status) (not= status 200))
+            (throw (ex-info (str "Anthropic API HTTP " status ": " body-str)
+                            {:provider "anthropic" :status status
+                             :retryable (or (= status 429) (>= status 500))
+                             :body body-str}))
+            (normalize-anthropic-response request (json/read-json body-str))))
+        (catch Object e (throw e)))))
+
+;; Gemini native generateContent adapter.
+(defn- gemini-message [message]
+  (let [role (:role message)
+        content (:content message)
+        tool-calls (:tool_calls message)]
+    (cond
+      (= role :tool)
+      {:role "user"
+       :parts (mapv (fn [result]
+                      {:functionResponse
+                       {:id (:tool_call_id result)
+                        :name (:tool_name result)
+                        :response (if (:is_error result)
+                                    {:error (:content result)}
+                                    {:output (:content result)})}})
+                    content)}
+
+      (= role :assistant)
+      {:role "model"
+       :parts (vec
+                (concat
+                  (when-not (str/blank? (str content)) [{:text (str content)}])
+                  (map (fn [call]
+                         {:functionCall {:id (:id call)
+                                         :name (:name call)
+                                         :args (:arguments call)}})
+                       (or tool-calls []))))}
+
+      :else {:role "user" :parts [{:text (str content)}]})))
+
+(defn normalize-gemini-tool-calls [parts]
+  (mapv (fn [part]
+          (let [call (get part "functionCall")]
+            {:id (or (get call "id") (str "call_" (random-uuid)))
+             :name (or (get call "name") "")
+             :arguments (or (get call "args") {})}))
+        (filter (fn [part] (some? (get part "functionCall"))) (or parts []))))
+
+(defn- gemini-request-data [request api-key base-url]
+  (let [key (request-api-key request api-key "GEMINI_API_KEY")
+        url (resolve-gemini-url (or base-url (:base_url request)) (:model request))
+        system-messages (filter (fn [m]
+                                  (or (= (:role m) :system)
+                                      (= (:role m) :developer)))
+                                (:messages request))
+        system-text (str/join "\n\n" (map (fn [m] (str (:content m))) system-messages))
+        contents (mapv gemini-message
+                       (remove (fn [m]
+                                 (or (= (:role m) :system)
+                                     (= (:role m) :developer)))
+                               (:messages request)))
+        tools (or (:tools request) [])
+        generation-config (gemini-generation-config request)
+        payload (merge
+                  (cond-> {:contents contents}
+                    (not (str/blank? system-text))
+                    (assoc :systemInstruction {:parts [{:text system-text}]})
+                    (seq tools) (assoc :tools
+                                       [{:functionDeclarations
+                                         (mapv (fn [tool]
+                                                 {:name (:name tool)
+                                                  :description (:description tool)
+                                                  :parameters (:parameters tool)})
+                                               tools)}])
+                    (seq generation-config) (assoc :generationConfig generation-config))
+                  (provider-options request "gemini"))
+        headers {"x-goog-api-key" key "Content-Type" "application/json"}]
+    (require-api-key! "gemini" key)
+    {:url url :headers headers :payload payload}))
+
+(defn- gemini-usage [usage]
+  {:input_tokens (or (get usage "promptTokenCount") 0)
+   :output_tokens (or (get usage "candidatesTokenCount") 0)
+   :reasoning_tokens (or (get usage "thoughtsTokenCount") 0)
+   :cache_read_tokens (or (get usage "cachedContentTokenCount") 0)
+   :total_tokens (or (get usage "totalTokenCount") 0)})
+
+(defn- normalize-gemini-response [request body]
+  (let [candidate (first (get body "candidates"))
+        parts (or (get-in candidate ["content" "parts"]) [])
+        text (str/join "" (map (fn [part]
+                                  (if (and (some? (get part "text"))
+                                           (not (get part "thought")))
+                                    (or (get part "text") "")
+                                    ""))
+                                parts))
+        tool-calls (normalize-gemini-tool-calls parts)
+        usage (gemini-usage (or (get body "usageMetadata") {}))]
+    {:id (get body "responseId")
+     :model (or (get body "modelVersion") (:model request))
+     :provider "gemini"
+     :message {:role :assistant :content text :parts parts}
+     :tool_calls tool-calls
+     :usage usage
+     :finish_reason (if (seq tool-calls)
+                      :tool_calls
+                      (finish-reason (get candidate "finishReason")))
+     :raw body}))
+
+(defn gemini-complete [request & [api-key base-url]]
+  (let [{:keys [url headers payload]}
+        (gemini-request-data request api-key base-url)]
+    (try
+        (let [transport (or (:transport request) http/request)
+              resp (transport {:method :post :url url :headers headers
+                               :body (json/write-json (json-safe payload))})
+              status (:status resp)
+              body-str (str (:body resp))]
+          (if (and (number? status) (not= status 200))
+            (throw (ex-info (str "Gemini API HTTP " status ": " body-str)
+                            {:provider "gemini" :status status
+                             :retryable (or (= status 429) (>= status 500))
+                             :body body-str}))
+            (normalize-gemini-response request (json/read-json body-str))))
+        (catch Object e (throw e)))))
+
+;; Unified Client Complete
+(defn complete [request & [client-opts]]
+  (let [opts (merge request client-opts)
+        parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
+        provider (:provider parsed)
+        actual-model (:model parsed)
+        req (assoc request :provider provider :model actual-model)]
+    (case provider
+      "openai" (openai-complete req (:api_key opts) (:base_url opts))
+      "ollama" (openai-compatible-complete req (:api_key opts) (:base_url opts))
+      "anthropic" (anthropic-complete req (:api_key opts) (:base_url opts))
+      "gemini" (gemini-complete req (:api_key opts) (:base_url opts))
+      "mock" (mock-complete req (:mock_handler opts))
+      (throw (ex-info (str "Unsupported LLM provider: " provider)
+                      {:provider provider :category :configuration})))))
+
+(defn parse-sse-lines [lines]
+  (let [state (atom {:event "" :data []})]
+    (keep
+      (fn [line]
+        (cond
+          (str/blank? line)
+          (let [{:keys [event data]} @state]
+            (reset! state {:event "" :data []})
+            (when (seq data)
+              {:event event :data (str/join "\n" data)}))
+
+          (str/starts-with? line ":") nil
+
+          (str/starts-with? line "event:")
+          (do (swap! state assoc :event (str/trim (subs line 6))) nil)
+
+          (str/starts-with? line "data:")
+          (do (swap! state update :data conj (str/trim (subs line 5))) nil)
+
+          :else nil))
+      lines)))
+
+(defn- stream-lines [body]
+  (if (string? body)
+    (str/split body #"\r?\n")
+    (io/line-seq body)))
+
+(defn- openai-stream-event [request event]
+  (let [data (:data event)]
+    (when-not (= data "[DONE]")
+      (let [body (json/read-json data)
+            event-type (or (get body "type") (:event event))]
+        (case event-type
+          "response.created"
+          {:type :stream_start :raw body}
+
+          "response.output_item.added"
+          (let [item (get body "item")]
+            (if (= (get item "type") "function_call")
+              {:type :tool_call_start
+               :tool_call (first (normalize-openai-tool-calls [item]))
+               :raw body}
+              {:type :text_start :text_id (or (get item "id") "text") :raw body}))
+
+          "response.output_text.delta"
+          {:type :text_delta
+           :delta (or (get body "delta") "")
+           :text_id (or (get body "item_id") "text")
+           :raw body}
+
+          "response.output_text.done"
+          {:type :text_end
+           :text_id (or (get body "item_id") "text")
+           :raw body}
+
+          "response.function_call_arguments.delta"
+          {:type :tool_call_delta
+           :tool_call {:id (or (get body "item_id") "")
+                       :arguments (or (get body "delta") "")}
+           :raw body}
+
+          "response.output_item.done"
+          (let [item (get body "item")]
+            (if (= (get item "type") "function_call")
+              {:type :tool_call_end
+               :tool_call (first (normalize-openai-tool-calls [item]))
+               :raw body}
+              {:type :provider_event :raw body}))
+
+          "response.completed"
+          (let [response (normalize-openai-response request (get body "response"))]
+            {:type :finish
+             :finish_reason (:finish_reason response)
+             :usage (:usage response)
+             :response response
+             :raw body})
+
+          "response.failed"
+          {:type :error :error (or (get body "error") body) :raw body}
+
+          {:type :provider_event :raw body})))))
+
+(defn openai-stream [request & [api-key base-url]]
+  (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
+        transport (or (:transport request) http/request)
+        resp (transport {:method :post :url url :headers headers :as :stream
+                         :body (json/write-json (json-safe (assoc payload :stream true)))})
+        status (:status resp)]
+    (if (and (number? status) (not= status 200))
+      (throw (ex-info (str "OpenAI streaming API HTTP " status)
+                      {:provider "openai" :status status
+                       :retryable (or (= status 429) (>= status 500))}))
+      (keep (fn [event] (openai-stream-event request event))
+            (parse-sse-lines (stream-lines (:body resp)))))))
+
+(defn- append-string [value delta]
+  (str (or value "") (or delta "")))
+
+(defn- anthropic-stream-event [request state event]
+  (let [body (json/read-json (:data event))
+        event-type (or (get body "type") (:event event))]
+    (case event-type
+      "message_start"
+      (let [message (or (get body "message") {})]
+        (swap! state assoc
+               :id (get message "id")
+               :model (or (get message "model") (:model request))
+               :usage (or (get message "usage") {}))
+        {:type :stream_start :raw body})
+
+      "content_block_start"
+      (let [index (or (get body "index") 0)
+            block (or (get body "content_block") {})
+            block-type (get block "type")]
+        (swap! state assoc-in [:blocks index] block)
+        (swap! state update :order conj index)
+        (case block-type
+          "text" {:type :text_start :text_id (str "text-" index) :raw body}
+          "tool_use" {:type :tool_call_start
+                      :tool_call {:id (or (get block "id") "")
+                                  :name (or (get block "name") "")
+                                  :arguments (or (get block "input") {})}
+                      :raw body}
+          ("thinking" "redacted_thinking")
+          {:type :reasoning_start :text_id (str "reasoning-" index) :raw body}
+          {:type :provider_event :raw body}))
+
+      "content_block_delta"
+      (let [index (or (get body "index") 0)
+            delta (or (get body "delta") {})
+            delta-type (get delta "type")]
+        (case delta-type
+          "text_delta"
+          (let [text (or (get delta "text") "")]
+            (swap! state update-in [:blocks index "text"] append-string text)
+            {:type :text_delta :delta text :text_id (str "text-" index) :raw body})
+
+          "input_json_delta"
+          (let [partial (or (get delta "partial_json") "")
+                block (get-in @state [:blocks index])]
+            (swap! state update-in [:blocks index :partial_json] append-string partial)
+            {:type :tool_call_delta
+             :tool_call {:id (or (get block "id") "")
+                         :name (or (get block "name") "")
+                         :arguments partial}
+             :raw body})
+
+          "thinking_delta"
+          (let [thinking (or (get delta "thinking") "")]
+            (swap! state update-in [:blocks index "thinking"] append-string thinking)
+            {:type :reasoning_delta :reasoning_delta thinking
+             :text_id (str "reasoning-" index) :raw body})
+
+          "signature_delta"
+          (do
+            (swap! state update-in [:blocks index "signature"]
+                   append-string (or (get delta "signature") ""))
+            nil)
+
+          {:type :provider_event :raw body}))
+
+      "content_block_stop"
+      (let [index (or (get body "index") 0)
+            block (or (get-in @state [:blocks index]) {})
+            block-type (get block "type")]
+        (case block-type
+          "text" {:type :text_end :text_id (str "text-" index) :raw body}
+          "tool_use"
+          (let [raw-args (or (:partial_json block) "")
+                args (if (str/blank? raw-args)
+                       (or (get block "input") {})
+                       (try (json/read-json raw-args)
+                            (catch Object _ {})))
+                tool-call {:id (or (get block "id") "")
+                           :name (or (get block "name") "")
+                           :arguments args}]
+            (swap! state assoc-in [:blocks index "input"] args)
+            {:type :tool_call_end :tool_call tool-call :raw body})
+          ("thinking" "redacted_thinking")
+          {:type :reasoning_end :text_id (str "reasoning-" index) :raw body}
+          {:type :provider_event :raw body}))
+
+      "message_delta"
+      (let [delta (or (get body "delta") {})]
+        (swap! state update :usage merge (or (get body "usage") {}))
+        (swap! state assoc :stop_reason (get delta "stop_reason"))
+        nil)
+
+      "message_stop"
+      (let [snapshot @state
+            blocks (mapv (fn [index] (get-in snapshot [:blocks index]))
+                         (:order snapshot))
+            response (normalize-anthropic-response
+                       request
+                       {"id" (:id snapshot)
+                        "model" (:model snapshot)
+                        "content" blocks
+                        "usage" (:usage snapshot)
+                        "stop_reason" (:stop_reason snapshot)})]
+        {:type :finish
+         :finish_reason (:finish_reason response)
+         :usage (:usage response)
+         :response response
+         :raw body})
+
+      "error" {:type :error :error (or (get body "error") body) :raw body}
+      {:type :provider_event :raw body})))
+
+(defn anthropic-stream [request & [api-key base-url]]
+  (let [{:keys [url headers payload]}
+        (anthropic-request-data request api-key base-url)
+        transport (or (:transport request) http/request)
+        resp (transport {:method :post :url url :headers headers :as :stream
+                         :body (json/write-json (json-safe (assoc payload :stream true)))})
+        status (:status resp)]
+    (if (and (number? status) (not= status 200))
+      (throw (ex-info (str "Anthropic streaming API HTTP " status)
+                      {:provider "anthropic" :status status
+                       :retryable (or (= status 429) (>= status 500))}))
+      (let [state (atom {:blocks {} :order [] :usage {}})]
+        (keep (fn [event] (anthropic-stream-event request state event))
+              (parse-sse-lines (stream-lines (:body resp))))))))
+
+(defn- gemini-stream-url [url]
+  (str/replace url ":generateContent" ":streamGenerateContent?alt=sse"))
+
+(defn- gemini-stream-response [request state raw]
+  (let [snapshot @state
+        tool-calls (:tool_calls snapshot)
+        usage (gemini-usage (:usage snapshot))]
+    {:id (:id snapshot)
+     :model (or (:model snapshot) (:model request))
+     :provider "gemini"
+     :message {:role :assistant :content (:text snapshot)}
+     :tool_calls tool-calls
+     :usage usage
+     :finish_reason (if (seq tool-calls)
+                      :tool_calls
+                      (finish-reason (:finish_reason snapshot)))
+     :raw raw}))
+
+(defn- gemini-stream-events [request state event]
+  (let [body (json/read-json (:data event))
+        candidate (first (or (get body "candidates") []))
+        parts (or (get-in candidate ["content" "parts"]) [])
+        text-parts (filter (fn [part]
+                             (and (some? (get part "text"))
+                                  (not (get part "thought"))))
+                           parts)
+        reasoning-parts (filter (fn [part]
+                                  (and (some? (get part "text"))
+                                       (get part "thought")))
+                                parts)
+        provider-calls (filter (fn [part] (some? (get part "functionCall"))) parts)
+        calls (mapv (fn [part]
+                      (let [call (get part "functionCall")]
+                        {:id (or (get call "id") (str "call_" (random-uuid)))
+                         :name (or (get call "name") "")
+                         :arguments (or (get call "args") {})}))
+                    provider-calls)
+        first-event? (not (:started @state))
+        first-text? (and (seq text-parts) (not (:text_started @state)))
+        first-reasoning? (and (seq reasoning-parts) (not (:reasoning_started @state)))
+        finish-provider (get candidate "finishReason")]
+    (swap! state assoc :started true)
+    (when-let [id (get body "responseId")] (swap! state assoc :id id))
+    (when-let [model (get body "modelVersion")] (swap! state assoc :model model))
+    (when-let [usage (get body "usageMetadata")] (swap! state update :usage merge usage))
+    (when first-text? (swap! state assoc :text_started true))
+    (when first-reasoning? (swap! state assoc :reasoning_started true))
+    (doseq [part text-parts]
+      (swap! state update :text append-string (get part "text")))
+    (doseq [part reasoning-parts]
+      (swap! state update :reasoning append-string (get part "text")))
+    (when (seq calls) (swap! state update :tool_calls into calls))
+    (when finish-provider (swap! state assoc :finish_reason finish-provider))
+    (let [start-events (when first-event? [{:type :stream_start :raw body}])
+          text-events (concat
+                        (when first-text? [{:type :text_start :text_id "text" :raw body}])
+                        (map (fn [part]
+                               {:type :text_delta :delta (or (get part "text") "")
+                                :text_id "text" :raw body})
+                             text-parts))
+          reasoning-events (concat
+                             (when first-reasoning?
+                               [{:type :reasoning_start :text_id "reasoning" :raw body}])
+                             (map (fn [part]
+                                    {:type :reasoning_delta
+                                     :reasoning_delta (or (get part "text") "")
+                                     :text_id "reasoning" :raw body})
+                                  reasoning-parts))
+          tool-events (mapcat (fn [call]
+                                [{:type :tool_call_start :tool_call call :raw body}
+                                 {:type :tool_call_end :tool_call call :raw body}])
+                              calls)
+          end-events (when finish-provider
+                       (concat
+                         (when (:text_started @state)
+                           [{:type :text_end :text_id "text" :raw body}])
+                         (when (:reasoning_started @state)
+                           [{:type :reasoning_end :text_id "reasoning" :raw body}])
+                         (let [response (gemini-stream-response request state body)]
+                           [{:type :finish
+                             :finish_reason (:finish_reason response)
+                             :usage (:usage response)
+                             :response response
+                             :raw body}]))) ]
+      (vec (concat start-events text-events reasoning-events tool-events end-events)))))
+
+(defn gemini-stream [request & [api-key base-url]]
+  (let [{:keys [url headers payload]}
+        (gemini-request-data request api-key base-url)
+        transport (or (:transport request) http/request)
+        resp (transport {:method :post :url (gemini-stream-url url)
+                         :headers headers :as :stream
+                         :body (json/write-json (json-safe payload))})
+        status (:status resp)]
+    (if (and (number? status) (not= status 200))
+      (throw (ex-info (str "Gemini streaming API HTTP " status)
+                      {:provider "gemini" :status status
+                       :retryable (or (= status 429) (>= status 500))}))
+      (let [state (atom {:started false :text_started false
+                         :reasoning_started false :text "" :reasoning ""
+                         :tool_calls [] :usage {}})]
+        (mapcat (fn [event] (gemini-stream-events request state event))
+                (parse-sse-lines (stream-lines (:body resp))))))))
+
+(defn stream [request & [client-opts]]
+  (let [opts (merge request client-opts)
+        parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
+        provider (:provider parsed)
+        req (assoc request :provider provider :model (:model parsed))]
+    (case provider
+      "openai" (openai-stream req (:api_key opts) (:base_url opts))
+      "anthropic" (anthropic-stream req (:api_key opts) (:base_url opts))
+      "gemini" (gemini-stream req (:api_key opts) (:base_url opts))
+      (throw (ex-info (str "Streaming is not implemented for provider: " provider)
+                      {:provider provider :category :configuration})))))
+
+;; High-level generate API
+(defn generate [model prompt & [opts]]
+  (let [messages [{:role :user :content prompt}]
+        req (make-request model messages opts)
+        resp (complete req opts)]
+    (get-in resp [:message :content])))
+
+(defn- schema-value [m key]
+  (or (get m key) (get m (keyword (str key)))))
+
+(defn- schema-type-valid? [value expected]
+  (case expected
+    "object" (map? value)
+    "array" (vector? value)
+    "string" (string? value)
+    "integer" (integer? value)
+    "number" (number? value)
+    "boolean" (or (= value true) (= value false))
+    "null" (nil? value)
+    true))
+
+(defn validate-json-schema [value schema]
+  (let [expected (field schema :type)]
+    (cond
+      (not (schema-type-valid? value expected))
+      [false (str "Expected " expected)]
+
+      (= expected "object")
+      (let [required (or (field schema :required) [])
+            missing (first (filter (fn [key]
+                                     (and (not (contains? value key))
+                                          (not (contains? value (keyword (str key))))))
+                                   required))
+            properties (or (field schema :properties) {})]
+        (if missing
+          [false (str "Missing required property: " missing)]
+          (loop [entries (seq properties)]
+            (if (empty? entries)
+              [true ""]
+              (let [[key child-schema] (first entries)
+                    child-value (schema-value value key)]
+                (if (nil? child-value)
+                  (recur (next entries))
+                  (let [[valid? reason] (validate-json-schema child-value child-schema)]
+                    (if valid?
+                      (recur (next entries))
+                      [false (str "Property " (name key) ": " reason)]))))))))
+
+      (= expected "array")
+      (if-let [item-schema (field schema :items)]
+        (loop [items (seq value)]
+          (if (empty? items)
+            [true ""]
+            (let [[valid? reason] (validate-json-schema (first items) item-schema)]
+              (if valid? (recur (next items)) [false reason]))))
+        [true ""])
+
+      :else [true ""])))
+
+(defn generate-object [model prompt schema & [opts]]
+  (let [request (make-request
+                  model
+                  [{:role :user :content prompt}]
+                  (assoc (or opts {})
+                         :response_format {:type "json_schema"
+                                           :json_schema schema
+                                           :strict true}))
+        response (complete request opts)
+        text (get-in response [:message :content])
+        parsed (try
+                 (json/read-json text)
+                 (catch Object e
+                   (throw (ex-info "No object generated: response was not valid JSON"
+                                   {:category :no-object-generated :cause (str e)}))))
+        [valid? reason] (validate-json-schema parsed schema)]
+    (when-not valid?
+      (throw (ex-info (str "No object generated: " reason)
+                      {:category :no-object-generated :reason reason})))
+    {:text text
+     :output parsed
+     :tool_calls (or (:tool_calls response) [])
+     :tool_results []
+     :finish_reason (:finish_reason response)
+     :usage (:usage response)
+     :total_usage (:usage response)
+     :steps [{:response response :tool_calls (or (:tool_calls response) [])
+              :tool_results []}]
+     :response response}))

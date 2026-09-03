@@ -1,0 +1,65 @@
+(ns attractor.dotenv
+  (:require [clojure.string :as str]
+            [os :as os]
+            [io :as io]))
+
+;; Split string once by separator
+(defn- split-once [s sep]
+  (let [idx (str/index-of s sep)]
+    (if idx
+      [(subs s 0 idx) (subs s (+ idx (count sep)))]
+      [s ""])))
+
+;; Parse a single line from a .env file
+(defn parse-dotenv-line [line]
+  (let [l (str/trim (or line ""))]
+    (when (and (seq l) (not (str/starts-with? l "#")))
+      ;; Strip optional leading "export "
+      (let [l (if (str/starts-with? l "export ")
+                (str/trim (subs l 7))
+                l)]
+        (when (str/includes? l "=")
+          (let [[raw-k raw-v] (split-once l "=")
+                k (str/trim raw-k)
+                v (str/trim raw-v)]
+            (when (seq k)
+              ;; Strip surrounding quotes (double or single)
+              (let [val (cond
+                          (and (str/starts-with? v "\"") (str/ends-with? v "\"") (>= (count v) 2))
+                          (-> (subs v 1 (dec (count v)))
+                              (str/replace "\\n" "\n")
+                              (str/replace "\\\"" "\""))
+
+                          (and (str/starts-with? v "'") (str/ends-with? v "'") (>= (count v) 2))
+                          (subs v 1 (dec (count v)))
+
+                          ;; Strip inline comments if unquoted (e.g. KEY=VAL # comment)
+                          :else
+                          (first (str/split v #"\s+#")))]
+                [k (str/trim (or val ""))]))))))))
+
+;; Parse the full content of a .env file into a key-value map
+(defn parse-dotenv [content]
+  (if (str/blank? content)
+    {}
+    (let [lines (str/split content #"\r?\n")]
+      (into {}
+            (keep parse-dotenv-line lines)))))
+
+;; Load .env file into process environment variables
+;; override? defaults to false (preserves already-set environment variables)
+(defn load-dotenv! [& [file-path override?]]
+  (let [path (or file-path ".env")]
+    (if (and (not (str/blank? path)) (os/stat path))
+      (try
+        (let [content (io/slurp path)
+              env-map (parse-dotenv content)]
+          (doseq [[k v] env-map]
+            (let [existing (os/getenv k)]
+              (when (or override? (str/blank? existing))
+                (os/setenv k v))))
+          env-map)
+        (catch Object e
+          (println (str "Warning: Failed to load " path ": " e))
+          {}))
+      {})))

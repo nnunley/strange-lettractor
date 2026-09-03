@@ -1,0 +1,112 @@
+(ns attractor.stylesheet
+  (:require [clojure.string :as str]))
+
+;; Split string once by separator
+(defn- split-once [s sep]
+  (let [idx (str/index-of s sep)]
+    (if idx
+      [(subs s 0 idx) (subs s (+ idx (count sep)))]
+      [s ""])))
+
+;; Parse a literal property value (strip quotes)
+(defn- parse-val [v]
+  (let [v (str/trim (str v))]
+    (if (and (str/starts-with? v "\"") (str/ends-with? v "\"") (>= (count v) 2))
+      (subs v 1 (dec (count v)))
+      v)))
+
+;; Parse CSS-like model_stylesheet text into a list of rule maps:
+;; [{:selector "*" :specificity 0 :order 0 :properties {:llm_model "..." :llm_provider "..." :reasoning_effort "..."}} ...]
+(defn parse-stylesheet [css-text]
+  (if (str/blank? css-text)
+    []
+    (let [re #"[*#.a-zA-Z0-9_-]+[ \t\r\n]*\{[^}]+\}"
+          matches (re-seq re css-text)]
+      (map-indexed
+        (fn [idx m]
+          (let [[raw-selector raw-decls] (split-once (str m) "{")
+                sel (str/trim raw-selector)
+                decls-str (str/trim (str/replace raw-decls #"\}[ \t\r\n]*$" ""))
+                spec (cond
+                       (= sel "*") 0
+                       (str/starts-with? sel "#") 3
+                       (str/starts-with? sel ".") 2
+                       :else 1)
+                decls (->> (str/split decls-str #";")
+                           (map str/trim)
+                           (remove str/blank?)
+                           (map (fn [d]
+                                  (let [[prop val] (split-once d ":")]
+                                    [(keyword (str/trim prop)) (parse-val val)])))
+                           (filter (fn [[prop _]] (#{:llm_model :llm_provider :reasoning_effort} prop)))
+                           (into {}))]
+            {:selector sel
+             :specificity spec
+             :order idx
+             :properties decls}))
+        matches))))
+
+;; Check if a node matches a stylesheet rule
+;; node is a map with :id, :shape, :class
+(defn rule-matches-node? [rule node]
+  (let [sel (:selector rule)
+        shape (or (:shape node) "box")
+        node-id (:id node)
+        classes (if (str/blank? (:class node))
+                  #{}
+                  (set (map str/trim (str/split (:class node) #","))))]
+    (cond
+      (= sel "*") true
+      (= sel shape) true
+      (str/starts-with? sel "#") (= (subs sel 1) node-id)
+      (str/starts-with? sel ".") (contains? classes (subs sel 1))
+      :else false)))
+
+;; Resolve model configuration for a specific node given stylesheet rules and graph defaults
+;; Resolution precedence:
+;; 1. Explicit node attribute
+;; 2. Matching stylesheet rule by specificity (ID > class > shape > universal), later rules of equal specificity win
+;; 3. Graph-level default attribute
+;; 4. System default
+(defn resolve-node-model-props [node rules graph-attrs]
+  (let [matching-rules (filter (fn [r] (rule-matches-node? r node)) rules)
+        ;; Sort matching rules: specificity ascending, order ascending
+        sorted-rules (sort-by (juxt :specificity :order) matching-rules)
+        ;; Fold matching rules from lowest to highest precedence
+        stylesheet-props (reduce (fn [acc r] (merge acc (:properties r))) {} sorted-rules)
+        ;; Explicit node attributes (only non-blank)
+        explicit-model (when-not (str/blank? (:llm_model node)) (:llm_model node))
+        explicit-provider (when-not (str/blank? (:llm_provider node)) (:llm_provider node))
+        explicit-reasoning (when-not (str/blank? (:reasoning_effort node)) (:reasoning_effort node))
+
+        final-model (or explicit-model
+                        (:llm_model stylesheet-props)
+                        (:llm_model graph-attrs)
+                        nil)
+        final-provider (or explicit-provider
+                           (:llm_provider stylesheet-props)
+                           (:llm_provider graph-attrs)
+                           nil)
+        final-reasoning (or explicit-reasoning
+                            (:reasoning_effort stylesheet-props)
+                            (:reasoning_effort graph-attrs)
+                            "high")]
+    {:llm_model final-model
+     :llm_provider final-provider
+     :reasoning_effort final-reasoning}))
+
+;; Validate stylesheet syntax
+;; Returns nil if valid, or a diagnostic error message if invalid
+(defn validate-stylesheet-syntax [css-text]
+  (if (str/blank? css-text)
+    nil
+    (let [trimmed (str/trim css-text)]
+      ;; Simple check: every '{' should have a matching '}'
+      (let [open-count (count (filter #(= % \{) trimmed))
+            close-count (count (filter #(= % \}) trimmed))]
+        (if (not= open-count close-count)
+          "Unbalanced braces in model_stylesheet"
+          (let [rules (parse-stylesheet trimmed)]
+            (if (and (not (str/blank? trimmed)) (empty? rules))
+              "Invalid model_stylesheet syntax: no valid rules found"
+              nil)))))))
