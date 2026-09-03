@@ -56,25 +56,49 @@
     "command_text=$3\n"
     "timeout_marker=$4\n"
     "cancel_marker=$5\n"
-    "shift 5\n"
+    "env_policy=$6\n"
+    "shift 6\n"
     "cd \"$workdir\" || exit 126\n"
-    "while IFS='=' read -r name value; do\n"
-    "  case \"$name\" in\n"
-    "    *_API_KEY|*_SECRET|*_TOKEN|*PASSWORD*|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|GOOGLE_APPLICATION_CREDENTIALS) unset \"$name\" ;;\n"
-    "  esac\n"
-    "done < <(env)\n"
-    "while [ \"$#\" -ge 2 ]; do\n"
-    "  export \"$1=$2\"\n"
-    "  shift 2\n"
-    "done\n"
     "if command -v setsid >/dev/null 2>&1; then\n"
-    "  setsid /bin/bash -c \"$command_text\" &\n"
+    "  launcher=(\"$(command -v setsid)\" /bin/bash -c)\n"
     "elif command -v perl >/dev/null 2>&1; then\n"
-    "  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash -c \"$command_text\" &\n"
+    "  launcher=(\"$(command -v perl)\" -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash -c)\n"
     "else\n"
     "  set -m\n"
-    "  ( eval \"$command_text\" ) &\n"
+    "  launcher=(/bin/bash -c)\n"
     "fi\n"
+    "command_env=()\n"
+    "case \"$env_policy\" in\n"
+    "  filtered)\n"
+    "    shopt -s nocasematch\n"
+    "    while IFS='=' read -r name value; do\n"
+    "      case \"$name\" in\n"
+    "        *_API_KEY|*_SECRET|*_TOKEN|*_PASSWORD|*_CREDENTIAL|*_CREDENTIALS|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY) unset \"$name\" ;;\n"
+    "      esac\n"
+    "    done < <(env)\n"
+    "    shopt -u nocasematch\n"
+    "    ;;\n"
+    "  all) ;;\n"
+    ;; Bash synthesizes a default PATH when it is absent. Supplying an empty
+    ;; value preserves the observable "inherit none" contract; an explicit
+    ;; per-command PATH is appended later and therefore overrides it.
+    "  none) command_env=(/usr/bin/env -i PATH=) ;;\n"
+    "  core)\n"
+    "    command_env=(/usr/bin/env -i)\n"
+    "    for name in PATH HOME USER SHELL LANG TERM TMPDIR GOPATH GOROOT CARGO_HOME RUSTUP_HOME NVM_DIR NODE_PATH PYTHONPATH VIRTUAL_ENV JAVA_HOME CLASSPATH GEM_HOME GEM_PATH BUNDLE_PATH DOTNET_ROOT; do\n"
+    "      if [ \"${!name+x}\" = x ]; then command_env+=(\"$name=${!name}\"); fi\n"
+    "    done\n"
+    "    ;;\n"
+    "esac\n"
+    "while [ \"$#\" -ge 2 ]; do\n"
+    "  if [ \"$env_policy\" = none ] || [ \"$env_policy\" = core ]; then\n"
+    "    command_env+=(\"$1=$2\")\n"
+    "  else\n"
+    "    export \"$1=$2\"\n"
+    "  fi\n"
+    "  shift 2\n"
+    "done\n"
+    "\"${command_env[@]}\" \"${launcher[@]}\" \"$command_text\" &\n"
     "child=$!\n"
     "(\n"
     "  sleep \"$timeout_s\"\n"
@@ -116,6 +140,16 @@
         working-dir (or (:working_dir options) (os/cwd))
         default-timeout (max 1 (or (:default_command_timeout_ms options) 10000))
         max-timeout (max 1 (or (:max_command_timeout_ms options) 600000))
+        raw-env-policy (or (:env_policy options) :filtered)
+        env-policy (if (keyword? raw-env-policy)
+                     (name raw-env-policy)
+                     (str raw-env-policy))
+        _ (when-not (contains? #{"filtered" "all" "none" "core"} env-policy)
+            (throw
+              (ex-info
+                (str "Unknown environment inheritance policy: " raw-env-policy)
+                {:category :invalid-environment-policy
+                 :env_policy raw-env-policy})))
         lifecycle
         (or (:_lifecycle options)
             {:active_commands (atom {})
@@ -151,9 +185,18 @@
                                 (swap! command-counter inc))
                 timeout-marker (str (os/temp-dir) "/lettractor-timeout-" command-id)
                 cancel-marker (str (os/temp-dir) "/lettractor-cancel-" command-id)
+                explicit-environment (or env-vars {})
+                _ (doseq [[key _] explicit-environment]
+                    (when (nil? (re-matches #"[A-Za-z_][A-Za-z0-9_]*"
+                                            (str key)))
+                      (throw
+                        (ex-info
+                          (str "Invalid environment variable name: " key)
+                          {:category :invalid-environment-variable
+                           :name (str key)}))))
                 environment-args
                 (vec (mapcat (fn [[key value]] [(str key) (str value)])
-                             (or env-vars {})))
+                             explicit-environment))
                 registered?
                 (with-control-lock
                   (fn []
@@ -168,10 +211,15 @@
               (try
                 (let [result
                       (apply os/sh
-                             (concat ["/bin/bash" "-c" command-wrapper
+                             ;; Privileged mode suppresses BASH_ENV, ENV,
+                             ;; inherited functions, and startup-option imports
+                             ;; before the wrapper has sanitized the child env.
+                             (concat ["/bin/bash" "--noprofile" "--norc"
+                                      "-p" "-c" command-wrapper
                                       "lettractor" dir
                                       (str (/ timeout 1000.0))
-                                      (str command) timeout-marker cancel-marker]
+                                      (str command) timeout-marker cancel-marker
+                                      env-policy]
                                      environment-args))
                       timed-out (some? (os/stat timeout-marker))
                       cancelled (some? (os/stat cancel-marker))

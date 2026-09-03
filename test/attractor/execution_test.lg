@@ -66,14 +66,80 @@
     (is (false? ((:file_exists environment) "descendant-survived")))))
 
 (deftest test-local-command-filters-secrets-and-allows-explicit-environment
-  (let [secret-name "LETTRACTOR_EXECUTION_TEST_API_KEY"
-        _ (os/setenv secret-name "do-not-leak")
+  (let [_ (os/setenv "lettractor_execution_test_token" "lowercase-secret")
+        _ (os/setenv "Lettractor_Execution_Test_CREDENTIAL" "mixed-secret")
+        _ (os/setenv "LETTRACTOR_EXECUTION_VISIBLE" "inherited")
         environment (execution/make-local-environment)
         result ((:exec_command environment)
-                "printf '%s|%s' \"$LETTRACTOR_EXECUTION_TEST_API_KEY\" \"$VISIBLE_VALUE\""
-                1000 nil {"VISIBLE_VALUE" "explicit"})]
+                (str "printf '%s|%s|%s|%s' "
+                     "\"$lettractor_execution_test_token\" "
+                     "\"$Lettractor_Execution_Test_CREDENTIAL\" "
+                     "\"$LETTRACTOR_EXECUTION_VISIBLE\" "
+                     "\"$EXPLICIT_TOKEN\"")
+                1000 nil {"EXPLICIT_TOKEN" "allowed"})]
     (is (= 0 (:exit_code result)))
-    (is (= "|explicit" (:stdout result)))))
+    (is (= "||inherited|allowed" (:stdout result)))))
+
+(deftest test-local-command-environment-inheritance-policies
+  (let [_ (os/setenv "LETTRACTOR_POLICY_VISIBLE" "inherited")
+        _ (os/setenv "LETTRACTOR_POLICY_TOKEN" "secret")
+        read-environment
+        (fn [policy]
+          (let [environment (execution/make-local-environment
+                              {:env_policy policy})]
+            ((:exec_command environment)
+             (str "printf '%s|%s|%s|%s' "
+                  "\"$LETTRACTOR_POLICY_VISIBLE\" "
+                  "\"$LETTRACTOR_POLICY_TOKEN\" "
+                  "\"${PATH:+core}\" "
+                  "\"$EXPLICIT_VALUE\"")
+             1000 nil {"EXPLICIT_VALUE" "explicit"})))]
+    (is (= "inherited|secret|core|explicit"
+           (:stdout (read-environment :all))))
+    (is (= "|||explicit"
+           (:stdout (read-environment :none))))
+    (is (= "||core|explicit"
+           (:stdout (read-environment :core))))
+    (let [environment (execution/make-local-environment {:env_policy :none})
+          result ((:exec_command environment)
+                  "printf '%s' \"$PATH\""
+                  1000 nil {"PATH" "/explicit/bin"})]
+      (is (= "/explicit/bin" (:stdout result))))))
+
+(deftest test-local-environment-rejects-unknown-inheritance-policy
+  (is (= :invalid-environment-policy
+         (try
+           (do (execution/make-local-environment {:env_policy :mystery}) nil)
+           (catch Object error (:category (ex-data error)))))))
+
+(deftest test-local-command-rejects-invalid-explicit-environment-name
+  (let [environment (execution/make-local-environment {:env_policy :none})]
+    (is (= :invalid-environment-variable
+           (try
+             (do ((:exec_command environment)
+                  "printf unreachable" 1000 nil {"--unset" "PATH"})
+                 nil)
+             (catch Object error (:category (ex-data error))))))))
+
+(deftest test-isolated-policies-block-bash-env-secret-exfiltration
+  (let [hook (str (os/temp-dir) "/lettractor-bash-env-"
+                  (System/currentTimeMillis))]
+    (io/spit hook
+             (str "if [ -n \"$LETTRACTOR_BOOTSTRAP_TOKEN\" ]; then "
+                  "export LETTRACTOR_EXFILTRATED=\"$LETTRACTOR_BOOTSTRAP_TOKEN\"; "
+                  "fi\n"))
+    (os/setenv "LETTRACTOR_BOOTSTRAP_TOKEN" "bootstrap-secret")
+    (os/setenv "BASH_ENV" hook)
+    (try
+      (doseq [policy [:filtered :none :core]]
+        (let [environment (execution/make-local-environment
+                            {:env_policy policy})
+              result ((:exec_command environment)
+                      "printf '%s' \"$LETTRACTOR_EXFILTRATED\""
+                      1000 nil nil)]
+          (is (= "" (:stdout result)) (str "policy=" policy))))
+      (finally
+        (os/setenv "BASH_ENV" "")))))
 
 (deftest test-local-command-timeout-is-clamped-to-configured-maximum
   (let [environment (execution/make-local-environment
