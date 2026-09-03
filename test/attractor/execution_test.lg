@@ -223,6 +223,70 @@
            ((:grep environment) "Needle" "."
             {:glob_filter "!/foo.lg" :max_results 10})))))
 
+(deftest test-local-grep-supports-anthropic-output-modes
+  (let [root (str (os/temp-dir) "/lettractor-grep-output-mode-"
+                  (System/currentTimeMillis))
+        environment
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})]
+    ((:write_file environment) "a.lg" "Needle one\nNeedle two\n")
+    ((:write_file environment) "nested/b.lg" "Needle three\n")
+    ((:write_file environment) "nested/c.lg" "nothing\n")
+    (is (= "a.lg\nnested/b.lg"
+           ((:grep environment) "Needle" "."
+            {:output_mode "files_with_matches" :max_results 10})))
+    (is (= "a.lg:2\nnested/b.lg:1"
+           ((:grep environment) "Needle" "."
+            {:output_mode "count" :max_results 10})))
+    (is (= :invalid-grep-output-mode
+           (try
+             (do ((:grep environment) "Needle" "."
+                  {:output_mode "unknown"}) nil)
+             (catch Object error (:category (ex-data error))))))))
+
+(deftest test-local-grep-ripgrep-output-matches-native-contract
+  (let [root (str (os/temp-dir) "/lettractor-grep-rg-output-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})]
+    ((:write_file environment) "a.lg" "Needle one\nNeedle two\n")
+    ((:write_file environment) "nested/b.lg" "Needle three\n")
+    (is (= "a.lg:1:Needle one\na.lg:2:Needle two\nnested/b.lg:1:Needle three"
+           ((:grep environment) "Needle" "."
+            {:output_mode "content" :max_results 10})))
+    (is (= "a.lg\nnested/b.lg"
+           ((:grep environment) "Needle" "."
+            {:output_mode "files_with_matches" :max_results 10})))
+    (is (= "a.lg:2\nnested/b.lg:1"
+           ((:grep environment) "Needle" "."
+            {:output_mode "count" :max_results 10})))))
+
+(deftest test-local-grep-fallback-preserves-requested-paths
+  (let [root (str (os/temp-dir) "/lettractor-grep-path-parity-"
+                  (System/currentTimeMillis))
+        ripgrep (execution/make-local-environment {:working_dir root})
+        fallback
+        (execution/make-local-environment
+          {:working_dir root :env_policy :none})
+        options {:output_mode "content" :max_results 10}]
+    ((:write_file ripgrep) "nested/match.lg" "Needle\n")
+    (is (= "nested/match.lg:1:Needle"
+           ((:grep fallback) "Needle" "nested" options)))
+    (is (= ((:grep ripgrep) "Needle" "nested" options)
+           ((:grep fallback) "Needle" "nested" options)))
+    (is (= "nested/match.lg:1:Needle"
+           ((:grep fallback) "Needle" "./nested" options)))
+    (is (= ((:grep ripgrep) "Needle" "./nested" options)
+           ((:grep fallback) "Needle" "./nested" options)))
+    (is (= "nested/match.lg:1:Needle"
+           ((:grep fallback) "Needle" "nested/match.lg" options)))
+    (is (= "nested/match.lg:1:Needle"
+           ((:grep fallback) "Needle" "./nested/match.lg" options)))
+    (let [absolute (str root "/nested")]
+      (is (= (str absolute "/match.lg:1:Needle")
+             ((:grep fallback) "Needle" absolute options)))
+      (is (= ((:grep ripgrep) "Needle" absolute options)
+             ((:grep fallback) "Needle" absolute options))))))
+
 (deftest test-local-glob-is-native-safe-and-newest-first
   (let [root (str (os/temp-dir) "/lettractor-native-glob-"
                   (System/currentTimeMillis))

@@ -52,11 +52,51 @@
            (names gemini)))
     (doseq [profile [openai anthropic gemini]]
       (is (= #{:command :timeout_ms :description}
-             (set (keys (properties profile "shell")))))
+             (set (keys (properties profile "shell"))))))
+    (doseq [profile [openai gemini]]
       (is (= #{:pattern :path :glob_filter :case_insensitive :max_results}
              (set (keys (properties profile "grep"))))))
+    (is (= #{:pattern :path :glob_filter :case_insensitive :max_results
+             :output_mode}
+           (set (keys (properties anthropic "grep")))))
+    (is (= ["content" "files_with_matches" "count"]
+           (get-in (properties anthropic "grep") [:output_mode :enum])))
     (is (= #{:path :depth}
            (set (keys (properties gemini "list_dir")))))))
+
+(deftest test-profile-shell-tools-use-provider-specific-defaults
+  (let [calls (atom [])
+        environment
+        {:default_command_timeout_ms 5000
+         :exec_command
+         (fn [command timeout-ms working-directory env]
+           (swap! calls conj [command timeout-ms working-directory env])
+           {:exit_code 0 :stdout "ok" :stderr ""})}
+        invoke
+        (fn [profile arguments]
+          (let [tool (profiles/registry-get (:tool_registry profile) "shell")]
+            ((:executor tool) arguments environment)))]
+    (invoke (profiles/create-openai-profile) {"command" "openai"})
+    (invoke (profiles/create-anthropic-profile) {"command" "anthropic"})
+    (invoke (profiles/create-gemini-profile)
+            {"command" "gemini" "timeout_ms" 321})
+    (is (= [["openai" 5000 nil nil]
+            ["anthropic" 120000 nil nil]
+            ["gemini" 321 nil nil]]
+           @calls))))
+
+(deftest test-anthropic-grep-forwards-output-mode
+  (let [calls (atom [])
+        profile (profiles/create-anthropic-profile)
+        tool (profiles/registry-get (:tool_registry profile) "grep")
+        environment
+        {:grep (fn [pattern path options]
+                 (swap! calls conj [pattern path options])
+                 "a.lg:2")}
+        arguments {"pattern" "needle" "path" "src"
+                   "output_mode" "count"}]
+    (is (= "a.lg:2" ((:executor tool) arguments environment)))
+    (is (= [["needle" "src" arguments]] @calls))))
 
 (deftest test-gemini-list-dir-delegates-to-execution-environment
   (let [calls (atom [])

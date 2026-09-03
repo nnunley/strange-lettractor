@@ -177,10 +177,19 @@
       (if (:negated compiled) (not matches) matches))))
 
 (defn- displayed-glob-path [requested-path relative]
-  (let [requested (or requested-path ".")]
+  (let [requested (str/replace (or requested-path ".") #"^\./" "")]
     (cond
       (or (= requested ".") (str/blank? requested)) relative
       :else (child-path requested relative))))
+
+(defn- displayed-search-path [root requested-path relative]
+  (let [requested (str/replace (or requested-path ".") #"^\./" "")
+        root-stat (os/stat root)]
+    (if (:dir? root-stat)
+      (displayed-glob-path requested relative)
+      (if (or (= requested ".") (str/blank? requested))
+        relative
+        requested))))
 
 (defn- numeric-modification-time [path]
   (let [result (if (= "darwin" (os/os-name))
@@ -204,7 +213,7 @@
          (filter (fn [[_ relative]] (glob-includes? compiled relative)))
          (map (fn [[absolute relative]]
                 (let [stat (os/stat absolute)]
-                  {:path (displayed-glob-path requested-path relative)
+                  {:path (displayed-search-path root requested-path relative)
                    ;; Epoch seconds keep ordering correct across UTC offset
                    ;; changes; the formatted nanosecond timestamp breaks ties
                    ;; for files modified within the same second.
@@ -215,7 +224,9 @@
          (map :path)
          vec)))
 
-(defn- native-grep [root pattern case-insensitive glob-filter max-results]
+(defn- native-grep
+  [root requested-path pattern case-insensitive glob-filter max-results
+   output-mode]
   (let [regex
         (try
           (re-pattern (str (when case-insensitive "(?i)") pattern))
@@ -223,18 +234,42 @@
             (throw (ex-info (str "Invalid grep pattern: " error)
                             {:category :grep-failed :pattern pattern}))))
         compiled-glob (compile-glob-filter glob-filter)
-        matches
-        (mapcat
+        file-results
+        (map
           (fn [[absolute relative]]
-            (if (not (glob-includes? compiled-glob relative))
-              []
-              (keep-indexed
-                (fn [index line]
-                  (when (re-find regex line)
-                    (str relative ":" (inc index) ":" line)))
-                (str/split (io/slurp absolute) #"\r?\n"))))
-          (walk-files root ""))]
-    (str/join "\n" (take max-results matches))))
+            (let [displayed (displayed-search-path root requested-path relative)]
+              (if (not (glob-includes? compiled-glob relative))
+                {:relative displayed :matches []}
+                {:relative displayed
+               :matches
+               (vec
+                 (keep-indexed
+                   (fn [index line]
+                     (when (re-find regex line)
+                         {:line_number (inc index) :content line}))
+                     (str/split (io/slurp absolute) #"\r?\n")))})))
+          (walk-files root ""))
+        results
+        (case output-mode
+          "files_with_matches"
+          (keep (fn [result]
+                  (when (seq (:matches result)) (:relative result)))
+                file-results)
+
+          "count"
+          (keep (fn [result]
+                  (when (seq (:matches result))
+                    (str (:relative result) ":" (count (:matches result)))))
+                file-results)
+
+          (mapcat
+            (fn [result]
+              (map (fn [match]
+                     (str (:relative result) ":" (:line_number match) ":"
+                          (:content match)))
+                   (:matches result)))
+            file-results))]
+    (str/join "\n" (take max-results results))))
 
 (def command-wrapper
   (str
@@ -524,9 +559,24 @@
          (let [options (or grep-options {})
                case-insensitive (boolean (option options "case_insensitive"))
                glob-filter (option options "glob_filter")
+               requested-mode (or (option options "output_mode") "content")
+               output-mode (if (keyword? requested-mode)
+                             (name requested-mode)
+                             requested-mode)
+               _ (when-not (contains? #{"content" "files_with_matches" "count"}
+                                      output-mode)
+                   (throw
+                     (ex-info (str "Unsupported grep output mode: " output-mode)
+                              {:category :invalid-grep-output-mode
+                               :output_mode output-mode})))
                requested-limit (or (option options "max_results") 100)
                max-results (max 1 requested-limit)
-               flags (cond-> ["--line-number" "--color" "never"]
+               mode-flag (case output-mode
+                           "files_with_matches" "--files-with-matches"
+                           "count" "--count"
+                           "--line-number")
+               flags (cond-> [mode-flag "--with-filename" "--sort" "path"
+                              "--color" "never"]
                        case-insensitive (conj "--ignore-case")
                        (not (str/blank? glob-filter))
                        (conj "--glob" (shell-quote glob-filter)))
@@ -539,14 +589,17 @@
                exit-code (:exit_code result)]
            (cond
              (= 127 exit-code)
-             (native-grep (path-for (or path ".")) pattern case-insensitive
-                          glob-filter max-results)
+             (native-grep (path-for (or path ".")) path pattern
+                          case-insensitive glob-filter max-results output-mode)
 
              (or (= 0 exit-code) (= 1 exit-code))
              (str/join "\n"
                        (take max-results
-                             (remove str/blank?
-                                     (str/split (:stdout result) #"\r?\n"))))
+                             (map (fn [line]
+                                    (str/replace line #"^\./" ""))
+                                  (remove str/blank?
+                                          (str/split (:stdout result)
+                                                     #"\r?\n")))))
 
              :else
              (throw

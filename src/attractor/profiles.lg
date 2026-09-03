@@ -97,7 +97,7 @@
 (defn- registered [definition executor]
   {:definition definition :executor executor})
 
-(defn- base-tools [edit-kind]
+(defn- base-tools [edit-kind default-shell-timeout grep-output-modes]
   (let [read-def (definition "read_file" "Read a line-numbered file"
                              {:file_path {:type "string"}
                               :offset {:type "integer"}
@@ -123,11 +123,18 @@
                                :description {:type "string"}}
                               ["command"])
         grep-def (definition "grep" "Search file contents"
-                             {:pattern {:type "string"}
-                              :path {:type "string"}
-                              :glob_filter {:type "string"}
-                              :case_insensitive {:type "boolean"}
-                              :max_results {:type "integer"}}
+                             (cond->
+                               {:pattern {:type "string"}
+                                :path {:type "string"}
+                                :glob_filter {:type "string"}
+                                :case_insensitive {:type "boolean"}
+                                :max_results {:type "integer"}}
+                               grep-output-modes
+                               (assoc :output_mode
+                                      {:type "string"
+                                       :enum ["content"
+                                              "files_with_matches"
+                                              "count"]}))
                              ["pattern"])
         glob-def (definition "glob" "Find files by pattern"
                              {:pattern {:type "string"} :path {:type "string"}}
@@ -160,6 +167,7 @@
                  (fn [args env]
                    ((:exec_command env) (arg args "command")
                     (or (arg args "timeout_ms")
+                        default-shell-timeout
                         (:default_command_timeout_ms env)
                         10000)
                     nil nil)))
@@ -170,8 +178,11 @@
                  (fn [args env]
                    ((:glob env) (arg args "pattern") (arg args "path"))))]))))
 
-(defn- profile-registry [edit-kind extra-tools]
-  (make-tool-registry (concat (base-tools edit-kind) extra-tools)))
+(defn- profile-registry
+  [edit-kind default-shell-timeout grep-output-modes extra-tools]
+  (make-tool-registry
+    (concat (base-tools edit-kind default-shell-timeout grep-output-modes)
+            extra-tools)))
 
 (defn- provider-prompt [provider editing-guidance]
   (fn [environment project-docs]
@@ -185,7 +196,7 @@
 (defn create-openai-profile [& [model]]
   (make-profile
     {:id "openai" :model (or model "gpt-5.2-codex")
-     :tool_registry (profile-registry "apply_patch" [])
+     :tool_registry (profile-registry "apply_patch" nil false [])
      :build_system_prompt
      (provider-prompt "OpenAI/Codex"
                       "Use apply_patch for precise file modifications.")}))
@@ -193,7 +204,7 @@
 (defn create-anthropic-profile [& [model]]
   (make-profile
     {:id "anthropic" :model (or model "claude-opus-4.6")
-     :tool_registry (profile-registry "edit_file" [])
+     :tool_registry (profile-registry "edit_file" 120000 true [])
      :default_command_timeout_ms 120000
      :build_system_prompt
      (provider-prompt "Anthropic/Claude"
@@ -218,7 +229,8 @@
              (or (arg args "depth") 1))))]
     (make-profile
       {:id "gemini" :model (or model "gemini-3-pro")
-       :tool_registry (profile-registry "edit_file" [read-many list-dir])
+       :tool_registry (profile-registry "edit_file" nil false
+                                        [read-many list-dir])
        :build_system_prompt
        (provider-prompt "Google/Gemini"
                         "Use the available filesystem tools and honor GEMINI.md guidance.")})))
@@ -229,7 +241,8 @@
     "anthropic" (create-anthropic-profile model)
     "gemini" (create-gemini-profile model)
     (make-profile {:id provider :model model
-                   :tool_registry (profile-registry "edit_file" [])})))
+                   :tool_registry (profile-registry "edit_file" nil false
+                                                    [])})))
 
 (defn get-profile-by-id [id]
   (case (str/lower-case (or id ""))
