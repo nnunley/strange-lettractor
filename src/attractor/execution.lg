@@ -1,5 +1,6 @@
 (ns attractor.execution
   (:require [clojure.string :as str]
+            [clojure.core :as core]
             [io :as io]
             [os :as os]
             [attractor.patch :as patch]))
@@ -50,12 +51,12 @@
 
 (def command-wrapper
   (str
-    "set -m\n"
     "workdir=$1\n"
     "timeout_s=$2\n"
     "command_text=$3\n"
     "timeout_marker=$4\n"
-    "shift 4\n"
+    "cancel_marker=$5\n"
+    "shift 5\n"
     "cd \"$workdir\" || exit 126\n"
     "while IFS='=' read -r name value; do\n"
     "  case \"$name\" in\n"
@@ -66,7 +67,14 @@
     "  export \"$1=$2\"\n"
     "  shift 2\n"
     "done\n"
-    "( eval \"$command_text\" ) &\n"
+    "if command -v setsid >/dev/null 2>&1; then\n"
+    "  setsid /bin/bash -c \"$command_text\" &\n"
+    "elif command -v perl >/dev/null 2>&1; then\n"
+    "  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash -c \"$command_text\" &\n"
+    "else\n"
+    "  set -m\n"
+    "  ( eval \"$command_text\" ) &\n"
+    "fi\n"
     "child=$!\n"
     "(\n"
     "  sleep \"$timeout_s\"\n"
@@ -74,16 +82,33 @@
     "  kill -TERM -\"$child\" 2>/dev/null || exit 0\n"
     "  sleep 2\n"
     "  kill -KILL -\"$child\" 2>/dev/null || true\n"
-    ") &\n"
+    ") >/dev/null 2>&1 &\n"
     "watchdog=$!\n"
+    "(\n"
+    "  while [ ! -e \"$cancel_marker\" ]; do sleep 0.05; done\n"
+    "  kill -TERM -\"$child\" 2>/dev/null || exit 0\n"
+    "  sleep 2\n"
+    "  kill -KILL -\"$child\" 2>/dev/null || true\n"
+    ") >/dev/null 2>&1 &\n"
+    "canceller=$!\n"
     "wait \"$child\"\n"
     "status=$?\n"
+    "if [ -e \"$cancel_marker\" ]; then\n"
+    "  kill -KILL \"$watchdog\" 2>/dev/null\n"
+    "  wait \"$watchdog\" 2>/dev/null\n"
+    "  wait \"$canceller\" 2>/dev/null\n"
+    "  exit 130\n"
+    "fi\n"
     "if [ -e \"$timeout_marker\" ]; then\n"
+    "  kill -KILL \"$canceller\" 2>/dev/null\n"
+    "  wait \"$canceller\" 2>/dev/null\n"
     "  wait \"$watchdog\" 2>/dev/null\n"
     "  exit 124\n"
     "fi\n"
-    "kill \"$watchdog\" 2>/dev/null\n"
+    "kill -KILL \"$watchdog\" 2>/dev/null\n"
+    "kill -KILL \"$canceller\" 2>/dev/null\n"
     "wait \"$watchdog\" 2>/dev/null\n"
+    "wait \"$canceller\" 2>/dev/null\n"
     "exit \"$status\"\n"))
 
 (defn make-local-environment [& [opts]]
@@ -91,44 +116,128 @@
         working-dir (or (:working_dir options) (os/cwd))
         default-timeout (max 1 (or (:default_command_timeout_ms options) 10000))
         max-timeout (max 1 (or (:max_command_timeout_ms options) 600000))
+        lifecycle
+        (or (:_lifecycle options)
+            {:active_commands (atom {})
+             :command_counter (atom 0)
+             :environment_id (System/nanoTime)
+             :control_lock (atom false)
+             :closed (atom false)})
+        active-commands (:active_commands lifecycle)
+        command-counter (:command_counter lifecycle)
+        environment-id (:environment_id lifecycle)
+        control-lock (:control_lock lifecycle)
+        closed (:closed lifecycle)
+        acquire-control-lock!
+        (fn []
+          (loop []
+            (when-not (compare-and-set! control-lock false true)
+              (core/sleep 1)
+              (recur))))
+        with-control-lock
+        (fn [operation]
+          (acquire-control-lock!)
+          (try
+            (operation)
+            (finally
+              (reset! control-lock false))))
         path-for (fn [path] (resolve-path working-dir path))
         exec-command
         (fn [command timeout-ms requested-dir env-vars]
           (let [dir (or requested-dir working-dir)
                 started (System/currentTimeMillis)
                 timeout (min max-timeout (max 1 (or timeout-ms default-timeout)))
-                marker (str (os/temp-dir) "/lettractor-timeout-" (random-uuid))
+                command-id (str environment-id "-" started "-"
+                                (swap! command-counter inc))
+                timeout-marker (str (os/temp-dir) "/lettractor-timeout-" command-id)
+                cancel-marker (str (os/temp-dir) "/lettractor-cancel-" command-id)
                 environment-args
                 (vec (mapcat (fn [[key value]] [(str key) (str value)])
                              (or env-vars {})))
-                result (apply os/sh
-                              (concat ["/bin/bash" "-c" command-wrapper
-                                       "lettractor" dir
-                                       (str (/ timeout 1000.0))
-                                       (str command) marker]
-                                      environment-args))
-                timed-out (some? (os/stat marker))
-                _cleanup (os/sh "rm" "-f" marker)
-                duration (- (System/currentTimeMillis) started)
-                timeout-message
-                (str "[ERROR: Command timed out after " timeout
-                     "ms. Partial output is shown above.\n"
-                     "You can retry with a longer timeout by setting the timeout_ms parameter.]")]
-            {:stdout (:out result)
-             :stderr (if timed-out
-                       (str (:err result)
-                            (when-not (str/blank? (:err result)) "\n")
-                            timeout-message)
-                       (:err result))
-             :exit_code (if timed-out 124 (:exit result))
-             :timed_out timed-out
-             :duration_ms duration}))]
+                registered?
+                (with-control-lock
+                  (fn []
+                    (when-not @closed
+                      (swap! active-commands assoc command-id cancel-marker)
+                      true)))]
+            (if-not registered?
+              {:stdout ""
+               :stderr "[ERROR: Command cancelled because the execution environment is closed.]"
+               :exit_code 130 :timed_out false :cancelled true
+               :duration_ms 0}
+              (try
+                (let [result
+                      (apply os/sh
+                             (concat ["/bin/bash" "-c" command-wrapper
+                                      "lettractor" dir
+                                      (str (/ timeout 1000.0))
+                                      (str command) timeout-marker cancel-marker]
+                                     environment-args))
+                      timed-out (some? (os/stat timeout-marker))
+                      cancelled (some? (os/stat cancel-marker))
+                      duration (- (System/currentTimeMillis) started)
+                      timeout-message
+                      (str "[ERROR: Command timed out after " timeout
+                           "ms. Partial output is shown above.\n"
+                           "You can retry with a longer timeout by setting the timeout_ms parameter.]")
+                      cancel-message
+                      "[ERROR: Command cancelled by session shutdown. Partial output is shown above.]"
+                      message (cond cancelled cancel-message
+                                    timed-out timeout-message
+                                    :else nil)]
+                  {:stdout (:out result)
+                   :stderr (if message
+                             (str (:err result)
+                                  (when-not (str/blank? (:err result)) "\n")
+                                  message)
+                             (:err result))
+                   :exit_code (cond cancelled 130
+                                    timed-out 124
+                                    :else (:exit result))
+                   :timed_out (boolean timed-out)
+                   :cancelled (boolean cancelled)
+                   :duration_ms duration})
+                (finally
+                  (with-control-lock
+                    (fn [] (swap! active-commands dissoc command-id)))
+                  (os/sh "rm" "-f" timeout-marker)
+                  (os/sh "rm" "-f" cancel-marker))))))
+        cleanup
+        (fn []
+          (let [signal-errors (atom [])]
+            (with-control-lock
+              (fn []
+                (reset! closed true)
+                (doseq [[command-id marker] @active-commands]
+                  (try
+                    (io/spit marker "")
+                    (catch Object error
+                      (swap! signal-errors conj
+                             {:command_id command-id
+                              :error (str error)}))))))
+            (let [deadline (+ (System/currentTimeMillis) 3000)]
+              (loop []
+                (when (and (seq @active-commands)
+                           (< (System/currentTimeMillis) deadline))
+                  (core/sleep 10)
+                  (recur))))
+            (let [remaining (vec (keys @active-commands))]
+              (when (or (seq @signal-errors) (seq remaining))
+                (throw
+                  (ex-info
+                    "Execution environment cleanup did not terminate every command"
+                    {:category :execution-cleanup-failed
+                     :signal_errors @signal-errors
+                     :active_command_ids remaining}))))))]
     (make-environment
-      {:working_directory (fn [] working-dir)
+      {:cleanup cleanup
+       :working_directory (fn [] working-dir)
        :with_working_directory
        (fn [directory]
          (make-local-environment
-           (assoc options :working_dir (path-for directory))))
+           (assoc options
+                  :working_dir (path-for directory)
+                  :_lifecycle lifecycle)))
        :platform (fn [] (os/os-name))
        :os_version (fn [] (str (os/os-name) "/" (os/arch)))
        :inspect_command

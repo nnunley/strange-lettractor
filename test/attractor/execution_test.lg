@@ -1,6 +1,7 @@
 (ns attractor.execution-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [clojure.core :as core]
             [io :as io]
             [os :as os]
             [attractor.execution :as execution]))
@@ -81,3 +82,110 @@
         result ((:exec_command environment) "sleep 1" 5000 nil nil)]
     (is (= 124 (:exit_code result)))
     (is (str/includes? (:stderr result) "after 50ms"))))
+
+(deftest test-local-environment-cleanup-cancels-active-process-group
+  (let [root (str (os/temp-dir) "/lettractor-execution-cancel-"
+                  (System/currentTimeMillis))
+        started (str root "/started")
+        survived (str root "/survived")
+        environment (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir root)
+        task
+        (core/future
+          ((:exec_command environment)
+           (str "printf started > \"" started "\"; "
+                "trap '' TERM; sleep 5; "
+                "printf survived > \"" survived "\"")
+           500 nil nil))]
+    (loop [attempt 0]
+      (when (and (< attempt 100) (nil? (os/stat started)))
+        (core/sleep 5)
+        (recur (inc attempt))))
+    (is (some? (os/stat started)))
+    ((:cleanup environment))
+    (let [result (deref task 4000 :timeout)]
+      (is (not= :timeout result))
+      (is (= 130 (:exit_code result)))
+      (is (true? (:cancelled result)))
+      (is (false? (some? (os/stat survived)))))))
+
+(deftest test-local-environment-rejects-commands-after-cleanup
+  (let [root (str (os/temp-dir) "/lettractor-execution-closed-"
+                  (System/currentTimeMillis))
+        launched (str root "/launched")
+        environment (execution/make-local-environment {:working_dir root})]
+    (io/mkdir root)
+    ((:cleanup environment))
+    (let [result ((:exec_command environment)
+                  (str "printf launched > \"" launched "\"")
+                  1000 nil nil)]
+      (is (= 130 (:exit_code result)))
+      (is (true? (:cancelled result)))
+      (is (false? (some? (os/stat launched)))))))
+
+(deftest test-local-environment-cleanup-cancels-all-active-commands
+  (let [root (str (os/temp-dir) "/lettractor-execution-cancel-all-"
+                  (System/currentTimeMillis))
+        environment (execution/make-local-environment {:working_dir root})
+        started-a (str root "/started-a")
+        started-b (str root "/started-b")
+        survived-a (str root "/survived-a")
+        survived-b (str root "/survived-b")
+        command (fn [started survived]
+                  (str "printf started > \"" started "\"; "
+                       "trap '' TERM; sleep 5; "
+                       "printf survived > \"" survived "\""))
+        _ (io/mkdir root)
+        task-a (core/future
+                 ((:exec_command environment)
+                  (command started-a survived-a) 10000 nil nil))
+        task-b (core/future
+                 ((:exec_command environment)
+                  (command started-b survived-b) 10000 nil nil))]
+    (loop [attempt 0]
+      (when (and (< attempt 200)
+                 (or (nil? (os/stat started-a))
+                     (nil? (os/stat started-b))))
+        (core/sleep 5)
+        (recur (inc attempt))))
+    (is (some? (os/stat started-a)))
+    (is (some? (os/stat started-b)))
+    ((:cleanup environment))
+    (let [result-a (deref task-a 4000 :timeout)
+          result-b (deref task-b 4000 :timeout)]
+      (is (not= :timeout result-a) (str "result-a=" (pr-str result-a)))
+      (is (not= :timeout result-b) (str "result-b=" (pr-str result-b)))
+      (is (= 130 (:exit_code result-a)) (str "result-a=" (pr-str result-a)))
+      (is (= 130 (:exit_code result-b)) (str "result-b=" (pr-str result-b)))
+      (is (true? (:cancelled result-a)))
+      (is (true? (:cancelled result-b)))
+      (is (false? (some? (os/stat survived-a))))
+      (is (false? (some? (os/stat survived-b)))))))
+
+(deftest test-working-directory-view-shares-parent-cancellation-lifecycle
+  (let [root (str (os/temp-dir) "/lettractor-execution-scoped-"
+                  (System/currentTimeMillis))
+        nested (str root "/nested")
+        started (str nested "/started")
+        survived (str nested "/survived")
+        parent (execution/make-local-environment {:working_dir root})
+        _ (io/mkdir nested)
+        scoped ((:with_working_directory parent) "nested")
+        task
+        (core/future
+          ((:exec_command scoped)
+           (str "printf started > \"" started "\"; "
+                "trap '' TERM; sleep 5; "
+                "printf survived > \"" survived "\"")
+           10000 nil nil))]
+    (loop [attempt 0]
+      (when (and (< attempt 200) (nil? (os/stat started)))
+        (core/sleep 5)
+        (recur (inc attempt))))
+    (is (some? (os/stat started)))
+    ((:cleanup parent))
+    (let [result (deref task 4000 :timeout)]
+      (is (not= :timeout result))
+      (is (= 130 (:exit_code result)))
+      (is (true? (:cancelled result)))
+      (is (false? (some? (os/stat survived)))))))

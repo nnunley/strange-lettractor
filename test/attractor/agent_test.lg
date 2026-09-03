@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [clojure.core :as core]
+            [io :as io]
+            [os :as os]
             [attractor.agent :as agent]
             [attractor.execution :as execution]
             [attractor.llm :as llm]
@@ -182,6 +184,21 @@
     (is (= 1 (count (filter #(= :session_end (:type %))
                             (agent/session-events aborted)))))))
 
+(deftest test-session-shutdown-terminates-environment-before-subagents
+  (let [order (atom [])
+        parent-environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! order conj :environment))})
+        child-environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! order conj :subagent))})
+        child (agent/make-session {:execution_env child-environment})
+        parent (agent/make-session {:execution_env parent-environment})]
+    (swap! parent assoc :subagents
+           {"child" {:id "child" :session child :status :idle}})
+    (agent/abort-session! parent)
+    (is (= [:environment :subagent] @order))))
+
 (deftest test-session-streams-assistant-text-deltas
   (let [events (atom [])
         requests (atom [])
@@ -264,6 +281,48 @@
     (is (empty? (filter #(= :assistant (:type %)) (:history @session))))
     (is (= 1 (count (filter #(= :session_end (:type %))
                             (agent/session-events session)))))))
+
+(deftest test-abort-kills-running-local-tool-process
+  (let [root (str (os/temp-dir) "/lettractor-agent-cancel-"
+                  (System/currentTimeMillis))
+        started (str root "/started")
+        survived (str root "/survived")
+        _ (io/mkdir root)
+        environment (execution/make-local-environment {:working_dir root})
+        profile (profiles/create-openai-profile "test")
+        session
+        (agent/make-session
+          {:provider_profile profile
+           :execution_env environment
+           :project_docs []
+           :stream_fn
+           (fn [_]
+             [{:type :stream_start}
+              {:type :finish :finish_reason :tool_calls :usage {}
+               :response
+               {:message {:role :assistant :content ""}
+                :tool_calls
+                [{:id "shell-1" :name "shell"
+                  :arguments
+                  {"command"
+                   (str "printf started > \"" started "\"; "
+                        "trap '' TERM; sleep 5; "
+                        "printf survived > \"" survived "\"")
+                   "timeout_ms" 10000}}]
+                :usage {} :finish_reason :tool_calls}}])})
+        processing (core/future (agent/process-input! session "work"))]
+    (loop [attempt 0]
+      (when (and (< attempt 200) (nil? (os/stat started)))
+        (core/sleep 5)
+        (recur (inc attempt))))
+    (is (some? (os/stat started)))
+    (agent/abort-session! session)
+    ;; Shutdown allows the process group two seconds to exit after SIGTERM
+    ;; before escalating to SIGKILL.
+    (is (not= :timeout (deref processing 4000 :timeout)))
+    (is (= :closed (:state @session)))
+    (is (false? (some? (os/stat survived))))
+    (is (= :session_end (:type (last (agent/session-events session)))))))
 
 (deftest test-closed-sessions-reject-input-without-mutation
   (let [calls (atom 0)
@@ -712,6 +771,50 @@
                       (get-in @child [:provider_profile :tool_registry])))
                "spawn_agent")))
     (is (= :closed (:status (agent/close-subagent! parent agent-id))))))
+
+(deftest test-parent-abort-kills-command-in-scoped-subagent-environment
+  (let [root (str (os/temp-dir) "/lettractor-subagent-cancel-"
+                  (System/currentTimeMillis))
+        nested (str root "/nested")
+        started (str nested "/started")
+        survived (str nested "/survived")
+        calls (atom 0)
+        environment (execution/make-local-environment {:working_dir root})
+        profile (profiles/create-openai-profile "test")
+        _ (io/mkdir nested)
+        parent
+        (agent/make-session
+          {:execution_env environment
+           :provider_profile profile
+           :project_docs []
+           :complete_fn
+           (fn [_]
+             (if (= 1 (swap! calls inc))
+               {:message {:role :assistant :content ""}
+                :tool_calls
+                [{:id "scoped-shell" :name "shell"
+                  :arguments
+                  {"command"
+                   (str "printf started > \"" started "\"; "
+                        "trap '' TERM; sleep 5; "
+                        "printf survived > \"" survived "\"")
+                   "timeout_ms" 10000}}]}
+               {:message {:role :assistant :content "done"}
+                :tool_calls []}))})
+        spawned
+        (agent/spawn-subagent!
+          parent {"task" "work" :working_dir "nested"})
+        agent-id (:agent_id spawned)]
+    (loop [attempt 0]
+      (when (and (< attempt 200) (nil? (os/stat started)))
+        (core/sleep 5)
+        (recur (inc attempt))))
+    (is (some? (os/stat started)))
+    (agent/abort-session! parent)
+    (let [result (deref (core/future (agent/wait-subagent! parent agent-id))
+                        4000 :timeout)]
+      (is (not= :timeout result))
+      (is (false? (some? (os/stat survived)))))))
 
 (deftest test-subagent-send-input-runs-another-independent-cycle
   (let [parent (agent/make-session

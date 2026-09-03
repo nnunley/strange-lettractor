@@ -456,13 +456,13 @@
             (close-stream)
             (catch Object e (swap! errors conj e))))
         (swap! session assoc :active_stream_close nil)
-        (doseq [[agent-id _] (:subagents @session)]
-          (try
-            (close-subagent! session agent-id)
-            (catch Object e (swap! errors conj e))))
         (when-let [cleanup (get-in @session [:execution_env :cleanup])]
           (try
             (cleanup)
+            (catch Object e (swap! errors conj e))))
+        (doseq [[agent-id _] (:subagents @session)]
+          (try
+            (close-subagent! session agent-id)
             (catch Object e (swap! errors conj e))))
         (finally
           (when (seq @errors)
