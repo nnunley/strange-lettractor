@@ -127,9 +127,18 @@
       {:working_directory (fn [] working-dir)
        :platform (fn [] (os/os-name))
        :os_version (fn [] (str (os/os-name) "/" (os/arch)))
+       :inspect_command
+       (fn [command]
+         (let [result (os/sh "/bin/bash" "-c"
+                             "cd \"$1\" && eval \"$2\""
+                             "lettractor-inspect" working-dir command)]
+           {:exit_code (:exit result)
+            :stdout (:out result)
+            :stderr (:err result)}))
        :read_file
        (fn [path offset limit]
          (numbered-lines (io/slurp (path-for path)) offset limit))
+       :read_text (fn [path] (io/slurp (path-for path)))
        :write_file
        (fn [path content]
          (let [resolved (path-for path)]

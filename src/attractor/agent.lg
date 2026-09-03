@@ -123,6 +123,131 @@
     (catch Object e
       (str "Error listing directory " dir ": " e))))
 
+(defn- emit-event! [session event & [listener]]
+  (let [stored-listener (:event_fn @session)
+        stamped (assoc event
+                       :timestamp (System/currentTimeMillis)
+                       :session_id (:id @session))]
+    (swap! (:events @session) conj stamped)
+    (when stored-listener (stored-listener stamped))
+    (when (and listener (not= listener stored-listener))
+      (listener stamped))
+    stamped))
+
+(defn session-events [session]
+  (vec @(:events @session)))
+
+(defn- environment-command [environment command]
+  (when-let [execute (or (:inspect_command environment)
+                         (when-let [exec-command (:exec_command environment)]
+                           (fn [cmd] (exec-command cmd 5000 nil nil))))]
+    (try
+      (let [result (execute command)]
+        (when (= 0 (:exit_code result))
+          (str/trim (:stdout result))))
+      (catch Object _ nil))))
+
+(defn- directory-chain [root working-dir]
+  (if (or (str/blank? root)
+          (not (str/starts-with? working-dir root)))
+    [working-dir]
+    (let [suffix (subs working-dir (count root))
+          parts (vec (remove str/blank? (str/split suffix #"/")))]
+      (loop [remaining parts current root directories [root]]
+        (if (empty? remaining)
+          directories
+          (let [next-dir (str current "/" (first remaining))]
+            (recur (subvec remaining 1) next-dir
+                   (conj directories next-dir))))))))
+
+(defn- provider-doc-paths [provider]
+  (case (str/lower-case (or provider ""))
+    "openai" ["AGENTS.md" ".codex/instructions.md"]
+    "anthropic" ["AGENTS.md" "CLAUDE.md"]
+    "gemini" ["AGENTS.md" "GEMINI.md"]
+    ["AGENTS.md"]))
+
+(defn discover-project-docs [environment provider]
+  (let [working-dir ((:working_directory environment))
+        git-root (environment-command environment "git rev-parse --show-toplevel")
+        directories (directory-chain (or git-root working-dir) working-dir)
+        candidates (for [directory directories
+                         relative-path (provider-doc-paths provider)]
+                     (str directory "/" relative-path))
+        exists? (:file_exists environment)
+        read-text (or (:read_text environment)
+                      (when-let [read-file (:read_file environment)]
+                        (fn [path] (read-file path nil nil))))]
+    (if (or (nil? exists?) (nil? read-text))
+      []
+      (loop [remaining candidates docs [] used 0]
+        (if (empty? remaining)
+          docs
+          (let [path (first remaining)]
+            (if-not (exists? path)
+              (recur (rest remaining) docs used)
+              (let [content (str (read-text path))
+                    available (- 32768 used)]
+                (if (<= (count content) available)
+                  (recur (rest remaining)
+                         (conj docs (str "# " path "\n" content))
+                         (+ used (count content)))
+                  (conj docs
+                        (str "# " path "\n"
+                             (subs content 0 (max 0 available))
+                             "\n[Project instructions truncated at 32KB]")))))))))))
+
+(defn- environment-snapshot [environment model]
+  (let [working-dir ((:working_directory environment))
+        git-root (environment-command environment "git rev-parse --show-toplevel")
+        branch (when git-root
+                 (environment-command environment "git branch --show-current"))
+        status (when git-root
+                 (environment-command environment "git status --short"))
+        recent (when git-root
+                 (environment-command environment "git log -5 --pretty=%s"))]
+    {:working_directory working-dir
+     :is_git_repository (boolean git-root)
+     :git_branch (or branch "")
+     :git_status_count (if (str/blank? status)
+                         0
+                         (count (str/split status #"\r?\n")))
+     :recent_commits (or recent "")
+     :platform ((:platform environment))
+     :os_version ((:os_version environment))
+     :date (or (environment-command environment "date +%F") "unknown")
+     :model model}))
+
+(defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions]
+  (let [base (profiles/build-system-prompt profile environment [])
+        tool-text
+        (str/join "\n"
+                  (map (fn [tool]
+                         (str (:name tool) ": " (:description tool)))
+                       (profiles/profile-tools profile)))
+        environment-text
+        (str "<environment>\n"
+             "Working directory: " (:working_directory snapshot) "\n"
+             "Is git repository: " (:is_git_repository snapshot) "\n"
+             "Git branch: " (:git_branch snapshot) "\n"
+             "Git changed files: " (:git_status_count snapshot) "\n"
+             (when-not (str/blank? (:recent_commits snapshot))
+               (str "Recent commits:\n" (:recent_commits snapshot) "\n"))
+             "Platform: " (:platform snapshot) "\n"
+             "OS version: " (:os_version snapshot) "\n"
+             "Today's date: " (:date snapshot) "\n"
+             "Model: " (:model snapshot) "\n"
+             "</environment>")]
+    (str base
+         "\n\n" environment-text
+         "\n\n<tools>\n" tool-text "\n</tools>"
+         (when (seq project-docs)
+           (str "\n\n<project_instructions>\n"
+                (str/join "\n\n" project-docs)
+                "\n</project_instructions>"))
+         (when-not (str/blank? user-instructions)
+           (str "\n\n" user-instructions)))))
+
 ;; Tool Dispatcher
 (defn execute-tool [tool-name args]
   (case tool-name
@@ -155,25 +280,37 @@
                            :max_command_timeout_ms
                            (or (:max_command_timeout_ms options) 600000))]
     ((:initialize environment))
-    (atom {:id (str "agent-" (System/currentTimeMillis))
-           :model (:model profile)
-           :provider_profile profile
-           :execution_env environment
-           :llm_client (:llm_client options)
-           :state :idle
-           :abort_signaled false
-           :cleanup_done false
-           :history []
-           :steering-queue []
-           :followup-queue []
-           :config (merge {:max_turns 0
-                           :max_tool_rounds_per_input 0
-                           :default_command_timeout_ms 10000
-                           :max_command_timeout_ms 600000
-                           :reasoning_effort nil
-                           :enable_loop_detection true
-                           :loop_detection_window 10}
-                          options)})))
+    (let [project-docs
+          (if (contains? options :project_docs)
+            (vec (:project_docs options))
+            (discover-project-docs environment (:id profile)))
+          snapshot (environment-snapshot environment (:model profile))
+          session
+          (atom {:id (str "agent-" (random-uuid))
+                 :model (:model profile)
+                 :provider_profile profile
+                 :execution_env environment
+                 :llm_client (:llm_client options)
+                 :event_fn (:on_event options)
+                 :events (atom [])
+                 :project_docs project-docs
+                 :environment_snapshot snapshot
+                 :state :idle
+                 :abort_signaled false
+                 :cleanup_done false
+                 :history []
+                 :steering-queue []
+                 :followup-queue []
+                 :config (merge {:max_turns 0
+                                 :max_tool_rounds_per_input 0
+                                 :default_command_timeout_ms 10000
+                                 :max_command_timeout_ms 600000
+                                 :reasoning_effort nil
+                                 :enable_loop_detection true
+                                 :loop_detection_window 10}
+                                options)})]
+      (emit-event! session {:type :session_start})
+      session)))
 
 ;; Inject a steering message into the session
 (defn steer-session! [session msg]
@@ -194,7 +331,7 @@
 (defn close-session! [session & [on-event]]
   (cleanup-session! session)
   (swap! session assoc :state :closed)
-  ((or on-event (fn [_] nil)) {:type :session_end :state :closed})
+  (emit-event! session {:type :session_end :state :closed} on-event)
   session)
 
 (defn abort-session! [session & [on-event]]
@@ -204,7 +341,9 @@
 (defn- drain-steering! [session event-fn]
   (let [queued (:steering-queue @session)]
     (doseq [msg queued]
-      (swap! session update :history conj {:type :steering :role :user :content msg})
+      (swap! session update :history conj
+             {:type :steering :role :user :content msg
+              :timestamp (System/currentTimeMillis)})
       (event-fn {:type :steering_injected :content msg}))
     (swap! session assoc :steering-queue [])))
 
@@ -324,7 +463,7 @@
 
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn process-input! [session prompt & [on-event]]
-  (let [event-fn (or on-event (fn [_] nil))
+  (let [event-fn (fn [event] (emit-event! session event on-event))
         config (:config @session)
         profile (:provider_profile @session)
         environment (:execution_env @session)
@@ -335,7 +474,9 @@
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)]
     (swap! session assoc :state :processing)
-    (swap! session update :history conj {:type :user :role :user :content prompt})
+    (swap! session update :history conj
+           {:type :user :role :user :content prompt
+            :timestamp (System/currentTimeMillis)})
     (event-fn {:type :user_input :content prompt})
     (drain-steering! session event-fn)
     (let [result
@@ -351,8 +492,11 @@
                              :total_turns assistant-count})
                   last-text)
                 (let [system-prompt
-                      (profiles/build-system-prompt
-                        profile environment (or (:project_docs config) []))
+                      (assemble-system-prompt
+                        profile environment
+                        (:environment_snapshot @session)
+                        (:project_docs @session)
+                        (:user_instructions config))
                       request {:model (:model profile)
                                :provider (:id profile)
                                :messages
@@ -362,17 +506,31 @@
                                :tool_choice {:mode "auto"}
                                :reasoning_effort (:reasoning_effort config)
                                :provider_options (:provider_options profile)}
-                      response (complete-fn request)
+                      _assistant-start (event-fn {:type :assistant_text_start})
+                      response
+                      (try
+                        (complete-fn request)
+                        (catch Object e
+                          (event-fn {:type :error :error (str e)
+                                     :category (:category (ex-data e))})
+                          (cleanup-session! session)
+                          (swap! session assoc :state :closed)
+                          (event-fn {:type :session_end :state :closed
+                                     :error (str e)})
+                          (throw e)))
                       text (response-content response)
                       tool-calls (response-tool-calls response)
                       assistant-turn {:type :assistant
                                       :role :assistant
                                       :content text
                                       :tool_calls tool-calls
+                                      :reasoning (:reasoning response)
                                       :usage (:usage response)
-                                      :response_id (:id response)}]
+                                      :response_id (:id response)
+                                      :timestamp (System/currentTimeMillis)}]
                   (swap! session update :history conj assistant-turn)
-                  (event-fn {:type :assistant_text_end :text text})
+                  (event-fn {:type :assistant_text_end :text text
+                             :reasoning (:reasoning response)})
                   (if (empty? tool-calls)
                     text
                     (let [execute-call
@@ -384,7 +542,8 @@
                             (vec (pmap execute-call tool-calls))
                             (mapv execute-call tool-calls))]
                       (swap! session update :history conj
-                             {:type :tool_results :role :tool :results results})
+                             {:type :tool_results :role :tool :results results
+                              :timestamp (System/currentTimeMillis)})
                       (drain-steering! session event-fn)
                       (when (and (:enable_loop_detection config)
                                  (detect-loop (:history @session)
@@ -393,7 +552,8 @@
                               (str "Loop detected: recent tool calls repeat. "
                                    "Try a different approach.")]
                           (swap! session update :history conj
-                                 {:type :steering :role :user :content warning})
+                                 {:type :steering :role :user :content warning
+                                  :timestamp (System/currentTimeMillis)})
                           (event-fn {:type :loop_detection :message warning})))
                       (recur (inc round-count) text)))))))]
       (cond

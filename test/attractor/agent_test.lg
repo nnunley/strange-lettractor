@@ -110,8 +110,8 @@
     (is (= "done" (agent/process-input! session "work")))
     (is (= [["README.md" nil nil]] @environment-calls))
     (is (= :system (get-in @requests [0 :messages 0 :role])))
-    (is (= "cwd=/virtual/project"
-           (get-in @requests [0 :messages 0 :content])))
+    (is (str/includes? (get-in @requests [0 :messages 0 :content])
+                       "cwd=/virtual/project"))
     (is (= "test-provider" (get-in @requests [0 :provider])))
     (is (= "native-model" (get-in @requests [0 :model])))
     (is (= "read_file" (get-in @requests [0 :tools 0 :name])))))
@@ -166,3 +166,91 @@
     (is (= :closed (:state @aborted)))
     (is (true? (:abort_signaled @aborted)))
     (is (= 2 @cleanups))))
+
+(deftest test-session-event-stream-brackets-lifecycle-and-stamps-events
+  (let [delivered (atom [])
+        session (agent/make-session
+                  {:on_event (fn [event] (swap! delivered conj event))
+                   :complete_fn
+                   (fn [_]
+                     {:message {:role :assistant :content "done"}
+                      :tool_calls []})})]
+    (agent/process-input! session "work")
+    (agent/close-session! session)
+    (let [events (agent/session-events session)
+          types (mapv :type events)]
+      (is (= [:session_start :user_input :assistant_text_start
+              :assistant_text_end :processing_end :session_end]
+             types))
+      (is (= events @delivered))
+      (is (every? #(= (:id @session) (:session_id %)) events))
+      (is (every? number? (map :timestamp events))))))
+
+(deftest test-unrecoverable-session-error-closes-and-cleans-up
+  (let [cleanups (atom 0)
+        environment (execution/make-environment
+                      {:cleanup (fn [] (swap! cleanups inc))})
+        session (agent/make-session
+                  {:execution_env environment
+                   :complete_fn
+                   (fn [_]
+                     (throw (ex-info "bad credentials"
+                                     {:category :authentication})))})
+        thrown? (try
+                  (do (agent/process-input! session "work") false)
+                  (catch Object _ true))]
+    (is (true? thrown?))
+    (is (= :closed (:state @session)))
+    (is (= 1 @cleanups))
+    (is (= [:session_start :user_input :assistant_text_start
+            :error :session_end]
+           (mapv :type (agent/session-events session))))))
+
+(deftest test-project-doc-discovery-is-provider-aware-and-root-first
+  (let [files {"/repo/AGENTS.md" "root universal"
+               "/repo/CLAUDE.md" "root anthropic"
+               "/repo/GEMINI.md" "wrong provider"
+               "/repo/sub/AGENTS.md" "nested universal"
+               "/repo/sub/CLAUDE.md" "nested anthropic"}
+        environment
+        (execution/make-environment
+          {:working_directory (fn [] "/repo/sub")
+           :file_exists (fn [path] (contains? files path))
+           :read_text (fn [path] (get files path))
+           :exec_command
+           (fn [command _ _ _]
+             (if (str/includes? command "rev-parse")
+               {:exit_code 0 :stdout "/repo\n" :stderr ""}
+               {:exit_code 1 :stdout "" :stderr ""}))})
+        docs (agent/discover-project-docs environment "anthropic")
+        joined (str/join "\n" docs)]
+    (is (= 4 (count docs)))
+    (is (< (str/index-of joined "root universal")
+           (str/index-of joined "nested universal")))
+    (is (str/includes? joined "root anthropic"))
+    (is (str/includes? joined "nested anthropic"))
+    (is (not (str/includes? joined "wrong provider")))))
+
+(deftest test-system-prompt-layers-environment-tools-docs-and-user-override
+  (let [requests (atom [])
+        environment
+        (execution/make-environment
+          {:working_directory (fn [] "/virtual/project")
+           :platform (fn [] "wasm")
+           :os_version (fn [] "wasm/test")})
+        session
+        (agent/make-session
+          {:execution_env environment
+           :project_docs ["project rules"]
+           :user_instructions "highest priority"
+           :complete_fn
+           (fn [request]
+             (swap! requests conj request)
+             {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (agent/process-input! session "work")
+    (let [prompt (get-in @requests [0 :messages 0 :content])]
+      (is (str/includes? prompt "<environment>"))
+      (is (str/includes? prompt "Working directory: /virtual/project"))
+      (is (str/includes? prompt "<tools>"))
+      (is (str/includes? prompt "project rules"))
+      (is (str/ends-with? prompt "highest priority")))))

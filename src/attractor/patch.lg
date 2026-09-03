@@ -67,7 +67,7 @@
       (let [line (get lines index)]
         (cond
           (= line "*** End Patch")
-          (if (= index (dec (count lines)))
+          (if (every? str/blank? (subvec lines (inc index)))
             operations
             (invalid-patch "content follows *** End Patch"))
 
