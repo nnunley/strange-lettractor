@@ -77,7 +77,11 @@
                         (if (str/blank? p)
                           (or (:label node) node-id)
                           p))
-           prompt (str/replace raw-prompt "$goal" goal)
+           base-prompt (str/replace raw-prompt "$goal" goal)
+           preamble (or (:context_preamble node) "")
+           prompt (if (str/blank? preamble)
+                    base-prompt
+                    (str preamble "\n" base-prompt))
            stage-dir (str (or logs-root "attractor_runs/run_latest") "/" node-id)]
 
        (os/sh "mkdir" "-p" stage-dir)
@@ -108,7 +112,7 @@
          (catch Object e
            (let [fail-outcome {:status :fail :failure_reason (str e)}]
              (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json fail-outcome)))
-             fail-outcome)))))))
+             (throw e))))))))
 
 ;; Wait.human Handler (Section 4.6)
 (defn make-wait-human-handler [interviewer]
@@ -160,7 +164,7 @@
 
 ;; Parallel Handler (Section 4.8)
 ;; Executes multiple branches concurrently with bounded parallelism
-(defn make-parallel-handler [execute-branch-fn]
+(defn- make-parallel-handler* [execute-branch-fn pass-edge?]
   (fn [node ctx graph logs-root]
     (let [branches (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
           join-policy (or (get-in node [:attrs :join_policy]) "wait_all")
@@ -168,19 +172,20 @@
                          (if (and (number? mp) (> mp 0)) mp 4))]
       (if (empty? branches)
         {:status :fail :failure_reason "Parallel node has no outgoing branches"}
-        (let [branch-targets (mapv :to branches)
-              results
-              (loop [remaining branch-targets
+        (let [results
+              (loop [remaining branches
                      accumulated []]
                 (if (empty? remaining)
                   accumulated
                   (let [batch (vec (take max-parallel remaining))
                         batch-results
                         (doall
-                          (pmap (fn [target-id]
-                                  (let [branch-ctx (context/ctx-clone ctx)
+                          (pmap (fn [branch-edge]
+                                  (let [target-id (:to branch-edge)
+                                        branch-ctx (context/ctx-clone ctx)
                                         branch-logs (str logs-root "/branches/" target-id)
-                                        result (execute-branch-fn target-id branch-ctx graph branch-logs)]
+                                        branch-start (if pass-edge? branch-edge target-id)
+                                        result (execute-branch-fn branch-start branch-ctx graph branch-logs)]
                                     (assoc result :id target-id :node_id target-id)))
                                 batch))]
                     (recur (drop max-parallel remaining)
@@ -199,6 +204,12 @@
               (merge base {:status :success :notes "All parallel branches succeeded"})
               (merge base {:status :partial_success
                            :notes (str fail-count " parallel branch(es) failed")}))))))))
+
+(defn make-parallel-handler
+  ([execute-branch-fn]
+   (make-parallel-handler* execute-branch-fn false))
+  ([execute-branch-fn pass-edge?]
+   (make-parallel-handler* execute-branch-fn pass-edge?)))
 
 ;; Fan-In Handler (Section 4.9)
 (defn handle-fan-in [node ctx _graph _logs-root]
@@ -402,11 +413,12 @@
          manager-runtime (atom {})
          parallel-handler
          (make-parallel-handler
-           (fn [target-id branch-ctx graph logs-root]
+           (fn [branch-edge branch-ctx graph logs-root]
              (if-let [execute-fn @branch-executor]
-               (execute-fn target-id branch-ctx graph logs-root)
+               (execute-fn branch-edge branch-ctx graph logs-root)
                {:status :fail
-                :failure_reason "Parallel branch executor is not initialized"})))
+                :failure_reason "Parallel branch executor is not initialized"}))
+           true)
          manager-handler (make-manager-loop-handler manager-runtime)]
      (atom {"start" handle-start
             "exit" handle-exit

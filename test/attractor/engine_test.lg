@@ -1,10 +1,12 @@
 (ns attractor.engine-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [attractor.parser :as p]
             [attractor.engine :as e]
             [attractor.context :as c]
             [attractor.handlers :as h]
             [attractor.interviewer :as i]
+            [attractor.agent :as agent]
             [json :as json]
             [io :as io]
             [os :as os]))
@@ -523,4 +525,279 @@ digraph Gate {
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= true (get (:context result) "manager.custom")))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-engine-resolves-fidelity-and-injects-fresh-session-preambles
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             graph [goal=\"Ship it\", default_fidelity=compact]
+             start [shape=Mdiamond]
+             first [shape=box, fidelity=full]
+             second [shape=box, fidelity=full, thread_id=\"node-thread\"]
+             exit [shape=Msquare]
+             start -> first [fidelity=truncate]
+             first -> second [fidelity=full, thread_id=\"edge-thread\"]
+             second -> exit
+           }")
+        calls (atom [])
+        backend
+        (fn [node prompt _]
+          (swap! calls conj {:id (:id node)
+                             :fidelity (:resolved_fidelity node)
+                             :thread (:resolved_thread_id node)
+                             :prompt prompt})
+          {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_fidelity"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})
+        first-call (first @calls)
+        second-call (second @calls)]
+    (is (= :success (:status result)))
+    (is (= "truncate" (:fidelity first-call)))
+    (is (nil? (:thread first-call)))
+    (is (str/includes? (:prompt first-call) "Pipeline Goal: Ship it"))
+    (is (= "full" (:fidelity second-call)))
+    (is (= "node-thread" (:thread second-call)))
+    (is (= "second" (:prompt second-call)))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-full-fidelity-reuses-agent-session-by-thread
+  (let [requests (atom [])
+        closed (atom 0)
+        complete-fn
+        (fn [request]
+          (swap! requests conj request)
+          {:id (str "response-" (count @requests))
+           :content "ok" :tool_calls []})
+        backend (agent/make-agent-codergen-backend
+                  {:model "mock/test" :complete_fn complete-fn
+                   :project_docs []
+                   :on_event
+                   (fn [event]
+                     (when (= :session_end (:type event))
+                       (swap! closed inc)))})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        graph
+        (p/parse-dot
+          "digraph G {
+             graph [default_fidelity=full]
+             node [thread_id=shared]
+             start [shape=Mdiamond]
+             first [shape=box]
+             second [shape=box]
+             third [shape=box, thread_id=other]
+             exit [shape=Msquare]
+             start -> first -> second -> third -> exit
+           }")
+        logs "test_engine_full_fidelity"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= 3 (count @requests)))
+    (is (= 2 (count (:messages (first @requests)))))
+    (is (= 4 (count (:messages (second @requests)))))
+    (is (= 2 (count (:messages (nth @requests 2)))))
+    (is (= 2 @closed))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-resume-degrades-first-full-fidelity-hop
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             graph [goal=\"Resume safely\", default_fidelity=full]
+             start [shape=Mdiamond]
+             first [shape=box, thread_id=shared]
+             second [shape=box, thread_id=shared]
+             exit [shape=Msquare]
+             start -> first -> second -> exit
+           }")
+        root "test_engine_resume_fidelity"
+        checkpoint (str root "/checkpoint.edn")
+        _ (os/sh "mkdir" "-p" root)
+        _ (c/save-checkpoint
+            {:timestamp "1"
+             :current_node "first"
+             :completed_nodes ["start" "first"]
+             :node_retries {}
+             :node_outcomes
+             {"start" {:status :success}
+              "first" {:status :success}}
+             :context_values {"outcome" "success"}
+             :logs []}
+            checkpoint)
+        calls (atom [])
+        backend
+        (fn [node prompt _]
+          (swap! calls conj {:fidelity (:resolved_fidelity node)
+                             :prompt prompt})
+          {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/resume-pipeline checkpoint graph
+                                  {:registry registry :logs-root root})]
+    (is (= :success (:status result)))
+    (is (= "summary:high" (:fidelity (first @calls))))
+    (is (str/includes? (:prompt (first @calls))
+                       "Comprehensive stage history"))
+    (os/sh "rm" "-rf" root)))
+
+(deftest test-parallel-branches-apply-incoming-edge-fidelity
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             graph [goal=\"Parallel context\", default_fidelity=compact]
+             start [shape=Mdiamond]
+             fork [shape=component]
+             branch [shape=box]
+             join [shape=tripleoctagon]
+             exit [shape=Msquare]
+             start -> fork
+             fork -> branch [fidelity=truncate]
+             branch -> join
+             join -> exit
+           }")
+        calls (atom [])
+        backend
+        (fn [node prompt _]
+          (swap! calls conj {:fidelity (:resolved_fidelity node)
+                             :prompt prompt})
+          {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_parallel_fidelity"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= "truncate" (:fidelity (first @calls))))
+    (is (str/includes? (:prompt (first @calls))
+                       "Pipeline Goal: Parallel context"))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-parallel-branch-uses-its-exact-fork-edge
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             graph [default_fidelity=compact]
+             start [shape=Mdiamond]
+             fork [shape=component]
+             decoy [shape=box]
+             branch [shape=box, thread_id=selected]
+             join [shape=tripleoctagon]
+             exit [shape=Msquare]
+             start -> fork
+             decoy -> branch [fidelity=truncate]
+             fork -> branch [fidelity=full]
+             branch -> join
+             join -> exit
+           }")
+        seen (atom nil)
+        backend (fn [node _ _]
+                  (reset! seen (:resolved_fidelity node))
+                  {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_parallel_exact_edge"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= "full" @seen))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-loop-restart-starts-fresh-full-fidelity-sessions
+  (let [requests (atom [])
+        closed (atom 0)
+        backend
+        (agent/make-agent-codergen-backend
+          {:model "mock/test"
+           :project_docs []
+           :complete_fn
+           (fn [request]
+             (swap! requests conj request)
+             {:id "response" :content "ok" :tool_calls []})
+           :on_event
+           (fn [event]
+             (when (= :session_end (:type event))
+               (swap! closed inc)))})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        graph
+        (p/parse-dot
+          "digraph G {
+             graph [default_fidelity=full, thread_id=shared]
+             start [shape=Mdiamond]
+             first [shape=box]
+             second [shape=box]
+             exit [shape=Msquare]
+             start -> first
+             first -> second [loop_restart=true]
+             second -> exit
+           }")
+        root "test_engine_restart_fidelity"
+        logs (str root "/run")
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= [2 2] (mapv (comp count :messages) @requests)))
+    (is (= 2 @closed))
+    (os/sh "rm" "-rf" root)))
+
+(deftest test-retryable-agent-failure-evicts-closed-full-session
+  (let [calls (atom 0)
+        backend
+        (agent/make-agent-codergen-backend
+          {:model "mock/test"
+           :project_docs []
+           :complete_fn
+           (fn [_]
+             (let [call (swap! calls inc)]
+               (if (= 1 call)
+                 (throw (ex-info "temporary" {:category :network-error
+                                                :retryable true}))
+                 {:id "response" :content "ok" :tool_calls []})))})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        graph
+        (p/parse-dot
+          "digraph G {
+             graph [default_fidelity=full, thread_id=shared]
+             start [shape=Mdiamond]
+             work [shape=box, max_retries=1]
+             exit [shape=Msquare]
+             start -> work -> exit
+           }")
+        logs "test_engine_retry_full_session"
+        result (e/run-pipeline
+                 graph {:registry registry :logs-root logs
+                        :sleep-fn (fn [_] nil)
+                        :random-fn (fn [] 0.5)})]
+    (is (= :success (:status result)))
+    (is (= 2 @calls))
+    (os/sh "rm" "-rf" logs)))
+
+(deftest test-fidelity-uses-the-exact-selected-edge
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             start [shape=Mdiamond]
+             first [shape=box]
+             second [shape=box, thread_id=chosen]
+             exit [shape=Msquare]
+             start -> first
+             first -> second [condition=\"context.choice=no\", fidelity=truncate]
+             first -> second [condition=\"context.choice=yes\", fidelity=full]
+             second -> exit
+           }")
+        seen (atom nil)
+        backend
+        (fn [node _ _]
+          (if (= "first" (:id node))
+            {:status :success :context_updates {"choice" "yes"}}
+            (do
+              (reset! seen (:resolved_fidelity node))
+              {:status :success})))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        logs "test_engine_exact_fidelity_edge"
+        result (e/run-pipeline graph {:registry registry :logs-root logs})]
+    (is (= :success (:status result)))
+    (is (= "full" @seen))
     (os/sh "rm" "-rf" logs)))

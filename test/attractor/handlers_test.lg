@@ -173,3 +173,18 @@
            (:status
              (handler {:id "manager" :attrs {}}
                       (context/make-context) {:attrs {}} "run"))))))
+
+(deftest test-parallel-handler-callback-keeps-target-id-contract
+  (let [received (atom [])
+        handler
+        (handlers/make-parallel-handler
+          (fn [target-id _ _ _]
+            (swap! received conj target-id)
+            {:status :success :boundary_node_id "join"}))
+        result
+        (handler {:id "fork" :attrs {}}
+                 (context/make-context)
+                 {:edges [{:from "fork" :to "branch"}]}
+                 "run")]
+    (is (= :success (:status result)))
+    (is (= ["branch"] @received))))

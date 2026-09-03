@@ -103,8 +103,9 @@
         (:thread_id incoming-edge))
       (when (not (str/blank? (get-in graph [:attrs :thread_id])))
         (get-in graph [:attrs :thread_id]))
-      (when (and target-node (not (str/blank? (:class target-node))))
-        (:class target-node))
+      (when (and target-node
+                 (not (str/blank? (:subgraph_class target-node))))
+        (:subgraph_class target-node))
       (str prev-node-id)))
 
 ;; Synthesize context carryover text based on fidelity mode
@@ -113,7 +114,8 @@
         completed-count (count completed-nodes)]
     (case fidelity-mode
       "truncate"
-      (str "Pipeline Goal: " goal "\nStages completed: " completed-count "\n")
+      (str "Pipeline Goal: " goal "\n"
+           "Run ID: " (ctx-get-string ctx "run.id" "") "\n")
 
       "summary:low"
       (let [stages-str (str/join ", " completed-nodes)]
@@ -147,10 +149,14 @@
       (let [lines (map (fn [nid]
                          (let [out (get node-outcomes nid)]
                            (str "* Stage [" nid "] -> " (:status out))))
-                       completed-nodes)]
+                       completed-nodes)
+            key-context
+            (map (fn [[key value]] (str "* " key ": " value))
+                 (take 10 (:values @ctx)))]
         (str "Goal: " goal "\nCompleted Stages:\n"
              (str/join "\n" lines) "\n"
-             "Last stage: " (ctx-get-string ctx "last_stage" "none") "\n")))))
+             "Last stage: " (ctx-get-string ctx "last_stage" "none") "\n"
+             "Key Context:\n" (str/join "\n" key-context) "\n")))))
 
 ;; Create an ArtifactStore
 (defn make-artifact-store [base-dir]

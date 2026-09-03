@@ -296,10 +296,46 @@
             (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
             outcome)))))))
 
-(defn execute-subgraph [start-node-id ctx graph logs-root registry on-event retry-options]
-  (loop [current-node (parser/find-node graph start-node-id)
+(defn- incoming-edge-for [graph completed-nodes node-id]
+  (when-let [previous-node-id (last completed-nodes)]
+    (first
+      (filter (fn [edge]
+                (and (= previous-node-id (:from edge))
+                     (= node-id (:to edge))))
+              (:edges graph)))))
+
+(defn- execution-node [node incoming-edge graph ctx completed-nodes
+                       node-outcomes fidelity-threads fidelity-override]
+  (let [resolved-fidelity (context/resolve-fidelity incoming-edge node graph)
+        effective-fidelity (or fidelity-override resolved-fidelity)
+        previous-node-id (or (last completed-nodes) (:from incoming-edge))
+        resolved-thread-id
+        (when (= "full" effective-fidelity)
+          (context/resolve-thread-id incoming-edge node graph previous-node-id))
+        preamble
+        (if (= "full" effective-fidelity)
+          ""
+          (context/synthesize-context-preamble
+            effective-fidelity graph ctx completed-nodes node-outcomes))]
+    (assoc node
+           :resolved_fidelity effective-fidelity
+           :resolved_thread_id resolved-thread-id
+           :context_preamble preamble
+           :fidelity_threads fidelity-threads)))
+
+(defn execute-subgraph [branch-start ctx graph logs-root registry on-event retry-options]
+  (let [start-node-id (if (map? branch-start) (:to branch-start) branch-start)
+        incoming-branch-edge
+        (if (map? branch-start)
+          branch-start
+          (first (filter (fn [edge] (= start-node-id (:to edge)))
+                         (:edges graph))))]
+   (loop [current-node (parser/find-node graph start-node-id)
          last-outcome {:status :success}
-         step-count 0]
+         step-count 0
+         incoming-edge incoming-branch-edge
+         completed-nodes []
+         node-outcomes {}]
     (cond
       (nil? current-node)
       {:status :fail
@@ -314,10 +350,16 @@
       (assoc last-outcome :boundary_node_id (:id current-node))
 
       :else
-      (let [handler (handlers/resolve-handler registry current-node)
-            outcome (execute-with-retry handler current-node ctx graph logs-root
+      (let [prepared-node
+            (execution-node current-node incoming-edge graph ctx completed-nodes
+                            node-outcomes
+                            (or (:fidelity-threads retry-options) (atom {})) nil)
+            handler (handlers/resolve-handler registry prepared-node)
+            outcome (execute-with-retry handler prepared-node ctx graph logs-root
                                         on-event retry-options)
-            node-id (:id current-node)]
+            node-id (:id current-node)
+            next-completed (conj completed-nodes node-id)
+            next-outcomes (assoc node-outcomes node-id outcome)]
         (write-stage-status! logs-root node-id outcome)
         (context/ctx-apply-updates! ctx (:context_updates outcome))
         (context/ctx-set! ctx "outcome"
@@ -333,14 +375,21 @@
                 (if (and retry-target (parser/find-node graph retry-target))
                   (recur (parser/find-node graph retry-target)
                          outcome
-                         (inc step-count))
+                         (inc step-count)
+                         nil
+                         next-completed
+                         next-outcomes)
                   outcome))
               outcome)
             (recur (parser/find-node graph (:to next-edge))
                    outcome
-                   (inc step-count))))))))
+                   (inc step-count)
+                   next-edge
+                   next-completed
+                   next-outcomes))))))))
 
 (declare run-pipeline)
+(declare close-fidelity-threads!)
 
 (defn- clone-handler-registry [registry]
   (let [original @registry
@@ -348,12 +397,13 @@
         manager-runtime (atom {})
         parallel-handler
         (handlers/make-parallel-handler
-          (fn [target-id branch-ctx graph logs-root]
+          (fn [branch-edge branch-ctx graph logs-root]
             (if-let [execute-fn @branch-executor]
-              (execute-fn target-id branch-ctx graph logs-root)
+              (execute-fn branch-edge branch-ctx graph logs-root)
               {:status :fail
                :failure_reason
-               "Parallel branch executor is not initialized"})))
+               "Parallel branch executor is not initialized"}))
+          true)
         manager-handler (handlers/make-manager-loop-handler manager-runtime)
         default-parallel? (identical?
                             (get original "parallel")
@@ -490,8 +540,8 @@
            (recur (- remaining chunk))))))})
 
 ;; Main execution loop (Section 3.2)
-(defn run-pipeline
-  ([graph] (run-pipeline graph {}))
+(defn- run-pipeline*
+  ([graph] (run-pipeline* graph {}))
   ([graph options]
    (let [ctx (or (:context options) (context/make-context))
          logs-root (context/init-run-dir (:logs-root options) graph)
@@ -505,17 +555,24 @@
                     registry-template)
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
+         fidelity-threads (or (:fidelity-threads options) (atom {}))
          retry-options (assoc options :retry-counts retry-counts)
          parallel-executor (get @registry handlers/parallel-executor-key)
          manager-runtime (get @registry handlers/manager-runtime-key)
          _parallel-init (when parallel-executor
                           (reset! parallel-executor
-                                  (fn [target-id branch-ctx branch-graph branch-logs]
-                                    (execute-subgraph target-id branch-ctx branch-graph
-                                                      branch-logs registry on-event
-                                                      (assoc retry-options
-                                                             :retry-counts
-                                                             (atom {}))))))
+                                  (fn [branch-edge branch-ctx branch-graph branch-logs]
+                                    (let [branch-threads (atom {})]
+                                      (try
+                                        (execute-subgraph
+                                          branch-edge branch-ctx branch-graph
+                                          branch-logs registry on-event
+                                          (assoc retry-options
+                                                 :retry-counts (atom {})
+                                                 :fidelity-threads branch-threads))
+                                        (finally
+                                          (close-fidelity-threads!
+                                            branch-threads)))))))
          _manager-init (when manager-runtime
                          (reset! manager-runtime
                                  (or (:manager-runtime options)
@@ -529,11 +586,13 @@
        (throw (ex-info "Pipeline start node could not be resolved" {})))
 
      (context/mirror-graph-attributes! graph ctx)
+     (context/ctx-set! ctx "run.id" logs-root)
      (on-event {:type :pipeline.started :id (:id graph) :goal (:goal graph) :logs_root logs-root})
 
      (loop [current-node initial-start-node
             completed-nodes (or (:completed-nodes options) [])
             node-outcomes (normalize-node-outcomes (:node-outcomes options))
+            incoming-edge (:initial-incoming-edge options)
             step-count 0]
 
        (cond
@@ -567,6 +626,7 @@
                        (recur (parser/find-node graph retry-id)
                               completed-nodes
                               node-outcomes
+                              nil
                               (inc step-count)))
                      (let [fail-res {:status :fail
                                      :failure_reason "Goal gate unsatisfied and no retry target"
@@ -592,8 +652,15 @@
                    success-res)))
 
              ;; Step 2: Execute node handler with retry policy
-             (let [handler (handlers/resolve-handler registry current-node)
-                   outcome (execute-with-retry handler current-node ctx graph logs-root
+             (let [prepared-node
+                   (execution-node
+                     current-node incoming-edge graph ctx completed-nodes
+                     node-outcomes fidelity-threads
+                     (when (and (zero? step-count)
+                                (:first-node-fidelity-override options))
+                       (:first-node-fidelity-override options)))
+                   handler (handlers/resolve-handler registry prepared-node)
+                   outcome (execute-with-retry handler prepared-node ctx graph logs-root
                                                on-event retry-options)
                    st (:status outcome)]
 
@@ -628,6 +695,7 @@
                            :completed_nodes new-completed
                            :node_retries @retry-counts
                            :node_outcomes new-outcomes
+                           :current_fidelity (:resolved_fidelity prepared-node)
                            :context_values (context/ctx-snapshot ctx)
                            :logs (:logs @ctx)}]
                    (context/save-checkpoint cp (str logs-root "/checkpoint.edn"))
@@ -648,6 +716,7 @@
                            (recur (parser/find-node graph retry-target)
                                   new-completed
                                   new-outcomes
+                                  nil
                                   (inc step-count))
                            (let [fail-res {:status :fail
                                            :failure_reason (or (:failure_reason outcome) "Stage failed and no route found")
@@ -666,9 +735,14 @@
                      (if (:loop_restart next-edge)
                        (let [fresh-logs (str logs-root "_restart_" (System/currentTimeMillis))]
                          (on-event {:type :pipeline.restarting :target (:to next-edge) :new_logs fresh-logs})
-                         (run-pipeline graph (assoc options :start-at (:to next-edge)
-                                                   :logs-root fresh-logs
-                                                   :retry-counts retry-counts)))
+                         (close-fidelity-threads! fidelity-threads)
+                         (run-pipeline
+                           graph
+                           (assoc (dissoc options :fidelity-threads)
+                                  :start-at (:to next-edge)
+                                  :logs-root fresh-logs
+                                  :initial-incoming-edge next-edge
+                                  :retry-counts retry-counts)))
 
                        ;; Step 8: Advance to next node
                        (let [next-node (parser/find-node graph (:to next-edge))]
@@ -681,7 +755,25 @@
                            (recur next-node
                                   new-completed
                                   new-outcomes
+                                  next-edge
                                   (inc step-count)))))))))))))))))
+
+(defn- close-fidelity-threads! [threads]
+  (doseq [[_ entry] @threads]
+    (when-let [close-fn (:close entry)]
+      (close-fn)))
+  (reset! threads {}))
+
+(defn run-pipeline
+  ([graph] (run-pipeline graph {}))
+  ([graph options]
+   (let [owns-threads? (nil? (:fidelity-threads options))
+         threads (or (:fidelity-threads options) (atom {}))]
+     (try
+       (run-pipeline* graph (assoc options :fidelity-threads threads))
+       (finally
+         (when owns-threads?
+           (close-fidelity-threads! threads)))))))
 
 ;; Resume pipeline execution from a saved checkpoint (Section 5.3)
 (defn resume-pipeline [checkpoint-path graph options]
@@ -690,6 +782,12 @@
         ctx (context/make-context (:context_values cp))
         completed-nodes (:completed_nodes cp)
         last-node (parser/find-node graph last-node-id)
+        last-incoming-edge
+        (incoming-edge-for graph (vec (butlast completed-nodes)) last-node-id)
+        last-fidelity
+        (or (:current_fidelity cp)
+            (when last-node
+              (context/resolve-fidelity last-incoming-edge last-node graph)))
         node-outcomes (normalize-node-outcomes (:node_outcomes cp))
         saved-outcome (get node-outcomes last-node-id)
         outcome (or saved-outcome
@@ -708,12 +806,18 @@
 
     (cond
       (and next-id (parser/find-node graph next-id))
-      (run-pipeline graph (assoc options
-                            :context ctx
-                            :start-at next-id
-                            :completed-nodes completed-nodes
-                            :node-outcomes node-outcomes
-                            :node-retries (:node_retries cp)))
+      (run-pipeline
+        graph
+        (cond->
+          (assoc options
+                 :context ctx
+                 :start-at next-id
+                 :completed-nodes completed-nodes
+                 :node-outcomes node-outcomes
+                 :node-retries (:node_retries cp)
+                 :initial-incoming-edge next-edge)
+          (= "full" last-fidelity)
+          (assoc :first-node-fidelity-override "summary:high")))
 
       failed?
       (cond-> {:status :fail

@@ -25,21 +25,23 @@
   (let [force-mock? (some #{"--mock"} args)
         has-keys? (or (not (str/blank? (os/getenv "ANTHROPIC_API_KEY")))
                       (not (str/blank? (os/getenv "OPENAI_API_KEY")))
+                      (not (str/blank? (os/getenv "GEMINI_API_KEY")))
+                      (not (str/blank? (os/getenv "GOOGLE_API_KEY")))
                       (not (str/blank? (os/getenv "OLLAMA_API_KEY")))
                       (not (str/blank? (os/getenv "OLLAMA_BASE_URL"))))
         use-live-llm? (and (not force-mock?) (or (some #{"--llm"} args) has-keys?))
         override-model (find-arg-val args "--model")
         override-provider (find-arg-val args "--provider")]
     (if use-live-llm?
-      (fn [node prompt ctx]
-        (let [raw-model (or override-model (:llm_model node) "claude-3-7-sonnet")
-              parsed (llm/parse-model-spec raw-model (or override-provider (:llm_provider node)))
-              model (:model parsed)
-              provider (:provider parsed)
-              model-spec (str provider "/" model)
-              session (agent/make-session {:model model-spec
-                                           :reasoning_effort (:reasoning_effort node)})]
-          (agent/process-input! session prompt)))
+      (agent/make-agent-codergen-backend
+        {:session_options_fn
+         (fn [node]
+           (let [raw-model (or override-model (:llm_model node)
+                               "claude-3-7-sonnet")
+                 parsed (llm/parse-model-spec
+                          raw-model (or override-provider (:llm_provider node)))]
+             {:model (str (:provider parsed) "/" (:model parsed))
+              :reasoning_effort (:reasoning_effort node)}))})
       nil)))
 
 (defn print-usage []
@@ -185,7 +187,8 @@
                       parser/parse-dot
                       transforms/apply-transforms)
             interviewer (interviewer/make-console-interviewer)
-            registry (handlers/make-handler-registry interviewer nil)
+            codergen-backend (make-codergen-backend-from-args args)
+            registry (handlers/make-handler-registry interviewer codergen-backend)
             outcome (engine/resume-pipeline cp-path graph {:registry registry})]
         (println (str "Resumed execution finished with status: " (:status outcome)))
         (if (= (:status outcome) :success)

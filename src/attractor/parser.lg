@@ -308,7 +308,11 @@
                                   :loop_restart (boolean (:loop_restart merged-edge-attrs))
                                   :attrs merged-edge-attrs})
                                (partition 2 1 chain))
-                defaults (:node-defaults state)
+                defaults (if (:current-subgraph state)
+                           (:scoped-node-defaults (:current-subgraph state))
+                           (:node-defaults state))
+                sub-class (if (:current-subgraph state)
+                            (:derived-class (:current-subgraph state)) "")
                 registered-nodes (reduce (fn [acc-nodes nid]
                                            (if (contains? acc-nodes nid)
                                              acc-nodes
@@ -324,8 +328,11 @@
                                                      :fallback_retry_target ""
                                                      :fidelity (:fidelity defaults)
                                                      :thread_id (:thread_id defaults)
-                                                     :class ""
-                                                     :attrs defaults})))
+                                                     :class sub-class
+                                                     :subgraph_class sub-class
+                                                     :attrs (assoc defaults
+                                                               :class sub-class
+                                                               :subgraph_class sub-class)})))
                                          (:nodes state)
                                          chain)]
             (-> state
@@ -359,6 +366,7 @@
                           :fidelity (or (:fidelity explicit-attrs) (:fidelity effective-defaults))
                           :thread_id (or (:thread_id explicit-attrs) (:thread_id effective-defaults))
                           :class combined-class
+                          :subgraph_class sub-class
                           :timeout (or (:timeout explicit-attrs) (:timeout effective-defaults))
                           :llm_model (or (:llm_model explicit-attrs) (:llm_model effective-defaults))
                           :llm_provider (or (:llm_provider explicit-attrs) (:llm_provider effective-defaults))
@@ -367,7 +375,9 @@
                           :reasoning_effort (or (:reasoning_effort explicit-attrs) (:reasoning_effort effective-defaults))
                           :auto_status (boolean (or (:auto_status explicit-attrs) (:auto_status effective-defaults) false))
                           :allow_partial (boolean (or (:allow_partial explicit-attrs) (:allow_partial effective-defaults) false))
-                          :attrs (assoc merged-attrs :class combined-class)}]
+                          :attrs (assoc merged-attrs
+                                        :class combined-class
+                                        :subgraph_class sub-class)}]
             (-> state
                 (assoc :idx next-idx)
                 (assoc-in [:nodes first-id] node-rec)))))

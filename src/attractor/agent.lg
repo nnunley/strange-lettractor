@@ -747,7 +747,38 @@
 
 ;; CodergenBackend implementation backed by the Coding Agent Loop
 (defn make-agent-codergen-backend [& [session-opts]]
-  (fn [node prompt ctx]
-    (let [session (make-session (merge session-opts {:model (or (:llm_model node) "default")}))
-          response (run-agent-turn! session prompt)]
-      response)))
+  (let [base-options (or session-opts {})]
+    (fn [node prompt _ctx]
+      (let [options-fn (:session_options_fn base-options)
+            dynamic-options (if options-fn (or (options-fn node) {}) {})
+            static-options (dissoc base-options :session_options_fn)
+            node-model (:llm_model node)
+            session-options
+            (assoc (merge static-options dynamic-options)
+                   :model (or (:model dynamic-options)
+                              (when-not (str/blank? node-model) node-model)
+                              (:model static-options)
+                              "default"))
+            full? (= "full" (:resolved_fidelity node))
+            thread-key (:resolved_thread_id node)
+            threads (:fidelity_threads node)]
+        (if (and full? thread-key threads)
+          (let [existing (get @threads thread-key)
+                session (or (:session existing)
+                            (let [created (make-session session-options)]
+                              (swap! threads assoc thread-key
+                                     {:session created
+                                      :close #(close-session! created)})
+                              created))]
+            (try
+              (run-agent-turn! session prompt)
+              (catch Object e
+                (when-not (= :closed (:state @session))
+                  (close-session! session))
+                (swap! threads dissoc thread-key)
+                (throw e))))
+          (let [session (make-session session-options)]
+            (try
+              (run-agent-turn! session prompt)
+              (finally
+                (close-session! session)))))))))

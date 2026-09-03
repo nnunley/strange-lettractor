@@ -1,0 +1,34 @@
+(ns attractor.context-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.context :as context]))
+
+(deftest test-truncate-preamble-carries-goal-and-run-id
+  (let [ctx (context/make-context {"run.id" "run-42"})
+        preamble
+        (context/synthesize-context-preamble
+          "truncate" {:goal "Ship it"} ctx ["plan"]
+          {"plan" {:status :success}})]
+    (is (str/includes? preamble "Pipeline Goal: Ship it"))
+    (is (str/includes? preamble "Run ID: run-42"))
+    (is (not (str/includes? preamble "plan")))))
+
+(deftest test-compact-preamble-carries-outcomes-and-key-context
+  (let [ctx (context/make-context {"priority" "high"})
+        preamble
+        (context/synthesize-context-preamble
+          "compact" {:goal "Ship it"} ctx ["plan"]
+          {"plan" {:status :success}})]
+    (is (str/includes? preamble "[plan] -> :success"))
+    (is (str/includes? preamble "priority: high"))))
+
+(deftest test-thread-id-uses-only-the-enclosing-subgraph-class
+  (is (= "previous"
+         (context/resolve-thread-id nil {:class "styling-only"} {}
+                                    "previous")))
+  (is (= "review-loop"
+         (context/resolve-thread-id nil
+                                    {:class "styling-only,review-loop"
+                                     :subgraph_class "review-loop"}
+                                    {}
+                                    "previous"))))
