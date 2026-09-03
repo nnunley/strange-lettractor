@@ -174,7 +174,7 @@
             (and (= method :get) (= sub-route "checkpoint"))
             (let [cp-path (str (:logs_root pipe) "/checkpoint.edn")]
               (if (os/stat cp-path)
-                (json-response (json/read-json (io/slurp cp-path)))
+                (json-response (context/load-checkpoint cp-path))
                 (json-response {:status "no_checkpoint_yet"})))
 
             ;; GET /pipelines/:id/context

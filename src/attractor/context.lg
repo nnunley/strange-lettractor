@@ -22,7 +22,10 @@
    (let [vals (:values @ctx)
          k-str (str key)
          k-kw (keyword k-str)]
-     (or (get vals k-str) (get vals k-kw) default-val))))
+     (cond
+       (contains? vals k-str) (get vals k-str)
+       (contains? vals k-kw) (get vals k-kw)
+       :else default-val))))
 
 ;; Get a context value as string
 (defn ctx-get-string

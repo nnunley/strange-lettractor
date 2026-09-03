@@ -15,6 +15,13 @@
       (subs v 1 (dec (count v)))
       v)))
 
+(defn- lookup-context-value [values key]
+  (let [keyword-key (keyword key)]
+    (cond
+      (contains? values key) (get values key)
+      (contains? values keyword-key) (get values keyword-key)
+      :else nil)))
+
 ;; Resolve a condition key against outcome and context
 ;; outcome is a map: {:status :success :preferred_label "..."}
 ;; context is a map or atom: key -> value
@@ -34,13 +41,16 @@
 
       (str/starts-with? k "context.")
       (let [short-k (subs k 8)
-            v1 (or (get ctx-vals k) (get ctx-vals (keyword k)))
-            v2 (or (get ctx-vals short-k) (get ctx-vals (keyword short-k)))]
-        (str (or v1 v2 "")))
+            qualified-present? (or (contains? ctx-vals k)
+                                   (contains? ctx-vals (keyword k)))
+            value (if qualified-present?
+                    (lookup-context-value ctx-vals k)
+                    (lookup-context-value ctx-vals short-k))]
+        (if (nil? value) "" (str value)))
 
       :else
-      (let [v (or (get ctx-vals k) (get ctx-vals (keyword k)))]
-        (str (or v ""))))))
+      (let [value (lookup-context-value ctx-vals k)]
+        (if (nil? value) "" (str value))))))
 
 ;; Evaluate a single clause (e.g. "outcome=success" or "context.count!=0" or "is_ready")
 (defn evaluate-clause [clause outcome context]

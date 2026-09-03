@@ -24,11 +24,17 @@
     (is (true? (c/evaluate-condition "" {:status :fail} {}))))
 
   (testing "Runtime Context values"
-    (let [context (ctx/make-context {"tests_passed" "true" "count" 3})]
+    (let [context (ctx/make-context {"tests_passed" "true" "count" 3
+                                     "enabled" false})]
       (is (true? (c/evaluate-condition "context.tests_passed=true"
                                       {:status :success} context)))
       (is (true? (c/evaluate-condition "count=3"
-                                      {:status :success} context)))))
+                                      {:status :success} context)))
+      (is (= false (ctx/ctx-get context "enabled" true)))
+      (is (= "false" (c/resolve-key "context.enabled"
+                                    {:status :success} context)))
+      (is (true? (c/evaluate-condition "context.enabled=false"
+                                       {:status :success} context)))))
 
   (testing "Syntax validation"
     (is (nil? (c/validate-condition-syntax "outcome=success && context.x!=1")))

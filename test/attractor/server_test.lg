@@ -1,0 +1,29 @@
+(ns attractor.server-test
+  (:require [clojure.test :refer [deftest is]]
+            [json :as json]
+            [os :as os]
+            [attractor.context :as context]
+            [attractor.server :as server]))
+
+(deftest test-checkpoint-endpoint-reads-edn-and-returns-json
+  (let [logs-root (str "/tmp/strange-lettractor-server-" (System/currentTimeMillis))
+        _ (os/sh "mkdir" "-p" logs-root)
+        _ (context/save-checkpoint
+            {:timestamp 123
+             :current_node "review"
+             :completed_nodes ["start" "plan"]
+             :node_retries {"plan" 1}
+             :node_outcomes {"plan" :success}
+             :context_values {:goal "ship"}}
+            (str logs-root "/checkpoint.edn"))
+        _ (reset! server/active-pipelines
+                  {"pipe-test" {:logs_root logs-root}})
+        response (server/app-handler
+                   {:request-method "GET"
+                    :path "/pipelines/pipe-test/checkpoint"})
+        body (json/read-json (:body response))]
+    (is (= 200 (:status response)))
+    (is (= "application/json" (get-in response [:headers "Content-Type"])))
+    (is (= "review" (get body "current_node")))
+    (is (= ["start" "plan"] (get body "completed_nodes")))
+    (is (= "ship" (get-in body ["context_values" "goal"])))))

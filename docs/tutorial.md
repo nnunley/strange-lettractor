@@ -1,6 +1,6 @@
-# Attractor Tutorial: Multi-Stage LLM Workflow Orchestration
+# Strange Lettractor Tutorial: Multi-Stage LLM Workflow Orchestration
 
-Attractor is a workflow orchestration engine that models autonomous coding agents and multi-stage LLM pipelines as **Graphviz DOT graphs**. Built in **[let-go](https://github.com/abogoyavlensky/let-go)** and managed with **[lgx](https://github.com/abogoyavlensky/lgx)**, Attractor provides declarative routing, goal gate guarantees, human approval gates, CSS-like model stylesheets, and stage checkpointing.
+Strange Lettractor is an implementation of [StrongDM's Attractor](https://github.com/strongdm/attractor), built in **[let-go](https://github.com/nooga/let-go)** and managed with **[lgx](https://github.com/abogoyavlensky/lgx)**. It models autonomous coding agents and multi-stage LLM pipelines as **Graphviz DOT graphs**.
 
 ---
 
@@ -11,13 +11,13 @@ Attractor is a workflow orchestration engine that models autonomous coding agent
 Configure `lgx` to point to your `let-go` runtime:
 
 ```bash
-export LGX_LG=/Users/ndn/development/let-go/lg
+export LGX_LG="$HOME/development/let-go/lg"
 ```
 
 ### Build & Verify
 
 ```bash
-# 1. Run the test suite (33 tests, 114 assertions)
+# 1. Run the test suite
 lgx test
 
 # 2. Compile the standalone binary
@@ -239,15 +239,14 @@ You can also pass this directly via CLI:
 
 Attractor writes state to `{logs_root}/checkpoint.edn` after every stage:
 
-```json
-{
-  "timestamp": "1788384849015",
-  "current_node": "implement",
-  "completed_nodes": ["start", "plan", "implement"],
-  "node_retries": {},
-  "context": {"graph.goal": "...", "last_stage": "implement"},
-  "logs": [...]
-}
+```edn
+{:timestamp 1788384849015
+ :current_node "implement"
+ :completed_nodes ["start" "plan" "implement"]
+ :node_retries {}
+ :node_outcomes {"plan" :success "implement" :success}
+ :context_values {"graph.goal" "..." "last_stage" "implement"}
+ :logs []}
 ```
 
 To resume execution from a saved checkpoint:
@@ -260,7 +259,7 @@ To resume execution from a saved checkpoint:
 
 ## 5. HTTP Management Server Mode
 
-Start the built-in HTTP server to monitor and steer runs over REST & Server-Sent Events (SSE):
+Start the experimental HTTP server to inspect runs over REST and submit human-gate answers:
 
 ```bash
 ./bin/attractor serve --port :7070
@@ -273,8 +272,8 @@ Start the built-in HTTP server to monitor and steer runs over REST & Server-Sent
 | `POST` | `/pipelines` | Submit a DOT pipeline body and begin background execution. Returns `{"id": "pipe-..."}`. |
 | `GET` | `/pipelines` | List all active and completed pipelines. |
 | `GET` | `/pipelines/:id` | Get status and progress for a specific pipeline. |
-| `GET` | `/pipelines/:id/events` | Stream real-time pipeline events via Server-Sent Events (SSE). |
-| `POST` | `/pipelines/:id/cancel` | Cancel an active pipeline. |
+| `GET` | `/pipelines/:id/events` | Retrieve the currently collected events encoded as SSE records. |
+| `POST` | `/pipelines/:id/cancel` | Mark a pipeline cancelled. Cooperative execution cancellation is not implemented yet. |
 | `GET` | `/pipelines/:id/graph` | Retrieve the pipeline DOT definition. |
 | `GET` | `/pipelines/:id/questions` | Poll for pending `wait.human` approval questions. |
 | `POST` | `/pipelines/:id/questions/:qid/answer` | Submit an answer to a human interaction question (`{"answer": "Y"}`). |

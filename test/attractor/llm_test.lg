@@ -114,8 +114,12 @@
         gemini-body (json/read-json (:body @gemini-captured))]
     (is (= "trace-1" (get-in openai-body ["metadata" "trace_id"])))
     (is (= "flex" (get openai-body "service_tier")))
-    (is (= "feature-a,feature-b"
-           (get-in @anthropic-captured [:headers "anthropic-beta"])))
+    (is (str/includes?
+          (get-in @anthropic-captured [:headers "anthropic-beta"])
+          "feature-a,feature-b"))
+    (is (str/includes?
+          (get-in @anthropic-captured [:headers "anthropic-beta"])
+          "prompt-caching-2024-07-31"))
     (is (= 128 (get-in anthropic-body ["thinking" "budget_tokens"])))
     (is (= "cachedContents/1" (get gemini-body "cachedContent")))
     (is (= "BLOCK_NONE"
@@ -164,7 +168,8 @@
         gemini-body (json/read-json (:body @gemini-captured))]
     (is (= "json_schema" (get-in openai-body ["text" "format" "type"])))
     (is (= true (get-in openai-body ["text" "format" "strict"])))
-    (is (str/includes? (get anthropic-body "system") "required"))
+    (is (str/includes? (get-in anthropic-body ["system" 0 "text"])
+                       "required"))
     (is (= "application/json"
            (get-in gemini-body ["generationConfig" "responseMimeType"])))
     (is (= ["name"]
@@ -205,12 +210,18 @@
         sse (str
               "event: response.created\n"
               "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stream\"}}\n\n"
+              "event: response.output_item.added\n"
+              "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg-1\",\"type\":\"message\",\"content\":[]}}\n\n"
+              "event: response.content_part.added\n"
+              "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg-1\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n"
               "event: response.output_text.delta\n"
               "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"delta\":\"Hel\"}\n\n"
               "event: response.output_text.delta\n"
               "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"delta\":\"lo\"}\n\n"
+              "event: response.output_text.done\n"
+              "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg-1\",\"text\":\"Hello\"}\n\n"
               "event: response.completed\n"
-              "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stream\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n")
+              "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stream\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}")
         events (vec
                  (llm/stream
                    {:provider "openai" :model "gpt-test" :api_key "key"
@@ -220,12 +231,25 @@
                                  {:status 200 :body sse})}))]
     (is (= true (get (json/read-json (:body @captured)) "stream")))
     (is (= :stream (:as @captured)))
-    (is (= [:stream_start :text_delta :text_delta :finish]
+    (is (= [:stream_start :text_start :text_delta :text_delta :text_end :finish]
            (mapv :type events)))
     (is (= ["Hel" "lo"]
            (mapv :delta (filter (fn [event] (= (:type event) :text_delta)) events))))
     (is (= "Hello" (get-in (last events) [:response :message :content])))
     (is (= 3 (get-in (last events) [:usage :total_tokens])))))
+
+(deftest test-sse-parser-handles-multiline-retry-comments-and-eof
+  (let [events (vec
+                 (llm/parse-sse-lines
+                   [": keepalive"
+                    "event: update"
+                    "retry: 1500"
+                    "data: first"
+                    "data: second"]))]
+    (is (= 1 (count events)))
+    (is (= "update" (:event (first events))))
+    (is (= 1500 (:retry (first events))))
+    (is (= "first\nsecond" (:data (first events))))))
 
 (deftest test-anthropic-stream-normalizes-native-sse
   (let [captured (atom nil)
@@ -377,6 +401,78 @@
     (is (= "call-1" (get-in payload ["messages" 1 "content" 0 "tool_use_id"])))
     (is (= "Done" (get-in response [:message :content])))
     (is (= :stop (:finish_reason response)))))
+
+(deftest test-anthropic-alternation-thinking-and-prompt-caching
+  (let [captured (atom nil)
+        response-body
+        {:id "msg-thinking"
+         :model "claude-test"
+         :stop_reason "end_turn"
+         :content [{:type "thinking" :thinking "reasoning" :signature "sig-1"}
+                   {:type "redacted_thinking" :data "opaque"}
+                   {:type "text" :text "answer"}]
+         :usage {:input_tokens 5 :output_tokens 8
+                 :cache_read_input_tokens 20
+                 :cache_creation_input_tokens 10}}
+        transport (fn [request]
+                    (reset! captured request)
+                    {:status 200 :body (json/write-json response-body)})
+        response
+        (llm/anthropic-complete
+          {:model "claude-test" :api_key "key" :transport transport
+           :messages
+           [{:role :system :content "system"}
+            {:role :developer :content "developer"}
+            {:role :user :content "first"}
+            {:role :user :content "second"}
+            {:role :assistant :content "prior"}
+            {:role :assistant :content "continued"}
+            {:role :tool
+             :content [{:tool_call_id "call-1" :tool_name "lookup"
+                        :content "result" :is_error false}]}
+            {:role :user :content "now finish"}]
+           :tools [{:name "lookup" :description "Look up"
+                    :parameters {:type "object"}}]})
+        payload (json/read-json (:body @captured))
+        messages (get payload "messages")
+        parts (get-in response [:message :parts])
+        replay-captured (atom nil)
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key"
+             :provider_options {:anthropic {:auto_cache false}}
+             :transport (fn [request]
+                          (reset! replay-captured request)
+                          {:status 200 :body (json/write-json response-body)})
+             :messages [{:role :user :content "question"}
+                        {:role :assistant :content "answer" :parts parts}
+                        {:role :user :content "continue"}]})
+        replay-payload (json/read-json (:body @replay-captured))]
+    (is (= ["user" "assistant" "user"] (mapv #(get % "role") messages)))
+    (is (= ["first" "second"]
+           (mapv #(get % "text") (get-in messages [0 "content"]))))
+    (is (= ["prior" "continued"]
+           (mapv #(get % "text") (get-in messages [1 "content"]))))
+    (is (= "ephemeral"
+           (get-in messages [1 "content" 1 "cache_control" "type"])))
+    (is (= ["tool_result" "text"]
+           (mapv #(get % "type") (get-in messages [2 "content"]))))
+    (is (= "system\n\ndeveloper"
+           (get-in payload ["system" 0 "text"])))
+    (is (= "ephemeral" (get-in payload ["system" 0 "cache_control" "type"])))
+    (is (= "ephemeral" (get-in payload ["tools" 0 "cache_control" "type"])))
+    (is (str/includes? (str (get-in @captured [:headers "anthropic-beta"]))
+                       "prompt-caching-2024-07-31"))
+    (is (= "reasoning" (:reasoning response)))
+    (is (= 3 (get-in response [:usage :reasoning_tokens])))
+    (is (= "sig-1" (get-in response [:message :parts 0 "signature"])))
+    (is (= "opaque" (get-in response [:message :parts 1 "data"])))
+    (is (= 20 (get-in response [:usage :cache_read_tokens])))
+    (is (= 10 (get-in response [:usage :cache_write_tokens])))
+    (is (= "thinking" (get-in replay-payload ["messages" 1 "content" 0 "type"])))
+    (is (= "sig-1" (get-in replay-payload ["messages" 1 "content" 0 "signature"])))
+    (is (nil? (get replay-payload "auto_cache")))
+    (is (nil? (get replay-payload "cache_control")))
+    (is (nil? (get-in @replay-captured [:headers "anthropic-beta"])))))
 
 (deftest test-provider-failures-are-not-mock-successes
   (testing "Unknown providers are rejected"

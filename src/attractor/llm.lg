@@ -249,10 +249,27 @@
                     {:provider provider :category :configuration})))
   key)
 
+(defn- anthropic-content-part [part]
+  (if (some? (get part "type"))
+    part
+    (let [kind (or (:kind part) (:type part))
+          thinking (:thinking part)]
+      (case kind
+        (:thinking "thinking")
+        {:type "thinking"
+         :thinking (or (:text thinking) (:text part) "")
+         :signature (or (:signature thinking) (:signature part) "")}
+        (:redacted_thinking "redacted_thinking")
+        {:type "redacted_thinking"
+         :data (or (:data thinking) (:data part) "")}
+        (:text "text") {:type "text" :text (or (:text part) (:content part) "")}
+        part))))
+
 (defn- anthropic-message [message]
   (let [role (:role message)
         content (:content message)
-        tool-calls (:tool_calls message)]
+        tool-calls (:tool_calls message)
+        prior-parts (:parts message)]
     (cond
       (= role :tool)
       {:role "user"
@@ -267,8 +284,10 @@
       {:role "assistant"
        :content (vec
                   (concat
-                    (when-not (str/blank? (str content))
-                      [{:type "text" :text (str content)}])
+                    (if (seq prior-parts)
+                      (map anthropic-content-part prior-parts)
+                      (when-not (str/blank? (str content))
+                        [{:type "text" :text (str content)}]))
                     (map (fn [call]
                            {:type "tool_use"
                             :id (:id call)
@@ -277,7 +296,35 @@
                          (or tool-calls []))))}
 
       :else
-      {:role "user" :content (str content)})))
+      {:role "user"
+       :content (if (seq prior-parts)
+                  (mapv anthropic-content-part prior-parts)
+                  [{:type "text" :text (str content)}])})))
+
+(defn- merge-anthropic-messages [messages]
+  (reduce
+    (fn [merged message]
+      (if (and (seq merged) (= (:role (last merged)) (:role message)))
+        (conj (vec (butlast merged))
+              (update (last merged) :content into (:content message)))
+        (conj merged message)))
+    []
+    messages))
+
+(defn- annotate-last-cacheable [blocks]
+  (let [items (vec blocks)
+        index (dec (count items))]
+    (if (neg? index)
+      items
+      (assoc items index
+             (assoc (get items index) :cache_control {:type "ephemeral"})))))
+
+(defn- cache-anthropic-prefix [messages]
+  (let [items (vec messages)
+        stable-index (- (count items) 2)]
+    (if (neg? stable-index)
+      items
+      (update-in items [stable-index :content] annotate-last-cacheable))))
 
 (defn- json-safe [value]
   (cond
@@ -532,27 +579,54 @@
                              (or (= (:role m) :system)
                                  (= (:role m) :developer)))
                            (:messages request))
-        msgs (map anthropic-message non-system)
-        anthropic-tools (mapv (fn [tool]
-                                {:name (:name tool)
-                                 :description (:description tool)
-                                 :input_schema (:parameters tool)})
-                              (or (:tools request) []))
+        raw-msgs (merge-anthropic-messages (map anthropic-message non-system))
+        raw-tools (mapv (fn [tool]
+                          {:name (:name tool)
+                           :description (:description tool)
+                           :input_schema (:parameters tool)})
+                        (or (:tools request) []))
         options (provider-options request "anthropic")
         beta-headers (or (:beta_headers options) (get options "beta_headers") [])
-        body-options (dissoc (dissoc options :beta_headers) "beta_headers")
+        auto-cache-setting (if (contains? options :auto_cache)
+                             (:auto_cache options)
+                             (if (contains? options "auto_cache")
+                               (get options "auto_cache")
+                               true))
+        auto-cache? (not (= false auto-cache-setting))
+        body-options (dissoc
+                       (dissoc
+                         (dissoc
+                           (dissoc options :beta_headers)
+                           "beta_headers")
+                         :auto_cache)
+                       "auto_cache")
+        explicit-cache? (or (contains? body-options :cache_control)
+                            (contains? body-options "cache_control"))
+        effective-beta-headers
+        (vec (distinct
+               (concat beta-headers
+                       (when (or auto-cache? explicit-cache?)
+                         ["prompt-caching-2024-07-31"]))))
+        msgs (if auto-cache? (cache-anthropic-prefix raw-msgs) raw-msgs)
+        anthropic-tools (if (and auto-cache? (seq raw-tools))
+                          (annotate-last-cacheable raw-tools)
+                          raw-tools)
+        system-value (if auto-cache?
+                       [{:type "text" :text system-text
+                         :cache_control {:type "ephemeral"}}]
+                       system-text)
         payload (merge
                   (cond-> {:model (:model request)
                            :messages msgs
                            :max_tokens (or (:max_tokens request) 4096)}
-                    (not (str/blank? system-text)) (assoc :system system-text)
+                    (not (str/blank? system-text)) (assoc :system system-value)
                     (seq anthropic-tools) (assoc :tools anthropic-tools))
                   body-options)
         headers (cond-> {"x-api-key" key
                          "anthropic-version" "2023-06-01"
                          "Content-Type" "application/json"}
-                  (seq beta-headers)
-                  (assoc "anthropic-beta" (str/join "," beta-headers)))]
+                  (seq effective-beta-headers)
+                  (assoc "anthropic-beta" (str/join "," effective-beta-headers)))]
     (require-api-key! "anthropic" key)
     {:url url :headers headers :payload payload}))
 
@@ -573,12 +647,23 @@
                                 (or (get block "text") "")
                                 ""))
                             content-blocks))
+        reasoning (str/join ""
+                            (map (fn [block]
+                                   (if (= (get block "type") "thinking")
+                                     (or (get block "thinking") "")
+                                     ""))
+                                 content-blocks))
         tool-calls (normalize-anthropic-tool-calls content-blocks)
-        usage (anthropic-usage (or (get body-map "usage") {}))]
+        base-usage (anthropic-usage (or (get body-map "usage") {}))
+        usage (assoc base-usage :reasoning_tokens
+                     (if (str/blank? reasoning)
+                       0
+                       (quot (+ (count reasoning) 3) 4)))]
     {:id (get body-map "id")
      :model (or (get body-map "model") (:model request))
      :provider "anthropic"
      :message {:role :assistant :content text :parts content-blocks}
+     :reasoning reasoning
      :tool_calls tool-calls
      :usage usage
      :finish_reason (if (seq tool-calls)
@@ -737,87 +822,194 @@
       (throw (ex-info (str "Unsupported LLM provider: " provider)
                       {:provider provider :category :configuration})))))
 
+(defn- sse-field-value [line prefix-length]
+  (let [value (subs line prefix-length)]
+    (if (str/starts-with? value " ") (subs value 1) value)))
+
+(defn- sse-event [state]
+  (cond-> {:event (:event state)
+           :data (str/join "\n" (:data state))}
+    (some? (:retry state)) (assoc :retry (:retry state))))
+
 (defn parse-sse-lines [lines]
-  (let [state (atom {:event "" :data []})]
-    (keep
-      (fn [line]
-        (cond
-          (str/blank? line)
-          (let [{:keys [event data]} @state]
-            (reset! state {:event "" :data []})
-            (when (seq data)
-              {:event event :data (str/join "\n" data)}))
+  (letfn [(step [remaining state]
+            (lazy-seq
+              (if-let [input (seq remaining)]
+                (let [line (first input)
+                      more (rest input)]
+                  (cond
+                    (str/blank? line)
+                    (let [next-state {:event "" :data [] :retry (:retry state)}]
+                      (if (seq (:data state))
+                        (cons (sse-event state) (step more next-state))
+                        (step more next-state)))
 
-          (str/starts-with? line ":") nil
+                    (str/starts-with? line ":")
+                    (step more state)
 
-          (str/starts-with? line "event:")
-          (do (swap! state assoc :event (str/trim (subs line 6))) nil)
+                    (str/starts-with? line "event:")
+                    (step more (assoc state :event
+                                      (str/trim (sse-field-value line 6))))
 
-          (str/starts-with? line "data:")
-          (do (swap! state update :data conj (str/trim (subs line 5))) nil)
+                    (str/starts-with? line "data:")
+                    (step more (update state :data conj
+                                       (sse-field-value line 5)))
 
-          :else nil))
-      lines)))
+                    (str/starts-with? line "retry:")
+                    (let [retry-value (try
+                                        (parse-long
+                                          (str/trim (sse-field-value line 6)))
+                                        (catch Object _ nil))]
+                      (step more (if (some? retry-value)
+                                   (assoc state :retry retry-value)
+                                   state)))
+
+                    :else (step more state)))
+                (when (seq (:data state))
+                  (list (sse-event state))))))]
+    (step lines {:event "" :data [] :retry nil})))
 
 (defn- stream-lines [body]
   (if (string? body)
     (str/split body #"\r?\n")
     (io/line-seq body)))
 
-(defn- openai-stream-event [request event]
+(defn- mark-stream-part! [state key id]
+  (let [seen? (contains? (get @state key #{}) id)]
+    (when-not seen? (swap! state update key conj id))
+    (not seen?)))
+
+(defn- openai-stream-events [request state event]
   (let [data (:data event)]
-    (when-not (= data "[DONE]")
+    (if (= data "[DONE]")
+      []
       (let [body (json/read-json data)
             event-type (or (get body "type") (:event event))]
         (case event-type
           "response.created"
-          {:type :stream_start :raw body}
+          [{:type :stream_start :raw body}]
 
           "response.output_item.added"
           (let [item (get body "item")]
-            (if (= (get item "type") "function_call")
-              {:type :tool_call_start
-               :tool_call (first (normalize-openai-tool-calls [item]))
-               :raw body}
-              {:type :text_start :text_id (or (get item "id") "text") :raw body}))
+            (case (get item "type")
+              "function_call"
+              (let [tool-call (first (normalize-openai-tool-calls [item]))]
+                (swap! state assoc-in [:tools (get item "id")] tool-call)
+                [{:type :tool_call_start :tool_call tool-call :raw body}])
+              "message" []
+              [{:type :provider_event :raw body}]))
+
+          "response.content_part.added"
+          (let [part (or (get body "part") {})
+                id (or (get body "item_id") "text")]
+            (case (get part "type")
+              "output_text"
+              (if (mark-stream-part! state :text_started id)
+                [{:type :text_start :text_id id :raw body}]
+                [])
+              "reasoning_text"
+              (if (mark-stream-part! state :reasoning_started id)
+                [{:type :reasoning_start :text_id id :raw body}]
+                [])
+              [{:type :provider_event :raw body}]))
 
           "response.output_text.delta"
-          {:type :text_delta
-           :delta (or (get body "delta") "")
-           :text_id (or (get body "item_id") "text")
-           :raw body}
+          (let [id (or (get body "item_id") "text")
+                start? (mark-stream-part! state :text_started id)]
+            (vec
+              (concat
+                (when start? [{:type :text_start :text_id id :raw body}])
+                [{:type :text_delta
+                  :delta (or (get body "delta") "")
+                  :text_id id
+                  :raw body}])))
 
           "response.output_text.done"
-          {:type :text_end
-           :text_id (or (get body "item_id") "text")
-           :raw body}
+          (let [id (or (get body "item_id") "text")
+                start? (mark-stream-part! state :text_started id)
+                end? (mark-stream-part! state :text_ended id)]
+            (if end?
+              (vec (concat
+                     (when start? [{:type :text_start :text_id id :raw body}])
+                     [{:type :text_end :text_id id :raw body}]))
+              []))
+
+          "response.content_part.done"
+          (let [part (or (get body "part") {})
+                id (or (get body "item_id") "text")]
+            (case (get part "type")
+              "output_text"
+              (let [start? (mark-stream-part! state :text_started id)
+                    end? (mark-stream-part! state :text_ended id)]
+                (if end?
+                  (vec (concat
+                         (when start? [{:type :text_start :text_id id :raw body}])
+                         [{:type :text_end :text_id id :raw body}]))
+                  []))
+              "reasoning_text"
+              (let [start? (mark-stream-part! state :reasoning_started id)
+                    end? (mark-stream-part! state :reasoning_ended id)]
+                (if end?
+                  (vec (concat
+                         (when start? [{:type :reasoning_start :text_id id :raw body}])
+                         [{:type :reasoning_end :text_id id :raw body}]))
+                  []))
+              [{:type :provider_event :raw body}]))
+
+          "response.reasoning_text.delta"
+          (let [id (or (get body "item_id") "reasoning")
+                start? (mark-stream-part! state :reasoning_started id)]
+            (vec
+              (concat
+                (when start? [{:type :reasoning_start :text_id id :raw body}])
+                [{:type :reasoning_delta
+                  :reasoning_delta (or (get body "delta") "")
+                  :text_id id :raw body}])))
+
+          "response.reasoning_text.done"
+          (let [id (or (get body "item_id") "reasoning")
+                start? (mark-stream-part! state :reasoning_started id)
+                end? (mark-stream-part! state :reasoning_ended id)]
+            (if end?
+              (vec (concat
+                     (when start? [{:type :reasoning_start :text_id id :raw body}])
+                     [{:type :reasoning_end :text_id id :raw body}]))
+              []))
 
           "response.function_call_arguments.delta"
-          {:type :tool_call_delta
-           :tool_call {:id (or (get body "item_id") "")
-                       :arguments (or (get body "delta") "")}
-           :raw body}
+          (let [item-id (or (get body "item_id") "")
+                known (or (get-in @state [:tools item-id]) {:id item-id})]
+            [{:type :tool_call_delta
+              :tool_call (assoc known :arguments (or (get body "delta") ""))
+              :raw body}])
 
           "response.output_item.done"
           (let [item (get body "item")]
-            (if (= (get item "type") "function_call")
-              {:type :tool_call_end
-               :tool_call (first (normalize-openai-tool-calls [item]))
-               :raw body}
-              {:type :provider_event :raw body}))
+            (case (get item "type")
+              "function_call"
+              [{:type :tool_call_end
+                :tool_call (first (normalize-openai-tool-calls [item]))
+                :raw body}]
+              "message"
+              (let [id (or (get item "id") "text")]
+                (if (and (contains? (:text_started @state) id)
+                         (mark-stream-part! state :text_ended id))
+                  [{:type :text_end :text_id id :raw body}]
+                  []))
+              [{:type :provider_event :raw body}]))
 
           "response.completed"
           (let [response (normalize-openai-response request (get body "response"))]
-            {:type :finish
-             :finish_reason (:finish_reason response)
-             :usage (:usage response)
-             :response response
-             :raw body})
+            [{:type :finish
+              :finish_reason (:finish_reason response)
+              :usage (:usage response)
+              :response response
+              :raw body}])
 
           "response.failed"
-          {:type :error :error (or (get body "error") body) :raw body}
+          [{:type :error :error (or (get body "error") body) :raw body}]
 
-          {:type :provider_event :raw body})))))
+          [{:type :provider_event :raw body}])))))
 
 (defn openai-stream [request & [api-key base-url]]
   (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
@@ -829,8 +1021,11 @@
       (throw (ex-info (str "OpenAI streaming API HTTP " status)
                       {:provider "openai" :status status
                        :retryable (or (= status 429) (>= status 500))}))
-      (keep (fn [event] (openai-stream-event request event))
-            (parse-sse-lines (stream-lines (:body resp)))))))
+      (let [state (atom {:text_started #{} :text_ended #{}
+                         :reasoning_started #{} :reasoning_ended #{}
+                         :tools {}})]
+        (mapcat (fn [event] (openai-stream-events request state event))
+                (parse-sse-lines (stream-lines (:body resp))))))))
 
 (defn- append-string [value delta]
   (str (or value "") (or delta "")))
