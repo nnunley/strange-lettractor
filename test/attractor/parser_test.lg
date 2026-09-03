@@ -62,3 +62,43 @@ digraph Chaining {
         (is (= 10 (:weight e1)))
         (is (= "exit" (:to e2)))
         (is (= 10 (:weight e2)))))))
+
+(defn- parse-fails? [source]
+  (try
+    (do (p/parse-dot source) false)
+    (catch Object _ true)))
+
+(deftest test-strict-dot-subset-rejects-malformed-input
+  (doseq [source
+          ["digraph G { A [label=\"x\"]"
+           "digraph G { A [label=\"unterminated] }"
+           "digraph G { A [label=\"x\" shape=box] }"
+           "digraph G { A -> }"
+           "digraph G { 9bad [shape=box] }"
+           "digraph G { bad-id [shape=box] }"
+           "digraph G { A -- B }"
+           "strict digraph G { A }"
+           "digraph G { A } digraph H { B }"
+           "digraph G junk { A }"]]
+    (is (true? (parse-fails? source)) source)))
+
+(deftest test-strict-dot-subset-accepts-negative-values-and-comments
+  (let [graph (p/parse-dot
+                "digraph G { /* block */ A [weight=-2, label=\"ok\"]; // line\n }")]
+    (is (= -2 (get-in graph [:nodes "A" :attrs :weight])))))
+
+(deftest test-nested-subgraphs-restore-parent-scope
+  (let [graph
+        (p/parse-dot
+          "digraph G {
+             subgraph outer {
+               node [thread_id=outer]
+               Before
+               subgraph inner { node [thread_id=inner] Inside }
+               After
+             }
+           }")]
+    (is (= "outer" (:thread_id (p/find-node graph "Before"))))
+    (is (= "inner" (:thread_id (p/find-node graph "Inside"))))
+    (is (= "outer" (:thread_id (p/find-node graph "After"))))
+    (is (= 2 (count (:subgraphs graph))))))

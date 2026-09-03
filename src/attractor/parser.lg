@@ -14,7 +14,7 @@
   (loop [j (inc start)
          chars []]
     (if (>= j n)
-      [(apply str chars) j]
+      (throw (ex-info "Unterminated quoted string" {:offset start}))
       (let [ch (subs src j (inc j))]
         (cond
           (= ch "\\")
@@ -77,8 +77,14 @@
             ;; Block comment /* ... */
             (and (< (inc i) n) (= (subs src i (+ i 2)) "/*"))
             (let [end-pos (str/index-of src "*/" (+ i 2))
-                  next-i (if end-pos (+ end-pos 2) n)]
-              (recur next-i tokens))
+                  next-i (when end-pos (+ end-pos 2))]
+              (if next-i
+                (recur next-i tokens)
+                (throw (ex-info "Unterminated block comment" {:offset i}))))
+
+            ;; Undirected edges are outside the supported subset.
+            (and (< (inc i) n) (= (subs src i (+ i 2)) "--"))
+            (throw (ex-info "Undirected edges are not supported" {:offset i}))
 
             ;; Arrow ->
             (and (< (inc i) n) (= (subs src i (+ i 2)) "->"))
@@ -96,11 +102,12 @@
             ;; Word / Identifier / Number / Duration / BareValue
             :else
             (let [rest-s (subs src i)
-                  m (re-find #"^[A-Za-z0-9_.:-]+" rest-s)]
+                  m (re-find #"^-?[A-Za-z0-9_.:]+" rest-s)]
               (if m
                 (let [val-len (count m)]
                   (recur (+ i val-len) (conj tokens {:type :word :val m})))
-                (recur (inc i) tokens)))))))))
+                (throw (ex-info (str "Unexpected character in DOT source: " c)
+                                {:offset i :character c}))))))))))
 
 ;; Convert raw token value to typed value
 (defn- convert-val [token]
@@ -121,35 +128,63 @@
           (not= (get-in tokens [start-idx :val]) "["))
     [{} start-idx]
     (loop [i (inc start-idx)
-           attrs {}]
+           attrs {}
+           need-attr? false]
       (if (>= i (count tokens))
-        [attrs i]
+        (throw (ex-info "Unterminated attribute block" {:token-index start-idx}))
         (let [t (nth tokens i)]
           (cond
             (= (:val t) "]")
-            [attrs (inc i)]
+            (if need-attr?
+              (throw (ex-info "Trailing comma in attribute block" {:token-index i}))
+              [attrs (inc i)])
 
             (= (:val t) ",")
-            (recur (inc i) attrs)
-
-            (= (:val t) ";")
-            (recur (inc i) attrs)
+            (throw (ex-info "Unexpected comma in attribute block" {:token-index i}))
 
             ;; key = val
             (= (:type t) :word)
             (let [k-name (:val t)
                   next-t (get tokens (inc i))]
-              (if (and next-t (= (:val next-t) "="))
-                (let [v-token (get tokens (+ i 2))]
-                  (if v-token
-                    (let [val (convert-val v-token)]
-                      (recur (+ i 3) (assoc attrs (keyword k-name) val)))
-                    [attrs (+ i 2)]))
-                ;; Bare key without value (e.g. flag)
-                (recur (inc i) (assoc attrs (keyword k-name) true))))
+              (when-not (and next-t (= (:val next-t) "="))
+                (throw (ex-info "Attribute requires '=' and a value"
+                                {:attribute k-name :token-index i})))
+              (let [v-token (get tokens (+ i 2))
+                    separator (get tokens (+ i 3))]
+                (when-not (and v-token
+                               (or (= (:type v-token) :word)
+                                   (= (:type v-token) :string)))
+                  (throw (ex-info "Attribute value is missing"
+                                  {:attribute k-name :token-index i})))
+                (cond
+                  (nil? separator)
+                  (throw (ex-info "Unterminated attribute block"
+                                  {:token-index start-idx}))
+
+                  (= (:val separator) "]")
+                  [(assoc attrs (keyword k-name) (convert-val v-token)) (+ i 4)]
+
+                  (= (:val separator) ",")
+                  (recur (+ i 4)
+                         (assoc attrs (keyword k-name) (convert-val v-token))
+                         true)
+
+                  :else
+                  (throw (ex-info "Attributes must be separated by commas"
+                                  {:token-index (+ i 3)})))))
 
             :else
-            (recur (inc i) attrs)))))))
+            (throw (ex-info "Expected attribute name" {:token-index i}))))))))
+
+(defn- valid-identifier? [value]
+  (and (string? value)
+       (some? (re-matches #"[A-Za-z_][A-Za-z0-9_]*" value))))
+
+(defn- require-identifier! [value context]
+  (when-not (valid-identifier? value)
+    (throw (ex-info (str "Invalid " context " identifier: " value)
+                    {:identifier value :context context})))
+  value)
 
 ;; Helper to collect chained edge node IDs: A -> B -> C ...
 ;; Returns [chain-vector next-idx]
@@ -157,7 +192,12 @@
   (loop [curr-idx (inc start-idx)
          chain [first-id]]
     (if (and (< curr-idx n) (= (get-in tokens [curr-idx :val]) "->"))
-      (let [target-id (get-in tokens [(inc curr-idx) :val])]
+      (let [target-token (get tokens (inc curr-idx))
+            target-id (:val target-token)]
+        (when-not (and target-token (= (:type target-token) :word))
+          (throw (ex-info "Directed edge is missing a target node"
+                          {:token-index curr-idx})))
+        (require-identifier! target-id "node")
         (recur (+ curr-idx 2) (conj chain target-id)))
       [chain curr-idx])))
 
@@ -171,12 +211,14 @@
       (= val "}")
       (if (:current-subgraph state)
         ;; Exit subgraph back to parent scope
-        (-> state
-            (update :idx inc)
-            (update :subgraphs conj (:current-subgraph state))
-            (assoc :current-subgraph nil))
+        (let [stack (:subgraph-stack state)]
+          (-> state
+              (update :idx inc)
+              (update :subgraphs conj (:current-subgraph state))
+              (assoc :current-subgraph (last stack))
+              (assoc :subgraph-stack (vec (butlast stack)))))
         ;; Exit graph
-        (assoc state :done? true))
+        (-> state (assoc :done? true) (update :idx inc)))
 
       (= val ";")
       (update state :idx inc)
@@ -211,10 +253,18 @@
       (let [has-name? (and (< (inc idx) n) (not= (get-in tokens [(inc idx) :val]) "{"))
             sub-name (if has-name? (get-in tokens [(inc idx) :val]) (str "subgraph_" (count (:subgraphs state))))
             brace-idx (if has-name? (+ idx 2) (inc idx))]
+        (when has-name? (require-identifier! sub-name "subgraph"))
+        (when-not (= "{" (get-in tokens [brace-idx :val]))
+          (throw (ex-info "Expected '{' after subgraph declaration"
+                          {:token-index brace-idx})))
         (-> state
             (assoc :idx (inc brace-idx))
+            (cond-> (:current-subgraph state)
+              (update :subgraph-stack conj (:current-subgraph state)))
             (assoc :current-subgraph {:id sub-name
-                                      :scoped-node-defaults (:node-defaults state)
+                                      :scoped-node-defaults
+                                      (or (get-in state [:current-subgraph :scoped-node-defaults])
+                                          (:node-defaults state))
                                       :label ""
                                       :derived-class ""})))
 
@@ -238,6 +288,7 @@
       ;; Node or Edge statement
       (= (:type tok) :word)
       (let [first-id val]
+        (require-identifier! first-id "node")
         (if (and (< (inc idx) n) (= (get-in tokens [(inc idx) :val]) "->"))
           ;; Edge chain
           (let [[chain curr-idx] (collect-edge-chain tokens idx n first-id)
@@ -333,12 +384,11 @@
       (when (not= (:val t0) "digraph")
         (throw (ex-info (str "Expected 'digraph', found: " (:val t0)) {}))))
 
-    (let [graph-id (if (> n 1) (get-in tokens [1 :val]) "G")
-          open-brace-idx (loop [i 0]
-                           (cond
-                             (>= i n) (throw (ex-info "Missing opening '{'" {}))
-                             (= (get-in tokens [i :val]) "{") i
-                             :else (recur (inc i))))
+    (let [graph-id (get-in tokens [1 :val])
+          _ (require-identifier! graph-id "graph")
+          open-brace-idx 2
+          _ (when-not (= "{" (get-in tokens [open-brace-idx :val]))
+              (throw (ex-info "Expected '{' immediately after graph identifier" {})))
           initial-state {:idx (inc open-brace-idx)
                          :done? false
                          :graph-attrs {:id graph-id
@@ -352,12 +402,18 @@
                          :nodes {}
                          :edges []
                          :subgraphs []
+                         :subgraph-stack []
                          :current-subgraph nil}]
 
       (loop [state initial-state]
         (if (or (:done? state) (>= (:idx state) n))
           ;; Construct final graph map
-          (let [ga (:graph-attrs state)]
+          (let [_ (when-not (:done? state)
+                    (throw (ex-info "Missing closing '}'" {})))
+                _ (when-not (= (:idx state) n)
+                    (throw (ex-info "Unexpected tokens after graph closing '}'"
+                                    {:token-index (:idx state)})))
+                ga (:graph-attrs state)]
             {:id graph-id
              :goal (or (:goal ga) "")
              :label (or (:label ga) "")
