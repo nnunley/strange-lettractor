@@ -1,7 +1,9 @@
 (ns attractor.context-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
-            [attractor.context :as context]))
+            [attractor.context :as context]
+            [io :as io]
+            [os :as os]))
 
 (deftest test-truncate-preamble-carries-goal-and-run-id
   (let [ctx (context/make-context {"run.id" "run-42"})
@@ -32,3 +34,83 @@
                                      :subgraph_class "review-loop"}
                                     {}
                                     "previous"))))
+
+(deftest test-artifact-store-uses-edn-and-supports-full-lifecycle
+  (let [root (str (os/temp-dir) "/lettractor-artifacts-" (random-uuid))
+        store (context/make-artifact-store root)
+        small {:answer 42 :ok false}
+        large (str (apply str (repeat context/file-backing-threshold "x")) "y")
+        replacement (str large "replacement")
+        unicode-large (apply str (repeat 40000 "€"))
+        small-info (context/store-artifact! store "small" "Small" small)
+        large-info (context/store-artifact! store "large" "Large" large)
+        unicode-info
+        (context/store-artifact! store "unicode" "Unicode" unicode-large)]
+    (is (false? (:is_file_backed small-info)))
+    (is (true? (:is_file_backed large-info)))
+    (is (= small (context/retrieve-artifact store "small")))
+    (is (= large (context/retrieve-artifact store "large")))
+    (context/store-artifact! store "large" "Replacement" replacement)
+    (is (= replacement (context/retrieve-artifact store "large")))
+    (is (true? (:is_file_backed unicode-info)))
+    (is (= 120000 (:size_bytes unicode-info)))
+    (is (some? (os/stat (str root "/artifacts/large.edn"))))
+    (is (= 3 (count (context/list-artifacts store))))
+    (context/remove-artifact! store "large")
+    (is (false? (context/has-artifact? store "large")))
+    (is (nil? (os/stat (str root "/artifacts/large.edn"))))
+    (context/clear-artifacts! store)
+    (is (empty? (context/list-artifacts store)))
+    (is (true?
+          (try
+            (do (context/retrieve-artifact store "missing") false)
+            (catch Object _ true))))
+    (is (true?
+          (try
+            (do (context/store-artifact! store "../escape" "bad" large)
+                false)
+            (catch Object _ true))))))
+
+(deftest test-artifact-store-rejects-values-that-cannot-round-trip-through-edn
+  (let [root (str (os/temp-dir) "/lettractor-artifacts-" (random-uuid))
+        store (context/make-artifact-store root)
+        unsupported (vec (repeat 10000 (fn [] nil)))]
+    (is (true?
+          (try
+            (do (context/store-artifact! store "unsupported" "Unsupported"
+                                         unsupported)
+                false)
+            (catch Object _ true))))
+    (is (false? (context/has-artifact? store "unsupported")))))
+
+(deftest test-artifact-removal-keeps-registration-when-file-deletion-fails
+  (let [root (str (os/temp-dir) "/lettractor-artifacts-" (random-uuid))
+        store (context/make-artifact-store root)
+        large (str (apply str (repeat context/file-backing-threshold "x")) "y")
+        path (str root "/artifacts/delete-failure.edn")]
+    (context/store-artifact! store "delete-failure" "Delete failure" large)
+    (io/delete-file path)
+    (io/mkdir path)
+    (io/spit (str path "/blocker") "keep directory non-empty")
+    (is (true?
+          (try
+            (do (context/remove-artifact! store "delete-failure") false)
+            (catch Object _ true))))
+    (is (true? (context/has-artifact? store "delete-failure")))))
+
+(deftest test-artifact-clear-keeps-only-file-backed-registrations-that-still-exist
+  (let [root (str (os/temp-dir) "/lettractor-artifacts-" (random-uuid))
+        store (context/make-artifact-store root)
+        large (str (apply str (repeat context/file-backing-threshold "x")) "y")
+        blocked-path (str root "/artifacts/second.edn")]
+    (context/store-artifact! store "first" "First" large)
+    (context/store-artifact! store "second" "Second" large)
+    (io/delete-file blocked-path)
+    (io/mkdir blocked-path)
+    (io/spit (str blocked-path "/blocker") "keep directory non-empty")
+    (is (true?
+          (try
+            (do (context/clear-artifacts! store) false)
+            (catch Object _ true))))
+    (doseq [info (context/list-artifacts store)]
+      (is (some? (os/stat (str root "/artifacts/" (:id info) ".edn")))))))

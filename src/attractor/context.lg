@@ -1,6 +1,7 @@
 (ns attractor.context
   (:require [clojure.string :as str]
             [clojure.edn :as edn]
+            [clojure.core :as core]
             [json :as json]
             [io :as io]
             [os :as os]))
@@ -161,45 +162,150 @@
 ;; Create an ArtifactStore
 (defn make-artifact-store [base-dir]
   (atom {:base-dir base-dir
-         :artifacts {}}))
+         :artifacts {}
+         :lock (atom false)}))
+
+(defn- acquire-artifact-lock! [lock]
+  (loop []
+    (when-not (compare-and-set! lock false true)
+      (core/sleep 1)
+      (recur))))
+
+(defn- with-artifact-lock [store operation]
+  (let [lock (:lock @store)]
+    (acquire-artifact-lock! lock)
+    (try
+      (operation)
+      (finally
+        (reset! lock false)))))
+
+(defn- validate-artifact-id! [artifact-id]
+  (let [id (str artifact-id)]
+    (when (or (nil? (re-matches #"[A-Za-z0-9._-]+" id))
+              (str/includes? id ".."))
+      (throw (ex-info "Artifact ID must be a safe filename component"
+                      {:category :invalid-artifact-id
+                       :artifact_id id})))
+    id))
+
+(defn- delete-file-backed-entry! [entry]
+  (when (and entry (get-in entry [:info :is_file_backed]))
+    (let [path (:data entry)]
+      (when (io/file-exists? path)
+        (io/delete-file path)))))
+
+(defn- validate-edn-round-trip! [data serialized]
+  (let [round-tripped
+        (try
+          (edn/read-string serialized)
+          (catch Object cause
+            (throw (ex-info "Artifact value is not EDN-serializable"
+                            {:category :unsupported-artifact-value
+                             :cause (str cause)}))))]
+    (when-not (= data round-tripped)
+      (throw (ex-info "Artifact value does not round-trip through EDN"
+                      {:category :unsupported-artifact-value})))
+    serialized))
+
+(defn- move-artifact-file! [source target]
+  (let [result (os/sh "mv" source target)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "Failed to publish artifact file"
+                      {:category :artifact-write-failed
+                       :source source
+                       :target target
+                       :exit (:exit result)
+                       :error (:err result)})))))
 
 ;; Store an artifact (in memory if <= 100KB, file-backed if > 100KB)
 (defn store-artifact! [store artifact-id name data]
-  (let [base-dir (:base-dir @store)
-        data-str (if (string? data) data (json/write-json data))
-        size (count data-str)
-        is-file-backed (and (> size file-backing-threshold) (not (str/blank? base-dir)))
-        stored-data (if is-file-backed
-                      (let [art-dir (str base-dir "/artifacts")
-                            _ (os/sh "mkdir" "-p" art-dir)
-                            file-path (str art-dir "/" artifact-id ".json")]
-                        (io/spit file-path data-str)
-                        file-path)
-                      data)
-        info {:id (str artifact-id)
-              :name (str name)
-              :size_bytes size
-              :stored_at (str (System/currentTimeMillis))
-              :is_file_backed is-file-backed}]
-    (swap! store update :artifacts assoc (str artifact-id) {:info info :data stored-data})
-    info))
+  (let [id (validate-artifact-id! artifact-id)]
+    (with-artifact-lock
+      store
+      (fn []
+        (let [base-dir (:base-dir @store)
+              serialized (pr-str data)
+              _ (validate-edn-round-trip! data serialized)
+              size-source (if (string? data) data serialized)
+              size (count (.getBytes size-source "UTF-8"))
+              is-file-backed
+              (and (> size file-backing-threshold)
+                   (not (str/blank? base-dir)))
+              old-entry (get-in @store [:artifacts id])
+              stored-data
+              (if is-file-backed
+                (let [art-dir (str base-dir "/artifacts")
+                      _ (io/mkdir art-dir)
+                      file-path (str art-dir "/" id ".edn")
+                      temp-path (str file-path ".tmp-" (random-uuid))]
+                  (try
+                    (io/spit temp-path serialized)
+                    (move-artifact-file! temp-path file-path)
+                    file-path
+                    (catch Object cause
+                      (when (io/file-exists? temp-path)
+                        (io/delete-file temp-path))
+                      (throw cause))))
+                data)
+              info {:id id
+                    :name (str name)
+                    :size_bytes size
+                    :stored_at (str (System/currentTimeMillis))
+                    :is_file_backed is-file-backed}]
+          (when (and old-entry
+                     (get-in old-entry [:info :is_file_backed])
+                     (not is-file-backed))
+            (delete-file-backed-entry! old-entry))
+          (swap! store update :artifacts assoc id
+                 {:info info :data stored-data})
+          info)))))
 
 ;; Retrieve an artifact
 (defn retrieve-artifact [store artifact-id]
-  (let [entry (get-in @store [:artifacts (str artifact-id)])]
-    (when entry
-      (let [{:keys [info data]} entry]
-        (if (:is_file_backed info)
-          (json/read-json (io/slurp data))
-          data)))))
+  (with-artifact-lock
+    store
+    (fn []
+      (let [entry (get-in @store [:artifacts (str artifact-id)])]
+        (when (nil? entry)
+          (throw (ex-info "Artifact not found"
+                          {:category :artifact-not-found
+                           :artifact_id (str artifact-id)})))
+        (let [{:keys [info data]} entry]
+          (if (:is_file_backed info)
+            (edn/read-string (io/slurp data))
+            data))))))
 
 ;; Check if artifact exists
 (defn has-artifact? [store artifact-id]
-  (contains? (:artifacts @store) (str artifact-id)))
+  (with-artifact-lock
+    store
+    (fn [] (contains? (:artifacts @store) (str artifact-id)))))
 
 ;; List all artifacts
 (defn list-artifacts [store]
-  (map :info (vals (:artifacts @store))))
+  (with-artifact-lock
+    store
+    (fn [] (mapv :info (vals (:artifacts @store))))))
+
+(defn remove-artifact! [store artifact-id]
+  (with-artifact-lock
+    store
+    (fn []
+      (let [id (str artifact-id)
+            entry (get-in @store [:artifacts id])]
+        (when entry
+          (delete-file-backed-entry! entry)
+          (swap! store update :artifacts dissoc id))
+        (some? entry)))))
+
+(defn clear-artifacts! [store]
+  (with-artifact-lock
+    store
+    (fn []
+      (doseq [[id entry] (:artifacts @store)]
+        (delete-file-backed-entry! entry)
+        (swap! store update :artifacts dissoc id))
+      nil)))
 
 ;; Initialize the run directory structure (Section 5.6)
 (defn init-run-dir [logs-root graph]
