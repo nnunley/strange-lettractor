@@ -205,6 +205,135 @@
                 false)
             (catch Object _ true))))))
 
+(deftest test-client-routes-default-and-explicit-providers
+  (let [calls (atom [])
+        adapter (fn [provider]
+                  (llm/make-adapter
+                    provider
+                    (fn [request]
+                      (swap! calls conj [provider (:model request)])
+                      {:provider provider :model (:model request)
+                       :message {:role :assistant :content provider}
+                       :tool_calls [] :usage {} :finish_reason :stop})
+                    (fn [_] [])))
+        client (llm/make-client
+                 {:providers {"alpha" (adapter "alpha")
+                              "beta" (adapter "beta")}
+                  :default_provider "alpha"})]
+    (is (= "alpha" (:provider (llm/client-complete
+                                client {:model "native-model" :messages []}))))
+    (is (= "beta" (:provider (llm/client-complete
+                               client {:provider "beta"
+                                       :model "other-model" :messages []}))))
+    (is (= [["alpha" "native-model"] ["beta" "other-model"]] @calls))
+    (is (true?
+          (try
+            (do (llm/client-complete (llm/make-client {:providers {}})
+                                     {:model "ambiguous" :messages []})
+                false)
+            (catch Object _ true))))))
+
+(deftest test-client-middleware-uses-onion-order
+  (let [events (atom [])
+        middleware
+        [(fn [request next]
+           (swap! events conj :one-before)
+           (let [response (next request)]
+             (swap! events conj :one-after)
+             response))
+         (fn [request next]
+           (swap! events conj :two-before)
+           (let [response (next request)]
+             (swap! events conj :two-after)
+             response))]
+        adapter (llm/make-adapter
+                  "mock"
+                  (fn [_]
+                    (swap! events conj :adapter)
+                    {:provider "mock" :message {:content "ok"}
+                     :tool_calls [] :usage {} :finish_reason :stop})
+                  (fn [_] [{:type :finish}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"
+                                 :middleware middleware})]
+    (llm/client-complete client {:model "test" :messages []})
+    (is (= [:one-before :two-before :adapter :two-after :one-after]
+           @events))))
+
+(deftest test-client-middleware-wraps-streams
+  (let [adapter (llm/make-adapter
+                  "mock" (fn [_] {})
+                  (fn [_] [{:type :text_delta :delta "hi"}]))
+        middleware (fn [request next]
+                     (map (fn [event] (assoc event :observed true))
+                          (next request)))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"
+                                 :middleware [middleware]})
+        events (vec (llm/client-stream client {:model "test" :messages []}))]
+    (is (= "hi" (:delta (first events))))
+    (is (true? (:observed (first events))))))
+
+(deftest test-client-initializes-and-closes-adapters
+  (let [events (atom [])
+        adapter (llm/make-adapter
+                  "mock" (fn [_] {}) (fn [_] [])
+                  {:initialize (fn [] (swap! events conj :initialize))
+                   :close (fn [] (swap! events conj :close))})
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})]
+    (is (= [:initialize] @events))
+    (llm/client-close! client)
+    (is (= [:initialize :close] @events))))
+
+(deftest test-client-from-env-registers-only-configured-providers
+  (let [client (llm/client-from-env
+                 {"OPENAI_API_KEY" "openai-key"
+                  "GOOGLE_API_KEY" "google-key"})]
+    (is (= #{"openai" "gemini"} (set (keys (:providers client)))))
+    (is (= "openai" (:default_provider client)))
+    (is (= "google-key"
+           (get-in client [:providers "gemini" :options :api_key])))))
+
+(deftest test-high-level-generate-standardizes-input-and-result
+  (let [captured (atom nil)
+        adapter (llm/make-adapter
+                  "mock"
+                  (fn [request]
+                    (reset! captured request)
+                    {:id "response-1" :provider "mock" :model (:model request)
+                     :message {:role :assistant :content "Hello"}
+                     :reasoning "because"
+                     :tool_calls []
+                     :usage {:input_tokens 2 :output_tokens 1 :total_tokens 3}
+                     :finish_reason :stop})
+                  (fn [_] []))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/generate "native-model" "Hi"
+                             {:system "Be kind" :client client})]
+    (is (= [{:role :system :content "Be kind"}
+            {:role :user :content "Hi"}]
+           (:messages @captured)))
+    (is (= "Hello" (:text result)))
+    (is (= "because" (:reasoning result)))
+    (is (= 3 (get-in result [:total_usage :total_tokens])))
+    (is (= 1 (count (:steps result))))
+    (is (= "response-1" (get-in result [:response :id])))
+    (is (= "Hello"
+           (:text (llm/generate
+                    "native-model" nil
+                    {:messages [{:role :user :content "From history"}]
+                     :client client}))))
+    (is (= [{:role :user :content "From history"}] (:messages @captured)))
+    (is (true?
+          (try
+            (do (llm/generate "native-model" nil
+                              {:messages [{:role :user :content "Hi"}]
+                               :prompt "also hi" :client client})
+                false)
+            (catch Object _ true))))))
+
 (deftest test-openai-stream-normalizes-responses-sse
   (let [captured (atom nil)
         sse (str

@@ -1271,12 +1271,217 @@
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
                       {:provider provider :category :configuration})))))
 
+;; Provider adapter and configurable Client layer
+(defn make-adapter [name complete-fn stream-fn & [opts]]
+  (when (str/blank? name)
+    (throw (ex-info "Provider adapter name is required"
+                    {:category :configuration})))
+  (when (nil? complete-fn)
+    (throw (ex-info (str "Provider adapter " name " must implement complete")
+                    {:provider name :category :configuration})))
+  {:name (str/lower-case name)
+   :complete complete-fn
+   :stream stream-fn
+   :options (or (:options opts) {})
+   :initialize (:initialize opts)
+   :close (:close opts)
+   :supports_tool_choice (:supports_tool_choice opts)})
+
+(defn make-provider-adapter [provider & [opts]]
+  (let [name (str/lower-case provider)
+        options (or opts {})
+        request-with-options (fn [request] (merge options request))
+        complete-fn
+        (fn [request]
+          (let [req (request-with-options request)]
+            (case name
+              "openai" (openai-complete req (:api_key req) (:base_url req))
+              "ollama" (openai-compatible-complete req (:api_key req) (:base_url req))
+              "anthropic" (anthropic-complete req (:api_key req) (:base_url req))
+              "gemini" (gemini-complete req (:api_key req) (:base_url req))
+              "mock" (mock-complete req (:mock_handler req))
+              (throw (ex-info (str "Unsupported LLM provider: " name)
+                              {:provider name :category :configuration})))))
+        stream-fn
+        (fn [request]
+          (let [req (request-with-options request)]
+            (case name
+              "openai" (openai-stream req (:api_key req) (:base_url req))
+              "anthropic" (anthropic-stream req (:api_key req) (:base_url req))
+              "gemini" (gemini-stream req (:api_key req) (:base_url req))
+              (throw (ex-info (str "Streaming is not implemented for provider: " name)
+                              {:provider name :category :configuration})))))]
+    (make-adapter name complete-fn stream-fn {:options options})))
+
+(defn- normalize-provider-name [provider]
+  (when (some? provider)
+    (str/lower-case (name provider))))
+
+(defn make-client [& [opts]]
+  (let [options (or opts {})
+        providers
+        (into {}
+              (map (fn [[provider adapter]]
+                     [(normalize-provider-name provider) adapter])
+                   (or (:providers options) {})))
+        default-provider (normalize-provider-name (:default_provider options))]
+    (when (and (some? default-provider)
+               (nil? (get providers default-provider)))
+      (throw (ex-info (str "Default provider is not registered: " default-provider)
+                      {:provider default-provider :category :configuration})))
+    (doseq [[_ adapter] providers]
+      (when-let [initialize (:initialize adapter)]
+        (initialize)))
+    {:providers providers
+     :default_provider default-provider
+     :middleware (vec (or (:middleware options) []))}))
+
+(defn- client-provider [client request]
+  (let [provider (normalize-provider-name
+                   (or (:provider request) (:default_provider client)))]
+    (when (nil? provider)
+      (throw (ex-info "No provider specified and Client has no default provider"
+                      {:category :configuration})))
+    (let [adapter (get (:providers client) provider)]
+      (when (nil? adapter)
+        (throw (ex-info (str "Provider is not registered: " provider)
+                        {:provider provider :category :configuration})))
+      [provider adapter])))
+
+(defn- middleware-chain [middleware terminal]
+  (reduce (fn [next middleware-fn]
+            (fn [request] (middleware-fn request next)))
+          terminal
+          (reverse middleware)))
+
+(defn client-complete [client request]
+  (let [[provider adapter] (client-provider client request)
+        req (assoc request :provider provider)
+        invoke (middleware-chain
+                 (:middleware client)
+                 (fn [r] ((:complete adapter) r)))]
+    (invoke req)))
+
+(defn client-stream [client request]
+  (let [[provider adapter] (client-provider client request)
+        stream-fn (:stream adapter)]
+    (when (nil? stream-fn)
+      (throw (ex-info (str "Provider does not implement streaming: " provider)
+                      {:provider provider :category :configuration})))
+    ((middleware-chain (:middleware client)
+                       (fn [r] (stream-fn r)))
+     (assoc request :provider provider))))
+
+(defn client-close! [client]
+  (doseq [[_ adapter] (:providers client)]
+    (when-let [close (:close adapter)]
+      (close)))
+  nil)
+
+(defn- env-get [environment key]
+  (if (map? environment)
+    (get environment key)
+    (os/getenv key)))
+
+(defn- present-env [environment key]
+  (let [value (env-get environment key)]
+    (when-not (str/blank? value) value)))
+
+(defn client-from-env [& [environment]]
+  (let [env (or environment :process)
+        openai-key (present-env env "OPENAI_API_KEY")
+        anthropic-key (present-env env "ANTHROPIC_API_KEY")
+        gemini-key (or (present-env env "GEMINI_API_KEY")
+                       (present-env env "GOOGLE_API_KEY"))
+        providers
+        (cond-> {}
+          openai-key
+          (assoc "openai"
+                 (make-provider-adapter
+                   "openai" {:api_key openai-key
+                             :base_url (present-env env "OPENAI_BASE_URL")
+                             :org_id (present-env env "OPENAI_ORG_ID")
+                             :project_id (present-env env "OPENAI_PROJECT_ID")}))
+          anthropic-key
+          (assoc "anthropic"
+                 (make-provider-adapter
+                   "anthropic" {:api_key anthropic-key
+                                :base_url (present-env env "ANTHROPIC_BASE_URL")}))
+          gemini-key
+          (assoc "gemini"
+                 (make-provider-adapter
+                   "gemini" {:api_key gemini-key
+                             :base_url (present-env env "GEMINI_BASE_URL")})))
+        default-provider (cond openai-key "openai"
+                               anthropic-key "anthropic"
+                               gemini-key "gemini"
+                               :else nil)]
+    (make-client {:providers providers :default_provider default-provider})))
+
+(defonce default-client (atom nil))
+
+(defn set-default-client! [client]
+  (reset! default-client client)
+  client)
+
+(defn get-default-client []
+  (or @default-client
+      (let [client (client-from-env)]
+        (reset! default-client client)
+        client)))
+
+(defn- generation-client [options]
+  (or (:client options)
+      (when (contains? options :mock_handler)
+        (make-client
+          {:providers {"mock" (make-provider-adapter
+                                "mock" {:mock_handler (:mock_handler options)})}
+           :default_provider "mock"}))
+      (get-default-client)))
+
 ;; High-level generate API
 (defn generate [model prompt & [opts]]
-  (let [messages [{:role :user :content prompt}]
-        req (make-request model messages opts)
-        resp (complete req opts)]
-    (get-in resp [:message :content])))
+  (let [options (or opts {})
+        prompt-present (or (some? prompt) (contains? options :prompt))
+        messages-present (contains? options :messages)
+        prompt-value (if (some? prompt) prompt (:prompt options))]
+    (when (= prompt-present messages-present)
+      (throw (ex-info "Exactly one of prompt or messages must be provided"
+                      {:category :invalid-request})))
+    (let [input-messages (if messages-present
+                           (:messages options)
+                           [{:role :user :content prompt-value}])
+          messages (if (some? (:system options))
+                     (vec (cons {:role :system :content (:system options)}
+                                input-messages))
+                     (vec input-messages))
+          request-options (dissoc
+                            (dissoc
+                              (dissoc
+                                (dissoc options :client)
+                                :prompt)
+                              :system)
+                            :messages)
+          request (merge request-options {:model model :messages messages})
+          response (client-complete (generation-client options) request)
+          text (or (get-in response [:message :content]) "")
+          reasoning (:reasoning response)
+          tool-calls (or (:tool_calls response) [])
+          usage (or (:usage response) {})
+          finish-reason (:finish_reason response)
+          step {:text text :reasoning reasoning :tool_calls tool-calls
+                :tool_results [] :finish_reason finish-reason
+                :usage usage :response response :warnings []}]
+      {:text text
+       :reasoning reasoning
+       :tool_calls tool-calls
+       :tool_results []
+       :finish_reason finish-reason
+       :usage usage
+       :total_usage usage
+       :steps [step]
+       :response response
+       :output nil})))
 
 (defn- schema-value [m key]
   (or (get m key) (get m (keyword (str key)))))
@@ -1331,15 +1536,13 @@
       :else [true ""])))
 
 (defn generate-object [model prompt schema & [opts]]
-  (let [request (make-request
-                  model
-                  [{:role :user :content prompt}]
-                  (assoc (or opts {})
-                         :response_format {:type "json_schema"
-                                           :json_schema schema
-                                           :strict true}))
-        response (complete request opts)
-        text (get-in response [:message :content])
+  (let [result (generate
+                 model prompt
+                 (assoc (or opts {})
+                        :response_format {:type "json_schema"
+                                          :json_schema schema
+                                          :strict true}))
+        text (:text result)
         parsed (try
                  (json/read-json text)
                  (catch Object e
@@ -1349,13 +1552,4 @@
     (when-not valid?
       (throw (ex-info (str "No object generated: " reason)
                       {:category :no-object-generated :reason reason})))
-    {:text text
-     :output parsed
-     :tool_calls (or (:tool_calls response) [])
-     :tool_results []
-     :finish_reason (:finish_reason response)
-     :usage (:usage response)
-     :total_usage (:usage response)
-     :steps [{:response response :tool_calls (or (:tool_calls response) [])
-              :tool_results []}]
-     :response response}))
+    (assoc result :output parsed)))
