@@ -623,7 +623,10 @@
         {})))
 
 (defn- field [m k]
-  (or (get m k) (get m (name k))))
+  (cond
+    (and (map? m) (contains? m k)) (get m k)
+    (and (map? m) (contains? m (name k))) (get m (name k))
+    :else nil))
 
 (defn make-tool [tool-name description parameters & [execute]]
   (when (or (not (string? tool-name))
@@ -2369,56 +2372,264 @@
             (generate-result response tool-results next-steps next-total)))))))
 
 (defn- schema-value [m key]
-  (or (get m key) (get m (keyword (str key)))))
+  (let [string-key (if (keyword? key) (name key) (str key))
+        keyword-key (keyword string-key)]
+    (cond
+      (contains? m key) {:present true :value (get m key)}
+      (contains? m string-key) {:present true :value (get m string-key)}
+      (contains? m keyword-key) {:present true :value (get m keyword-key)}
+      :else {:present false :value nil})))
 
 (defn- schema-type-valid? [value expected]
-  (case expected
-    "object" (map? value)
-    "array" (vector? value)
-    "string" (string? value)
-    "integer" (integer? value)
-    "number" (number? value)
-    "boolean" (or (= value true) (= value false))
-    "null" (nil? value)
-    true))
+  (if (sequential? expected)
+    (some (fn [candidate] (schema-type-valid? value candidate)) expected)
+    (case expected
+      "object" (map? value)
+      "array" (vector? value)
+      "string" (string? value)
+      "integer" (and (number? value)
+                     (= (double value) (math/floor (double value))))
+      "number" (number? value)
+      "boolean" (or (= value true) (= value false))
+      "null" (nil? value)
+      true)))
+
+(defn- schema-field-entry [schema key]
+  (let [string-key (name key)]
+    (cond
+      (contains? schema key) {:present true :value (get schema key)}
+      (contains? schema string-key) {:present true :value (get schema string-key)}
+      :else {:present false :value nil})))
+
+(defn- schema-key-name [key]
+  (if (keyword? key) (name key) (str key)))
+
+(defn- resolve-local-schema-ref [root reference]
+  (cond
+    (= reference "#") root
+    (and (string? reference) (str/starts-with? reference "#/"))
+    (reduce
+      (fn [current segment]
+        (let [decoded (-> segment
+                          (str/replace "~1" "/")
+                          (str/replace "~0" "~"))]
+          (cond
+            (map? current)
+            (let [entry (schema-value current decoded)]
+              (when (:present entry) (:value entry)))
+
+            (and (vector? current) (re-matches #"[0-9]+" decoded))
+            (let [index (parse-long decoded)]
+              (when (< index (count current)) (get current index)))
+
+            :else nil)))
+      root
+      (str/split (subs reference 2) #"/"))
+    :else nil))
+
+(declare validate-json-schema*)
+
+(defn- validate-schema-list [value schemas root mode]
+  (let [results (mapv (fn [candidate]
+                        (validate-json-schema* value candidate root))
+                      schemas)
+        valid-count (count (filter first results))]
+    (case mode
+      :all (if (= valid-count (count results))
+             [true ""]
+             (or (first (filter (fn [result] (not (first result))) results))
+                 [false "Value does not satisfy allOf"]))
+      :any (if (pos? valid-count) [true ""]
+             [false "Value does not satisfy anyOf"])
+      :one (if (= 1 valid-count) [true ""]
+             [false "Value does not satisfy exactly one oneOf schema"]))))
+
+(defn- validate-object-schema [value schema root]
+  (let [required (or (field schema :required) [])
+        missing (first (filter (fn [key]
+                                 (not (:present (schema-value value key))))
+                               required))
+        properties (or (field schema :properties) {})
+        property-names (set (map (fn [[key _]] (schema-key-name key))
+                                 properties))
+        additional-entry (schema-field-entry schema :additionalProperties)
+        extra-entries (filter (fn [[key _]]
+                                (not (contains? property-names
+                                                (schema-key-name key))))
+                              value)
+        min-properties (field schema :minProperties)
+        max-properties (field schema :maxProperties)]
+    (cond
+      missing [false (str "Missing required property: " missing)]
+      (and (number? min-properties) (< (count value) min-properties))
+      [false (str "Expected at least " min-properties " properties")]
+      (and (number? max-properties) (> (count value) max-properties))
+      [false (str "Expected at most " max-properties " properties")]
+      (and (:present additional-entry)
+           (= false (:value additional-entry))
+           (seq extra-entries))
+      [false (str "Unexpected property: " (schema-key-name (first (first extra-entries))))]
+      :else
+      (loop [entries (seq properties)]
+        (if (seq entries)
+          (let [[key child-schema] (first entries)
+                child (schema-value value key)]
+            (if-not (:present child)
+              (recur (next entries))
+              (let [[valid? reason]
+                    (validate-json-schema* (:value child) child-schema root)]
+                (if valid?
+                  (recur (next entries))
+                  [false (str "Property " (schema-key-name key) ": " reason)]))))
+          (if (and (:present additional-entry)
+                   (map? (:value additional-entry)))
+            (loop [extras (seq extra-entries)]
+              (if (seq extras)
+                (let [[key extra-value] (first extras)
+                      [valid? reason]
+                      (validate-json-schema* extra-value
+                                             (:value additional-entry)
+                                             root)]
+                  (if valid?
+                    (recur (next extras))
+                    [false (str "Property " (schema-key-name key) ": " reason)]))
+                [true ""]))
+            [true ""]))))))
+
+(defn- validate-array-schema [value schema root]
+  (let [min-items (field schema :minItems)
+        max-items (field schema :maxItems)
+        unique-items (field schema :uniqueItems)
+        item-schema (field schema :items)]
+    (cond
+      (and (number? min-items) (< (count value) min-items))
+      [false (str "Expected at least " min-items " items")]
+      (and (number? max-items) (> (count value) max-items))
+      [false (str "Expected at most " max-items " items")]
+      (and (= true unique-items)
+           (not= (count value) (count (distinct value))))
+      [false "Array items must be unique"]
+      (some? item-schema)
+      (loop [items (seq value) index 0]
+        (if (seq items)
+          (let [[valid? reason]
+                (validate-json-schema* (first items) item-schema root)]
+            (if valid?
+              (recur (next items) (inc index))
+              [false (str "Item " index ": " reason)]))
+          [true ""]))
+      :else [true ""])))
+
+(defn- validate-string-schema [value schema]
+  (let [min-length (field schema :minLength)
+        max-length (field schema :maxLength)
+        pattern (field schema :pattern)]
+    (cond
+      (and (number? min-length) (< (count value) min-length))
+      [false (str "Expected at least " min-length " characters")]
+      (and (number? max-length) (> (count value) max-length))
+      [false (str "Expected at most " max-length " characters")]
+      (and (string? pattern) (nil? (re-find (re-pattern pattern) value)))
+      [false (str "String does not match pattern: " pattern)]
+      :else [true ""])))
+
+(defn- json-multiple-of? [value divisor]
+  (when (and (number? divisor) (pos? divisor))
+    (let [quotient (/ (double value) (double divisor))
+          nearest (math/round quotient)
+          tolerance (min 1.0e-7
+                         (max 1.0e-12
+                              (* 1.0e-12 (math/abs quotient))))]
+      (<= (math/abs (- quotient nearest)) tolerance))))
+
+(defn- validate-number-schema [value schema]
+  (let [minimum (field schema :minimum)
+        maximum (field schema :maximum)
+        exclusive-minimum (field schema :exclusiveMinimum)
+        exclusive-maximum (field schema :exclusiveMaximum)
+        multiple-of (field schema :multipleOf)]
+    (cond
+      (and (number? minimum) (< value minimum))
+      [false (str "Number is below minimum " minimum)]
+      (and (number? maximum) (> value maximum))
+      [false (str "Number is above maximum " maximum)]
+      (and (number? exclusive-minimum) (<= value exclusive-minimum))
+      [false (str "Number must be greater than " exclusive-minimum)]
+      (and (number? exclusive-maximum) (>= value exclusive-maximum))
+      [false (str "Number must be less than " exclusive-maximum)]
+      (and (number? multiple-of) (not (json-multiple-of? value multiple-of)))
+      [false (str "Number must be a multiple of " multiple-of)]
+      :else [true ""])))
+
+(defn- validate-json-schema* [value schema root]
+  (cond
+    (= schema true) [true ""]
+    (= schema false) [false "Schema rejects this value"]
+    (not (map? schema)) [false "Schema must be an object or boolean"]
+    :else
+    (let [reference-entry (schema-field-entry schema :$ref)
+          reference (:value reference-entry)
+          resolved (when reference (resolve-local-schema-ref root reference))
+          enum-entry (schema-field-entry schema :enum)
+          const-entry (schema-field-entry schema :const)
+          expected (field schema :type)
+          all-of-entry (schema-field-entry schema :allOf)
+          any-of-entry (schema-field-entry schema :anyOf)
+          one-of-entry (schema-field-entry schema :oneOf)
+          not-entry (schema-field-entry schema :not)
+          immediate-failure
+          (cond
+            (and (:present reference-entry) (nil? resolved))
+            [false (str "Unresolved schema reference: " reference)]
+            (and (:present enum-entry)
+                 (not (some (fn [candidate] (= value candidate))
+                            (:value enum-entry))))
+            [false "Value is not in enum"]
+            (and (:present const-entry) (not= value (:value const-entry)))
+            [false "Value does not match const"]
+            (not (schema-type-valid? value expected))
+            [false (str "Expected " expected)]
+            :else nil)]
+      (if immediate-failure
+        immediate-failure
+        (let [checks
+              (concat
+                (when (:present reference-entry)
+                  [(validate-json-schema* value resolved root)])
+                (when (:present all-of-entry)
+                  [(validate-schema-list value (:value all-of-entry) root :all)])
+                (when (:present any-of-entry)
+                  [(validate-schema-list value (:value any-of-entry) root :any)])
+                (when (:present one-of-entry)
+                  [(validate-schema-list value (:value one-of-entry) root :one)])
+                (when (:present not-entry)
+                  [(if (first (validate-json-schema* value (:value not-entry) root))
+                     [false "Value matches forbidden not schema"]
+                     [true ""])])
+                [(cond
+                   (map? value) (validate-object-schema value schema root)
+                   (vector? value) (validate-array-schema value schema root)
+                   (string? value) (validate-string-schema value schema)
+                   (number? value) (validate-number-schema value schema)
+                   :else [true ""])])
+              failed (first (filter (fn [result] (not (first result))) checks))]
+          (or failed [true ""]))))))
 
 (defn validate-json-schema [value schema]
-  (let [expected (field schema :type)]
-    (cond
-      (not (schema-type-valid? value expected))
-      [false (str "Expected " expected)]
+  (validate-json-schema* value schema schema))
 
-      (= expected "object")
-      (let [required (or (field schema :required) [])
-            missing (first (filter (fn [key]
-                                     (and (not (contains? value key))
-                                          (not (contains? value (keyword (str key))))))
-                                   required))
-            properties (or (field schema :properties) {})]
-        (if missing
-          [false (str "Missing required property: " missing)]
-          (loop [entries (seq properties)]
-            (if (empty? entries)
-              [true ""]
-              (let [[key child-schema] (first entries)
-                    child-value (schema-value value key)]
-                (if (nil? child-value)
-                  (recur (next entries))
-                  (let [[valid? reason] (validate-json-schema child-value child-schema)]
-                    (if valid?
-                      (recur (next entries))
-                      [false (str "Property " (name key) ": " reason)]))))))))
-
-      (= expected "array")
-      (if-let [item-schema (field schema :items)]
-        (loop [items (seq value)]
-          (if (empty? items)
-            [true ""]
-            (let [[valid? reason] (validate-json-schema (first items) item-schema)]
-              (if valid? (recur (next items)) [false reason]))))
-        [true ""])
-
-      :else [true ""])))
+(defn- parse-validated-object [text schema]
+  (let [parsed (try
+                 (json/read-json text)
+                 (catch Object e
+                   (throw (ex-info "No object generated: response was not valid JSON"
+                                   {:category :no-object-generated
+                                    :cause (str e)}))))
+        [valid? reason] (validate-json-schema parsed schema)]
+    (when-not valid?
+      (throw (ex-info (str "No object generated: " reason)
+                      {:category :no-object-generated :reason reason})))
+    parsed))
 
 (defn generate-object [model prompt schema & [opts]]
   (let [result (generate
@@ -2426,18 +2637,8 @@
                  (assoc (or opts {})
                         :response_format {:type "json_schema"
                                           :json_schema schema
-                                          :strict true}))
-        text (:text result)
-        parsed (try
-                 (json/read-json text)
-                 (catch Object e
-                   (throw (ex-info "No object generated: response was not valid JSON"
-                                   {:category :no-object-generated :cause (str e)}))))
-        [valid? reason] (validate-json-schema parsed schema)]
-    (when-not valid?
-      (throw (ex-info (str "No object generated: " reason)
-                      {:category :no-object-generated :reason reason})))
-    (assoc result :output parsed)))
+                                          :strict true}))]
+    (assoc result :output (parse-validated-object (:text result) schema))))
 
 (defn- streamed-continuation-messages [conversation response tool-calls tool-results]
   (let [assistant-message
@@ -2576,3 +2777,208 @@
      (high-level-stream request-or-model options-or-prompt {})))
   ([model prompt options]
    (high-level-stream model prompt options)))
+
+(defn- partial-json-scan [text]
+  (let [n (count text)]
+    (loop [i 0
+           stack []
+           in-string? false
+           escaped? false
+           string-role nil
+           string-start nil
+           last-significant nil]
+      (if (>= i n)
+        {:stack stack
+         :in_string in-string?
+         :escaped escaped?
+         :string_role string-role
+         :string_start string-start
+         :last_significant last-significant}
+        (let [ch (subs text i (inc i))]
+          (if in-string?
+            (cond
+              escaped?
+              (recur (inc i) stack true false string-role string-start
+                     last-significant)
+
+              (= ch "\\")
+              (recur (inc i) stack true true string-role string-start
+                     last-significant)
+
+              (= ch "\"")
+              (recur (inc i) stack false false nil nil "\"")
+
+              :else
+              (recur (inc i) stack true false string-role string-start
+                     last-significant))
+            (cond
+              (= ch "\"")
+              (let [top (last stack)
+                    role (if (and (= top "{")
+                                  (or (= last-significant "{")
+                                      (= last-significant ",")))
+                           :key
+                           :value)]
+                (recur (inc i) stack true false role i last-significant))
+
+              (or (= ch "{") (= ch "["))
+              (recur (inc i) (conj stack ch) false false nil nil ch)
+
+              (or (= ch "}") (= ch "]"))
+              (recur (inc i) (if (seq stack) (pop stack) stack)
+                     false false nil nil ch)
+
+              (re-matches #"\\s" ch)
+              (recur (inc i) stack false false nil nil last-significant)
+
+              :else
+              (recur (inc i) stack false false nil nil ch))))))))
+
+(defn- trim-trailing-comma [text]
+  (let [trimmed (str/trim text)]
+    (if (str/ends-with? trimmed ",")
+      (subs trimmed 0 (dec (count trimmed)))
+      trimmed)))
+
+(defn- complete-json-token [text]
+  (cond
+    (str/ends-with? text ":") (str text "null")
+    (re-find #"(?:^|[^A-Za-z])tru$" text) (str text "e")
+    (re-find #"(?:^|[^A-Za-z])fals$" text) (str text "e")
+    (re-find #"(?:^|[^A-Za-z])nul$" text) (str text "l")
+    :else text))
+
+(defn- repair-partial-json [text]
+  (let [scan (partial-json-scan text)
+        key-in-progress (and (:in_string scan)
+                             (= :key (:string_role scan)))
+        prefix
+        (if key-in-progress
+          (trim-trailing-comma (subs text 0 (:string_start scan)))
+          (let [trimmed (str/trim text)
+                without-comma (trim-trailing-comma trimmed)
+                without-dangling-escape
+                (if (and (:in_string scan) (:escaped scan)
+                         (str/ends-with? without-comma "\\"))
+                  (subs without-comma 0 (dec (count without-comma)))
+                  without-comma)
+                with-string-end
+                (if (:in_string scan)
+                  (str without-dangling-escape "\"")
+                  without-dangling-escape)]
+            (complete-json-token with-string-end)))
+        closers
+        (apply str
+               (map (fn [opening] (if (= opening "{") "}" "]"))
+                    (reverse (:stack scan))))]
+    (str prefix closers)))
+
+(def ^:private invalid-partial-value :attractor.llm/invalid-partial-value)
+
+(defn- partial-value-for-schema [value schema]
+  (let [expected (field schema :type)]
+    (cond
+      (= expected "object")
+      (if-not (map? value)
+        invalid-partial-value
+        (let [properties (or (field schema :properties) {})]
+          (if (empty? properties)
+            value
+            (reduce
+              (fn [result [key child-value]]
+                (let [child-schema (or (get properties key)
+                                       (get properties (keyword (str key))))]
+                  (if (nil? child-schema)
+                    result
+                    (let [partial (partial-value-for-schema child-value child-schema)]
+                      (if (= invalid-partial-value partial)
+                        result
+                        (assoc result key partial))))))
+              {}
+              value))))
+
+      (= expected "array")
+      (if-not (vector? value)
+        invalid-partial-value
+        (if-let [item-schema (field schema :items)]
+          (vec (remove (fn [item] (= invalid-partial-value item))
+                       (map (fn [item]
+                              (partial-value-for-schema item item-schema))
+                            value)))
+          value))
+
+      (schema-type-valid? value expected) value
+      :else invalid-partial-value)))
+
+(defn- parse-partial-object [text schema]
+  (try
+    (let [parsed (json/read-json (repair-partial-json text))
+          partial (partial-value-for-schema parsed schema)]
+      (when-not (= invalid-partial-value partial) partial))
+    (catch Object _ nil)))
+
+(defn- stream-object-updates [events schema state]
+  (mapcat
+    (fn [event]
+      (case (:type event)
+        :stream_start
+        (do
+          (reset! (:text state) "")
+          (reset! (:partial state) nil)
+          (reset! (:object state) nil)
+          (reset! (:error state) nil)
+          [])
+
+        :text_delta
+        (let [text (swap! (:text state) str (or (:delta event) ""))
+              partial (parse-partial-object text schema)]
+          (if (and (some? partial) (not= partial @(:partial state)))
+            (do (reset! (:partial state) partial) [partial])
+            []))
+
+        :error
+        (do (reset! (:error state) (:error event)) [])
+
+        :finish
+        (if (= :tool_calls (:finish_reason event))
+          []
+          (let [final-text (response-text (:response event))]
+            (try
+              (let [final-object (parse-validated-object final-text schema)]
+                (reset! (:error state) nil)
+                (reset! (:object state) final-object)
+                (if (= final-object @(:partial state))
+                  []
+                  (do (reset! (:partial state) final-object) [final-object])))
+              (catch Object error
+                (reset! (:error state) error)
+                []))))
+
+        []))
+    events))
+
+(defn stream-object [model prompt schema & [opts]]
+  (let [stream-result
+        (high-level-stream
+          model prompt
+          (assoc (or opts {})
+                 :response_format {:type "json_schema"
+                                   :json_schema schema
+                                   :strict true}))
+        state {:text (atom "")
+               :partial (atom nil)
+               :object (atom nil)
+               :error (atom nil)}
+        objects (stream-object-updates (:events stream-result) schema state)]
+    {:objects objects
+     :events (:events stream-result)
+     :partial_object (fn [] @(:partial state))
+     :response (:response stream-result)
+     :object
+     (fn []
+       (doall objects)
+       (when-let [error @(:error state)]
+         (throw error))
+       (or @(:object state)
+           (throw (ex-info "No object generated: stream did not finish"
+                           {:category :no-object-generated}))))}))

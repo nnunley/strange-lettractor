@@ -1103,6 +1103,174 @@
     (is (= "partial"
            (get-in ((:partial_response result)) [:message :text])))))
 
+(deftest test-stream-object-yields-growing-partials-and-validates-final-object
+  (let [captured (atom nil)
+        schema {:type "object"
+                :properties
+                {:recipes
+                 {:type "array"
+                  :items {:type "object"
+                          :properties {:name {:type "string"}}
+                          :required ["name"]}}}
+                :required ["recipes"]}
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [request]
+            (reset! captured request)
+            [{:type :stream_start}
+             {:type :text_delta
+              :delta "{\"recipes\":[{\"name\":\"Soup\""}
+             {:type :text_delta
+              :delta "},{\"name\":\"Pie\""}
+             {:type :text_delta :delta "}]}"}
+             {:type :finish :finish_reason :stop :usage {}
+              :response
+              {:message {:text
+                         "{\"recipes\":[{\"name\":\"Soup\"},{\"name\":\"Pie\"}]}"}
+               :tool_calls [] :usage {} :finish_reason :stop}}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream-object "mock/model" "recipes" schema
+                                  {:client client})
+        partials (vec (:objects result))]
+    (is (= [1 2] (mapv #(count (get % "recipes")) partials)))
+    (is (= {"recipes" [{"name" "Soup"} {"name" "Pie"}]}
+           ((:object result))))
+    (is (= "json_schema"
+           (get-in @captured [:response_format :type])))
+    (is (= schema
+           (get-in @captured [:response_format :json_schema])))))
+
+(deftest test-stream-object-rejects-an-invalid-final-object
+  (let [schema {:type "object"
+                :properties {:name {:type "string"}}
+                :required ["name"]}
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [_]
+            [{:type :stream_start}
+             {:type :text_delta :delta "{}"}
+             {:type :finish :finish_reason :stop :usage {}
+              :response {:message {:text "{}"}
+                         :tool_calls [] :usage {}
+                         :finish_reason :stop}}]))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result (llm/stream-object "mock/model" "name" schema
+                                  {:client client})]
+    (is (true?
+          (try
+            (do ((:object result)) false)
+            (catch Object error
+              (= :no-object-generated (:category (ex-data error)))))))))
+
+(deftest test-stream-object-resets-partial-state-after-a-tool-call-step
+  (let [calls (atom 0)
+        schema {:type "object"
+                :properties {:name {:type "string"}}
+                :required ["name"]}
+        adapter
+        (llm/make-adapter
+          "mock" (fn [_] nil)
+          (fn [_]
+            (swap! calls inc)
+            (if (= 1 @calls)
+              [{:type :stream_start}
+               {:type :text_delta :delta "calling tool"}
+               {:type :tool_call_start
+                :tool_call {:id "call-1" :name "lookup" :arguments {}}}
+               {:type :tool_call_end
+                :tool_call {:id "call-1" :name "lookup" :arguments {}}}
+               {:type :finish :finish_reason :tool_calls :usage {}
+                :response {:message {:text "calling tool"}
+                           :tool_calls [{:id "call-1" :name "lookup"
+                                         :arguments {}}]
+                           :usage {} :finish_reason :tool_calls}}]
+              [{:type :stream_start}
+               {:type :text_delta :delta "{\"name\":\"Ad"}
+               {:type :text_delta :delta "a\"}"}
+               {:type :finish :finish_reason :stop :usage {}
+                :response {:message {:text "{\"name\":\"Ada\"}"}
+                           :tool_calls [] :usage {} :finish_reason :stop}}])))
+        client (llm/make-client {:providers {"mock" adapter}
+                                 :default_provider "mock"})
+        result
+        (llm/stream-object
+          "mock/model" "name" schema
+          {:client client :max_tool_rounds 1
+           :tools [{:name "lookup" :parameters {:type "object"}
+                    :execute (fn [_] "done")}]} )
+        partials (vec (:objects result))]
+    (is (= 2 @calls))
+    (is (= {"name" "Ad"} (first partials)))
+    (is (= {"name" "Ada"} ((:object result))))))
+
+(deftest test-json-schema-validation-distinguishes-presence-and-enforces-constraints
+  (let [object-schema
+        {:type "object"
+         :properties
+         {:enabled {:type "boolean"}
+          :nothing {:type "null"}
+          :name {:type "string" :minLength 2 :pattern "^[A-Z]"}
+          :score {:type "number" :minimum 1 :maximum 10}
+          :kind {:type "string" :enum ["a" "b"]}
+          :tags {:type "array" :minItems 1 :uniqueItems true}}
+         :required ["enabled" "nothing" "name" "score" "kind"]
+         :additionalProperties false}
+        valid {"enabled" false "nothing" nil "name" "Ada"
+               "score" 5 "kind" "a" "tags" ["x"]}]
+    (is (true? (first (llm/validate-json-schema valid object-schema))))
+    (is (false?
+          (first
+            (llm/validate-json-schema
+              3 {:type "integer" :minimum 5
+                 :allOf [{:type "integer" :maximum 10}]}))))
+    (is (true?
+          (first
+            (llm/validate-json-schema
+              0.3 {:type "number" :multipleOf 0.1}))))
+    (is (true?
+          (first (llm/validate-json-schema 1.0 {:type "integer"}))))
+    (is (false?
+          (first (llm/validate-json-schema 1.5 {:type "integer"}))))
+    (is (false?
+          (first
+            (llm/validate-json-schema
+              0.31 {:type "number" :multipleOf 0.1}))))
+    (is (false?
+          (first
+            (llm/validate-json-schema
+              1000000000.25 {:type "number" :multipleOf 1}))))
+    (is (true?
+          (first
+            (llm/validate-json-schema
+              {"next" {"next" nil}}
+              {:type "object"
+               :properties
+               {:next {:anyOf [{:$ref "#"} {:type "null"}]}}
+               :required ["next"]}))))
+    (is (true?
+          (first
+            (llm/validate-json-schema
+              3
+              {:$ref "#/$defs/choices/1"
+               :$defs {:choices [{:type "string"}
+                                  {:type "integer" :minimum 2}]}}))))
+    (doseq [invalid
+            [(assoc valid "enabled" "false")
+             (assoc valid "name" nil)
+             (assoc valid "name" "a")
+             (assoc valid "name" "lower")
+             (assoc valid "score" 0)
+             (assoc valid "score" 11)
+             (assoc valid "kind" "c")
+             (assoc valid "tags" [])
+             (assoc valid "tags" ["x" "x"])
+             (assoc valid "extra" true)]]
+      (is (false? (first (llm/validate-json-schema invalid object-schema)))))))
+
 (deftest test-client-initializes-and-closes-adapters
   (let [events (atom [])
         adapter (llm/make-adapter
