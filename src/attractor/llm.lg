@@ -346,6 +346,56 @@
 (defn- field [m k]
   (or (get m k) (get m (name k))))
 
+(defn make-tool [tool-name description parameters & [execute]]
+  (when (or (not (string? tool-name))
+            (> (count tool-name) 64)
+            (nil? (re-matches #"[A-Za-z][A-Za-z0-9_]*" tool-name)))
+    (throw (ex-info
+             "Tool name must start with a letter, contain only letters, numbers, or underscores, and be at most 64 characters"
+             {:category :invalid-tool-definition :tool_name tool-name})))
+  (when (or (not (map? parameters))
+            (not= "object" (field parameters :type)))
+    (throw (ex-info "Tool parameter schema root must have type object"
+                    {:category :invalid-tool-definition
+                     :tool_name tool-name})))
+  (cond-> {:name tool-name
+           :description (or description "")
+           :parameters parameters}
+    (some? execute) (assoc :execute execute)))
+
+(defn- tool-choice-mode [request]
+  (when-let [mode (field (:tool_choice request) :mode)]
+    (str/lower-case (name mode))))
+
+(defn- tool-choice-name [request]
+  (field (:tool_choice request) :tool_name))
+
+(defn- openai-tool-choice [request]
+  (case (tool-choice-mode request)
+    "auto" "auto"
+    "none" "none"
+    "required" "required"
+    "named" {:type "function"
+             :function {:name (tool-choice-name request)}}
+    nil))
+
+(defn- anthropic-tool-choice [request]
+  (case (tool-choice-mode request)
+    "auto" {:type "auto"}
+    "required" {:type "any"}
+    "named" {:type "tool" :name (tool-choice-name request)}
+    nil))
+
+(defn- gemini-tool-choice [request]
+  (case (tool-choice-mode request)
+    "auto" {:functionCallingConfig {:mode "AUTO"}}
+    "none" {:functionCallingConfig {:mode "NONE"}}
+    "required" {:functionCallingConfig {:mode "ANY"}}
+    "named" {:functionCallingConfig
+             {:mode "ANY"
+              :allowedFunctionNames [(tool-choice-name request)]}}
+    nil))
+
 (defn- structured-schema [request]
   (let [format (:response_format request)]
     (when (= (field format :type) "json_schema")
@@ -509,12 +559,14 @@
                               :parameters (:parameters tool)
                               :strict true})
                            (or (:tools request) []))
+        tool-choice (openai-tool-choice request)
         payload (merge
                   (cond-> {:model (:model request)
                            :input (openai-input-items messages)
                            :store false}
                     (not (str/blank? instructions)) (assoc :instructions instructions)
                     (seq openai-tools) (assoc :tools openai-tools)
+                    (some? tool-choice) (assoc :tool_choice tool-choice)
                     (:max_tokens request) (assoc :max_output_tokens (:max_tokens request))
                     (not (str/blank? (:reasoning_effort request)))
                     (assoc :reasoning {:effort (:reasoning_effort request)}))
@@ -580,11 +632,14 @@
                                  (= (:role m) :developer)))
                            (:messages request))
         raw-msgs (merge-anthropic-messages (map anthropic-message non-system))
-        raw-tools (mapv (fn [tool]
+        raw-tools (if (= "none" (tool-choice-mode request))
+                    []
+                    (mapv (fn [tool]
                           {:name (:name tool)
                            :description (:description tool)
                            :input_schema (:parameters tool)})
-                        (or (:tools request) []))
+                          (or (:tools request) [])))
+        tool-choice (anthropic-tool-choice request)
         options (provider-options request "anthropic")
         beta-headers (or (:beta_headers options) (get options "beta_headers") [])
         auto-cache-setting (if (contains? options :auto_cache)
@@ -620,7 +675,8 @@
                            :messages msgs
                            :max_tokens (or (:max_tokens request) 4096)}
                     (not (str/blank? system-text)) (assoc :system system-value)
-                    (seq anthropic-tools) (assoc :tools anthropic-tools))
+                    (seq anthropic-tools) (assoc :tools anthropic-tools)
+                    (some? tool-choice) (assoc :tool_choice tool-choice))
                   body-options)
         headers (cond-> {"x-api-key" key
                          "anthropic-version" "2023-06-01"
@@ -743,6 +799,7 @@
                                (:messages request)))
         tools (or (:tools request) [])
         generation-config (gemini-generation-config request)
+        tool-choice (gemini-tool-choice request)
         payload (merge
                   (cond-> {:contents contents}
                     (not (str/blank? system-text))
@@ -754,6 +811,7 @@
                                                   :description (:description tool)
                                                   :parameters (:parameters tool)})
                                                tools)}])
+                    (some? tool-choice) (assoc :toolConfig tool-choice)
                     (seq generation-config) (assoc :generationConfig generation-config))
                   (provider-options request "gemini"))
         headers {"x-goog-api-key" key "Content-Type" "application/json"}]

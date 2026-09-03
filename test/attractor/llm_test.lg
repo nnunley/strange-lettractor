@@ -175,6 +175,84 @@
     (is (= ["name"]
            (get-in gemini-body ["generationConfig" "responseSchema" "required"])))))
 
+(deftest test-provider-tool-choice-translation
+  (let [tool {:name "lookup" :description "Look up a value"
+              :parameters {:type "object"}}
+        openai-captured (atom nil)
+        anthropic-captured (atom nil)
+        anthropic-none-captured (atom nil)
+        gemini-captured (atom nil)
+        _ (llm/openai-complete
+            {:model "gpt-test" :api_key "key" :messages [] :tools [tool]
+             :tool_choice {:mode "named" :tool_name "lookup"}
+             :transport
+             (fn [request]
+               (reset! openai-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "r" :status "completed" :output [] :usage {}})})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key" :messages [] :tools [tool]
+             :tool_choice {:mode "required"}
+             :transport
+             (fn [request]
+               (reset! anthropic-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "a" :content [] :stop_reason "end_turn" :usage {}})})})
+        _ (llm/anthropic-complete
+            {:model "claude-test" :api_key "key" :messages [] :tools [tool]
+             :tool_choice {:mode "none"}
+             :transport
+             (fn [request]
+               (reset! anthropic-none-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:id "a2" :content [] :stop_reason "end_turn" :usage {}})})})
+        _ (llm/gemini-complete
+            {:model "gemini-test" :api_key "key" :messages [] :tools [tool]
+             :tool_choice {:mode "named" :tool_name "lookup"}
+             :transport
+             (fn [request]
+               (reset! gemini-captured request)
+               {:status 200
+                :body (json/write-json
+                        {:responseId "g" :candidates [] :usageMetadata {}})})})
+        openai-body (json/read-json (:body @openai-captured))
+        anthropic-body (json/read-json (:body @anthropic-captured))
+        anthropic-none-body (json/read-json (:body @anthropic-none-captured))
+        gemini-body (json/read-json (:body @gemini-captured))]
+    (is (= "function" (get-in openai-body ["tool_choice" "type"])))
+    (is (= "lookup"
+           (get-in openai-body ["tool_choice" "function" "name"])))
+    (is (= "any" (get-in anthropic-body ["tool_choice" "type"])))
+    (is (nil? (get anthropic-none-body "tools")))
+    (is (nil? (get anthropic-none-body "tool_choice")))
+    (is (= "ANY"
+           (get-in gemini-body
+                   ["toolConfig" "functionCallingConfig" "mode"])))
+    (is (= ["lookup"]
+           (get-in gemini-body
+                   ["toolConfig" "functionCallingConfig"
+                    "allowedFunctionNames"])))))
+
+(deftest test-tool-definition-validates-portable-name-and-schema
+  (let [execute (fn [_] "ok")
+        tool (llm/make-tool "lookup_weather" "Look up weather"
+                            {:type "object" :properties {}}
+                            execute)]
+    (is (= "lookup_weather" (:name tool)))
+    (is (= execute (:execute tool)))
+    (doseq [[name schema]
+            [["9invalid" {:type "object"}]
+             ["contains-dash" {:type "object"}]
+             [(apply str (repeat 65 "a")) {:type "object"}]
+             ["valid_name" {:type "array"}]]]
+      (is (true?
+            (try
+              (do (llm/make-tool name "bad" schema) false)
+              (catch Object _ true)))))))
+
 (deftest test-generate-object-parses-and-validates-schema
   (let [schema {:type "object"
                 :properties {:name {:type "string"} :age {:type "integer"}}
