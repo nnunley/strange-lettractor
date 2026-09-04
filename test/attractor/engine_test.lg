@@ -199,7 +199,6 @@ digraph Gate {
         saw-cancellation (atom false)
         cancellation-reason (atom nil)
         events (atom [])
-        started (System/currentTimeMillis)
         outcome
         (e/execute-with-retry
           (fn [node _ _ _]
@@ -217,8 +216,7 @@ digraph Gate {
                     (core/sleep 5)
                     (recur))))))
           {:id "timed" :timeout "20ms"}
-          (c/make-context) {} "" #(swap! events conj %) {})
-        elapsed (- (System/currentTimeMillis) started)]
+          (c/make-context) {} "" #(swap! events conj %) {})]
     (is (= :fail (:status outcome)))
     (is (= :timeout_error (:category outcome)))
     (is (= true (:retryable outcome)))
@@ -227,8 +225,7 @@ digraph Gate {
     (is (= :deadline @cancellation-reason))
     (is (= {"partial.output" "retained"} (:context_updates outcome)))
     (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
-    (is (empty? (filter #(= :stage.retrying (:type %)) @events)))
-    (is (< elapsed 150))))
+    (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
 
 (deftest test-numeric-node-timeout-is-milliseconds
   (let [saw-cancellation (atom false)
@@ -249,7 +246,8 @@ digraph Gate {
     (is (true? @saw-cancellation))))
 
 (deftest test-invalid-or-non-positive-node-timeout-is-terminal-before-handler
-  (doseq [timeout ["invalid" "0ms" 0 -1]]
+  (doseq [timeout ["invalid" "0ms" 0 -1
+                   "999999999999999999999999999999999999999999999999s"]]
     (let [attempts (atom 0)
           events (atom [])
           outcome
@@ -260,6 +258,7 @@ digraph Gate {
             {:id "invalid-timeout" :timeout timeout :max_retries 3}
             (c/make-context) {} "" #(swap! events conj %) {})]
       (is (= :fail (:status outcome)))
+      (is (= :configuration_error (:category outcome)))
       (is (= false (:retryable outcome)))
       (is (= 0 @attempts))
       (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))

@@ -226,11 +226,13 @@
   (let [configured-timeout (:timeout node)]
     (if (nil? configured-timeout)
       {:timeout-ms nil}
-      (let [parsed (parser/parse-duration-ms configured-timeout)]
+      (let [parsed (try
+                     (parser/parse-duration-ms configured-timeout)
+                     (catch Object _ ::invalid-timeout))]
         (if (and (number? parsed) (pos? parsed))
           {:timeout-ms (long parsed)}
           {:error
-           (ex-info (str "Invalid non-positive node timeout for '" (:id node) "'")
+           (ex-info (str "Invalid or non-positive node timeout for '" (:id node) "'")
                     {:category :configuration_error
                      :retryable false
                      :node_id (:id node)})})))))
