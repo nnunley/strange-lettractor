@@ -325,6 +325,80 @@
       (is (= 0 @handler-calls))
       (is (= [] @events))
       (is (= {:values {"untouched" true} :logs []} @ctx))
+      (is (nil? (os/stat logs)))))
+  (testing "invalid prepare returns its final graph and complete diagnostics without raising"
+    (let [transform-calls (atom 0)
+          rule-calls (atom 0)
+          handler-calls (atom 0)
+          events (atom [])
+          ctx (context/make-context {"preserve" [1 2 3]})
+          before @ctx
+          logs (str (os/temp-dir) "/attractor-invalid-prepare-" (System/nanoTime))
+          registry (handlers/make-handler-registry)
+          orphan {:id "orphan"
+                  :shape "box"
+                  :type "codergen"
+                  :label ""
+                  :prompt "Created by prepare transform"
+                  :attrs {:shape "box"
+                          :type "codergen"
+                          :label ""
+                          :prompt "Created by prepare transform"}}
+          expected-graph (assoc-in
+                           (transforms/apply-transforms
+                             (parser/parse-dot lifecycle-dot))
+                           [:nodes "orphan"] orphan)
+          custom-diagnostics
+          [{:rule "prepare_warning"
+            :severity :warning
+            :message "keep prepare warning"}
+           {:rule "prepare_info"
+            :severity :info
+            :message "keep prepare info"}
+           {:rule "prepare_error"
+            :severity :error
+            :message "return prepare error"}]
+          expected-diagnostics
+          (vec
+            (concat
+              [{:rule "reachability"
+                :severity :error
+                :node_id "orphan"
+                :message "Node 'orphan' is not reachable from start node 'start'"}]
+              custom-diagnostics))
+          invalid-transform
+          (fn [graph]
+            (swap! transform-calls inc)
+            (assoc-in graph [:nodes "orphan"] orphan))
+          custom-rule
+          (fn [graph]
+            (swap! rule-calls inc)
+            (is (= expected-graph graph))
+            custom-diagnostics)
+          _ (handlers/register-handler!
+              registry "codergen"
+              (fn [_ _ _ _]
+                (swap! handler-calls inc)
+                {:status :success}))
+          attempt
+          (try
+            (pipeline/prepare
+              lifecycle-dot
+              {:custom-transforms [invalid-transform]
+               :custom-rules [custom-rule]
+               :registry registry
+               :context ctx
+               :logs-root logs
+               :on-event #(swap! events conj %)})
+            (catch Object caught {:thrown caught}))]
+      (is (not (contains? attempt :thrown)))
+      (is (= expected-graph (:graph attempt)))
+      (is (= expected-diagnostics (:diagnostics attempt)))
+      (is (= 1 @transform-calls))
+      (is (= 1 @rule-calls))
+      (is (= 0 @handler-calls))
+      (is (= [] @events))
+      (is (= before @ctx))
       (is (nil? (os/stat logs))))))
 
 ;; SCN-TRANSFORM-ORDER COMPLETE
