@@ -1,8 +1,10 @@
 (ns attractor.handlers
   (:require [clojure.string :as str]
+            [clojure.core :as core]
             [json :as json]
             [io :as io]
             [os :as os]
+            [attractor.execution :as execution]
             [attractor.context :as context]
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
@@ -38,20 +40,87 @@
   {:status :success :notes (str "Conditional node evaluated: " (:id node))})
 
 ;; Tool Handler (Section 4.10)
-(defn handle-tool [node context _graph _logs-root]
-  (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")]
+(defn- parsed-tool-timeout-ms [node]
+  (when-let [configured-timeout (:timeout node)]
+    (let [parsed (parser/parse-duration-ms configured-timeout)]
+      (when (and (number? parsed) (> parsed 0))
+        (long parsed)))))
+
+(defn- tool-context-updates [stdout stderr]
+  {"tool.output" (or stdout "")
+   "tool.error" (or stderr "")})
+
+(defn- handle-unbounded-tool [cmd]
+  (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
+    (if (zero? (:exit res))
+      {:status :success
+       :context_updates {"tool.output" (:out res)}
+       :notes (str "Tool completed: " cmd)}
+      {:status :fail
+       :failure_reason (str "Tool exited with code " (:exit res) ": " (:err res))
+       :context_updates {"tool.output" (:out res)
+                         "tool.error" (:err res)}})))
+
+(defn- handle-timed-tool [node cmd timeout-ms]
+  (let [environment (execution/make-local-environment {:working_dir (os/cwd)})
+        cancelled? (:cancelled? node)
+        stop-watcher (atom false)
+        watcher (core/future
+                  (loop []
+                    (cond
+                      @stop-watcher nil
+                      (and cancelled? (cancelled?))
+                      (try
+                        ((:cleanup environment))
+                        (catch Object _ nil))
+                      :else
+                      (do
+                        (core/sleep 2)
+                        (recur)))))]
+    (try
+      (let [res ((:exec_command environment) cmd timeout-ms (os/cwd) nil)
+            context-updates (tool-context-updates (:stdout res) (:stderr res))]
+        (cond
+          (or (and cancelled? (cancelled?)) (:cancelled res))
+          {:status :cancelled
+           :failure_reason "Pipeline cancelled"
+           :context_updates context-updates}
+
+          (:timed_out res)
+          {:status :fail
+           :category :timeout_error
+           :retryable true
+           :failure_reason (str "Tool timed out after " timeout-ms "ms")
+           :context_updates context-updates}
+
+          (zero? (:exit_code res))
+          {:status :success
+           :context_updates context-updates
+           :notes (str "Tool completed: " cmd)}
+
+          :else
+          {:status :fail
+           :failure_reason (str "Tool exited with code " (:exit_code res)
+                                ": " (:stderr res))
+           :context_updates context-updates}))
+      (catch Object e
+        {:status :fail :failure_reason (str "Tool execution exception: " e)})
+      (finally
+        (reset! stop-watcher true)
+        @watcher
+        (try
+          ((:cleanup environment))
+          (catch Object _ nil))))))
+
+(defn handle-tool [node _context _graph _logs-root]
+  (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
+        timeout-ms (parsed-tool-timeout-ms node)]
     (if (str/blank? cmd)
       {:status :fail :failure_reason "No tool_command specified"}
       (try
-        (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
-          (if (zero? (:exit res))
-            {:status :success
-             :context_updates {"tool.output" (:out res)}
-             :notes (str "Tool completed: " cmd)}
-            {:status :fail
-             :failure_reason (str "Tool exited with code " (:exit res) ": " (:err res))
-             :context_updates {"tool.output" (:out res)
-                               "tool.error" (:err res)}}))
+        (if timeout-ms
+          (handle-timed-tool node cmd timeout-ms)
+          (handle-unbounded-tool cmd))
         (catch Object e
           {:status :fail :failure_reason (str "Tool execution exception: " e)})))))
 

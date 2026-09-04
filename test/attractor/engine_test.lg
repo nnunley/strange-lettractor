@@ -227,6 +227,33 @@ digraph Gate {
     (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
     (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
 
+(deftest test-timed-tool-node-keeps-partial-output-and-never-accepts-late-success
+  (let [late-marker (str (os/temp-dir) "/attractor-engine-tool-timeout-late-"
+                         (System/nanoTime))
+        command (str "printf 'partial stdout\\n'; "
+                     "printf 'partial stderr\\n' >&2; "
+                     "sleep 1; printf late > " late-marker)
+        started (System/currentTimeMillis)
+        task (core/future
+               (e/execute-with-retry
+                 h/handle-tool
+                 {:id "timed-tool"
+                  :timeout "50ms"
+                  :attrs {:tool_command command}}
+                 (c/make-context) {} "" (fn [_] nil) {}))
+        outcome (deref task 4000 ::timed-out)
+        elapsed (- (System/currentTimeMillis) started)]
+    (is (not= ::timed-out outcome))
+    (is (< elapsed 4000))
+    (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (= true (:retryable outcome)))
+    (is (= "partial stdout\n"
+           (get-in outcome [:context_updates "tool.output"])))
+    (is (str/includes? (get-in outcome [:context_updates "tool.error"])
+                       "partial stderr"))
+    (is (nil? (os/stat late-marker)))))
+
 (deftest test-timeout-retries-use-fresh-controllers-and-report-failures-in-order
   (let [clock (atom 0)
         entry-states (atom [])

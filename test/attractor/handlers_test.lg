@@ -1,5 +1,7 @@
 (ns attractor.handlers-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [clojure.string :as str]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [os :as os]))
@@ -24,6 +26,30 @@
   (let [result (handlers/handle-tool {:attrs {}} nil nil nil)]
     (is (= :fail (:status result)))
     (is (= "No tool_command specified" (:failure_reason result)))))
+
+(deftest test-tool-handler-times-out-with-partial-command-output
+  (let [late-marker (str (os/temp-dir) "/attractor-tool-timeout-late-"
+                         (System/nanoTime))
+        command (str "printf 'partial stdout\\n'; "
+                     "printf 'partial stderr\\n' >&2; "
+                     "sleep 1; printf late > " late-marker)
+        started (System/currentTimeMillis)
+        task (core/future
+               (handlers/handle-tool
+                 {:attrs {:tool_command command} :timeout "50ms"}
+                 nil nil nil))
+        result (deref task 4000 ::timed-out)
+        elapsed (- (System/currentTimeMillis) started)]
+    (is (not= ::timed-out result))
+    (is (< elapsed 4000))
+    (is (= :fail (:status result)))
+    (is (= :timeout_error (:category result)))
+    (is (= true (:retryable result)))
+    (is (= "partial stdout\n"
+           (get-in result [:context_updates "tool.output"])))
+    (is (str/includes? (get-in result [:context_updates "tool.error"])
+                       "partial stderr"))
+    (is (nil? (os/stat late-marker)))))
 
 (deftest test-manager-loop-starts-observes-and-completes-child
   (let [started (atom [])
