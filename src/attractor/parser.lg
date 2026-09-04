@@ -67,8 +67,18 @@
       :else (str classes "," derived-class))))
 
 (defn- apply-subgraph-class [node derived-class immediate?]
-  (let [combined-class (add-class-once (:class node) derived-class)]
+  (let [explicit-class (if (contains? node :explicit-class)
+                         (:explicit-class node)
+                         (:class node))
+        subgraph-classes (if (or (str/blank? derived-class)
+                                 (some (fn [class-name] (= class-name derived-class))
+                                       (:subgraph-classes node)))
+                           (or (:subgraph-classes node) [])
+                           (conj (or (:subgraph-classes node) []) derived-class))
+        combined-class (reduce add-class-once explicit-class subgraph-classes)]
     (cond-> (-> node
+                (assoc :explicit-class explicit-class)
+                (assoc :subgraph-classes subgraph-classes)
                 (assoc :class combined-class)
                 (assoc-in [:attrs :class] combined-class))
       immediate? (assoc :subgraph_class derived-class)
@@ -78,9 +88,6 @@
   (->> (conj (:subgraph-stack state) (:current-subgraph state))
        (map :derived-class)
        (remove str/blank?)))
-
-(defn- add-active-subgraph-classes [classes state]
-  (reduce add-class-once classes (active-subgraph-classes state)))
 
 (defn- apply-active-subgraph-classes [node state]
   (let [with-classes (reduce (fn [current-node derived-class]
@@ -381,9 +388,11 @@
                                                            :retry_target ""
                                                            :fallback_retry_target ""
                                                            :fidelity (:fidelity defaults)
-                                                           :thread_id (:thread_id defaults)
-                                                           :class (or (:class defaults) "")
-                                                           :subgraph_class sub-class
+                                                          :thread_id (:thread_id defaults)
+                                                          :class (or (:class defaults) "")
+                                                           :explicit-class (or (:class defaults) "")
+                                                           :subgraph-classes []
+                                                          :subgraph_class sub-class
                                                            :attrs (assoc defaults
                                                                      :class (or (:class defaults) "")
                                                                      :subgraph_class sub-class)})]
@@ -405,36 +414,51 @@
                 effective-defaults (if (:current-subgraph state)
                                      (:scoped-node-defaults (:current-subgraph state))
                                      (:node-defaults state))
-                sub-class (if (:current-subgraph state) (:derived-class (:current-subgraph state)) "")
-                explicit-class (or (:class explicit-attrs) (:class effective-defaults) "")
-                combined-class (add-active-subgraph-classes explicit-class state)
-                merged-attrs (merge effective-defaults explicit-attrs)
+                existing-node (get-in state [:nodes first-id])
+                base-attrs (if existing-node (:attrs existing-node) effective-defaults)
+                merged-attrs (merge base-attrs explicit-attrs)
+                explicit-class (cond
+                                 (contains? explicit-attrs :class) (:class explicit-attrs)
+                                 existing-node (:explicit-class existing-node)
+                                 :else (or (:class effective-defaults) ""))
+                subgraph-classes (reduce (fn [classes derived-class]
+                                           (if (some (fn [class-name]
+                                                       (= class-name derived-class))
+                                                     classes)
+                                             classes
+                                             (conj classes derived-class)))
+                                         (or (:subgraph-classes existing-node) [])
+                                         (active-subgraph-classes state))
+                combined-class (reduce add-class-once explicit-class subgraph-classes)
+                sub-class (if (:current-subgraph state)
+                            (:derived-class (:current-subgraph state))
+                            (or (:subgraph_class existing-node) ""))
                 node-rec {:id first-id
-                          :label (or (:label explicit-attrs) (:label effective-defaults) first-id)
-                          :shape (or (:shape explicit-attrs) (:shape effective-defaults) "box")
-                          :type (or (:type explicit-attrs) (:type effective-defaults) "")
-                          :prompt (or (:prompt explicit-attrs) (:prompt effective-defaults) "")
-                          :max_retries (or (:max_retries explicit-attrs) (:max_retries effective-defaults))
-                          :goal_gate (boolean (or (:goal_gate explicit-attrs) (:goal_gate effective-defaults) false))
-                          :retry_target (or (:retry_target explicit-attrs) (:retry_target effective-defaults) "")
-                          :fallback_retry_target (or (:fallback_retry_target explicit-attrs) (:fallback_retry_target effective-defaults) "")
-                          :fidelity (or (:fidelity explicit-attrs) (:fidelity effective-defaults))
-                          :thread_id (or (:thread_id explicit-attrs) (:thread_id effective-defaults))
+                          :label (or (:label merged-attrs) (:label existing-node) first-id)
+                          :shape (or (:shape merged-attrs) (:shape existing-node) "box")
+                          :type (or (:type merged-attrs) (:type existing-node) "")
+                          :prompt (or (:prompt merged-attrs) (:prompt existing-node) "")
+                          :max_retries (or (:max_retries merged-attrs) (:max_retries existing-node))
+                          :goal_gate (boolean (or (:goal_gate merged-attrs) false))
+                          :retry_target (or (:retry_target merged-attrs) "")
+                          :fallback_retry_target (or (:fallback_retry_target merged-attrs) "")
+                          :fidelity (:fidelity merged-attrs)
+                          :thread_id (:thread_id merged-attrs)
                           :class combined-class
+                          :explicit-class explicit-class
+                          :subgraph-classes subgraph-classes
                           :subgraph_class sub-class
-                          :timeout (or (:timeout explicit-attrs) (:timeout effective-defaults))
-                          :llm_model (or (:llm_model explicit-attrs) (:llm_model effective-defaults))
-                          :llm_provider (or (:llm_provider explicit-attrs) (:llm_provider effective-defaults))
+                          :timeout (:timeout merged-attrs)
+                          :llm_model (:llm_model merged-attrs)
+                          :llm_provider (:llm_provider merged-attrs)
                           ;; Keep unset distinct from the system default so a
                           ;; stylesheet can supply this property.
-                          :reasoning_effort (or (:reasoning_effort explicit-attrs) (:reasoning_effort effective-defaults))
+                          :reasoning_effort (:reasoning_effort merged-attrs)
                           :auto_status (boolean
-                                         (if (contains? explicit-attrs :auto_status)
-                                           (:auto_status explicit-attrs)
-                                           (if (contains? effective-defaults :auto_status)
-                                             (:auto_status effective-defaults)
-                                             false)))
-                          :allow_partial (boolean (or (:allow_partial explicit-attrs) (:allow_partial effective-defaults) false))
+                                         (if (contains? merged-attrs :auto_status)
+                                           (:auto_status merged-attrs)
+                                           false))
+                          :allow_partial (boolean (or (:allow_partial merged-attrs) false))
                           :attrs (assoc merged-attrs
                                         :class combined-class
                                         :subgraph_class sub-class)}]
@@ -509,7 +533,11 @@
              :fallback_retry_target (or (:fallback_retry_target ga) "")
              :attrs ga
              :explicit_attrs explicit-ga
-             :nodes (:nodes state)
+             :nodes (reduce-kv (fn [nodes node-id node]
+                                 (assoc nodes node-id
+                                        (dissoc node :explicit-class :subgraph-classes)))
+                               {}
+                               (:nodes state))
              :edges (:edges state)
              :subgraphs (:subgraphs state)})
           (recur (step-parse tokens n state)))))))

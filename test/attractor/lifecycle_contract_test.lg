@@ -7,12 +7,22 @@
   (let [graph
         (parser/parse-dot
           "digraph G {
-             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .edge-member { llm_provider: edge-provider; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_provider: inner-provider; }\"]
+             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .edge-member { llm_provider: edge-provider; } .ordinary-scope { llm_provider: ordinary-provider; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_provider: inner-provider; }\"]
              outside [class=external, prompt=preserved, shape=diamond]
              subgraph edge_membership {
                label = \"Edge Member\"
                outside -> introduced_inside
              }
+             ordinary_existing [class=external, prompt=preserved, shape=diamond]
+             subgraph existing_membership {
+               label = \"Ordinary Scope\"
+               ordinary_existing
+             }
+             subgraph later_redeclaration {
+               label = \"Ordinary Scope\"
+               member_redeclared
+             }
+             member_redeclared [prompt=later]
              subgraph late {
                before [class=explicit]
                chained -> edge_node
@@ -58,6 +68,24 @@
       (is (= "edge-provider" (:llm_provider (props-for "outside"))))
       (is (= "preserved" (:prompt (parser/find-node graph "outside"))))
       (is (= "diamond" (:shape (parser/find-node graph "outside")))))
+    (testing "ordinary membership preserves an existing node declaration"
+      (is (= "external,ordinary-scope"
+             (:class (parser/find-node graph "ordinary_existing"))))
+      (is (= "ordinary-scope"
+             (:subgraph_class (parser/find-node graph "ordinary_existing"))))
+      (is (= "ordinary-provider"
+             (:llm_provider (props-for "ordinary_existing"))))
+      (is (= "preserved"
+             (:prompt (parser/find-node graph "ordinary_existing"))))
+      (is (= "diamond" (:shape (parser/find-node graph "ordinary_existing")))))
+    (testing "later ordinary redeclaration preserves subgraph membership"
+      (is (= "ordinary-scope"
+             (:class (parser/find-node graph "member_redeclared"))))
+      (is (= "ordinary-scope"
+             (:subgraph_class (parser/find-node graph "member_redeclared"))))
+      (is (= "ordinary-provider"
+             (:llm_provider (props-for "member_redeclared"))))
+      (is (= "later" (:prompt (parser/find-node graph "member_redeclared")))))
     (testing "scoped defaults and nested scope restoration remain intact"
       (is (= "outer" (:thread_id (parser/find-node graph "inner_before"))))
       (is (= "explicit-inner,inner-scope,outer-scope"
