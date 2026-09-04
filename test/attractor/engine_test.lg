@@ -227,6 +227,53 @@ digraph Gate {
     (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
     (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
 
+(deftest test-timeout-retries-use-fresh-controllers-and-report-failures-in-order
+  (let [clock (atom 0)
+        controllers (atom [])
+        timings (atom [])
+        events (atom [])
+        outcome
+        (e/execute-with-retry
+          (fn [node _ _ _]
+            (let [attempt (inc (count @controllers))
+                  started-at @clock]
+              (swap! controllers conj (:cancellation_reason node))
+              ;; Advance this attempt's injected clock to its deadline, then
+              ;; cooperatively wait for its controller to be signalled.
+              (swap! clock + 20)
+              (loop []
+                (if ((:cancelled? node))
+                  (do
+                    (swap! timings conj {:attempt attempt
+                                         :started-at started-at
+                                         :cancelled-at @clock
+                                         :reason ((:cancellation_reason node))})
+                    {:status :success
+                     :context_updates {"partial.attempt" attempt}})
+                  (do
+                    (core/sleep 1)
+                    (recur))))))
+          {:id "timed-retry" :timeout 20 :max_retries 1}
+          (c/make-context) {} "" #(swap! events conj %)
+          {:now-ms (fn [] @clock)
+           :sleep-fn (fn [_] nil)})
+        failed-events (filter #(= :stage.failed (:type %)) @events)
+        retry-events (filter #(= :stage.retrying (:type %)) @events)]
+    (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (= {"partial.attempt" 2} (:context_updates outcome)))
+    (is (= 2 (count @controllers)))
+    (is (not (identical? (first @controllers) (second @controllers))))
+    (is (= [{:attempt 1 :started-at 0 :cancelled-at 20 :reason :deadline}
+            {:attempt 2 :started-at 20 :cancelled-at 40 :reason :deadline}]
+           @timings))
+    (is (= 2 (count failed-events)))
+    (is (= [true false] (mapv :will_retry failed-events)))
+    (is (= 1 (count retry-events)))
+    (is (= [:stage.started :stage.failed :stage.retrying
+            :stage.started :stage.failed]
+           (mapv :type @events)))))
+
 (deftest test-numeric-node-timeout-is-milliseconds
   (let [saw-cancellation (atom false)
         outcome

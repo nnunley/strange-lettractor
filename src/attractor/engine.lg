@@ -349,6 +349,8 @@
           (if (and ((:should_retry policy) error)
                    (< attempt max-attempts))
             (do
+              (on-event {:type :stage.failed :node_id node-id
+                         :outcome outcome :will_retry true})
               (schedule-retry! runtime policy node-id attempt on-event)
               (recur (inc attempt)))
             (do
