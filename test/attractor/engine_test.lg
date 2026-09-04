@@ -742,16 +742,16 @@ digraph Gate {
     (is (= "join" (:boundary_node_id result)))
     (os/sh "rm" "-rf" "test_engine_subgraph_retry_target")))
 
-(deftest test-execute-subgraph-propagates-cancellation-predicate
-  (let [observed (atom false)
+(deftest test-execute-subgraph-skips-pre-cancelled-branch
+  (let [invoked (atom 0)
         graph (p/parse-dot
                 "digraph G {
                    branch [shape=box]
                    join [shape=tripleoctagon]
                    branch -> join
                  }")
-        backend (fn [node _ _]
-                  (reset! observed ((:cancelled? node)))
+        backend (fn [_ _ _]
+                  (swap! invoked inc)
                   {:status :cancelled})
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
@@ -762,7 +762,7 @@ digraph Gate {
                  {:retry-counts (atom {})
                   :branch-cancelled? (fn [] true)})]
     (is (= :cancelled (:status result)))
-    (is (true? @observed))))
+    (is (= 0 @invoked))))
 
 (deftest test-execute-subgraph-stops-before-next-node-after-cancellation
   (let [seen (atom [])
