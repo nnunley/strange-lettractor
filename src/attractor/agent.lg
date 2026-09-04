@@ -1135,6 +1135,41 @@
     session))
 
 ;; CodergenBackend implementation backed by the Coding Agent Loop
+(defn- cancelled-turn-error [session]
+  (ex-info "Agent turn cancelled"
+           {:category :cancelled
+            :retryable false
+            :session_id (:id @session)}))
+
+(defn- run-agent-turn-with-cancellation!
+  [session prompt cancelled?]
+  (if-not cancelled?
+    (run-agent-turn! session prompt)
+    (let [pending (Object.)
+          task (core/future
+                 (try
+                   {:value (run-agent-turn! session prompt)}
+                   (catch Object error {:error error})))]
+      (loop []
+        (let [result (deref task 5 pending)]
+          (cond
+            (not (identical? pending result))
+            (if-let [error (:error result)]
+              (throw error)
+              (:value result))
+
+            (cancelled?)
+            (do
+              ;; abort-session! closes the active provider operation and runs
+              ;; the session's normal environment/subagent cleanup. Join the
+              ;; turn before reporting cancellation to the engine.
+              (abort-session! session)
+              @task
+              (throw (cancelled-turn-error session)))
+
+            :else
+            (recur)))))))
+
 (defn make-agent-codergen-backend [& [session-opts]]
   (let [base-options (or session-opts {})]
     (fn [node prompt _ctx]
@@ -1150,7 +1185,8 @@
                               "default"))
             full? (= "full" (:resolved_fidelity node))
             thread-key (:resolved_thread_id node)
-            threads (:fidelity_threads node)]
+            threads (:fidelity_threads node)
+            cancelled? (:cancelled? node)]
         (if (and full? thread-key threads)
           (let [existing (get @threads thread-key)
                 session (or (:session existing)
@@ -1160,14 +1196,21 @@
                                       :close #(close-session! created)})
                               created))]
             (try
-              (run-agent-turn! session prompt)
+              (run-agent-turn-with-cancellation! session prompt cancelled?)
               (catch Object e
                 (when-not (= :closed (:state @session))
                   (close-session! session))
-                (swap! threads dissoc thread-key)
+                ;; A cancelled/failed older turn can finish after a retry has
+                ;; installed a replacement. Only evict the entry it owns.
+                (swap! threads
+                       (fn [cached]
+                         (if (identical? session
+                                         (get-in cached [thread-key :session]))
+                           (dissoc cached thread-key)
+                           cached)))
                 (throw e))))
           (let [session (make-session session-options)]
             (try
-              (run-agent-turn! session prompt)
+              (run-agent-turn-with-cancellation! session prompt cancelled?)
               (finally
                 (close-session! session)))))))))

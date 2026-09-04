@@ -353,6 +353,115 @@
     (is (= 1 (count (filter #(= :session_end (:type %))
                             (agent/session-events session)))))))
 
+(deftest test-codergen-backend-cancels-an-active-non-full-turn
+  (let [cancelled (atom false)
+        started (promise)
+        release (promise)
+        stream-closed (promise)
+        stream-closes (atom 0)
+        cleanups (atom 0)
+        environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! cleanups inc))})
+        backend
+        (agent/make-agent-codergen-backend
+          {:model "mock/test"
+           :project_docs []
+           :execution_env environment
+           :stream_fn
+           (fn [request]
+             ((:register_stream_close request)
+              (fn []
+                (swap! stream-closes inc)
+                (deliver stream-closed :closed)))
+             (concat [{:type :stream_start}]
+                     (lazy-seq
+                       (deliver started :started)
+                       (deref release 1000 :release-timeout)
+                       [{:type :finish :finish_reason :stop :usage {}
+                         :response {:message {:role :assistant :content "late"}
+                                    :tool_calls []}}])))} )
+        task
+        (core/future
+          (try
+            {:value (backend {:id "cancelled"
+                              :cancelled? (fn [] @cancelled)}
+                             "work" nil)}
+            (catch Object error
+              {:category (:category (ex-data error))}))) ]
+    (is (= :started (deref started 1000 :timeout)))
+    (reset! cancelled true)
+    (is (= :closed (deref stream-closed 1000 :timeout)))
+    (deliver release :released)
+    (is (= :cancelled (:category (deref task 1000 :timeout))))
+    (is (= 1 @stream-closes))
+    (is (= 1 @cleanups))))
+
+(deftest test-codergen-cancellation-evicts-only-its-full-fidelity-session
+  (let [cancelled (atom false)
+        started (promise)
+        release (promise)
+        stream-closed (promise)
+        stream-closes (atom 0)
+        cleanup-order (atom [])
+        parent-environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! cleanup-order conj :environment))})
+        child-environment
+        (execution/make-environment
+          {:cleanup (fn [] (swap! cleanup-order conj :subagent))})
+        threads (atom {})
+        backend
+        (agent/make-agent-codergen-backend
+          {:model "mock/test"
+           :project_docs []
+           :execution_env parent-environment
+           :stream_fn
+           (fn [request]
+             ((:register_stream_close request)
+              (fn []
+                (swap! stream-closes inc)
+                (deliver stream-closed :closed)))
+             (concat [{:type :stream_start}]
+                     (lazy-seq
+                       (deliver started :started)
+                       (deref release 1000 :release-timeout)
+                       [{:type :finish :finish_reason :stop :usage {}
+                         :response {:message {:role :assistant :content "late"}
+                                    :tool_calls []}}])))} )
+        node {:id "full-cancelled"
+              :resolved_fidelity "full"
+              :resolved_thread_id "shared"
+              :fidelity_threads threads
+              :cancelled? (fn [] @cancelled)}
+        task
+        (core/future
+          (try
+            {:value (backend node "work" nil)}
+            (catch Object error
+              {:category (:category (ex-data error))}))) ]
+    (is (= :started (deref started 1000 :timeout)))
+    (let [old-entry (get @threads "shared")
+          old-session (:session old-entry)
+          child (agent/make-session {:execution_env child-environment})
+          replacement-session (atom {:id "replacement"})
+          replacement {:session replacement-session :close (fn [] nil)}]
+      (swap! old-session assoc :subagents
+             {"child" {:id "child" :session child :status :idle}})
+      (reset! cancelled true)
+      (is (= :closed (deref stream-closed 1000 :timeout)))
+      ;; Keep the old provider turn blocked while a retry installs a new
+      ;; session for the same thread. The old turn must not evict this entry.
+      (swap! threads assoc "shared" replacement)
+      (deliver release :released)
+      (is (= :cancelled (:category (deref task 1000 :timeout))))
+      (is (identical? replacement (get @threads "shared")))
+      (is (= :closed (:state @old-session)))
+      (is (= [:environment :subagent] @cleanup-order))
+      (is (= 1 @stream-closes))
+      (is (= 1 (count (filter #(= :session_end (:type %))
+                              (agent/session-events old-session))))))))
+
 (deftest test-abort-kills-running-local-tool-process
   (let [root (str (os/temp-dir) "/lettractor-agent-cancel-"
                   (System/currentTimeMillis))
