@@ -3,10 +3,7 @@
             [json :as json]
             [io :as io]
             [os :as os]
-            [attractor.parser :as parser]
-            [attractor.transforms :as transforms]
-            [attractor.validation :as validation]
-            [attractor.engine :as engine]
+            [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
@@ -35,11 +32,6 @@
              "Access-Control-Allow-Origin" "*"}
    :body svg})
 
-(defn prepare-graph [dot-source]
-  (let [graph (transforms/apply-transforms (parser/parse-dot dot-source))]
-    (validation/validate-or-raise graph)
-    graph))
-
 (defn render-graph-svg [dot-source]
   (let [dot-path (str (os/temp-dir) "/strange-lettractor-" (random-uuid) ".dot")]
     (try
@@ -62,14 +54,15 @@
                         {"dot" body})
                       body)
           dot-source (or (get body-data "dot") (get body-data :dot) "")
-          graph (prepare-graph dot-source)
           pipeline-id (str "pipe-" (random-uuid))
           events-atom (atom [])
           questions-atom (atom {})
           pending-answers (atom {})
           cancelled (atom false)
           ctx (context/make-context)
-          logs-dir (str "attractor_runs/" pipeline-id)]
+          logs-dir (str "attractor_runs/" pipeline-id)
+          prepared-signal (promise)
+          registered? (atom false)]
 
       ;; Custom interviewer for web human-gates
       (let [web-interviewer (reify interviewer/IInterviewer
@@ -101,34 +94,49 @@
             registry (handlers/make-handler-registry web-interviewer nil)
 
             on-event (fn [ev]
-                       (swap! events-atom conj ev))]
-
-        ;; Register pipeline
-        (swap! active-pipelines assoc pipeline-id
-               {:id pipeline-id
-                :graph graph
-                :dot dot-source
-                :status :running
-                :events events-atom
-                :questions questions-atom
-                :pending-answers pending-answers
-                :cancelled cancelled
-                :context ctx
-                :logs_root logs-dir})
+                       (swap! events-atom conj ev))
+            on-prepared
+            (fn [{:keys [graph diagnostics]}]
+              ;; Publish prepared state before allowing the HTTP response.
+              (swap! active-pipelines assoc pipeline-id
+                     {:id pipeline-id
+                      :graph graph
+                      :dot dot-source
+                      :status :running
+                      :diagnostics diagnostics
+                      :events events-atom
+                      :questions questions-atom
+                      :pending-answers pending-answers
+                      :cancelled cancelled
+                      :context ctx
+                      :logs_root logs-dir})
+              (reset! registered? true)
+              (deliver prepared-signal {:graph graph}))]
 
         ;; Run in background future
         (core/future
           (try
-            (let [outcome (engine/run-pipeline graph {:context ctx
-                                                      :logs-root logs-dir
-                                                      :registry registry
-                                                      :cancelled? (fn [] @cancelled)
-                                                      :on-event on-event})]
+            (let [outcome (pipeline/run dot-source
+                                        {:context ctx
+                                         :logs-root logs-dir
+                                         :registry registry
+                                         :cancelled? (fn [] @cancelled)
+                                         :on-prepared on-prepared
+                                         :on-event on-event})]
               (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
             (catch Object e
-              (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e)))))
+              (if @registered?
+                (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e))
+                (deliver prepared-signal {:error e})))))
 
-        (json-response {:id pipeline-id :status "started" :graph_id (:id graph)} 201)))
+        (let [prepared (deref prepared-signal 30000
+                              {:error (ex-info "Pipeline preparation timed out" {})})]
+          (if-let [error (:error prepared)]
+            (throw error)
+            (json-response {:id pipeline-id
+                            :status "started"
+                            :graph_id (:id (:graph prepared))}
+                           201)))))
     (catch Object e
       (json-response {:error (str "Failed to start pipeline: " e)} 400))))
 

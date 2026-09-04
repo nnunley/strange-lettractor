@@ -1,10 +1,16 @@
 (ns attractor.lifecycle-contract-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [io :as io]
+            [json :as json]
             [os :as os]
+            [attractor.cli :as cli]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.parser :as parser]
             [attractor.pipeline :as pipeline]
+            [attractor.server :as server]
             [attractor.stylesheet :as stylesheet]
             [attractor.transforms :as transforms]
             [attractor.validation :as validation]))
@@ -408,6 +414,8 @@
     (let [calls (atom [])
           handler-observations (atom [])
           events (atom [])
+          handoffs (atom [])
+          timeline (atom [])
           ctx (context/make-context {"seed" "present"})
           logs (str (os/temp-dir) "/attractor-public-run-" (System/nanoTime))
           registry (handlers/make-handler-registry)
@@ -434,7 +442,14 @@
                           {:registry registry
                            :context ctx
                            :logs-root logs
-                           :on-event #(swap! events conj %)}))
+                           :on-prepared
+                           (fn [prepared]
+                             (swap! handoffs conj prepared)
+                             (swap! timeline conj :prepared))
+                           :on-event
+                           (fn [event]
+                             (swap! events conj event)
+                             (swap! timeline conj (:type event)))}))
           checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
       (is (= [[:transform-1 "Deliver Ship it" "prepared-model"]
               [:transform-2 "first"]
@@ -446,6 +461,13 @@
                :marker "second"}]
              @handler-observations))
       (is (= diagnostics (:diagnostics result)))
+      (is (= 1 (count @handoffs)))
+      (is (= diagnostics (:diagnostics (first @handoffs))))
+      (is (= "second"
+             (get-in (first @handoffs)
+                     [:graph :nodes "work" :transform_marker])))
+      (is (= :prepared (first @timeline)))
+      (is (= :pipeline.started (second @timeline)))
       (is (= :success (:status result)))
       (is (= ["start" "work" "exit"] (:completed_nodes result)))
       (is (= "Ship it" (context/ctx-get ctx "graph.goal")))
@@ -468,6 +490,7 @@
           rule-calls (atom 0)
           handler-calls (atom 0)
           events (atom [])
+          handoffs (atom [])
           ctx (context/make-context {"seed" "unchanged"})
           before @ctx
           logs (str (os/temp-dir) "/attractor-public-invalid-" (System/nanoTime))
@@ -513,6 +536,7 @@
                        :registry registry
                        :context ctx
                        :logs-root logs
+                       :on-prepared #(swap! handoffs conj %)
                        :on-event #(swap! events conj %)})
                     nil)
                   (catch Object caught caught))
@@ -526,8 +550,119 @@
       (is (= 1 @rule-calls))
       (is (= 0 @handler-calls))
       (is (= [] @events))
+      (is (= [] @handoffs))
       (is (= before @ctx))
       (is (nil? (os/stat logs))))))
 
+(defn- await-server-pipeline [pipeline-id]
+  (loop [remaining 200]
+    (let [state (get @server/active-pipelines pipeline-id)]
+      (if (or (zero? remaining) (not= :running (:status state)))
+        state
+        (do
+          (core/sleep 10)
+          (recur (dec remaining)))))))
+
+(deftest cli-and-server-use-the-public-lifecycle
+  (testing "CLI validate and graph prepare once; run executes once through pipeline/run"
+    (let [dot-path (str (os/temp-dir) "/attractor-cli-lifecycle-" (System/nanoTime) ".dot")
+          logs (str (os/temp-dir) "/attractor-cli-run-" (System/nanoTime))
+          _ (io/spit dot-path lifecycle-dot)
+          real-prepare pipeline/prepare
+          prepare-calls (atom [])
+          inspect-output
+          (with-redefs
+            [pipeline/prepare
+             (fn [source]
+               (swap! prepare-calls conj source)
+               (real-prepare source {}))
+             os/exit (fn [_] nil)]
+            (str (with-out-str (cli/cmd-validate [dot-path]))
+                 (with-out-str (cli/cmd-graph [dot-path]))))
+          real-run pipeline/run
+          run-calls (atom [])
+          exit-codes (atom [])
+          run-output
+          (with-redefs
+            [pipeline/run
+             (fn [source options]
+               (swap! run-calls conj {:source source :options options})
+               (real-run source options))
+             os/exit #(swap! exit-codes conj %)]
+            (with-out-str
+              (cli/cmd-run
+                [dot-path "--mock" "--auto-approve" "--logs-root" logs])))
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+      (is (= [lifecycle-dot lifecycle-dot] @prepare-calls))
+      (is (str/includes? inspect-output "Pipeline 'Lifecycle' is valid"))
+      (is (str/includes? inspect-output "Pipeline Graph: Lifecycle"))
+      (is (= 1 (count @run-calls)))
+      (is (= lifecycle-dot (:source (first @run-calls))))
+      (is (= logs (get-in @run-calls [0 :options :logs-root])))
+      (is (some? (get-in @run-calls [0 :options :registry])))
+      (is (fn? (get-in @run-calls [0 :options :on-event])))
+      (is (= [0] @exit-codes))
+      (is (str/includes? run-output "Execution finished with status: :success"))
+      (is (= ["start" "work" "exit"] (:completed_nodes checkpoint)))))
+  (testing "server validates synchronously and completes asynchronously through pipeline/run"
+    (reset! server/active-pipelines {})
+    (let [real-run pipeline/run
+          calls (atom [])
+          invalid-response
+          (with-redefs
+            [pipeline/run
+             (fn [source options]
+               (swap! calls conj {:source source :options options})
+               (real-run source options))]
+            (server/handle-start-pipeline
+              {:body "digraph Invalid { only [shape=box] }"}))]
+      (is (= 400 (:status invalid-response)))
+      (is (= {} @server/active-pipelines))
+      (is (= 1 (count @calls))))
+    (let [source
+          "digraph ServerLifecycle {
+             graph [goal=\"Serve\", model_stylesheet=\".styled { llm_model: server-model; }\"]
+             start [shape=Mdiamond]
+             work [shape=box, class=styled, label=\"\", prompt=\"\"]
+             exit [shape=Msquare]
+             start -> work -> exit
+           }"
+          real-run pipeline/run
+          calls (atom [])
+          response
+          (with-redefs
+            [pipeline/run
+             (fn [dot-source options]
+               (swap! calls conj {:source dot-source :options options})
+               (real-run dot-source options))]
+            (server/handle-start-pipeline {:body source}))
+          body (json/read-json (:body response))
+          pipeline-id (get body "id")
+          registered (get @server/active-pipelines pipeline-id)
+          completed (await-server-pipeline pipeline-id)
+          expected-warning
+          {:rule "prompt_on_llm_nodes"
+           :severity :warning
+           :node_id "work"
+           :message "Codergen node 'work' should have a prompt or label attribute"}
+          checkpoint (context/load-checkpoint
+                       (str (:logs_root completed) "/checkpoint.edn"))]
+      (is (= 201 (:status response)))
+      (is (= 1 (count @calls)))
+      (is (= source (:source (first @calls))))
+      (is (= "server-model" (get-in registered [:graph :nodes "work" :llm_model])))
+      (is (some? (:context registered)))
+      (is (not= :running (:status completed)))
+      (is (= :success (:status completed)))
+      (is (= :success (get-in completed [:outcome :status])))
+      (is (= [expected-warning] (get-in completed [:outcome :diagnostics]))
+          (pr-str (get-in completed [:outcome :diagnostics])))
+      (is (= ["start" "work" "exit"]
+             (get-in completed [:outcome :completed_nodes])))
+      (is (= "Serve" (context/ctx-get (:context completed) "graph.goal")))
+      (is (= ["start" "work" "exit"] (:completed_nodes checkpoint)))
+      (is (= :pipeline.started (:type (first @(:events completed)))))
+      (is (= :pipeline.completed (:type (last @(:events completed))))))))
+
 ;; SCN-VALIDATION COMPLETE
-;; SCN-PUBLIC-LIFECYCLE PARTIAL
+;; SCN-PUBLIC-LIFECYCLE COMPLETE

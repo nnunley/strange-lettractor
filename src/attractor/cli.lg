@@ -4,8 +4,8 @@
             [io :as io]
             [attractor.parser :as parser]
             [attractor.transforms :as transforms]
-            [attractor.validation :as validation]
             [attractor.engine :as engine]
+            [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
@@ -86,9 +86,9 @@
           (os/exit 1))
         (try
           (let [dot-content (io/slurp dot-file)
-                graph (-> (parser/parse-dot dot-content)
-                          transforms/apply-transforms)
-                diags (validation/validate graph)]
+                prepared (pipeline/prepare dot-content)
+                graph (:graph prepared)
+                diags (:diagnostics prepared)]
             (if (empty? diags)
               (do
                 (println (str "✓ Pipeline '" (:id graph) "' is valid (0 errors, 0 warnings)."))
@@ -112,9 +112,8 @@
       (do
         (println "Error: Valid DOT file required.")
         (os/exit 1))
-      (let [graph (-> (io/slurp dot-file)
-                      parser/parse-dot
-                      transforms/apply-transforms)
+      (let [prepared (pipeline/prepare (io/slurp dot-file))
+            graph (:graph prepared)
             start-node (parser/find-start-node graph)
             exit-node (parser/find-exit-node graph)]
         (println (str "Pipeline Graph: " (:id graph)))
@@ -151,10 +150,6 @@
                           (interviewer/make-console-interviewer))
             codergen-backend (make-codergen-backend-from-args args)
             registry (handlers/make-handler-registry interviewer codergen-backend)
-            graph (-> (io/slurp dot-file)
-                      parser/parse-dot
-                      transforms/apply-transforms)
-            _ (validation/validate-or-raise graph)
             on-event (fn [ev]
                        (case (:type ev)
                          :pipeline.started
@@ -176,9 +171,10 @@
                          :pipeline.failed
                          (println (str "✖ Pipeline failed: " (:error ev)))
                          nil))
-            outcome (engine/run-pipeline graph {:logs-root logs-root
-                                                :registry registry
-                                                :on-event on-event})]
+            outcome (pipeline/run (io/slurp dot-file)
+                                  {:logs-root logs-root
+                                   :registry registry
+                                   :on-event on-event})]
         (println (str "\nExecution finished with status: " (:status outcome)))
         (println (str "Artifacts and checkpoints saved in: " logs-root))
         (if (= (:status outcome) :success)

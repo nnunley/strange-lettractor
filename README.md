@@ -15,6 +15,13 @@ lgx run-pipeline examples/hello.dot
 
 See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and CLI usage.
 
+## Programmatic lifecycle
+
+Use `attractor.pipeline/prepare` to parse, transform, and validate DOT source
+without execution. Use `attractor.pipeline/run` for the same preparation plus
+validation-gated execution. `attractor.engine/run-pipeline` is the low-level API
+for callers that already hold a parsed, transformed, and validated graph.
+
 ## License
 
 [Apache License 2.0](LICENSE)

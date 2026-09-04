@@ -20,8 +20,13 @@
   "Prepare DOT source, reject validation errors, then execute the prepared graph."
   ([dot-source] (run dot-source {}))
   ([dot-source options]
-   (let [{:keys [graph diagnostics]} (prepare dot-source options)
+   (let [prepared (prepare dot-source options)
+         graph (:graph prepared)
+         diagnostics (:diagnostics prepared)
          diagnostics (validation/raise-on-errors diagnostics)
-         engine-options (dissoc options :custom-transforms :custom-rules)
+         _ (when-let [on-prepared (:on-prepared options)]
+             (on-prepared prepared))
+         engine-options (dissoc options
+                                :custom-transforms :custom-rules :on-prepared)
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
