@@ -27,6 +27,41 @@
     (is (= :fail (:status result)))
     (is (= "No tool_command specified" (:failure_reason result)))))
 
+(deftest test-tool-handler-admits-timeout-above-local-environment-ceiling
+  (let [factory-options (atom nil)
+        forwarded-timeout (atom nil)
+        environment
+        {:exec_command
+         (fn [_command timeout-ms _working-dir _env-vars]
+           (reset! forwarded-timeout timeout-ms)
+           {:stdout "done" :stderr "" :exit_code 0
+            :timed_out false :cancelled false})
+         :cleanup (fn [] nil)}
+        result
+        (binding [handlers/*tool-environment-factory*
+                  (fn [options]
+                    (reset! factory-options options)
+                    environment)]
+          (handlers/handle-tool
+            {:attrs {:tool_command "printf done"} :timeout "900s"}
+            nil nil nil))]
+    (is (= :success (:status result)))
+    (is (= 900000 @forwarded-timeout))
+    (is (= {:default_command_timeout_ms 900000
+            :max_command_timeout_ms 900000}
+           (select-keys @factory-options
+                        [:default_command_timeout_ms
+                         :max_command_timeout_ms])))))
+
+(deftest test-tool-handler-rejects-invalid-timeout-when-called-directly
+  (let [result
+        (handlers/handle-tool
+          {:attrs {:tool_command "printf unexpected"} :timeout "invalid"}
+          nil nil nil)]
+    (is (= :fail (:status result)))
+    (is (= :configuration_error (:category result)))
+    (is (= false (:retryable result)))))
+
 (deftest test-tool-handler-times-out-with-partial-command-output
   (let [late-marker (str (os/temp-dir) "/attractor-tool-timeout-late-"
                          (System/nanoTime))

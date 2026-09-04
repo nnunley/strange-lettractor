@@ -40,11 +40,25 @@
   {:status :success :notes (str "Conditional node evaluated: " (:id node))})
 
 ;; Tool Handler (Section 4.10)
+(def ^:dynamic *tool-environment-factory* execution/make-local-environment)
+
 (defn- parsed-tool-timeout-ms [node]
-  (when-let [configured-timeout (:timeout node)]
-    (let [parsed (parser/parse-duration-ms configured-timeout)]
-      (when (and (number? parsed) (> parsed 0))
-        (long parsed)))))
+  (when (some? (:timeout node))
+    (let [parsed (try
+                   (parser/parse-duration-ms (:timeout node))
+                   (catch Object _ ::invalid-timeout))]
+      (if (and (number? parsed) (> parsed 0) (<= parsed Long/MAX_VALUE))
+        (long parsed)
+        (throw
+          (ex-info (str "Invalid or non-positive node timeout for '"
+                        (:id node) "'")
+                   {:category :configuration_error
+                    :retryable false}))))))
+
+(defn- tool-environment-options [timeout-ms]
+  {:working_dir (os/cwd)
+   :default_command_timeout_ms timeout-ms
+   :max_command_timeout_ms timeout-ms})
 
 (defn- tool-context-updates [stdout stderr]
   {"tool.output" (or stdout "")
@@ -62,7 +76,8 @@
                          "tool.error" (:err res)}})))
 
 (defn- handle-timed-tool [node cmd timeout-ms]
-  (let [environment (execution/make-local-environment {:working_dir (os/cwd)})
+  (let [environment (*tool-environment-factory*
+                      (tool-environment-options timeout-ms))
         cancelled? (:cancelled? node)
         stop-watcher (atom false)
         watcher (core/future
@@ -113,16 +128,18 @@
           (catch Object _ nil))))))
 
 (defn handle-tool [node _context _graph _logs-root]
-  (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
-        timeout-ms (parsed-tool-timeout-ms node)]
-    (if (str/blank? cmd)
-      {:status :fail :failure_reason "No tool_command specified"}
-      (try
+  (try
+    (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
+          timeout-ms (parsed-tool-timeout-ms node)]
+      (if (str/blank? cmd)
+        {:status :fail :failure_reason "No tool_command specified"}
         (if timeout-ms
           (handle-timed-tool node cmd timeout-ms)
-          (handle-unbounded-tool cmd))
-        (catch Object e
-          {:status :fail :failure_reason (str "Tool execution exception: " e)})))))
+          (handle-unbounded-tool cmd))))
+    (catch Object e
+      (merge {:status :fail
+              :failure_reason (str "Tool execution exception: " e)}
+             (select-keys (or (ex-data e) {}) [:category :retryable])))))
 
 (defn- outcome-to-status-json [outcome]
   (let [st (or (:status outcome) (get outcome "status") :success)
