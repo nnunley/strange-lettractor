@@ -3,6 +3,27 @@
             [attractor.context :as context]
             [attractor.handlers :as handlers]))
 
+(deftest test-tool-handler-evaluates-complete-command-through-shell
+  (let [output-path (str "/private/tmp/attractor-tool-handler-shell-" (System/nanoTime))
+        command (str "printf '%s\n' 'quoted value' | tr ' ' '_' > " output-path
+                     " && cat " output-path)
+        result (handlers/handle-tool {:attrs {:tool_command command}} nil nil nil)]
+    (is (= :success (:status result)))
+    (is (= "quoted_value\n" (get-in result [:context_updates "tool.output"])))))
+
+(deftest test-tool-handler-reports-shell-nonzero-exit
+  (let [result (handlers/handle-tool
+                 {:attrs {:tool_command "printf 'failed\n' >&2; exit 17"}}
+                 nil nil nil)]
+    (is (= :fail (:status result)))
+    (is (= "Tool exited with code 17: failed\n" (:failure_reason result)))
+    (is (= "failed\n" (get-in result [:context_updates "tool.error"])))))
+
+(deftest test-tool-handler-requires-command
+  (let [result (handlers/handle-tool {:attrs {}} nil nil nil)]
+    (is (= :fail (:status result)))
+    (is (= "No tool_command specified" (:failure_reason result)))))
+
 (deftest test-manager-loop-starts-observes-and-completes-child
   (let [started (atom [])
         observations (atom [{:status :running :active_stage "build"

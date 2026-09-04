@@ -43,8 +43,7 @@
     (if (str/blank? cmd)
       {:status :fail :failure_reason "No tool_command specified"}
       (try
-        (let [args (str/split (str/trim cmd) #"\s+")
-              res (apply os/sh args)]
+        (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
           (if (zero? (:exit res))
             {:status :success
              :context_updates {"tool.output" (:out res)}
