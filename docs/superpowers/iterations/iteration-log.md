@@ -50,4 +50,4 @@
 - Toolchain: `lgx.edn` requires let-go 1.12.2; the configured local compiler identifies as `v1.12.2-95-gbdd8268c9`.
 - Safety: no `TODO(ITER-0002)` markers remain, and server timeout abandonment prevents late registration or execution.
 - Reviews: every implementation task passed paired acceptance/evidence review and paired code-quality/boxing-in review before wrap-up.
-- Audit: paired three-tier evidence audit pending.
+- Audit: paired three-tier auditors returned CLEAN for ATTR-DOT-03, ATTR-ENG-03, ATTR-VAL-01, ATTR-XFORM-01, all five impacted scenarios, and all four sentinel scenarios.
