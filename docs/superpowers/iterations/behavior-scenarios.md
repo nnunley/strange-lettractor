@@ -73,9 +73,9 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 - Given a parent context containing nested EDN maps, vectors, sets, and lists
 - When a snapshot and two branch clones are made
-- Then nested containers are distinct copies, neither clone/sibling/snapshot/parent observes another copy's subsequent changes, and clone logs are independent
+- Then every non-empty nested container is non-identical to its source counterpart, the snapshot remains stable after later parent writes, neither clone/sibling/snapshot/parent observes another copy's structural updates, and clone logs are independent
 - Given an opaque or mutable non-EDN value
-- Then snapshot/clone fails explicitly with category and value-path data instead of silently sharing it
+- Then snapshot/clone throws with `:category :unsupported-context-value` and an exact `:path`: `[:values key]` at the root, map keys or sequence indexes for contained values, and `:map-key`/`:set-member` sentinels for unsupported keys/members
 - Seam: context unit/integration
 
 ### SCN-PIPELINE-COMPOSITION — Context-mapped composition
@@ -91,8 +91,11 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 - Given a selected edge with `loop_restart=true`
 - When the source stage completes
-- Then `pipeline.restarting` records old/new roots and target before the target stage starts, and execution targets that node under the fresh root
-- The prepared graph, registry, cancellation signal, event sink, current context values, and restart incoming edge are preserved; completed nodes, node outcomes, retry counters, fidelity sessions, checkpoint, and per-stage status/artifact state are reset
+- Then `pipeline.restarting` contains exact keys `:old_logs_root`, `:new_logs_root`, and `:target` before the fresh `pipeline.started` and target `stage.started`, and execution targets that node under the fresh root
+- Across two rapid restarts, roots are pairwise unique, prior roots and their checkpoint/status/artifacts remain intact, and each new root begins without inherited files
+- Given a nonterminating restart cycle and an injected small positive `:max-steps`, execution reaches one invocation-wide bound without stack growth, returns FAIL with exact reason `Pipeline step limit exceeded (<limit> steps)`, and emits the matching `pipeline.failed`; the production default remains 10,000
+- The prepared graph, custom registrations, cancellation predicate, event sink, semantic context, and selected restart edge are preserved; the edge's fidelity/thread data reaches the target; run-scoped handler slots, fidelity sessions, completed nodes, node outcomes, retry counters, checkpoint, and per-stage files reset
+- Context retains user, handler-output, and `graph.*` values, replaces `run.id`, sets `current_node` on target entry, and clears `outcome`, `preferred_label`, and `internal.retry_count.*`
 - Seam: engine integration
 
 ### SCN-TRANSFORM-ORDER — Deterministic custom transforms
