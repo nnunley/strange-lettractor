@@ -285,7 +285,19 @@
           (>= (now-ms) deadline)
           (do
             (signal-cancellation! controller :deadline)
-            (let [joined @task]
+            (let [joined
+                  (loop []
+                    ;; The handler may still be cooperatively winding down
+                    ;; after its deadline. Keep observing pipeline
+                    ;; cancellation so it can take precedence before join.
+                    (when (pipeline-cancelled?)
+                      (signal-cancellation! controller :pipeline_cancelled))
+                    (let [result (deref task 5 pending)]
+                      (when (pipeline-cancelled?)
+                        (signal-cancellation! controller :pipeline_cancelled))
+                      (if (= pending result)
+                        (recur)
+                        result)))]
               ;; A concurrent pipeline cancellation overrides a deadline,
               ;; including one detected while waiting for handler quiescence.
               (when (pipeline-cancelled?)
