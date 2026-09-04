@@ -82,6 +82,17 @@
 (defn- add-active-subgraph-classes [classes state]
   (reduce add-class-once classes (active-subgraph-classes state)))
 
+(defn- apply-active-subgraph-classes [node state]
+  (let [with-classes (reduce (fn [current-node derived-class]
+                               (apply-subgraph-class current-node derived-class false))
+                             node
+                             (active-subgraph-classes state))
+        current-subgraph (:current-subgraph state)
+        immediate-class (:derived-class current-subgraph)]
+    (cond-> with-classes
+      current-subgraph (assoc :subgraph_class immediate-class)
+      current-subgraph (assoc-in [:attrs :subgraph_class] immediate-class))))
+
 ;; Tokenize DOT source code
 (defn tokenize-dot [src]
   (let [n (count src)]
@@ -358,28 +369,26 @@
                            (:node-defaults state))
                 sub-class (if (:current-subgraph state)
                             (:derived-class (:current-subgraph state)) "")
-                combined-class (add-active-subgraph-classes
-                                  (or (:class defaults) "") state)
                 registered-nodes (reduce (fn [acc-nodes nid]
-                                           (if (contains? acc-nodes nid)
-                                             acc-nodes
+                                           (let [node (or (get acc-nodes nid)
+                                                          {:id nid
+                                                           :label nid
+                                                           :shape (or (:shape defaults) "box")
+                                                           :type (or (:type defaults) "")
+                                                           :prompt ""
+                                                           :max_retries (:max_retries defaults)
+                                                           :goal_gate false
+                                                           :retry_target ""
+                                                           :fallback_retry_target ""
+                                                           :fidelity (:fidelity defaults)
+                                                           :thread_id (:thread_id defaults)
+                                                           :class (or (:class defaults) "")
+                                                           :subgraph_class sub-class
+                                                           :attrs (assoc defaults
+                                                                     :class (or (:class defaults) "")
+                                                                     :subgraph_class sub-class)})]
                                              (assoc acc-nodes nid
-                                                    {:id nid
-                                                     :label nid
-                                                     :shape (or (:shape defaults) "box")
-                                                     :type (or (:type defaults) "")
-                                                     :prompt ""
-                                                     :max_retries (:max_retries defaults)
-                                                     :goal_gate false
-                                                     :retry_target ""
-                                                     :fallback_retry_target ""
-                                                     :fidelity (:fidelity defaults)
-                                                     :thread_id (:thread_id defaults)
-                                                     :class combined-class
-                                                     :subgraph_class sub-class
-                                                     :attrs (assoc defaults
-                                                               :class combined-class
-                                                               :subgraph_class sub-class)})))
+                                                    (apply-active-subgraph-classes node state))))
                                          (:nodes state)
                                          chain)]
             (-> state

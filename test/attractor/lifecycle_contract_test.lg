@@ -7,7 +7,12 @@
   (let [graph
         (parser/parse-dot
           "digraph G {
-             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_provider: inner-provider; }\"]
+             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .edge-member { llm_provider: edge-provider; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_provider: inner-provider; }\"]
+             outside [class=external, prompt=preserved, shape=diamond]
+             subgraph edge_membership {
+               label = \"Edge Member\"
+               outside -> introduced_inside
+             }
              subgraph late {
                before [class=explicit]
                chained -> edge_node
@@ -45,6 +50,14 @@
     (testing "label-before behavior remains styled"
       (is (= "manual,early-label" (:class (parser/find-node graph "early_node"))))
       (is (= "early-model" (model-for "early_node"))))
+    (testing "label-before edge membership updates existing endpoints"
+      (is (= "external,edge-member"
+             (:class (parser/find-node graph "outside"))))
+      (is (= "edge-member"
+             (:subgraph_class (parser/find-node graph "outside"))))
+      (is (= "edge-provider" (:llm_provider (props-for "outside"))))
+      (is (= "preserved" (:prompt (parser/find-node graph "outside"))))
+      (is (= "diamond" (:shape (parser/find-node graph "outside")))))
     (testing "scoped defaults and nested scope restoration remain intact"
       (is (= "outer" (:thread_id (parser/find-node graph "inner_before"))))
       (is (= "explicit-inner,inner-scope,outer-scope"
