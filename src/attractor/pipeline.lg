@@ -17,7 +17,12 @@
       :diagnostics diagnostics})))
 
 (defn run
-  "Prepare DOT source, reject validation errors, then execute the prepared graph."
+  "Prepare DOT source, reject validation errors, then execute the prepared graph.
+
+   The wrapper-only :on-prepared callback receives the exact prepare result once,
+   after error gating and before the engine or its events start. It is not
+   forwarded to the engine; if it throws, execution does not start and the
+   exception propagates."
   ([dot-source] (run dot-source {}))
   ([dot-source options]
    (let [prepared (prepare dot-source options)

@@ -679,7 +679,7 @@
           captured-context (atom nil)
           captured-logs (atom nil)
           completed (promise)
-          response
+          joined
           (with-redefs
             [pipeline/run
              (fn [dot-source options]
@@ -702,10 +702,14 @@
                               (server-on-event event))))
                    (finally
                      (deliver completed :finished)))))]
-            (server/handle-start-pipeline
-              {:body source
-               :preparation-timeout-ms 5}))
-          future-result (deref completed 1000 :timeout)
+            (let [response (server/handle-start-pipeline
+                             {:body source
+                              :preparation-timeout-ms 5})
+                  future-result (deref completed 1000 :timeout)]
+              {:response response
+               :future-result future-result}))
+          response (:response joined)
+          future-result (:future-result joined)
           ctx @captured-context
           logs @captured-logs]
       (is (= 400 (:status response)))
