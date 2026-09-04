@@ -4,6 +4,9 @@
             [clojure.core :as core]
             [attractor.engine :as engine]
             [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.parser :as parser]
             [json :as json]
             [io :as io]
             [os :as os]))
@@ -200,3 +203,37 @@
     (is (= 1 @attempts))
     (is (not= "must lose" (:notes outcome)))
     (is (= [:stage.started :stage.failed] (mapv :type @events)))))
+
+(deftest nested-string-context-keys-round-trip-through-codergen-status
+  (let [logs (test-logs "codergen-nested-context")
+        handler (handlers/make-codergen-handler
+                  (fn [_ _ _]
+                    {:status :success
+                     :context_updates
+                     {"outer" {"inner" "codergen"}}}))]
+    (handler {:id "stage" :prompt "work"}
+             (context/make-context) {} logs)
+    (let [status (json/read-json (io/slurp (status-path logs "stage")))]
+      (is (= "codergen"
+             (get-in status ["context_updates" "outer" "inner"]))))))
+
+(deftest nested-string-context-keys-round-trip-through-engine-status
+  (let [logs (test-logs "engine-nested-context")
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   stage [type=custom.status]
+                   exit [shape=Msquare]
+                   start -> stage -> exit
+                 }")
+        registry (handlers/make-handler-registry
+                   (interviewer/make-auto-approve-interviewer) nil)]
+    (handlers/register-handler!
+      registry "custom.status"
+      (fn [_ _ _ _]
+        {:status :success
+         :context_updates {"outer" {"inner" "engine"}}}))
+    (engine/run-pipeline graph {:logs-root logs :registry registry})
+    (let [status (json/read-json (io/slurp (status-path logs "stage")))]
+      (is (= "engine"
+             (get-in status ["context_updates" "outer" "inner"]))))))

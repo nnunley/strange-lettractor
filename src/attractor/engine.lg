@@ -8,37 +8,14 @@
             [attractor.conditions :as conditions]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
-            [attractor.interviewer :as interviewer]))
-
-(defn- json-safe-object-keys [value]
-  (cond
-    (map? value)
-    (into {}
-          (map (fn [[key nested]]
-                 [(if (keyword? key) key (keyword (str key)))
-                  (json-safe-object-keys nested)]))
-          value)
-
-    (sequential? value)
-    (mapv json-safe-object-keys value)
-
-    :else value))
+            [attractor.interviewer :as interviewer]
+            [attractor.status :as status]))
 
 (defn- write-stage-status! [logs-root node-id outcome]
-  (let [stage-dir (str logs-root "/" node-id)
-        status (:status outcome)
-        status-name (if (keyword? status) (name status) (str status))]
+  (let [stage-dir (str logs-root "/" node-id)]
     (os/sh "mkdir" "-p" stage-dir)
     (io/spit (str stage-dir "/status.json")
-             (json/write-json
-               {:outcome status-name
-                :status status-name
-                :preferred_label (or (:preferred_label outcome) "")
-                :suggested_next_ids (or (:suggested_next_ids outcome) [])
-                :context_updates (json-safe-object-keys
-                                   (or (:context_updates outcome) {}))
-                :notes (or (:notes outcome) "")
-                :failure_reason (or (:failure_reason outcome) "")}))))
+             (status/outcome->status-json outcome))))
 
 (defn- normalize-node-outcomes [outcomes]
   (into {}

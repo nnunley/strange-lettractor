@@ -4,7 +4,8 @@
             [clojure.core :as core]
             [json :as json]
             [io :as io]
-            [os :as os]))
+            [os :as os]
+            [attractor.status :as status]))
 
 ;; Default file-backing threshold: 100KB
 (def file-backing-threshold (* 100 1024))
@@ -327,13 +328,8 @@
       (io/spit (str stage-dir "/prompt.md") (str prompt)))
     (when response
       (io/spit (str stage-dir "/response.md") (str response)))
-    (let [st (if (keyword? (:status outcome)) (name (:status outcome)) (str (:status outcome)))
-          status-data {:outcome st
-                       :preferred_label (or (:preferred_label outcome) "")
-                       :suggested_next_ids (or (:suggested_next_ids outcome) [])
-                       :context_updates (or (:context_updates outcome) {})
-                       :notes (or (:notes outcome) "")}]
-      (io/spit (str stage-dir "/status.json") (json/write-json status-data)))
+    (io/spit (str stage-dir "/status.json")
+             (status/outcome->status-json outcome))
     stage-dir))
 
 ;; Save a checkpoint (Section 5.3)

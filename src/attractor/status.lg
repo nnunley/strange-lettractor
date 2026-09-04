@@ -1,0 +1,36 @@
+(ns attractor.status
+  (:require [json :as json]))
+
+(defn json-safe-object-keys [value]
+  (cond
+    (map? value)
+    (into {}
+          (map (fn [[key nested]]
+                 [(if (keyword? key) key (keyword (str key)))
+                  (json-safe-object-keys nested)]))
+          value)
+
+    (sequential? value)
+    (mapv json-safe-object-keys value)
+
+    :else value))
+
+(defn outcome->status-map [outcome]
+  (let [status (or (:status outcome) (get outcome "status") :success)
+        status-name (if (keyword? status) (name status) (str status))]
+    {:outcome status-name
+     ;; `status` is retained as a compatibility alias for existing readers.
+     :status status-name
+     :preferred_label (or (:preferred_label outcome)
+                          (get outcome "preferred_label") "")
+     :suggested_next_ids (or (:suggested_next_ids outcome)
+                             (get outcome "suggested_next_ids") [])
+     :context_updates
+     (json-safe-object-keys
+       (or (:context_updates outcome) (get outcome "context_updates") {}))
+     :notes (or (:notes outcome) (get outcome "notes") "")
+     :failure_reason (or (:failure_reason outcome)
+                         (get outcome "failure_reason") "")}))
+
+(defn outcome->status-json [outcome]
+  (json/write-json (outcome->status-map outcome)))

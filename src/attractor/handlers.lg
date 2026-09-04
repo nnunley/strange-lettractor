@@ -1,14 +1,14 @@
 (ns attractor.handlers
   (:require [clojure.string :as str]
             [clojure.core :as core]
-            [json :as json]
             [io :as io]
             [os :as os]
             [attractor.execution :as execution]
             [attractor.context :as context]
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
-            [attractor.interviewer :as interviewer]))
+            [attractor.interviewer :as interviewer]
+            [attractor.status :as status]))
 
 ;; Shape to handler type mapping (Section 2.8)
 (def shape-to-type
@@ -141,32 +141,6 @@
               :failure_reason (str "Tool execution exception: " e)}
              (select-keys (or (ex-data e) {}) [:category :retryable])))))
 
-(defn- json-safe-object-keys [value]
-  (cond
-    (map? value)
-    (into {}
-          (map (fn [[key nested]]
-                 [(if (keyword? key) key (keyword (str key)))
-                  (json-safe-object-keys nested)]))
-          value)
-
-    (sequential? value)
-    (mapv json-safe-object-keys value)
-
-    :else value))
-
-(defn- outcome-to-status-json [outcome]
-  (let [st (or (:status outcome) (get outcome "status") :success)
-        st-str (if (keyword? st) (name st) (str st))]
-    {:outcome st-str
-     :status st-str
-     :preferred_label (or (:preferred_label outcome) (get outcome "preferred_label") "")
-     :suggested_next_ids (or (:suggested_next_ids outcome) (get outcome "suggested_next_ids") [])
-     :context_updates (json-safe-object-keys
-                        (or (:context_updates outcome)
-                            (get outcome "context_updates") {}))
-     :notes (or (:notes outcome) (get outcome "notes") "")}))
-
 ;; Codergen Handler (Section 4.5)
 (defn make-codergen-handler
   ([] (make-codergen-handler nil))
@@ -197,7 +171,8 @@
              (do
                (when-not (os/stat (str stage-dir "/response.md"))
                  (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
-               (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json backend-result)))
+               (io/spit (str stage-dir "/status.json")
+                        (status/outcome->status-json backend-result))
                backend-result)
 
              ;; Backend returned a response string
@@ -208,11 +183,13 @@
                             :context_updates {"last_stage" node-id
                                               "last_response" truncated-resp}}]
                (io/spit (str stage-dir "/response.md") resp-str)
-               (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json outcome)))
+               (io/spit (str stage-dir "/status.json")
+                        (status/outcome->status-json outcome))
                outcome)))
          (catch Object e
            (let [fail-outcome {:status :fail :failure_reason (str e)}]
-             (io/spit (str stage-dir "/status.json") (json/write-json (outcome-to-status-json fail-outcome)))
+             (io/spit (str stage-dir "/status.json")
+                      (status/outcome->status-json fail-outcome))
              (throw e))))))))
 
 ;; Wait.human Handler (Section 4.6)
