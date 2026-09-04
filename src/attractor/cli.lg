@@ -60,6 +60,19 @@
   (println "  help                                                Show this help message")
   (println ""))
 
+(defn format-validation-diagnostic [diagnostic]
+  (let [prefix (case (:severity diagnostic)
+                 :error "[ERROR]"
+                 :warning "[WARN]"
+                 :info "[INFO]")
+        target (or (:node_id diagnostic)
+                   (when (:edge diagnostic)
+                     (str/join " -> " (:edge diagnostic)))
+                   "")]
+    (str "  " prefix " [" (:rule diagnostic) "] "
+         (when (seq target) (str target ": "))
+         (:message diagnostic))))
+
 (defn cmd-validate [args]
   (let [dot-file (first args)]
     (if (str/blank? dot-file)
@@ -85,11 +98,7 @@
                 (println (str "Validation results for '" (:id graph) "': "
                               (count errors) " error(s), " (count warnings) " warning(s)"))
                 (doseq [d diags]
-                  (let [prefix (if (= (:severity d) :error) "[ERROR]" "[WARN]")
-                        target (or (:node-id d) (when (:edge d) (str/join " -> " (:edge d))) "")]
-                    (println (str "  " prefix " [" (:rule d) "] "
-                                  (when (seq target) (str target ": "))
-                                  (:message d)))))
+                  (println (format-validation-diagnostic d)))
                 (if (seq errors)
                   (os/exit 1)
                   (os/exit 0)))))

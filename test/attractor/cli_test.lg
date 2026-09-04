@@ -1,0 +1,19 @@
+(ns attractor.cli-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.cli :as cli]))
+
+(deftest canonical-validation-diagnostics-retain-cli-targets
+  (testing "node diagnostics render the canonical node target"
+    (is (= "  [ERROR] [reachability] worker: Node is unreachable"
+           (cli/format-validation-diagnostic
+             {:rule "reachability"
+              :severity :error
+              :message "Node is unreachable"
+              :node_id "worker"}))))
+  (testing "edge diagnostics render both endpoints"
+    (is (= "  [WARN] [condition_syntax] from -> to: Invalid condition"
+           (cli/format-validation-diagnostic
+             {:rule "condition_syntax"
+              :severity :warning
+              :message "Invalid condition"
+              :edge ["from" "to"]})))))

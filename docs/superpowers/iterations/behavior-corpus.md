@@ -14,7 +14,7 @@ Commands are run from the repository root with let-go 1.12.2 or newer. Pending l
 | SCN-AUTO-STATUS | parser/engine integration | impacted | `rg -q '^;; SCN-AUTO-STATUS COMPLETE$' test/attractor/status_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in ITER-0001 |
 | SCN-CONTEXT-ISOLATION | context integration | impacted | `rg -q 'SCN-CONTEXT-ISOLATION' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0003 |
 | SCN-PIPELINE-COMPOSITION | engine end to end | impacted | `rg -q 'SCN-PIPELINE-COMPOSITION' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0004 |
-| SCN-VALIDATION | validation/engine integration | impacted | `rg -q 'SCN-VALIDATION' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0002 |
+| SCN-VALIDATION | validation/engine integration | impacted | `rg -q '^;; SCN-VALIDATION COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0002 |
 | SCN-LOOP-RESTART | engine integration | impacted | `rg -q 'SCN-LOOP-RESTART' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0003 |
 | SCN-TRANSFORM-ORDER | transform/validation integration | impacted | `rg -q 'SCN-TRANSFORM-ORDER' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0002 |
 | SCN-FIRST-SUCCESS | concurrency integration | impacted | `rg -q 'SCN-FIRST-SUCCESS' test/attractor/interactive_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0005 |
