@@ -282,56 +282,57 @@ digraph Gate {
   (let [clock (atom 0)
         cancelled (atom false)
         deadline-observed (promise)
-        cancellation-issued (promise)
         pipeline-observed (promise)
         release-handler (promise)
         attempts (atom 0)
         reason (atom nil)
         events (atom [])
-        coordinator
+        processing
         (core/future
-          (deref deadline-observed 1000 :not-observed)
-          (reset! cancelled true)
-          (deliver cancellation-issued :issued)
-          (deref pipeline-observed 1000 :not-observed)
-          (deliver release-handler :released))
-        outcome
-        (e/execute-with-retry
-          (fn [node _ _ _]
-            (swap! attempts inc)
-            (reset! clock 20)
-            (loop []
-              (if ((:cancelled? node))
-                (do
-                  ;; This acknowledges the engine's deadline signal before
-                  ;; the coordinator issues pipeline cancellation.
-                  (deliver deadline-observed
-                           ((:cancellation_reason node)))
-                  (deref cancellation-issued 1000 :not-issued)
-                  (loop []
-                    (let [state ((:cancellation_reason node))]
-                      (cond
-                        (= :pipeline_cancelled state)
-                        (do
-                          (deliver pipeline-observed state)
-                          (deref release-handler 1000 :released)
-                          (reset! reason state)
-                          {:status :success})
+          (e/execute-with-retry
+            (fn [node _ _ _]
+              (swap! attempts inc)
+              (reset! clock 20)
+              (loop []
+                (if ((:cancelled? node))
+                  (do
+                    ;; The controller is at :deadline only after the engine
+                    ;; begins joining this handler. Then issue cancellation.
+                    (deliver deadline-observed
+                             ((:cancellation_reason node)))
+                    (reset! cancelled true)
+                    (loop []
+                      (let [state ((:cancellation_reason node))]
+                        (cond
+                          (= :pipeline_cancelled state)
+                          (do
+                            (deliver pipeline-observed state)
+                            (deref release-handler 1000 :released)
+                            (reset! reason state)
+                            {:status :success})
 
-                        :else
-                        (do
-                          (core/sleep 1)
-                          (recur))))))
-                (do
-                  (core/sleep 1)
-                  (recur)))))
-          {:id "deadline-race" :timeout 20 :max_retries 1}
-          (c/make-context) {} "" #(swap! events conj %)
-          {:now-ms (fn [] @clock)
-           :cancelled? (fn [] @cancelled)
-           :sleep-fn (fn [_] nil)})
+                          ;; A broken controller transition must not strand
+                          ;; this test's handler after its observer times out.
+                          (not= ::pending
+                                (deref release-handler 1 ::pending))
+                          (do
+                            (reset! reason state)
+                            {:status :success})
+
+                          :else
+                          (recur)))))
+                  (do
+                    (core/sleep 1)
+                    (recur)))))
+            {:id "deadline-race" :timeout 20 :max_retries 1}
+            (c/make-context) {} "" #(swap! events conj %)
+            {:now-ms (fn [] @clock)
+             :cancelled? (fn [] @cancelled)
+             :sleep-fn (fn [_] nil)}))
         deadline-state (deref deadline-observed 1000 :not-observed)
-        pipeline-state (deref pipeline-observed 1000 :not-observed)]
+        pipeline-state (deref pipeline-observed 1000 :not-observed)
+        _released (deliver release-handler :released)
+        outcome (deref processing 1000 :not-finished)]
     (is (= :cancelled (:status outcome)))
     (is (= 1 @attempts))
     (is (= :deadline deadline-state))
