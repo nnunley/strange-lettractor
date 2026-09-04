@@ -5,6 +5,7 @@
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
             [attractor.parser :as parser]
+            [io :as io]
             [os :as os]))
 
 (defn restart-test-root [label]
@@ -40,6 +41,7 @@
         calls (atom [])
         events (atom [])
         fresh-at-restart (atom [])
+        preserved-files (atom [])
         root (restart-test-root "finite")
         _ (handlers/register-handler!
             registry "restart.probe"
@@ -65,10 +67,20 @@
            :on-event
            (fn [event]
              (when (= :pipeline.restarting (:type event))
-               (let [new-root (:new_logs_root event)]
+               (let [new-root (:new_logs_root event)
+                     old-root (:old_logs_root event)
+                     stage-id (get {"second" "first" "third" "second"}
+                                   (:target event))
+                     checkpoint-path (str old-root "/checkpoint.edn")
+                     status-path (str old-root "/" stage-id "/status.json")]
                  (swap! fresh-at-restart conj
                         (and (string? new-root)
-                             (nil? (os/stat new-root))))))
+                             (nil? (os/stat new-root))))
+                 (swap! preserved-files conj
+                        {:checkpoint {:path checkpoint-path
+                                      :contents (io/slurp checkpoint-path)}
+                         :status {:path status-path
+                                  :contents (io/slurp status-path)}})))
              (swap! events conj event))})
         call-data @calls
         roots (mapv :logs-root call-data)
@@ -84,6 +96,11 @@
     (is (= roots started-roots))
     (is (= [true true] @fresh-at-restart))
     (is (every? some? (map os/stat roots)))
+    (doseq [segment-files @preserved-files
+            recorded-file [(:checkpoint segment-files) (:status segment-files)]]
+      (is (some? (os/stat (:path recorded-file))))
+      (is (= (:contents recorded-file)
+             (io/slurp (:path recorded-file)))))
     (is (every? :graph-identical? call-data))
     (is (every? :context-identical? call-data))
     (is (every? :cancelled-identical? call-data))

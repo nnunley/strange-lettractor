@@ -1021,6 +1021,9 @@
           candidate)))))
 
 (defn- restarted-segment-options [base-options target edge logs-root]
+  ;; These drops are preparatory restart plumbing. The exhaustive bookkeeping,
+  ;; context, runtime-slot, and file-reset semantics remain Task 3-owned and are
+  ;; intentionally not claimed by this helper alone.
   (assoc
     (dissoc base-options
             :completed-nodes
