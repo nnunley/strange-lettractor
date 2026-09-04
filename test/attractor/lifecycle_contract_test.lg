@@ -7,7 +7,7 @@
   (let [graph
         (parser/parse-dot
           "digraph G {
-             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_model: inner-model; }\"]
+             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_provider: inner-provider; }\"]
              subgraph late {
                before [class=explicit]
                chained -> edge_node
@@ -19,21 +19,21 @@
                early_node [class=manual]
              }
              subgraph outer {
-               label = \"Outer Scope\"
                node [thread_id=outer]
                outer_before
                subgraph inner {
-                 inner_before
+                 inner_before [class=\"explicit-inner\"]
                  label = \"Inner Scope\"
                }
                outer_after
+               label = \"Outer Scope\"
              }
            }")
         rules (stylesheet/parse-stylesheet (:model_stylesheet graph))
-        model-for (fn [node-id]
-                    (:llm_model
-                      (stylesheet/resolve-node-model-props
-                        (parser/find-node graph node-id) rules (:attrs graph))))]
+        props-for (fn [node-id]
+                    (stylesheet/resolve-node-model-props
+                      (parser/find-node graph node-id) rules (:attrs graph)))
+        model-for (fn [node-id] (:llm_model (props-for node-id)))]
     (testing "label-after updates explicit and edge-introduced nodes"
       (is (= "explicit,late-label" (:class (parser/find-node graph "before"))))
       (is (= "late-label" (:class (parser/find-node graph "chained"))))
@@ -47,9 +47,15 @@
       (is (= "early-model" (model-for "early_node"))))
     (testing "scoped defaults and nested scope restoration remain intact"
       (is (= "outer" (:thread_id (parser/find-node graph "inner_before"))))
-      (is (= "inner-scope" (:class (parser/find-node graph "inner_before"))))
-      (is (= "inner-model" (model-for "inner_before")))
+      (is (= "explicit-inner,inner-scope,outer-scope"
+             (:class (parser/find-node graph "inner_before"))))
+      (is (= "inner-scope"
+             (:subgraph_class (parser/find-node graph "inner_before"))))
+      (is (= "inner-provider" (:llm_provider (props-for "inner_before"))))
+      (is (= "outer-model" (model-for "inner_before")))
       (is (= "outer-scope" (:class (parser/find-node graph "outer_after"))))
+      (is (= "outer-scope"
+             (:subgraph_class (parser/find-node graph "outer_after"))))
       (is (= "outer-model" (model-for "outer_after"))))))
 
 ;; SCN-SUBGRAPH-LABEL COMPLETE

@@ -66,13 +66,21 @@
       (str/blank? classes) derived-class
       :else (str classes "," derived-class))))
 
-(defn- apply-subgraph-class [node derived-class]
+(defn- apply-subgraph-class [node derived-class immediate?]
   (let [combined-class (add-class-once (:class node) derived-class)]
-    (-> node
-        (assoc :class combined-class)
-        (assoc :subgraph_class derived-class)
-        (assoc-in [:attrs :class] combined-class)
-        (assoc-in [:attrs :subgraph_class] derived-class))))
+    (cond-> (-> node
+                (assoc :class combined-class)
+                (assoc-in [:attrs :class] combined-class))
+      immediate? (assoc :subgraph_class derived-class)
+      immediate? (assoc-in [:attrs :subgraph_class] derived-class))))
+
+(defn- active-subgraph-classes [state]
+  (->> (conj (:subgraph-stack state) (:current-subgraph state))
+       (map :derived-class)
+       (remove str/blank?)))
+
+(defn- add-active-subgraph-classes [classes state]
+  (reduce add-class-once classes (active-subgraph-classes state)))
 
 ;; Tokenize DOT source code
 (defn tokenize-dot [src]
@@ -230,11 +238,16 @@
       (= val "}")
       (if (:current-subgraph state)
         ;; Exit subgraph back to parent scope
-        (let [stack (:subgraph-stack state)]
+        (let [stack (:subgraph-stack state)
+              closed-subgraph (:current-subgraph state)
+              parent-subgraph (last stack)
+              restored-parent (when parent-subgraph
+                                (update parent-subgraph :node-ids into
+                                        (:node-ids closed-subgraph)))]
           (-> state
               (update :idx inc)
-              (update :subgraphs conj (:current-subgraph state))
-              (assoc :current-subgraph (last stack))
+              (update :subgraphs conj closed-subgraph)
+              (assoc :current-subgraph restored-parent)
               (assoc :subgraph-stack (vec (butlast stack)))))
         ;; Exit graph
         (-> state (assoc :done? true) (update :idx inc)))
@@ -287,7 +300,8 @@
                                           (:node-defaults state))
                                       :label ""
                                       :derived-class ""
-                                      :node-ids #{}})))
+                                      :node-ids #{}
+                                      :direct-node-ids #{}})))
 
       ;; Top-level key = val statement (e.g. rankdir=LR or goal="...")
       (and (< (+ idx 2) n)
@@ -302,7 +316,10 @@
                               (= k-name "label") (assoc :label v :derived-class derived-class))
                 updated-nodes (if (= k-name "label")
                                 (reduce (fn [nodes node-id]
-                                          (update nodes node-id apply-subgraph-class derived-class))
+                                          (update nodes node-id apply-subgraph-class
+                                                  derived-class
+                                                  (contains? (:direct-node-ids updated-sub)
+                                                             node-id)))
                                         (:nodes state)
                                         (:node-ids updated-sub))
                                 (:nodes state))]
@@ -341,6 +358,8 @@
                            (:node-defaults state))
                 sub-class (if (:current-subgraph state)
                             (:derived-class (:current-subgraph state)) "")
+                combined-class (add-active-subgraph-classes
+                                  (or (:class defaults) "") state)
                 registered-nodes (reduce (fn [acc-nodes nid]
                                            (if (contains? acc-nodes nid)
                                              acc-nodes
@@ -356,10 +375,10 @@
                                                      :fallback_retry_target ""
                                                      :fidelity (:fidelity defaults)
                                                      :thread_id (:thread_id defaults)
-                                                     :class sub-class
+                                                     :class combined-class
                                                      :subgraph_class sub-class
                                                      :attrs (assoc defaults
-                                                               :class sub-class
+                                                               :class combined-class
                                                                :subgraph_class sub-class)})))
                                          (:nodes state)
                                          chain)]
@@ -367,7 +386,9 @@
                 (assoc :idx next-idx)
                 (assoc :nodes registered-nodes)
                 (cond-> (:current-subgraph state)
-                  (update-in [:current-subgraph :node-ids] into chain))
+                  (update-in [:current-subgraph :node-ids] into chain)
+                  (:current-subgraph state)
+                  (update-in [:current-subgraph :direct-node-ids] into chain))
                 (update :edges into new-edges)))
 
           ;; Node statement
@@ -376,8 +397,8 @@
                                      (:scoped-node-defaults (:current-subgraph state))
                                      (:node-defaults state))
                 sub-class (if (:current-subgraph state) (:derived-class (:current-subgraph state)) "")
-                explicit-class (or (:class explicit-attrs) "")
-                combined-class (add-class-once explicit-class sub-class)
+                explicit-class (or (:class explicit-attrs) (:class effective-defaults) "")
+                combined-class (add-active-subgraph-classes explicit-class state)
                 merged-attrs (merge effective-defaults explicit-attrs)
                 node-rec {:id first-id
                           :label (or (:label explicit-attrs) (:label effective-defaults) first-id)
@@ -412,7 +433,9 @@
                 (assoc :idx next-idx)
                 (assoc-in [:nodes first-id] node-rec)
                 (cond-> (:current-subgraph state)
-                  (update-in [:current-subgraph :node-ids] conj first-id))))))
+                  (update-in [:current-subgraph :node-ids] conj first-id)
+                  (:current-subgraph state)
+                  (update-in [:current-subgraph :direct-node-ids] conj first-id))))))
 
       :else
       (update state :idx inc))))
