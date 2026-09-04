@@ -102,6 +102,8 @@
         top-key-opaque (atom :top-key)
         map-key-opaque (atom :map-key)
         set-member-opaque (atom :set-member)
+        composite-map-key-opaque (atom :composite-map-key)
+        composite-set-member-opaque (atom :composite-set-member)
         cases
         [{:label "root value"
           :values {"bad" root-opaque}
@@ -123,6 +125,13 @@
           :path [:values "bad" :map-key]}
          {:label "set member"
           :values {"bad" (hash-set set-member-opaque)}
+          :path [:values "bad" :set-member]}
+         {:label "composite map key"
+          :values {"bad" (hash-map [:nested composite-map-key-opaque]
+                                    :value)}
+          :path [:values "bad" :map-key]}
+         {:label "composite set member"
+          :values {"bad" (hash-set [:nested composite-set-member-opaque])}
           :path [:values "bad" :set-member]}]]
     (doseq [case-data cases]
       (let [label (:label case-data)

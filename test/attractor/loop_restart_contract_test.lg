@@ -713,4 +713,87 @@
     (is (= (set @session-starts) (set @session-ends)))
     (is (= 3 (count @session-ends)))))
 
+(deftest caller-fidelity-thread-ownership-differs-on-restart-and-completion
+  (let [make-registry
+        (fn [calls]
+          (let [registry
+                (handlers/make-handler-registry
+                  (interviewer/make-auto-approve-interviewer) nil)]
+            (handlers/register-handler!
+              registry "ownership.probe"
+              (fn [node _ _ _]
+                (swap! calls conj
+                       {:node (:id node)
+                        :threads (:fidelity_threads node)})
+                {:status :success}))
+            registry))
+        restart-graph
+        (parser/parse-dot
+          "digraph RestartOwnership {
+             start [shape=Mdiamond, type=ownership.probe]
+             second [type=ownership.probe]
+             exit [shape=Msquare]
+             start -> second [loop_restart=true]
+             second -> exit
+           }")
+        restart-closes (atom 0)
+        caller-restart-threads
+        (atom {"caller" {:close (fn [] (swap! restart-closes inc))}})
+        restart-calls (atom [])
+        restart-inits (atom [])
+        restart-result
+        (engine/run-pipeline
+          restart-graph
+          {:registry (make-registry restart-calls)
+           :logs-root (restart-test-root "caller-restart-ownership")
+           :fidelity-threads caller-restart-threads
+           :attractor.engine/on-segment-initialized
+           (fn [state]
+             (swap! restart-inits conj (:fidelity-threads state)))})
+        ordinary-graph
+        (parser/parse-dot
+          "digraph OrdinaryOwnership {
+             start [shape=Mdiamond, type=ownership.probe]
+             exit [shape=Msquare]
+             start -> exit
+           }")
+        ordinary-closes (atom 0)
+        ordinary-close (fn [] (swap! ordinary-closes inc))
+        caller-ordinary-threads (atom {"caller" {:close ordinary-close}})
+        ordinary-calls (atom [])
+        ordinary-inits (atom [])
+        ordinary-result
+        (engine/run-pipeline
+          ordinary-graph
+          {:registry (make-registry ordinary-calls)
+           :logs-root (restart-test-root "caller-ordinary-ownership")
+           :fidelity-threads caller-ordinary-threads
+           :attractor.engine/on-segment-initialized
+           (fn [state]
+             (swap! ordinary-inits conj (:fidelity-threads state)))})]
+    (is (= :success (:status restart-result)))
+    (is (= ["start" "second"] (mapv :node @restart-calls)))
+    (is (identical? caller-restart-threads
+                    (:threads (first @restart-calls))))
+    (is (identical? caller-restart-threads (first @restart-inits)))
+    (is (not (identical? caller-restart-threads
+                         (:threads (second @restart-calls)))))
+    (is (identical? (:threads (second @restart-calls))
+                    (second @restart-inits)))
+    (is (= 1 @restart-closes))
+    (is (empty? @caller-restart-threads))
+
+    (is (= :success (:status ordinary-result)))
+    (is (= ["start"] (mapv :node @ordinary-calls)))
+    (is (identical? caller-ordinary-threads
+                    (:threads (first @ordinary-calls))))
+    (is (identical? caller-ordinary-threads (first @ordinary-inits)))
+    (is (= 0 @ordinary-closes))
+    (is (= #{"caller"} (set (keys @caller-ordinary-threads))))
+    ;; The engine retained caller ownership; perform the caller's cleanup now.
+    (ordinary-close)
+    (reset! caller-ordinary-threads {})
+    (is (= 1 @ordinary-closes))
+    (is (empty? @caller-ordinary-threads))))
+
 ;; SCN-LOOP-RESTART COMPLETE
