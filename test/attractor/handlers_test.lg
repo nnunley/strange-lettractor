@@ -315,12 +315,27 @@
         (handlers/make-parallel-handler
           (fn [target-id _ _ _ _]
             (swap! received conj target-id)
-            {:status :success :boundary_node_id "join"}))
+            {:status :success :boundary_node_id "join"})
+          false true)
         result
         (handler {:id "fork" :attrs {}}
                  (context/make-context)
                  {:edges [{:from "fork" :to "branch"}]}
                  "run")]
+    (is (= :success (:status result)))
+    (is (= ["branch"] @received))))
+
+(deftest test-parallel-handler-four-argument-executor-remains-compatible
+  (let [received (atom [])
+        handler (handlers/make-parallel-handler
+                  (fn [target-id _ _ _]
+                    (swap! received conj target-id)
+                    {:status :success})
+                  false)
+        result (handler {:id "fork" :attrs {}}
+                        (context/make-context)
+                        {:edges [{:from "fork" :to "branch"}]}
+                        "run")]
     (is (= :success (:status result)))
     (is (= ["branch"] @received))))
 
@@ -333,7 +348,7 @@
                     (reset! cancelled true)
                     (is (true? (branch-cancelled?)))
                     {:status :success})
-                  false)
+                  false true)
         result (handler {:id "fork"
                          :cancelled? (fn [] @cancelled)
                          :attrs {:max_parallel 1}}
@@ -356,7 +371,7 @@
                       (if (branch-cancelled?)
                         (do @release {:status :cancelled})
                         (do (core/sleep 1) (recur)))))
-                  false)
+                  false true)
                 {:id "fork" :cancelled? (fn [] @cancelled)
                  :attrs {:max_parallel 1}}
                 (context/make-context)

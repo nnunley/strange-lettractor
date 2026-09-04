@@ -450,6 +450,7 @@
 
 (defn execute-subgraph [branch-start ctx graph logs-root registry on-event retry-options]
   (let [start-node-id (if (map? branch-start) (:to branch-start) branch-start)
+        cancelled? (or (:cancelled? retry-options) (fn [] false))
         incoming-branch-edge
         (if (map? branch-start)
           branch-start
@@ -462,6 +463,9 @@
          completed-nodes []
          node-outcomes {}]
     (cond
+      (or (= :cancelled (:status last-outcome)) (cancelled?))
+      {:status :cancelled :failure_reason "Pipeline cancelled"}
+
       (nil? current-node)
       {:status :fail
        :failure_reason (str "Parallel branch target '" start-node-id "' does not exist")}
@@ -533,7 +537,7 @@
               {:status :fail
                :failure_reason
                "Parallel branch executor is not initialized"}))
-          true)
+          true true)
         manager-handler (handlers/make-manager-loop-handler manager-runtime)
         default-parallel? (identical?
                             (get original "parallel")
@@ -597,7 +601,10 @@
            child-registry (clone-handler-registry registry)
            child-context (context/make-context)
            child-stop (atom false)
-           child-cancelled? (fn [] (or @child-stop (cancelled?)))
+           manager-cancelled? (or (:cancelled? manager-node) (fn [] false))
+           child-cancelled? (fn [] (or @child-stop
+                                       (cancelled?)
+                                       (manager-cancelled?)))
            manager-node-id (:id manager-node)
            state (atom {:status :running :outcome :running
                         :active_stage "" :node_outcomes {}

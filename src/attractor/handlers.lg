@@ -249,7 +249,7 @@
 
 ;; Parallel Handler (Section 4.8)
 ;; Executes multiple branches concurrently with bounded parallelism
-(defn- make-parallel-handler* [execute-branch-fn pass-edge?]
+(defn- make-parallel-handler* [execute-branch-fn pass-edge? cancellation-aware?]
   (fn [node ctx graph logs-root]
     (let [branches (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
           cancelled? (or (:cancelled? node) (fn [] false))
@@ -271,7 +271,9 @@
                                         branch-ctx (context/ctx-clone ctx)
                                         branch-logs (str logs-root "/branches/" target-id)
                                         branch-start (if pass-edge? branch-edge target-id)
-                                        result (execute-branch-fn branch-start branch-ctx graph branch-logs cancelled?)]
+                                        result (if cancellation-aware?
+                                                 (execute-branch-fn branch-start branch-ctx graph branch-logs cancelled?)
+                                                 (execute-branch-fn branch-start branch-ctx graph branch-logs))]
                                     (assoc result :id target-id :node_id target-id)))
                                 batch))]
                     (recur (drop max-parallel remaining)
@@ -295,9 +297,11 @@
 
 (defn make-parallel-handler
   ([execute-branch-fn]
-   (make-parallel-handler* execute-branch-fn false))
+   (make-parallel-handler* execute-branch-fn false false))
   ([execute-branch-fn pass-edge?]
-   (make-parallel-handler* execute-branch-fn pass-edge?)))
+   (make-parallel-handler* execute-branch-fn pass-edge? false))
+  ([execute-branch-fn pass-edge? cancellation-aware?]
+   (make-parallel-handler* execute-branch-fn pass-edge? cancellation-aware?)))
 
 ;; Fan-In Handler (Section 4.9)
 (defn handle-fan-in [node ctx _graph _logs-root]
@@ -518,7 +522,7 @@
                (execute-fn branch-edge branch-ctx graph logs-root branch-cancelled?)
                {:status :fail
                 :failure_reason "Parallel branch executor is not initialized"}))
-           true)
+           true true)
          manager-handler (make-manager-loop-handler manager-runtime)]
      (atom {"start" handle-start
             "exit" handle-exit

@@ -1,6 +1,7 @@
 (ns attractor.engine-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [clojure.core :as core]
             [attractor.parser :as p]
             [attractor.engine :as e]
             [attractor.context :as c]
@@ -762,6 +763,28 @@ digraph Gate {
                   :branch-cancelled? (fn [] true)})]
     (is (= :cancelled (:status result)))
     (is (true? @observed))))
+
+(deftest test-execute-subgraph-stops-before-next-node-after-cancellation
+  (let [seen (atom [])
+        graph (p/parse-dot
+                "digraph G {
+                   first [shape=box]
+                   second [shape=box]
+                   first -> second
+                 }")
+        backend (fn [node _ _]
+                  (swap! seen conj (:id node))
+                  (if (= "first" (:id node))
+                    {:status :cancelled}
+                    {:status :success}))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/execute-subgraph
+                 "first" (c/make-context) graph
+                 (str (os/temp-dir) "/test_engine_subgraph_cancel-next-" (random-uuid))
+                 registry (fn [_] nil) {:retry-counts (atom {})})]
+    (is (= :cancelled (:status result)))
+    (is (= ["first"] @seen))))
 
 (deftest test-manager-node-autostarts-a-real-child-pipeline
   (let [child-dotfile "test_engine_manager_child.dot"
