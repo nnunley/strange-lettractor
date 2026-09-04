@@ -152,6 +152,46 @@
     (is (= :cancelled (:status outcome)))
     (is (not= "must lose" (:notes outcome)))))
 
+(deftest handler-returned-cancellation-emits-no-completion-or-retry-event
+  (let [logs (test-logs "handler-cancel-events")
+        events (atom [])
+        outcome
+        (engine/execute-with-retry
+          (fn [_ _ _ _]
+            {:status :cancelled :failure_reason "handler cancelled"})
+          {:id "stage" :max_retries 1}
+          (context/make-context) {} logs #(swap! events conj %) {})]
+    (is (= :cancelled (:status outcome)))
+    (is (empty?
+          (filter #(or (= :stage.completed (:type %))
+                       (= :stage.retrying (:type %))
+                       (and (= :stage.failed (:type %))
+                            (:will_retry %)))
+                  @events)))))
+
+(deftest pipeline-cancellation-wins-events-from-a-concurrent-retryable-throw
+  (let [logs (test-logs "throw-cancel-events")
+        events (atom [])
+        cancelled (atom false)
+        outcome
+        (engine/execute-with-retry
+          (fn [_ _ _ _]
+            (reset! cancelled true)
+            (throw (ex-info "transient after cancellation"
+                            {:category :network_error
+                             :retryable true})))
+          {:id "stage" :max_retries 1}
+          (context/make-context) {} logs #(swap! events conj %)
+          {:cancelled? (fn [] @cancelled)
+           :sleep-fn (fn [_] nil)})]
+    (is (= :cancelled (:status outcome)))
+    (is (empty?
+          (filter #(or (= :stage.completed (:type %))
+                       (= :stage.retrying (:type %))
+                       (and (= :stage.failed (:type %))
+                            (:will_retry %)))
+                  @events)))))
+
 (deftest cancellation-that-arrives-during-status-resolution-wins
   (let [logs (test-logs "cancel-during-resolve")
         events (atom [])
@@ -250,6 +290,44 @@
            ["non-string-or-keyword status" {:status 1}]
            ["invalid string status" {:status "unknown"}]
            ["invalid keyword status" {:status :skipped}]]]
+    (testing label
+      (let [result (try
+                     {:json (status/outcome->status-json outcome)}
+                     (catch Object error {:error error}))]
+        (is (= :status_contract_error
+               (:category (ex-data (:error result)))))
+        (is (= false (:retryable (ex-data (:error result)))))
+        (is (nil? (:json result)))))))
+
+(deftest status-codec-round-trips-valid-appendix-c-fields
+  (doseq [[label outcome expected]
+          [["keyword status and every optional"
+            {:status :partial_success
+             :preferred_label "Review"
+             :suggested_next_ids ["review" "done"]
+             :context_updates {"answer" 42}
+             :notes "ready"
+             :failure_reason "internal only"
+             :unknown "ignored"}
+            {"outcome" "partial_success"
+             "preferred_label" "Review"
+             "suggested_next_ids" ["review" "done"]
+             "context_updates" {"answer" 42}
+             "notes" "ready"}]
+           ["string status and absent optionals"
+            {"status" "success" "unknown" true}
+            {"outcome" "success"}]]]
+    (testing label
+      (is (= expected
+             (json/read-json (status/outcome->status-json outcome)))))))
+
+(deftest status-codec-rejects-invalid-appendix-c-optionals
+  (doseq [[label outcome]
+          [["preferred label" {:status :success :preferred_label 1}]
+           ["suggested IDs collection" {:status :success :suggested_next_ids "next"}]
+           ["suggested ID entry" {:status :success :suggested_next_ids ["next" 2]}]
+           ["context updates" {:status :success :context_updates []}]
+           ["notes" {:status :success :notes 9}]]]
     (testing label
       (let [result (try
                      {:json (status/outcome->status-json outcome)}

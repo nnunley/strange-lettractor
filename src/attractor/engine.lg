@@ -237,62 +237,15 @@
     (merge {:status :fail :failure_reason (str error)}
            (select-keys details [:retryable :category :context_updates]))))
 
-(def ^:private status-values
-  #{:success :retry :fail :partial_success})
-
 (defn- status-contract-failure [reason]
   {:status :fail
    :category :status_contract_error
    :retryable false
    :failure_reason reason})
 
-(defn- status-field-present? [value field]
-  (or (contains? value field)
-      (contains? value (name field))))
-
-(defn- status-field [value field]
-  (if (contains? value field)
-    (get value field)
-    (get value (name field))))
-
-(defn- normalize-status-value [value]
-  (let [status (cond
-                 (keyword? value) value
-                 (string? value) (keyword value)
-                 :else nil)]
-    (when (contains? status-values status) status)))
-
-(defn- valid-status-optionals? [value]
-  (and
-    (or (not (status-field-present? value :preferred_label))
-        (string? (status-field value :preferred_label)))
-    (or (not (status-field-present? value :suggested_next_ids))
-        (let [ids (status-field value :suggested_next_ids)]
-          (and (sequential? ids) (every? string? ids))))
-    (or (not (status-field-present? value :context_updates))
-        (map? (status-field value :context_updates)))
-    (or (not (status-field-present? value :notes))
-        (string? (status-field value :notes)))))
-
-(defn- normalize-status-contract [value status-field-name]
-  (let [status (normalize-status-value (status-field value status-field-name))]
-    (when (and (map? value)
-               (status-field-present? value status-field-name)
-               status
-               (valid-status-optionals? value))
-      (cond-> {:status status}
-        (status-field-present? value :preferred_label)
-        (assoc :preferred_label (status-field value :preferred_label))
-        (status-field-present? value :suggested_next_ids)
-        (assoc :suggested_next_ids (vec (status-field value :suggested_next_ids)))
-        (status-field-present? value :context_updates)
-        (assoc :context_updates (status-field value :context_updates))
-        (status-field-present? value :notes)
-        (assoc :notes (status-field value :notes))))))
-
 (defn- normalize-handler-outcome [value]
   (when-let [contract (and (map? value)
-                           (normalize-status-contract value :status))]
+                           (status/normalize-contract value :status))]
     ;; Handler outcomes may contain engine-only details such as artifacts or a
     ;; failure reason. Preserve those while canonicalizing contract fields.
     (merge (dissoc value
@@ -320,7 +273,7 @@
       (try
         (let [value (json/read-json (io/slurp path))
               outcome (and (map? value)
-                           (normalize-status-contract value :outcome))]
+                           (status/normalize-contract value :outcome))]
           (if outcome
             {:present? true :outcome outcome}
             {:present? true
@@ -498,6 +451,9 @@
             st (:status outcome)]
 
         (cond
+          (= st :cancelled)
+          outcome
+
           error
           (if (and ((:should_retry policy) error)
                    (< attempt max-attempts))

@@ -4,26 +4,6 @@
 (def ^:private allowed-statuses
   #{:success :retry :fail :partial_success})
 
-(defn- explicit-status [outcome]
-  (let [present? (and (map? outcome)
-                      (or (contains? outcome :status)
-                          (contains? outcome "status")))
-        value (when present?
-                (if (contains? outcome :status)
-                  (:status outcome)
-                  (get outcome "status")))
-        normalized (cond
-                     (keyword? value) value
-                     (string? value) (keyword value)
-                     :else nil)]
-    (if (and present? (contains? allowed-statuses normalized))
-      normalized
-      (throw
-        (ex-info "Outcome requires an explicit allowed status"
-                 {:category :status_contract_error
-                  :retryable false
-                  :status value})))))
-
 (defn json-safe-object-keys [value]
   (cond
     (map? value)
@@ -47,22 +27,64 @@
     (get outcome field)
     (get outcome (name field))))
 
+(defn- normalize-status-value [value]
+  (let [normalized (cond
+                     (keyword? value) value
+                     (string? value) (keyword value)
+                     :else nil)]
+    (when (contains? allowed-statuses normalized)
+      normalized)))
+
+(defn- valid-optionals? [value]
+  (and
+    (or (not (field-present? value :preferred_label))
+        (string? (field-value value :preferred_label)))
+    (or (not (field-present? value :suggested_next_ids))
+        (let [ids (field-value value :suggested_next_ids)]
+          (and (sequential? ids) (every? string? ids))))
+    (or (not (field-present? value :context_updates))
+        (map? (field-value value :context_updates)))
+    (or (not (field-present? value :notes))
+        (string? (field-value value :notes)))))
+
+(defn normalize-contract [value status-field]
+  (let [normalized-status
+        (when (and (map? value) (field-present? value status-field))
+          (normalize-status-value (field-value value status-field)))]
+    (when (and normalized-status (valid-optionals? value))
+      (cond-> {:status normalized-status}
+        (field-present? value :preferred_label)
+        (assoc :preferred_label (field-value value :preferred_label))
+
+        (field-present? value :suggested_next_ids)
+        (assoc :suggested_next_ids
+               (vec (field-value value :suggested_next_ids)))
+
+        (field-present? value :context_updates)
+        (assoc :context_updates (field-value value :context_updates))
+
+        (field-present? value :notes)
+        (assoc :notes (field-value value :notes))))))
+
 (defn outcome->status-map [outcome]
-  (let [status-name (name (explicit-status outcome))]
-    (cond-> {:outcome status-name}
-      (field-present? outcome :preferred_label)
-      (assoc :preferred_label (field-value outcome :preferred_label))
+  (if-let [normalized (normalize-contract outcome :status)]
+    (cond-> {:outcome (name (:status normalized))}
+      (contains? normalized :preferred_label)
+      (assoc :preferred_label (:preferred_label normalized))
 
-      (field-present? outcome :suggested_next_ids)
-      (assoc :suggested_next_ids (field-value outcome :suggested_next_ids))
+      (contains? normalized :suggested_next_ids)
+      (assoc :suggested_next_ids (:suggested_next_ids normalized))
 
-      (field-present? outcome :context_updates)
+      (contains? normalized :context_updates)
       (assoc :context_updates
-             (json-safe-object-keys
-               (field-value outcome :context_updates)))
+             (json-safe-object-keys (:context_updates normalized)))
 
-      (field-present? outcome :notes)
-      (assoc :notes (field-value outcome :notes)))))
+      (contains? normalized :notes)
+      (assoc :notes (:notes normalized)))
+    (throw
+      (ex-info "Outcome violates the status file contract"
+               {:category :status_contract_error
+                :retryable false}))))
 
 (defn outcome->status-json [outcome]
   (json/write-json (outcome->status-map outcome)))
