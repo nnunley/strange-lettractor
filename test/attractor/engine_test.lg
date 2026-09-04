@@ -282,12 +282,19 @@ digraph Gate {
   (let [clock (atom 0)
         cancelled (atom false)
         deadline-observed (promise)
+        cancellation-issued (promise)
+        pipeline-observed (promise)
+        release-handler (promise)
         attempts (atom 0)
         reason (atom nil)
         events (atom [])
-        _ (core/future
-            (deref deadline-observed 1000 :not-observed)
-            (reset! cancelled true))
+        coordinator
+        (core/future
+          (deref deadline-observed 1000 :not-observed)
+          (reset! cancelled true)
+          (deliver cancellation-issued :issued)
+          (deref pipeline-observed 1000 :not-observed)
+          (deliver release-handler :released))
         outcome
         (e/execute-with-retry
           (fn [node _ _ _]
@@ -296,19 +303,25 @@ digraph Gate {
             (loop []
               (if ((:cancelled? node))
                 (do
-                  (deliver deadline-observed :deadline)
-                  ;; The pipeline cancellation arrives while the engine has
-                  ;; joined this handler after its deadline signal.
-                  (loop [waits 0]
-                    (if (or (= :pipeline_cancelled
-                               ((:cancellation_reason node)))
-                            (>= waits 50))
-                      (do
-                        (reset! reason ((:cancellation_reason node)))
-                        {:status :success})
-                      (do
-                        (core/sleep 1)
-                        (recur (inc waits))))))
+                  ;; This acknowledges the engine's deadline signal before
+                  ;; the coordinator issues pipeline cancellation.
+                  (deliver deadline-observed
+                           ((:cancellation_reason node)))
+                  (deref cancellation-issued 1000 :not-issued)
+                  (loop []
+                    (let [state ((:cancellation_reason node))]
+                      (cond
+                        (= :pipeline_cancelled state)
+                        (do
+                          (deliver pipeline-observed state)
+                          (deref release-handler 1000 :released)
+                          (reset! reason state)
+                          {:status :success})
+
+                        :else
+                        (do
+                          (core/sleep 1)
+                          (recur))))))
                 (do
                   (core/sleep 1)
                   (recur)))))
@@ -316,10 +329,38 @@ digraph Gate {
           (c/make-context) {} "" #(swap! events conj %)
           {:now-ms (fn [] @clock)
            :cancelled? (fn [] @cancelled)
+           :sleep-fn (fn [_] nil)})
+        deadline-state (deref deadline-observed 1000 :not-observed)
+        pipeline-state (deref pipeline-observed 1000 :not-observed)]
+    (is (= :cancelled (:status outcome)))
+    (is (= 1 @attempts))
+    (is (= :deadline deadline-state))
+    (is (= :pipeline_cancelled pipeline-state))
+    (is (= :pipeline_cancelled @reason))
+    (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
+
+(deftest test-pipeline-cancellation-from-retry-failure-skips-the-next-attempt
+  (let [cancelled (atom false)
+        attempts (atom 0)
+        events (atom [])
+        outcome
+        (e/execute-with-retry
+          (fn [_ _ _ _]
+            (swap! attempts inc)
+            (throw (ex-info "transient timeout"
+                            {:category :timeout_error :retryable true})))
+          {:id "cancel-between-retries" :max_retries 1}
+          (c/make-context) {} ""
+          (fn [event]
+            (swap! events conj event)
+            (when (and (= :stage.failed (:type event))
+                       (:will_retry event))
+              (reset! cancelled true)))
+          {:cancelled? (fn [] @cancelled)
            :sleep-fn (fn [_] nil)})]
     (is (= :cancelled (:status outcome)))
     (is (= 1 @attempts))
-    (is (= :pipeline_cancelled @reason))
+    (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
     (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
 
 (deftest test-explicitly-non-retryable-timeout-like-error-is-terminal
@@ -362,6 +403,7 @@ digraph Gate {
 
 (deftest test-invalid-or-non-positive-node-timeout-is-terminal-before-handler
   (doseq [timeout ["invalid" "0ms" 0 -1
+                   1e100 9223372036854775807
                    "999999999999999999999999999999999999999999999999s"]]
     (let [attempts (atom 0)
           events (atom [])
@@ -371,7 +413,8 @@ digraph Gate {
               (swap! attempts inc)
               {:status :success})
             {:id "invalid-timeout" :timeout timeout :max_retries 3}
-            (c/make-context) {} "" #(swap! events conj %) {})]
+            (c/make-context) {} "" #(swap! events conj %)
+            {:now-ms (fn [] 1)})]
       (is (= :fail (:status outcome)))
       (is (= :configuration_error (:category outcome)))
       (is (= false (:retryable outcome)))

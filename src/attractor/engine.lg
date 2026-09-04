@@ -222,6 +222,12 @@
                :attempt attempt :delay_ms delay-ms})
     ((:sleep-fn runtime) delay-ms)))
 
+(defn- timeout-configuration-error [node]
+  (ex-info (str "Invalid or non-positive node timeout for '" (:id node) "'")
+           {:category :configuration_error
+            :retryable false
+            :node_id (:id node)}))
+
 (defn- resolve-node-timeout [node]
   (let [configured-timeout (:timeout node)]
     (if (nil? configured-timeout)
@@ -229,13 +235,10 @@
       (let [parsed (try
                      (parser/parse-duration-ms configured-timeout)
                      (catch Object _ ::invalid-timeout))]
-        (if (and (number? parsed) (pos? parsed))
+        (if (and (number? parsed) (pos? parsed)
+                 (<= parsed Long/MAX_VALUE))
           {:timeout-ms (long parsed)}
-          {:error
-           (ex-info (str "Invalid or non-positive node timeout for '" (:id node) "'")
-                    {:category :configuration_error
-                     :retryable false
-                     :node_id (:id node)})})))))
+          {:error (timeout-configuration-error node)})))))
 
 (defn- error-outcome [error]
   (let [details (or (ex-data error) {})]
@@ -253,19 +256,22 @@
 
 (defn- execute-with-attempt-timeout
   [handler node ctx graph logs-root options timeout-ms]
-  (let [controller (atom :running)
-        pipeline-cancelled? (or (:cancelled? options) (fn [] false))
-        timed-node (assoc node
-                          :cancelled? (fn [] (not= :running @controller))
-                          :cancellation_reason (fn [] @controller))
-        now-ms (or (:now-ms options) (fn [] (System/currentTimeMillis)))
-        deadline (+ (now-ms) timeout-ms)
-        task (core/future
-               (try
-                 {:outcome (handler timed-node ctx graph logs-root)}
-                 (catch Object e {:error e})))
-        pending ::pending]
-    (loop []
+  (let [now-ms (or (:now-ms options) (fn [] (System/currentTimeMillis)))
+        started-at (now-ms)]
+    (if (> started-at (- Long/MAX_VALUE timeout-ms))
+      {:error (timeout-configuration-error node)}
+      (let [controller (atom :running)
+            pipeline-cancelled? (or (:cancelled? options) (fn [] false))
+            timed-node (assoc node
+                              :cancelled? (fn [] (not= :running @controller))
+                              :cancellation_reason (fn [] @controller))
+            deadline (+ started-at timeout-ms)
+            task (core/future
+                   (try
+                     {:outcome (handler timed-node ctx graph logs-root)}
+                     (catch Object e {:error e})))
+            pending ::pending]
+        (loop []
       (when (pipeline-cancelled?)
         (signal-cancellation! controller :pipeline_cancelled))
       (let [execution (deref task 5 pending)]
@@ -322,7 +328,7 @@
           execution
 
           :else
-          (recur))))))
+          (recur))))))))
 
 ;; Execute node with retry logic (Section 3.5 & 3.6)
 (defn execute-with-retry
@@ -336,14 +342,18 @@
          runtime {:retry-counts retry-counts
                   :sleep-fn (or (:sleep-fn options) core/sleep)
                   :random-fn (or (:random-fn options) rand)}
+         pipeline-cancelled? (or (:cancelled? options) (fn [] false))
          timeout-config (resolve-node-timeout node)
          prior-retries (or (get @retry-counts node-id)
                            (get @retry-counts (keyword node-id))
                            0)]
 
     (loop [attempt (inc prior-retries)]
-      (on-event {:type :stage.started :node_id node-id :attempt attempt :max_attempts max-attempts})
-      (let [execution (if-let [configuration-error (:error timeout-config)]
+      (if (pipeline-cancelled?)
+        {:status :cancelled :failure_reason "Pipeline cancelled"}
+        (let [_ (on-event {:type :stage.started :node_id node-id
+                           :attempt attempt :max_attempts max-attempts})
+            execution (if-let [configuration-error (:error timeout-config)]
                         {:error configuration-error}
                         (if-let [timeout-ms (:timeout-ms timeout-config)]
                           (execute-with-attempt-timeout handler node ctx graph logs-root
@@ -363,8 +373,11 @@
             (do
               (on-event {:type :stage.failed :node_id node-id
                          :outcome outcome :will_retry true})
-              (schedule-retry! runtime policy node-id attempt on-event)
-              (recur (inc attempt)))
+              (if (pipeline-cancelled?)
+                {:status :cancelled :failure_reason "Pipeline cancelled"}
+                (do
+                  (schedule-retry! runtime policy node-id attempt on-event)
+                  (recur (inc attempt)))))
             (do
               (on-event {:type :stage.failed :node_id node-id
                          :outcome outcome :will_retry false})
@@ -404,7 +417,7 @@
           :else
           (do
             (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
-            outcome)))))))
+            outcome))))))))
 
 (defn- incoming-edge-for [graph completed-nodes node-id]
   (when-let [previous-node-id (last completed-nodes)]
