@@ -49,17 +49,7 @@
         props-for (fn [node-id]
                     (stylesheet/resolve-node-model-props
                       (parser/find-node graph node-id) rules (:attrs graph)))
-        model-for (fn [node-id] (:llm_model (props-for node-id)))
-        validation-graph
-        (parser/parse-dot
-          "digraph Invalid {
-             graph [model_stylesheet=\"not a stylesheet\"]
-             start [shape=Mdiamond]
-             invalid [type=unknown, fidelity=invalid, retry_target=missing]
-             exit [shape=Msquare]
-             start -> exit
-             exit -> start [condition=\"a==b\"]
-           }")]
+        model-for (fn [node-id] (:llm_model (props-for node-id)))]
     (testing "label-after updates explicit and edge-introduced nodes"
       (is (= "explicit,late-label" (:class (parser/find-node graph "before"))))
       (is (= "late-label" (:class (parser/find-node graph "chained"))))
@@ -108,28 +98,89 @@
       (is (= "outer-scope" (:class (parser/find-node graph "outer_after"))))
       (is (= "outer-scope"
              (:subgraph_class (parser/find-node graph "outer_after"))))
-      (is (= "outer-model" (model-for "outer_after"))))
-    (testing "built-in diagnostics use the canonical public schema"
-      (let [built-ins (validation/validate validation-graph)
-        allowed-keys #{:rule :severity :message :node_id :edge :fix}
+      (is (= "outer-model" (model-for "outer_after"))))))
+
+;; SCN-SUBGRAPH-LABEL COMPLETE
+
+(defn- validation-fixtures []
+  (let [invalid (parser/parse-dot
+                  "digraph Invalid {
+                     graph [model_stylesheet=\"not a stylesheet\"]
+                     start [shape=Mdiamond]
+                     invalid [type=unknown, fidelity=invalid, retry_target=missing]
+                     gate [goal_gate=true]
+                     exit [shape=Msquare]
+                     start -> exit
+                     exit -> start [condition=\"a==b\"]
+                   }")
+        missing-boundaries (parser/parse-dot
+                             "digraph Missing { lone [shape=box] }")
+        manual (-> (parser/parse-dot
+                     "digraph Manual {
+                        start [shape=Mdiamond]
+                        exit [shape=Msquare]
+                        start -> exit
+                      }")
+                   (assoc-in [:nodes "blank"]
+                             {:id "blank"
+                              :shape "box"
+                              :type "codergen"
+                              :label ""
+                              :prompt ""
+                              :class ""
+                              :subgraph_class ""
+                              :attrs {}})
+                   (update :edges conj
+                           {:from "ghost" :to "missing" :condition ""}))]
+    [invalid missing-boundaries manual]))
+
+(defn- canonical-diagnostic? [diag]
+  (let [allowed-keys #{:rule :severity :message :node_id :edge :fix}]
+    (and (every? allowed-keys (keys diag))
+         (contains? diag :rule)
+         (contains? diag :severity)
+         (contains? diag :message)
+         (string? (:rule diag))
+         (contains? #{:error :warning :info} (:severity diag))
+         (string? (:message diag))
+         (not (contains? diag :node-id))
+         (or (not (contains? diag :node_id))
+             (string? (:node_id diag)))
+         (or (not (contains? diag :edge))
+             (and (vector? (:edge diag))
+                  (= 2 (count (:edge diag)))
+                  (every? string? (:edge diag))))
+         (or (not (contains? diag :fix))
+             (string? (:fix diag))))))
+
+(deftest validation-api-preserves-schema-order-and-complete-results
+  (let [fixtures (validation-fixtures)
+        validation-graph (first fixtures)
+        built-in-diags (vec (mapcat validation/validate fixtures))
+        expected-rules #{"start_node"
+                         "terminal_node"
+                         "start_no_incoming"
+                         "exit_no_outgoing"
+                         "edge_target_exists"
+                         "reachability"
+                         "condition_syntax"
+                         "stylesheet_syntax"
+                         "type_known"
+                         "fidelity_valid"
+                         "retry_target_exists"
+                         "goal_gate_has_retry"
+                         "prompt_on_llm_nodes"}
+        emitted-rules (set (map :rule built-in-diags))
         reachability (first (filter (fn [diag]
                                       (= "reachability" (:rule diag)))
-                                    built-ins))]
-        (is (seq built-ins))
-        (is (every? (fn [diag]
-                      (and (every? allowed-keys (keys diag))
-                           (contains? diag :rule)
-                           (contains? diag :severity)
-                           (contains? diag :message)
-                           (string? (:rule diag))
-                           (contains? #{:error :warning :info} (:severity diag))
-                           (string? (:message diag))))
-                    built-ins))
-        (is (some (fn [diag] (= "stylesheet_syntax" (:rule diag))) built-ins))
-        (is (some (fn [diag] (= "condition_syntax" (:rule diag))) built-ins))
-        (is (= :error (:severity reachability)))
-        (is (= "invalid" (:node_id reachability)))
-        (is (not (contains? reachability :node-id)))))
+                                    built-in-diags))]
+    (testing "every built-in rule family uses the canonical public schema"
+      (is (every? emitted-rules expected-rules))
+      (is (every? canonical-diagnostic? built-in-diags))
+      (is (= :error (:severity reachability)))
+      (is (string? (:node_id reachability)))
+      (is (some :node_id built-in-diags))
+      (is (some :edge built-in-diags)))
     (testing "custom rules run after built-ins in registration and result order"
       (let [built-ins (validation/validate validation-graph)
             calls (atom [])
@@ -153,7 +204,8 @@
                           [(nth custom-diags 2)])
             diagnostics (validation/validate validation-graph [first-rule second-rule])]
         (is (= [:first :second] @calls))
-        (is (= (vec (concat built-ins custom-diags)) diagnostics))))
+        (is (= (vec (concat built-ins custom-diags)) diagnostics))
+        (is (every? canonical-diagnostic? diagnostics))))
     (testing "errors carry the complete diagnostics vector"
       (let [custom-rules [(fn [_]
                             [{:rule "custom_warning"
@@ -189,7 +241,5 @@
             expected (validation/validate valid-graph custom-rules)]
         (is (= expected
                (validation/validate-or-raise valid-graph custom-rules)))))))
-
-;; SCN-SUBGRAPH-LABEL COMPLETE
 
 ;; SCN-VALIDATION PARTIAL
