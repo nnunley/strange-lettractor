@@ -141,6 +141,20 @@
               :failure_reason (str "Tool execution exception: " e)}
              (select-keys (or (ex-data e) {}) [:category :retryable])))))
 
+(defn- json-safe-object-keys [value]
+  (cond
+    (map? value)
+    (into {}
+          (map (fn [[key nested]]
+                 [(if (keyword? key) key (keyword (str key)))
+                  (json-safe-object-keys nested)]))
+          value)
+
+    (sequential? value)
+    (mapv json-safe-object-keys value)
+
+    :else value))
+
 (defn- outcome-to-status-json [outcome]
   (let [st (or (:status outcome) (get outcome "status") :success)
         st-str (if (keyword? st) (name st) (str st))]
@@ -148,7 +162,9 @@
      :status st-str
      :preferred_label (or (:preferred_label outcome) (get outcome "preferred_label") "")
      :suggested_next_ids (or (:suggested_next_ids outcome) (get outcome "suggested_next_ids") [])
-     :context_updates (or (:context_updates outcome) (get outcome "context_updates") {})
+     :context_updates (json-safe-object-keys
+                        (or (:context_updates outcome)
+                            (get outcome "context_updates") {}))
      :notes (or (:notes outcome) (get outcome "notes") "")}))
 
 ;; Codergen Handler (Section 4.5)

@@ -1,0 +1,186 @@
+(ns attractor.status-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [attractor.engine :as engine]
+            [attractor.context :as context]
+            [json :as json]
+            [io :as io]
+            [os :as os]))
+
+(defn- test-logs [label]
+  (str (os/temp-dir) "/attractor-status-contract-" label "-"
+       (System/nanoTime)))
+
+(defn- status-path [logs node-id]
+  (str logs "/" node-id "/status.json"))
+
+(defn- write-status! [logs node-id value]
+  (let [stage-dir (str logs "/" node-id)]
+    (os/sh "mkdir" "-p" stage-dir)
+    (io/spit (status-path logs node-id)
+             (if (string? value) value (json/write-json value)))))
+
+(defn- execute [handler node logs events]
+  (engine/execute-with-retry handler node (context/make-context) {} logs
+                             #(swap! events conj %)
+                             {:sleep-fn (fn [_] nil)}))
+
+;; SCN-STATUS-FILE
+(deftest status-file-is-authoritative-and-normalized
+  (let [logs (test-logs "authoritative")
+        events (atom [])
+        outcome
+        (execute
+          (fn [_ _ _ _]
+            (write-status!
+              logs "stage"
+              "{\"outcome\":\"partial_success\",\"preferred_label\":\"Review\",\"suggested_next_ids\":[\"review\",\"done\"],\"context_updates\":{\"answer\":42},\"notes\":\"file wins\",\"unknown_field\":\"ignored\"}")
+            {:status :fail :failure_reason "handler loses"})
+          {:id "stage"} logs events)
+        completed (first (filter #(= :stage.completed (:type %)) @events))]
+    (is (= {:status :partial_success
+            :preferred_label "Review"
+            :suggested_next_ids ["review" "done"]
+            :context_updates {"answer" 42}
+            :notes "file wins"}
+           outcome))
+    (is (not (contains? outcome :unknown_field)))
+    (is (= outcome (:outcome completed)))))
+
+(deftest valid-handler-outcome-is-used-when-no-file-exists
+  (let [logs (test-logs "handler-fallback")
+        events (atom [])
+        outcome (execute (fn [_ _ _ _]
+                           {:status "success"
+                            :preferred_label "Next"
+                            :suggested_next_ids ["next"]
+                            :context_updates {"source" "handler"}
+                            :notes "fallback"})
+                         {:id "stage"} logs events)]
+    (is (= {:status :success
+            :preferred_label "Next"
+            :suggested_next_ids ["next"]
+            :context_updates {"source" "handler"}
+            :notes "fallback"}
+           outcome))))
+
+(deftest stale-status-is-cleared-before-every-attempt
+  (let [logs (test-logs "stale")
+        events (atom [])
+        attempts (atom 0)]
+    (write-status! logs "stage" {:outcome "fail" :notes "stale first attempt"})
+    (let [outcome
+          (execute
+            (fn [_ _ _ _]
+              (let [attempt (swap! attempts inc)]
+                (if (= attempt 1)
+                  (do
+                    (write-status! logs "stage" {:outcome "retry"})
+                    {:status :success})
+                  {:status :success :notes "fresh handler fallback"})))
+            {:id "stage" :max_retries 1} logs events)]
+      (is (= 2 @attempts))
+      (is (= :success (:status outcome)))
+      (is (= "fresh handler fallback" (:notes outcome)))
+      (is (= [:stage.started :stage.retrying :stage.started :stage.completed]
+             (mapv :type @events))))))
+
+(deftest malformed-or-invalid-status-is-a-terminal-failure
+  (let [invalid-values
+        ["{not-json"
+         []
+         {:notes "missing outcome"}
+         {:outcome 3}
+         {:outcome "unknown"}
+         {:outcome "success" :preferred_label 1}
+         {:outcome "success" :suggested_next_ids "next"}
+         {:outcome "success" :suggested_next_ids ["next" 2]}
+         {:outcome "success" :context_updates []}
+         {:outcome "success" :notes 9}]]
+    (doseq [[index invalid] (map-indexed vector invalid-values)]
+      (let [logs (test-logs (str "invalid-" index))
+            attempts (atom 0)
+            events (atom [])
+            outcome
+            (execute
+              (fn [_ _ _ _]
+                (swap! attempts inc)
+                (write-status! logs "stage" invalid)
+                {:status :success})
+              {:id "stage" :max_retries 2} logs events)]
+        (is (= :fail (:status outcome)))
+        (is (= :status_contract_error (:category outcome)))
+        (is (= false (:retryable outcome)))
+        (is (= 1 @attempts))
+        (is (= [:stage.started :stage.failed] (mapv :type @events)))))))
+
+;; SCN-AUTO-STATUS
+(deftest auto-status-synthesizes-the-exact-success-outcome
+  (let [logs (test-logs "auto")
+        events (atom [])
+        outcome (execute (fn [_ _ _ _] nil)
+                         {:id "stage" :auto_status true} logs events)]
+    (is (= {:status :success
+            :notes "auto-status: handler completed without writing status"}
+           outcome))))
+
+(deftest missing-file-and-invalid-handler-outcome-fails-without-auto-status
+  (let [logs (test-logs "missing")
+        events (atom [])
+        outcome (execute (fn [_ _ _ _] nil) {:id "stage"} logs events)]
+    (is (= :fail (:status outcome)))
+    (is (= :status_contract_error (:category outcome)))
+    (is (= false (:retryable outcome)))))
+
+(deftest cancellation-bypasses-a-conflicting-status-file
+  (let [logs (test-logs "cancel")
+        events (atom [])
+        cancelled (atom false)
+        outcome
+        (engine/execute-with-retry
+          (fn [_ _ _ _]
+            (write-status! logs "stage" {:outcome "success" :notes "must lose"})
+            (reset! cancelled true)
+            {:status :success})
+          {:id "stage"} (context/make-context) {} logs #(swap! events conj %)
+          {:cancelled? (fn [] @cancelled)})]
+    (is (= :cancelled (:status outcome)))
+    (is (not= "must lose" (:notes outcome)))))
+
+(deftest timeout-bypasses-a-status-file-written-by-the-handler
+  (let [logs (test-logs "timeout")
+        events (atom [])
+        outcome
+        (engine/execute-with-retry
+          (fn [node _ _ _]
+            (write-status! logs "stage" {:outcome "success" :notes "must lose"})
+            (loop []
+              (if ((:cancelled? node))
+                {:status :success}
+                (do (core/sleep 1) (recur)))))
+          {:id "stage" :timeout "10ms"}
+          (context/make-context) {} logs #(swap! events conj %) {})]
+    (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (not= "must lose" (:notes outcome)))))
+
+(deftest handler-error-bypasses-a-status-file-written-before-throwing
+  (let [logs (test-logs "error")
+        events (atom [])
+        attempts (atom 0)
+        outcome
+        (execute
+          (fn [_ _ _ _]
+            (swap! attempts inc)
+            (write-status! logs "stage" {:outcome "success" :notes "must lose"})
+            (throw (ex-info "handler failed"
+                            {:category :authentication_error
+                             :retryable false})))
+          {:id "stage" :max_retries 2} logs events)]
+    (is (= :fail (:status outcome)))
+    (is (= :authentication_error (:category outcome)))
+    (is (= false (:retryable outcome)))
+    (is (= 1 @attempts))
+    (is (not= "must lose" (:notes outcome)))
+    (is (= [:stage.started :stage.failed] (mapv :type @events)))))

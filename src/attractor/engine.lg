@@ -10,6 +10,20 @@
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]))
 
+(defn- json-safe-object-keys [value]
+  (cond
+    (map? value)
+    (into {}
+          (map (fn [[key nested]]
+                 [(if (keyword? key) key (keyword (str key)))
+                  (json-safe-object-keys nested)]))
+          value)
+
+    (sequential? value)
+    (mapv json-safe-object-keys value)
+
+    :else value))
+
 (defn- write-stage-status! [logs-root node-id outcome]
   (let [stage-dir (str logs-root "/" node-id)
         status (:status outcome)
@@ -21,7 +35,8 @@
                 :status status-name
                 :preferred_label (or (:preferred_label outcome) "")
                 :suggested_next_ids (or (:suggested_next_ids outcome) [])
-                :context_updates (or (:context_updates outcome) {})
+                :context_updates (json-safe-object-keys
+                                   (or (:context_updates outcome) {}))
                 :notes (or (:notes outcome) "")
                 :failure_reason (or (:failure_reason outcome) "")}))))
 
@@ -245,6 +260,118 @@
     (merge {:status :fail :failure_reason (str error)}
            (select-keys details [:retryable :category :context_updates]))))
 
+(def ^:private status-values
+  #{:success :retry :fail :partial_success})
+
+(defn- status-contract-failure [reason]
+  {:status :fail
+   :category :status_contract_error
+   :retryable false
+   :failure_reason reason})
+
+(defn- status-field-present? [value field]
+  (or (contains? value field)
+      (contains? value (name field))))
+
+(defn- status-field [value field]
+  (if (contains? value field)
+    (get value field)
+    (get value (name field))))
+
+(defn- normalize-status-value [value]
+  (let [status (cond
+                 (keyword? value) value
+                 (string? value) (keyword value)
+                 :else nil)]
+    (when (contains? status-values status) status)))
+
+(defn- valid-status-optionals? [value]
+  (and
+    (or (not (status-field-present? value :preferred_label))
+        (string? (status-field value :preferred_label)))
+    (or (not (status-field-present? value :suggested_next_ids))
+        (let [ids (status-field value :suggested_next_ids)]
+          (and (sequential? ids) (every? string? ids))))
+    (or (not (status-field-present? value :context_updates))
+        (map? (status-field value :context_updates)))
+    (or (not (status-field-present? value :notes))
+        (string? (status-field value :notes)))))
+
+(defn- normalize-status-contract [value status-field-name]
+  (let [status (normalize-status-value (status-field value status-field-name))]
+    (when (and (map? value)
+               (status-field-present? value status-field-name)
+               status
+               (valid-status-optionals? value))
+      (cond-> {:status status}
+        (status-field-present? value :preferred_label)
+        (assoc :preferred_label (status-field value :preferred_label))
+        (status-field-present? value :suggested_next_ids)
+        (assoc :suggested_next_ids (vec (status-field value :suggested_next_ids)))
+        (status-field-present? value :context_updates)
+        (assoc :context_updates (status-field value :context_updates))
+        (status-field-present? value :notes)
+        (assoc :notes (status-field value :notes))))))
+
+(defn- normalize-handler-outcome [value]
+  (when-let [contract (and (map? value)
+                           (normalize-status-contract value :status))]
+    ;; Handler outcomes may contain engine-only details such as artifacts or a
+    ;; failure reason. Preserve those while canonicalizing contract fields.
+    (merge (dissoc value
+                   "status" "preferred_label" "suggested_next_ids"
+                   "context_updates" "notes")
+           contract)))
+
+(defn- attempt-status-path [logs-root node-id]
+  (str logs-root "/" node-id "/status.json"))
+
+(defn- clear-attempt-status! [logs-root node-id]
+  (let [path (attempt-status-path logs-root node-id)]
+    (try
+      (when (io/file-exists? path)
+        (io/delete-file path))
+      nil
+      (catch Object error
+        (status-contract-failure
+          (str "Unable to clear stale status file '" path "': " error))))))
+
+(defn- read-attempt-status [logs-root node-id]
+  (let [path (attempt-status-path logs-root node-id)]
+    (if-not (io/file-exists? path)
+      {:present? false}
+      (try
+        (let [value (json/read-json (io/slurp path))
+              outcome (and (map? value)
+                           (normalize-status-contract value :outcome))]
+          (if outcome
+            {:present? true :outcome outcome}
+            {:present? true
+             :failure (status-contract-failure
+                        (str "Invalid status file '" path "'"))}))
+        (catch Object error
+          {:present? true
+           :failure (status-contract-failure
+                      (str "Malformed status file '" path "': " error))})))))
+
+(defn- resolve-attempt-outcome [logs-root node handler-outcome]
+  (let [file-result (read-attempt-status logs-root (:id node))]
+    (cond
+      (:failure file-result)
+      (:failure file-result)
+
+      (:present? file-result)
+      (:outcome file-result)
+
+      :else
+      (or (normalize-handler-outcome handler-outcome)
+          (when (:auto_status node)
+            {:status :success
+             :notes "auto-status: handler completed without writing status"})
+          (status-contract-failure
+            (str "Handler for node '" (:id node)
+                 "' produced neither status.json nor a valid Outcome"))))))
+
 (defn- signal-cancellation! [controller reason]
   (swap! controller
          (fn [current]
@@ -355,17 +482,34 @@
         {:status :cancelled :failure_reason "Pipeline cancelled"}
         (let [_ (on-event {:type :stage.started :node_id node-id
                            :attempt attempt :max_attempts max-attempts})
-            execution (if-let [configuration-error (:error timeout-config)]
-                        {:error configuration-error}
-                        (if-let [timeout-ms (:timeout-ms timeout-config)]
-                          (execute-with-attempt-timeout handler node ctx graph logs-root
-                                                        options timeout-ms)
-                          (try
-                            {:outcome (handler node ctx graph logs-root)}
-                            (catch Object e {:error e}))))
+            cleanup-failure (clear-attempt-status! logs-root node-id)
+            execution (if cleanup-failure
+                        {:resolved-outcome cleanup-failure}
+                        (if-let [configuration-error (:error timeout-config)]
+                          {:error configuration-error}
+                          (if-let [timeout-ms (:timeout-ms timeout-config)]
+                            (execute-with-attempt-timeout handler node ctx graph logs-root
+                                                          options timeout-ms)
+                            (try
+                              {:outcome (handler node ctx graph logs-root)}
+                              (catch Object e {:error e})))))
             error (:error execution)
-            outcome (or (:outcome execution)
-                        (error-outcome error))
+            handler-outcome (:outcome execution)
+            outcome (cond
+                      (pipeline-cancelled?)
+                      {:status :cancelled :failure_reason "Pipeline cancelled"}
+
+                      error
+                      (error-outcome error)
+
+                      (:resolved-outcome execution)
+                      (:resolved-outcome execution)
+
+                      (= :cancelled (:status handler-outcome))
+                      handler-outcome
+
+                      :else
+                      (resolve-attempt-outcome logs-root node handler-outcome))
             st (:status outcome)]
 
         (cond
