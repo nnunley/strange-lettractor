@@ -5,3 +5,4 @@ bin/
 *.log
 .env
 !.env.sample
+.worktrees/
