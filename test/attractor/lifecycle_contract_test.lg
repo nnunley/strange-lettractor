@@ -662,7 +662,61 @@
       (is (= "Serve" (context/ctx-get (:context completed) "graph.goal")))
       (is (= ["start" "work" "exit"] (:completed_nodes checkpoint)))
       (is (= :pipeline.started (:type (first @(:events completed)))))
-      (is (= :pipeline.completed (:type (last @(:events completed))))))))
+      (is (= :pipeline.completed (:type (last @(:events completed)))))))
+  (testing "a timed-out request cannot register or execute after preparation returns late"
+    (reset! server/active-pipelines {})
+    (let [source
+          "digraph DelayedServer {
+             start [shape=Mdiamond]
+             work [shape=box, prompt=\"Delayed work\"]
+             exit [shape=Msquare]
+             start -> work -> exit
+           }"
+          real-run pipeline/run
+          run-calls (atom [])
+          handler-calls (atom 0)
+          observed-events (atom [])
+          captured-context (atom nil)
+          captured-logs (atom nil)
+          completed (promise)
+          response
+          (with-redefs
+            [pipeline/run
+             (fn [dot-source options]
+               (swap! run-calls conj dot-source)
+               (reset! captured-context (:context options))
+               (reset! captured-logs (:logs-root options))
+               (handlers/register-handler!
+                 (:registry options) "codergen"
+                 (fn [_ _ _ _]
+                   (swap! handler-calls inc)
+                   {:status :success}))
+               (let [server-on-event (:on-event options)]
+                 (try
+                   (core/sleep 50)
+                   (real-run
+                     dot-source
+                     (assoc options :on-event
+                            (fn [event]
+                              (swap! observed-events conj event)
+                              (server-on-event event))))
+                   (finally
+                     (deliver completed :finished)))))]
+            (server/handle-start-pipeline
+              {:body source
+               :preparation-timeout-ms 5}))
+          future-result (deref completed 1000 :timeout)
+          ctx @captured-context
+          logs @captured-logs]
+      (is (= 400 (:status response)))
+      (is (= :finished future-result))
+      (is (= [source] @run-calls))
+      (is (= {} @server/active-pipelines))
+      (is (= 0 @handler-calls))
+      (is (= [] @observed-events))
+      (is (= {:values {} :logs []} @ctx))
+      (is (nil? (os/stat logs)))
+      (is (nil? (os/stat (str logs "/checkpoint.edn")))))))
 
 ;; SCN-VALIDATION COMPLETE
 ;; SCN-PUBLIC-LIFECYCLE COMPLETE

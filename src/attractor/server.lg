@@ -61,8 +61,9 @@
           cancelled (atom false)
           ctx (context/make-context)
           logs-dir (str "attractor_runs/" pipeline-id)
+          preparation-timeout-ms (or (:preparation-timeout-ms req) 30000)
           prepared-signal (promise)
-          registered? (atom false)]
+          preparation-phase (atom :waiting)]
 
       ;; Custom interviewer for web human-gates
       (let [web-interviewer (reify interviewer/IInterviewer
@@ -97,21 +98,32 @@
                        (swap! events-atom conj ev))
             on-prepared
             (fn [{:keys [graph diagnostics]}]
-              ;; Publish prepared state before allowing the HTTP response.
-              (swap! active-pipelines assoc pipeline-id
-                     {:id pipeline-id
-                      :graph graph
-                      :dot dot-source
-                      :status :running
-                      :diagnostics diagnostics
-                      :events events-atom
-                      :questions questions-atom
-                      :pending-answers pending-answers
-                      :cancelled cancelled
-                      :context ctx
-                      :logs_root logs-dir})
-              (reset! registered? true)
-              (deliver prepared-signal {:graph graph}))]
+              (if (compare-and-set! preparation-phase :waiting :registering)
+                (try
+                  ;; Publish prepared state before allowing the HTTP response.
+                  (swap! active-pipelines assoc pipeline-id
+                         {:id pipeline-id
+                          :graph graph
+                          :dot dot-source
+                          :status :running
+                          :diagnostics diagnostics
+                          :events events-atom
+                          :questions questions-atom
+                          :pending-answers pending-answers
+                          :cancelled cancelled
+                          :context ctx
+                          :logs_root logs-dir})
+                  (reset! preparation-phase :registered)
+                  (deliver prepared-signal {:graph graph})
+                  (catch Object e
+                    (swap! active-pipelines dissoc pipeline-id)
+                    (reset! preparation-phase :failed)
+                    (deliver prepared-signal {:error e})
+                    (throw e)))
+                (do
+                  (reset! cancelled true)
+                  (throw (ex-info "Pipeline preparation was abandoned"
+                                  {:category :preparation_abandoned})))))]
 
         ;; Run in background future
         (core/future
@@ -125,12 +137,26 @@
                                          :on-event on-event})]
               (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
             (catch Object e
-              (if @registered?
+              (if (= :registered @preparation-phase)
                 (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e))
-                (deliver prepared-signal {:error e})))))
+                (do
+                  (compare-and-set! preparation-phase :waiting :failed)
+                  (deliver prepared-signal {:error e}))))))
 
-        (let [prepared (deref prepared-signal 30000
-                              {:error (ex-info "Pipeline preparation timed out" {})})]
+        (let [timeout-error (ex-info "Pipeline preparation timed out"
+                                     {:category :preparation_timeout})
+              initial (deref prepared-signal preparation-timeout-ms
+                             :attractor.server/preparation-timeout)
+              prepared
+              (if (= initial :attractor.server/preparation-timeout)
+                (if (compare-and-set! preparation-phase :waiting :abandoned)
+                  (do
+                    (reset! cancelled true)
+                    {:error timeout-error})
+                  ;; Registration or failure already won the phase transition;
+                  ;; its callback/catch owns delivery and cannot be pre-empted.
+                  @prepared-signal)
+                initial)]
           (if-let [error (:error prepared)]
             (throw error)
             (json-response {:id pipeline-id
