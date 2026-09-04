@@ -11,6 +11,9 @@
 (defn matching-set-member [members wanted]
   (first (filter (fn [candidate] (= wanted candidate)) members)))
 
+(defn matching-map-key [copied wanted]
+  (first (filter (fn [candidate] (= wanted candidate)) (keys copied))))
+
 (defn assert-deep-copy [source copied path]
   (when (and (container? source) (seq source))
     (is (not (identical? source copied))
@@ -18,7 +21,9 @@
   (cond
     (map? source)
     (doseq [[key value] source]
-      (assert-deep-copy value (get copied key) (conj path key)))
+      (let [copied-key (matching-map-key copied key)]
+        (assert-deep-copy key copied-key (conj path :map-key))
+        (assert-deep-copy value (get copied copied-key) (conj path key))))
 
     (or (vector? source) (list? source))
     (doseq [[index value] (map-indexed vector source)]
@@ -36,12 +41,16 @@
       (ex-data error))))
 
 (deftest snapshots-and-clones-deep-copy-supported-edn-values
-  (let [source-values
-        {"nested"
-         {:map {:leaf [1 2]}
-          :vector [{:inside #{:a :b}}]
-          :set (hash-set {:member (list 3 4)})
-          :list (list {:tail [5 6]})}}
+  (let [container-key [:container {:nested-key (list :x :y)}]
+        source-values
+        (hash-map
+          "nested"
+          {:map {:leaf [1 2]}
+           :vector [{:inside #{:a :b}}]
+           :set (hash-set {:member (list 3 4)})
+           :list (list {:tail [5 6]})}
+          container-key
+          {:keyed-value (list 7 8)})
         parent (context/make-context source-values)
         _ (context/ctx-append-log! parent "parent-before-copy")
         snapshot (context/ctx-snapshot parent)
