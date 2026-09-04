@@ -24,13 +24,16 @@
 (def restart-bookkeeping-names
   #{"run.id" "current_node" "outcome" "preferred_label"})
 
-(defn context-key-name [key]
-  (if (keyword? key) (name key) (str key)))
+(defn restart-bookkeeping-key-name [key]
+  (cond
+    (string? key) key
+    (and (keyword? key) (nil? (namespace key))) (name key)
+    :else nil))
 
 (defn stale-restart-bookkeeping-keys [values]
   (filterv
     (fn [key]
-      (let [key-name (context-key-name key)]
+      (when-let [key-name (restart-bookkeeping-key-name key)]
         (or (contains? restart-bookkeeping-names key-name)
             (str/starts-with? key-name "internal.retry_count."))))
     (keys values)))
@@ -421,6 +424,18 @@
   (let [semantic {:nested {:items [1 2 3]}}
         first-produced {:from "start" :nested ["a"]}
         second-produced {:from "second" :nested ["b"]}
+        preserved-special-values
+        {:tenant/run.id {:kind :namespaced-run}
+         :tenant/current_node {:kind :namespaced-node}
+         :tenant/outcome {:kind :namespaced-outcome}
+         :tenant/preferred_label {:kind :namespaced-label}
+         :tenant/internal.retry_count.x {:kind :namespaced-retry}
+         'run.id {:kind :symbol-run}
+         'internal.retry_count.x {:kind :symbol-retry}
+         "run.id.extra" {:kind :string-run-boundary}
+         "internal.retry_count" {:kind :string-retry-boundary}
+         :run.id.extra {:kind :keyword-run-boundary}
+         :internal.retry_count {:kind :keyword-retry-boundary}}
         graph
         (parser/parse-dot
           "digraph Isolation {
@@ -442,18 +457,20 @@
         template-manager-value @template-manager
         ctx
         (context/make-context
-          {"semantic" semantic
-           "preserve.internal.retry_count.value" "yes"
-           "run.id" "old-string-run"
-           :run.id "old-keyword-run"
-           "current_node" "old-string-node"
-           :current_node "old-keyword-node"
-           "outcome" "old-string-outcome"
-           :outcome "old-keyword-outcome"
-           "preferred_label" "old-string-label"
-           :preferred_label "old-keyword-label"
-           "internal.retry_count.string" 1
-           :internal.retry_count.keyword 2})
+          (merge
+            {"semantic" semantic
+             "preserve.internal.retry_count.value" "yes"
+             "run.id" "old-string-run"
+             :run.id "old-keyword-run"
+             "current_node" "old-string-node"
+             :current_node "old-keyword-node"
+             "outcome" "old-string-outcome"
+             :outcome "old-keyword-outcome"
+             "preferred_label" "old-string-label"
+             :preferred_label "old-keyword-label"
+             "internal.retry_count.string" 1
+             :internal.retry_count.keyword 2}
+            preserved-special-values))
         cancelled? (fn [] false)
         root (restart-test-root "matrix")
         events (atom [])
@@ -564,6 +581,9 @@
     (is (= "yes" (context/ctx-get ctx "preserve.internal.retry_count.value")))
     (is (identical? first-produced (context/ctx-get ctx "produced.start")))
     (is (identical? second-produced (context/ctx-get ctx "produced.second")))
+    (doseq [[key expected] preserved-special-values]
+      (is (contains? (:values @ctx) key))
+      (is (identical? expected (get (:values @ctx) key))))
     (doseq [index [1 2]]
       (let [started-state (nth started index)
             values (:values started-state)

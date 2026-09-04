@@ -56,10 +56,15 @@
   ctx)
 
 (defn- restart-bookkeeping-key? [key]
-  (let [key-name (if (keyword? key) (name key) (str key))]
-    (or (contains? #{"run.id" "current_node" "outcome" "preferred_label"}
-                   key-name)
-        (str/starts-with? key-name "internal.retry_count."))))
+  (let [key-name
+        (cond
+          (string? key) key
+          (and (keyword? key) (nil? (namespace key))) (name key)
+          :else nil)]
+    (and key-name
+         (or (contains? #{"run.id" "current_node" "outcome" "preferred_label"}
+                        key-name)
+             (str/starts-with? key-name "internal.retry_count.")))))
 
 (defn ctx-reset-for-restart!
   "Remove run-segment bookkeeping while retaining the context atom, semantic
