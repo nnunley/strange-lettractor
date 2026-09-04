@@ -509,7 +509,15 @@
                       handler-outcome
 
                       :else
-                      (resolve-attempt-outcome logs-root node handler-outcome))
+                      (let [resolved (resolve-attempt-outcome
+                                       logs-root node handler-outcome)]
+                        ;; Resolution performs filesystem I/O. Cancellation
+                        ;; that arrives during it must win before routing or
+                        ;; lifecycle events observe the resolved status.
+                        (if (pipeline-cancelled?)
+                          {:status :cancelled
+                           :failure_reason "Pipeline cancelled"}
+                          resolved)))
             st (:status outcome)]
 
         (cond

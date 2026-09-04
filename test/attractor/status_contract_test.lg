@@ -26,7 +26,7 @@
                              #(swap! events conj %)
                              {:sleep-fn (fn [_] nil)}))
 
-;; SCN-STATUS-FILE
+;; SCN-STATUS-FILE PARTIAL
 (deftest status-file-is-authoritative-and-normalized
   (let [logs (test-logs "authoritative")
         events (atom [])
@@ -115,7 +115,7 @@
         (is (= 1 @attempts))
         (is (= [:stage.started :stage.failed] (mapv :type @events)))))))
 
-;; SCN-AUTO-STATUS
+;; SCN-AUTO-STATUS PARTIAL
 (deftest auto-status-synthesizes-the-exact-success-outcome
   (let [logs (test-logs "auto")
         events (atom [])
@@ -147,6 +147,22 @@
           {:cancelled? (fn [] @cancelled)})]
     (is (= :cancelled (:status outcome)))
     (is (not= "must lose" (:notes outcome)))))
+
+(deftest cancellation-that-arrives-during-status-resolution-wins
+  (let [logs (test-logs "cancel-during-resolve")
+        events (atom [])
+        cancellation-checks (atom 0)
+        outcome
+        (engine/execute-with-retry
+          (fn [_ _ _ _]
+            (write-status! logs "stage" {:outcome "success" :notes "must lose"})
+            {:status :success})
+          {:id "stage"} (context/make-context) {} logs #(swap! events conj %)
+          {:cancelled? (fn [] (>= (swap! cancellation-checks inc) 3))})]
+    (is (= 3 @cancellation-checks))
+    (is (= :cancelled (:status outcome)))
+    (is (not= "must lose" (:notes outcome)))
+    (is (empty? (filter #(= :success (:status %)) @events)))))
 
 (deftest timeout-bypasses-a-status-file-written-by-the-handler
   (let [logs (test-logs "timeout")
