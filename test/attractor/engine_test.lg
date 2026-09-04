@@ -868,6 +868,26 @@ digraph Gate {
       (finally
         (io/delete-file child-dotfile)))))
 
+(deftest test-execute-subgraph-combines-branch-cancellation-at-boundary
+  (let [seen (atom [])
+        branch-cancelled (atom false)
+        graph (p/parse-dot
+                "digraph G {\n first [shape=box]\n second [shape=box]\n first -> second\n }")
+        backend (fn [node _ _]
+                  (swap! seen conj (:id node))
+                  (when (= "first" (:id node)) (reset! branch-cancelled true))
+                  {:status :success})
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer) backend)
+        result (e/execute-subgraph
+                 "first" (c/make-context) graph
+                 (str (os/temp-dir) "/subgraph-branch-cancel-" (System/currentTimeMillis))
+                 registry (fn [_] nil)
+                 {:retry-counts (atom {})
+                  :branch-cancelled? (fn [] @branch-cancelled)})]
+    (is (= :cancelled (:status result)))
+    (is (= ["first"] @seen))))
+
 (deftest test-manager-node-can-observe-an-existing-child
   (let [parent
         (p/parse-dot

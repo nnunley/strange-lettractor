@@ -450,7 +450,10 @@
 
 (defn execute-subgraph [branch-start ctx graph logs-root registry on-event retry-options]
   (let [start-node-id (if (map? branch-start) (:to branch-start) branch-start)
-        cancelled? (or (:cancelled? retry-options) (fn [] false))
+        cancelled? (fn [] (or (when-let [pipeline-cancelled? (:cancelled? retry-options)]
+                               (pipeline-cancelled?))
+                             (when-let [branch-cancelled? (:branch-cancelled? retry-options)]
+                               (branch-cancelled?))))
         incoming-branch-edge
         (if (map? branch-start)
           branch-start
