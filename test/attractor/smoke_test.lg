@@ -12,6 +12,9 @@
             [attractor.interviewer :as i]
             [attractor.context :as ctx]))
 
+(defn- test-logs []
+  (str (os/temp-dir) "/attractor-smoke-" (System/nanoTime)))
+
 ;; Section 11.13 Integration Smoke Test
 (deftest test-integration-smoke
   (let [dot "
@@ -32,7 +35,7 @@ digraph test_pipeline {
     review -> implement [condition=\"outcome=fail\", label=\"Fix\"]
 }
 "
-        logs-root "smoke_test_run_dir"]
+        logs-root (test-logs)]
 
     ;; 1. Parse
     (let [graph (-> (p/parse-dot dot) t/apply-transforms)]
@@ -90,4 +93,4 @@ digraph test_pipeline {
             (is (contains? completed "review"))
             (is (contains? completed "done"))))))
 
-    (os/sh "rm" "-rf" logs-root)))
+    ))

@@ -12,6 +12,9 @@
             [io :as io]
             [os :as os]))
 
+(defn- test-logs [label]
+  (str (os/temp-dir) "/attractor-engine-" label "-" (System/nanoTime)))
+
 (deftest test-linear-pipeline-execution
   (let [dot "
 digraph Linear {
@@ -23,14 +26,14 @@ digraph Linear {
 }
 "
         g (p/parse-dot dot)
-        logs "test_engine_linear"
+        logs (test-logs "linear")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "step1" "exit"] (:completed_nodes res)))
     (is (= "success"
            (get (json/read-json (io/slurp (str logs "/start/status.json")))
                 "outcome")))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-human-gate-selection
   (let [dot "
@@ -51,11 +54,11 @@ digraph Review {
         g (p/parse-dot dot)
         queue (i/make-queue-interviewer [{:value "B" :text "Option B"}])
         reg (h/make-handler-registry queue nil)
-        logs "test_engine_human"
+        logs (test-logs "human")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "gate" "opt_b" "exit"] (:completed_nodes res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-goal-gate-enforcement
   (let [dot "
@@ -79,11 +82,11 @@ digraph Gate {
                               {:status :success}))
                           {:status :success}))
         reg (h/make-handler-registry (i/make-auto-approve-interviewer) flaky-backend)
-        logs "test_engine_gate"
+        logs (test-logs "gate")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "flaky" "fix" "flaky" "exit"] (:completed_nodes res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-pipeline-honors-cancellation-signal
   (let [graph (p/parse-dot
@@ -93,7 +96,7 @@ digraph Gate {
                    start -> exit
                  }")
         cancelled (atom true)
-        logs "test_engine_cancelled"
+        logs (test-logs "cancelled")
         events (atom [])
         result (e/run-pipeline graph
                                {:logs-root logs
@@ -102,7 +105,7 @@ digraph Gate {
                                             (swap! events conj event))})]
     (is (= :cancelled (:status result)))
     (is (some #(= :pipeline.cancelled (:type %)) @events))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-handler-cancellation-terminates-the-pipeline
   (let [graph (p/parse-dot
@@ -114,7 +117,7 @@ digraph Gate {
                  }")
         registry (h/make-handler-registry)
         events (atom [])
-        logs "test_engine_handler_cancelled"
+        logs (test-logs "handler-cancelled")
         _ (h/register-handler!
             registry "cancel.test"
             (fn [_ _ _ _]
@@ -126,7 +129,7 @@ digraph Gate {
     (is (= :cancelled (:status result)))
     (is (= ["start"] (:completed_nodes result)))
     (is (some #(= :pipeline.cancelled (:type %)) @events))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-pipeline-retry-policy-controls-backoff-without-real-sleep
   (let [graph (p/parse-dot
@@ -147,7 +150,7 @@ digraph Gate {
                     {:status :success}))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_retry_policy"
+        logs (test-logs "retry-policy")
         result (e/run-pipeline
                  graph
                  {:registry registry
@@ -165,7 +168,7 @@ digraph Gate {
     (is (= [10 20] (mapv :delay_ms retry-events)))
     (is (= {"start" 0 "flaky" 0}
            (:node_retries checkpoint)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-terminal-handler-exception-is-not-retried
   (let [graph (p/parse-dot
@@ -186,14 +189,14 @@ digraph Gate {
                     {:status :success}))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_terminal_error"
+        logs (test-logs "terminal-error")
         result (e/run-pipeline
                  graph
                  {:registry registry :logs-root logs
                   :sleep-fn (fn [_] nil)})]
     (is (= :fail (:status result)))
     (is (= 1 @attempts))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-node-timeout-signals-cooperative-handler-and-keeps-partial-updates
   (let [attempts (atom 0)
@@ -541,9 +544,9 @@ digraph Gate {
                    exit [shape=Msquare]
                    start -> work -> exit
                  }")
-        logs "test_engine_retry_resume"
+        logs (test-logs "retry-resume")
         checkpoint-path (str logs "/checkpoint.edn")
-        _ (os/sh "mkdir" "-p" logs)
+        _ (io/mkdir logs)
         _ (c/save-checkpoint
             {:timestamp "before-resume"
              :current_node "start"
@@ -572,7 +575,7 @@ digraph Gate {
     (is (= 2 @attempts))
     (is (= [2] @delays) (str "restored retry delays: " @delays))
     (is (= 2 (get (:node_retries final-checkpoint) "work")))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-resume-does-not-repeat-a-completed-failed-node
   (let [graph (p/parse-dot
@@ -582,9 +585,9 @@ digraph Gate {
                    exit [shape=Msquare]
                    start -> work -> exit
                  }")
-        logs "test_engine_completed_failure_resume"
+        logs (test-logs "completed-failure-resume")
         checkpoint-path (str logs "/checkpoint.edn")
-        _ (os/sh "mkdir" "-p" logs)
+        _ (io/mkdir logs)
         _ (c/save-checkpoint
             {:timestamp "after-failure"
              :current_node "work"
@@ -608,7 +611,7 @@ digraph Gate {
     (is (= :fail (:status result)))
     (is (= 0 @attempts))
     (is (= ["start" "work"] (:completed_nodes result)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-allow-partial-resets-retry-counter
   (let [graph (p/parse-dot
@@ -653,13 +656,13 @@ digraph Gate {
                     {:status :success}))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_explicit_fail_edge"
+        logs (test-logs "explicit-fail-edge")
         result (e/run-pipeline graph {:registry registry :context ctx
                                       :logs-root logs})]
     (is (= :success (:status result)))
     (is (some #{"failed"} (:completed_nodes result)))
     (is (not (some #{"contextual"} (:completed_nodes result))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-ordinary-failure-does-not-use-graph-goal-gate-target
   (let [graph (p/parse-dot
@@ -678,11 +681,11 @@ digraph Gate {
                     {:status :success}))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_graph_retry_target_scope"
+        logs (test-logs "graph-retry-target")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :fail (:status result)))
     (is (not (some #{"repair"} (:completed_nodes result))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-explicit-zero-and-legacy-graph-retry-limits
   (let [zero-graph (p/parse-dot
@@ -736,11 +739,10 @@ digraph Gate {
                    (i/make-auto-approve-interviewer) backend)
         result (e/execute-subgraph
                  "branch" (c/make-context) graph
-                 "test_engine_subgraph_retry_target" registry (fn [_] nil)
+                 (test-logs "subgraph-retry-target") registry (fn [_] nil)
                  {:retry-counts (atom {}) :sleep-fn (fn [_] nil)})]
     (is (= :success (:status result)))
-    (is (= "join" (:boundary_node_id result)))
-    (os/sh "rm" "-rf" "test_engine_subgraph_retry_target")))
+    (is (= "join" (:boundary_node_id result))))
 
 (deftest test-execute-subgraph-skips-pre-cancelled-branch
   (let [invoked (atom 0)
@@ -787,8 +789,9 @@ digraph Gate {
     (is (= ["first"] @seen))))
 
 (deftest test-manager-node-autostarts-a-real-child-pipeline
-  (let [child-dotfile "test_engine_manager_child.dot"
-        logs "test_engine_manager_parent"
+  (let [child-dotfile (str (os/temp-dir) "/attractor-manager-child-"
+                           (System/nanoTime) ".dot")
+        logs (test-logs "manager-parent")
         events (atom [])
         _ (io/spit child-dotfile
                    "digraph Child {
@@ -824,8 +827,7 @@ digraph Gate {
       (is (= (str logs "/manager/child") (:child_logs child-event))))
     (is (= ["report.edn"]
            (get (:context result) "context.stack.child.artifacts")))
-    (os/sh "rm" "-rf" logs)
-    (os/sh "rm" "-f" child-dotfile)))
+    (io/delete-file child-dotfile)))
 
 (deftest test-manager-real-child-observes-attempt-cancellation
   (let [stamp (System/currentTimeMillis)
@@ -902,14 +904,14 @@ digraph Gate {
         child {:state (atom {:status :completed :outcome :success
                              :active_stage "done"})
                :context (c/make-context)
-               :logs-root "test_engine_existing_child"}
-        logs "test_engine_manager_existing"
+               :logs-root (test-logs "existing-child")}
+        logs (test-logs "manager-existing")
         result (e/run-pipeline parent {:logs-root logs
                                        :manager-child child})]
     (is (= :success (:status result)))
     (is (= "done"
            (get (:context result) "context.stack.child.active_stage")))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-run-pipeline-does-not-mutate-template-handler-runtimes
   (let [graph (p/parse-dot
@@ -921,12 +923,12 @@ digraph Gate {
         registry (h/make-handler-registry)
         manager-runtime (get @registry h/manager-runtime-key)
         parallel-runtime (get @registry h/parallel-executor-key)
-        logs "test_engine_registry_isolation"
+        logs (test-logs "registry-isolation")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= {} @manager-runtime))
     (is (nil? @parallel-runtime))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-run-pipeline-preserves-registered-manager-overrides
   (let [graph (p/parse-dot
@@ -941,11 +943,11 @@ digraph Gate {
             registry "stack.manager_loop"
             (fn [_ _ _ _]
               {:status :success :context_updates {"manager.custom" true}}))
-        logs "test_engine_manager_override"
+        logs (test-logs "manager-override")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= true (get (:context result) "manager.custom")))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-engine-resolves-fidelity-and-injects-fresh-session-preambles
   (let [graph
@@ -970,7 +972,7 @@ digraph Gate {
           {:status :success})
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_fidelity"
+        logs (test-logs "fidelity")
         result (e/run-pipeline graph {:registry registry :logs-root logs})
         first-call (first @calls)
         second-call (second @calls)]
@@ -981,7 +983,7 @@ digraph Gate {
     (is (= "full" (:fidelity second-call)))
     (is (= "node-thread" (:thread second-call)))
     (is (= "second" (:prompt second-call)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-full-fidelity-reuses-agent-session-by-thread
   (let [requests (atom [])
@@ -1012,7 +1014,7 @@ digraph Gate {
              exit [shape=Msquare]
              start -> first -> second -> third -> exit
            }")
-        logs "test_engine_full_fidelity"
+        logs (test-logs "full-fidelity")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= 3 (count @requests)))
@@ -1020,7 +1022,7 @@ digraph Gate {
     (is (= 4 (count (:messages (second @requests)))))
     (is (= 2 (count (:messages (nth @requests 2)))))
     (is (= 2 @closed))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-resume-degrades-first-full-fidelity-hop
   (let [graph
@@ -1033,9 +1035,9 @@ digraph Gate {
              exit [shape=Msquare]
              start -> first -> second -> exit
            }")
-        root "test_engine_resume_fidelity"
+        root (test-logs "resume-fidelity")
         checkpoint (str root "/checkpoint.edn")
-        _ (os/sh "mkdir" "-p" root)
+        _ (io/mkdir root)
         _ (c/save-checkpoint
             {:timestamp "1"
              :current_node "first"
@@ -1061,7 +1063,7 @@ digraph Gate {
     (is (= "summary:high" (:fidelity (first @calls))))
     (is (str/includes? (:prompt (first @calls))
                        "Comprehensive stage history"))
-    (os/sh "rm" "-rf" root)))
+    ))
 
 (deftest test-parallel-branches-apply-incoming-edge-fidelity
   (let [graph
@@ -1086,13 +1088,13 @@ digraph Gate {
           {:status :success})
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_parallel_fidelity"
+        logs (test-logs "parallel-fidelity")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= "truncate" (:fidelity (first @calls))))
     (is (str/includes? (:prompt (first @calls))
                        "Pipeline Goal: Parallel context"))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-parallel-branch-uses-its-exact-fork-edge
   (let [graph
@@ -1117,11 +1119,11 @@ digraph Gate {
                   {:status :success})
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_parallel_exact_edge"
+        logs (test-logs "parallel-exact-edge")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= "full" @seen))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-loop-restart-starts-fresh-full-fidelity-sessions
   (let [requests (atom [])
@@ -1152,13 +1154,13 @@ digraph Gate {
              first -> second [loop_restart=true]
              second -> exit
            }")
-        root "test_engine_restart_fidelity"
+        root (test-logs "restart-fidelity")
         logs (str root "/run")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= [2 2] (mapv (comp count :messages) @requests)))
     (is (= 2 @closed))
-    (os/sh "rm" "-rf" root)))
+    ))
 
 (deftest test-retryable-agent-failure-evicts-closed-full-session
   (let [calls (atom 0)
@@ -1184,14 +1186,14 @@ digraph Gate {
              exit [shape=Msquare]
              start -> work -> exit
            }")
-        logs "test_engine_retry_full_session"
+        logs (test-logs "retry-full-session")
         result (e/run-pipeline
                  graph {:registry registry :logs-root logs
                         :sleep-fn (fn [_] nil)
                         :random-fn (fn [] 0.5)})]
     (is (= :success (:status result)))
     (is (= 2 @calls))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-fidelity-uses-the-exact-selected-edge
   (let [graph
@@ -1216,8 +1218,8 @@ digraph Gate {
               {:status :success})))
         registry (h/make-handler-registry
                    (i/make-auto-approve-interviewer) backend)
-        logs "test_engine_exact_fidelity_edge"
+        logs (test-logs "exact-fidelity-edge")
         result (e/run-pipeline graph {:registry registry :logs-root logs})]
     (is (= :success (:status result)))
     (is (= "full" @seen))
-    (os/sh "rm" "-rf" logs)))
+    ))

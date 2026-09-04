@@ -14,6 +14,9 @@
             [attractor.handlers :as h]
             [attractor.engine :as e]))
 
+(defn- test-logs [label]
+  (str (os/temp-dir) "/attractor-parity-" label "-" (System/nanoTime)))
+
 ;; Parity Matrix Case 1: Parse a simple linear pipeline (start -> A -> B -> done)
 (deftest test-parity-01-linear-parse
   (let [dot "digraph G { start -> A -> B -> done }"
@@ -68,11 +71,11 @@
 (deftest test-parity-07-execute-linear
   (let [dot "digraph G { start [shape=Mdiamond] mid [shape=box] exit [shape=Msquare] start -> mid -> exit }"
         g (p/parse-dot dot)
-        logs "test_parity_07"
+        logs (test-logs "07")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "mid" "exit"] (:completed_nodes res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 8: Execute with conditional branching (success/fail paths)
 (deftest test-parity-08-conditional-branching
@@ -90,12 +93,12 @@
     fail -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_parity_08"
+        logs (test-logs "08")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     (is (some #{"succ"} (:completed_nodes res)))
     (is (not (some #{"fail"} (:completed_nodes res))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 9: Execute with retry on failure (max_retries=2)
 (deftest test-parity-09-retry-on-failure
@@ -113,11 +116,11 @@
                             {:status :retry :failure_reason (str "Attempt " a " failed")}
                             {:status :success})))
         reg (h/make-handler-registry (i/make-auto-approve-interviewer) flaky-backend)
-        logs "test_parity_09"
+        logs (test-logs "09")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= 3 @attempts))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 10 & 11: Goal gate blocks exit when unsatisfied and allows when satisfied
 (deftest test-parity-10-11-goal-gates
@@ -138,11 +141,11 @@
                       (if (= v 1) {:status :fail} {:status :success}))
                     {:status :success}))
         reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
-        logs "test_parity_10_11"
+        logs (test-logs "10-11")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "work" "fix" "work" "exit"] (:completed_nodes res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 12: Wait.human presents choices and routes on selection
 (deftest test-parity-12-wait-human
@@ -162,11 +165,11 @@
         g (p/parse-dot dot)
         q (i/make-queue-interviewer [{:value "A" :text "Choice A"}])
         reg (h/make-handler-registry q nil)
-        logs "test_parity_12"
+        logs (test-logs "12")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= ["start" "gate" "a" "exit"] (:completed_nodes res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 13: Edge selection: condition match wins over weight
 (deftest test-parity-13-condition-wins-over-weight
@@ -184,13 +187,13 @@
     t2 -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_parity_13"
+        logs (test-logs "13")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     ;; t2 had weight 1 but matched condition; t1 had weight 100 but was unconditional
     (is (some #{"t2"} (:completed_nodes res)))
     (is (not (some #{"t1"} (:completed_nodes res))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 14: Edge selection: weight breaks ties for unconditional edges
 (deftest test-parity-14-weight-breaks-unconditional-ties
@@ -208,12 +211,12 @@
     light -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_parity_14"
+        logs (test-logs "14")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     (is (some #{"heavy"} (:completed_nodes res)))
     (is (not (some #{"light"} (:completed_nodes res))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 15: Edge selection: lexical tiebreak as final fallback
 (deftest test-parity-15-lexical-tiebreak
@@ -231,13 +234,13 @@
     beta -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_parity_15"
+        logs (test-logs "15")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     ;; Lexical tiebreak: "alpha" < "beta"
     (is (some #{"alpha"} (:completed_nodes res)))
     (is (not (some #{"beta"} (:completed_nodes res))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 16: Context updates from one node are visible to the next
 (deftest test-parity-16-context-propagation
@@ -258,11 +261,11 @@
                       (reset! seen-val (ctx/ctx-get ctx "shared_key"))
                       {:status :success})))
         reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
-        logs "test_parity_16"
+        logs (test-logs "16")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (= "hello_from_n1" @seen-val))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 17: Checkpoint save and resume produces same result
 (deftest test-parity-17-checkpoint-resume
@@ -275,7 +278,7 @@
     start -> step1 -> step2 -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_parity_17"
+        logs (test-logs "17")
         res (e/run-pipeline g {:logs-root logs})
         cp-path (str logs "/checkpoint.edn")]
     (is (= :success (:status res)))
@@ -284,7 +287,7 @@
       (is (= "exit" (:current_node loaded)))
       (is (= ["start" "step1" "step2" "exit"] (:completed_nodes loaded)))
       (is (= :success (get-in loaded [:node_outcomes "step1" :status]))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 (deftest test-resume-preserves-prior-goal-gate-outcomes
   (let [dot "digraph G {
@@ -294,9 +297,9 @@
     start -> gate -> exit
 }"
         g (p/parse-dot dot)
-        logs "test_resume_goal_gate"
+        logs (test-logs "resume-goal-gate")
         cp-path (str logs "/checkpoint.edn")
-        _ (os/sh "mkdir" "-p" logs)
+        _ (io/mkdir logs)
         _ (ctx/save-checkpoint
             {:timestamp "1"
              :current_node "gate"
@@ -311,7 +314,7 @@
         res (e/resume-pipeline cp-path g {:logs-root logs})]
     (is (= :fail (:status res)))
     (is (= "gate" (:unsatisfied_gate res)))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 18: Stylesheet applies model override to nodes by shape
 (deftest test-parity-18-stylesheet-by-shape
@@ -380,7 +383,7 @@
                   {:status :success
                    :context_updates {(str "branch." (:id node)) true}})
         reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
-        logs "test_parallel_pipeline"
+        logs (test-logs "parallel")
         res (e/run-pipeline g {:registry reg :logs-root logs})
         results (get-in res [:context "parallel.results"])]
     (is (= :success (:status res)))
@@ -389,7 +392,7 @@
     (is (= 3 (count results)))
     (is (= "a" (get-in res [:context "parallel.fan_in.best_id"])))
     (is (nil? (get-in res [:context "branch.a"])))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 21: Custom handler registration and execution works
 (deftest test-parity-21-custom-handler
@@ -406,11 +409,11 @@
             (fn [_ ctx _ _]
               (reset! custom-ran true)
               {:status :success}))
-        logs "test_parity_21"
+        logs (test-logs "21")
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
     (is (true? @custom-ran))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 22: Pipeline with 10+ nodes completes without errors
 (deftest test-parity-22-large-pipeline
@@ -420,11 +423,11 @@
                    "\nnode_10 -> exit")
         dot (str "digraph Large {\nstart [shape=Mdiamond]\nexit [shape=Msquare]\n" nodes "\n" edges "\n}")
         g (p/parse-dot dot)
-        logs "test_parity_22"
+        logs (test-logs "22")
         res (e/run-pipeline g {:logs-root logs})]
     (is (= :success (:status res)))
     (is (= 12 (count (:completed_nodes res))))
-    (os/sh "rm" "-rf" logs)))
+    ))
 
 ;; Parity Matrix Case 23: inherited node deadlines stop a real pipeline.
 (deftest test-parity-23-inherited-node-timeout-stops-success-edge
