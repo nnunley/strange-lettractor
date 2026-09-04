@@ -1,0 +1,204 @@
+(ns attractor.loop-restart-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.context :as context]
+            [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.parser :as parser]
+            [os :as os]))
+
+(defn restart-test-root [label]
+  (str (os/temp-dir) "/attractor-loop-restart-" label "-"
+       (System/nanoTime)))
+
+(defn first-event-index [events event-type target]
+  (first
+    (for [[index event] (map-indexed vector events)
+          :when (and (= event-type (:type event))
+                     (= target (:target event)))]
+      index)))
+
+(deftest restart-driver-preserves-run-inputs-and-orders-fresh-segments
+  (let [graph
+        (parser/parse-dot
+          "digraph Restart {
+             start [shape=Mdiamond]
+             first [type=restart.probe]
+             second [type=restart.probe]
+             third [type=restart.probe]
+             exit [shape=Msquare]
+             start -> first
+             first -> second [loop_restart=true, fidelity=full, thread_id=\"edge-one\"]
+             second -> third [loop_restart=true, fidelity=full, thread_id=\"edge-two\"]
+             third -> exit
+           }")
+        registry
+        (handlers/make-handler-registry
+          (interviewer/make-auto-approve-interviewer) nil)
+        ctx (context/make-context {"semantic" {:keep [1 2 3]}})
+        cancelled? (fn [] false)
+        calls (atom [])
+        events (atom [])
+        fresh-at-restart (atom [])
+        root (restart-test-root "finite")
+        _ (handlers/register-handler!
+            registry "restart.probe"
+            (fn [node handler-ctx handler-graph logs-root]
+              (swap! calls conj
+                     {:node (:id node)
+                      :logs-root logs-root
+                      :graph-identical? (identical? graph handler-graph)
+                      :context-identical? (identical? ctx handler-ctx)
+                      :cancelled-identical?
+                      (identical? cancelled? (:cancelled? node))
+                      :semantic (context/ctx-get handler-ctx "semantic")
+                      :fidelity (:resolved_fidelity node)
+                      :thread (:resolved_thread_id node)})
+              {:status :success}))
+        result
+        (engine/run-pipeline
+          graph
+          {:registry registry
+           :context ctx
+           :cancelled? cancelled?
+           :logs-root root
+           :on-event
+           (fn [event]
+             (when (= :pipeline.restarting (:type event))
+               (let [new-root (:new_logs_root event)]
+                 (swap! fresh-at-restart conj
+                        (and (string? new-root)
+                             (nil? (os/stat new-root))))))
+             (swap! events conj event))})
+        call-data @calls
+        roots (mapv :logs-root call-data)
+        restart-events
+        (filterv (fn [event] (= :pipeline.restarting (:type event))) @events)
+        started-roots
+        (mapv :logs_root
+              (filter (fn [event] (= :pipeline.started (:type event))) @events))]
+    (is (= :success (:status result)))
+    (is (not (contains? result :attractor.engine/restart)))
+    (is (= ["first" "second" "third"] (mapv :node call-data)))
+    (is (= 3 (count (set roots))))
+    (is (= roots started-roots))
+    (is (= [true true] @fresh-at-restart))
+    (is (every? some? (map os/stat roots)))
+    (is (every? :graph-identical? call-data))
+    (is (every? :context-identical? call-data))
+    (is (every? :cancelled-identical? call-data))
+    (is (every? (fn [call] (= {:keep [1 2 3]} (:semantic call)))
+                call-data))
+    (is (= "full" (:fidelity (second call-data))))
+    (is (= "edge-one" (:thread (second call-data))))
+    (is (= "full" (:fidelity (nth call-data 2))))
+    (is (= "edge-two" (:thread (nth call-data 2))))
+    (is (= [{:type :pipeline.restarting
+             :old_logs_root (first roots)
+             :new_logs_root (second roots)
+             :target "second"}
+            {:type :pipeline.restarting
+             :old_logs_root (second roots)
+             :new_logs_root (nth roots 2)
+             :target "third"}]
+           restart-events))
+    (doseq [[target expected-root] [["second" (second roots)]
+                                    ["third" (nth roots 2)]]]
+      (let [restart-index (first-event-index @events :pipeline.restarting target)
+            pipeline-started (nth @events (inc restart-index))
+            stage-started (nth @events (+ restart-index 2))]
+        (is (= {:type :pipeline.started
+                :id (:id graph)
+                :goal (:goal graph)
+                :logs_root expected-root}
+               pipeline-started))
+        (is (= :stage.started (:type stage-started)))
+        (is (= target (:node_id stage-started)))))))
+
+(deftest restart-cycle-uses-one-invocation-wide-step-budget
+  (let [limit 4
+        reason "Pipeline step limit exceeded (4 steps)"
+        graph
+        (parser/parse-dot
+          "digraph Cycle {
+             start [shape=Mdiamond, type=cycle.probe]
+             cycle [type=cycle.probe]
+             start -> cycle [loop_restart=true]
+             cycle -> cycle [loop_restart=true]
+           }")
+        registry
+        (handlers/make-handler-registry
+          (interviewer/make-auto-approve-interviewer) nil)
+        handler-count (atom 0)
+        events (atom [])
+        _ (handlers/register-handler!
+            registry "cycle.probe"
+            (fn [_ _ _ _]
+              (swap! handler-count inc)
+              {:status :success}))
+        result
+        (try
+          (engine/run-pipeline
+            graph
+            {:registry registry
+             :logs-root (restart-test-root "cycle")
+             :max-steps limit
+             :on-event (fn [event] (swap! events conj event))})
+          (catch Object error
+            {:thrown error}))]
+    (is (= :fail (:status result)))
+    (is (= reason (:failure_reason result)))
+    (is (= limit @handler-count))
+    (is (= [{:type :pipeline.failed :error reason}]
+           (filterv (fn [event] (= :pipeline.failed (:type event)))
+                    @events)))
+    (is (= limit
+           (count (filter (fn [event]
+                            (= :pipeline.restarting (:type event)))
+                          @events))))
+    (is (= (inc limit)
+           (count (filter (fn [event]
+                            (= :pipeline.started (:type event)))
+                          @events))))))
+
+(deftest max-steps-contract-is-public-and-rejects-invalid-values
+  (let [default-var (ns-resolve 'attractor.engine 'default-max-steps)]
+    (is (= 10000 (when default-var @default-var))))
+  (let [graph
+        (parser/parse-dot
+          "digraph InvalidBudget {
+             start [shape=Mdiamond, type=budget.probe]
+             exit [shape=Msquare]
+             start -> exit
+           }")]
+    (doseq [invalid [0 -1 1.5 "4"]]
+      (testing (str "invalid max steps " invalid)
+        (let [handler-count (atom 0)
+              events (atom [])
+              registry
+              (handlers/make-handler-registry
+                (interviewer/make-auto-approve-interviewer) nil)
+              _ (handlers/register-handler!
+                  registry "budget.probe"
+                  (fn [_ _ _ _]
+                    (swap! handler-count inc)
+                    {:status :success}))
+              error
+              (try
+                (do
+                  (engine/run-pipeline
+                    graph
+                    {:registry registry
+                     :logs-root (restart-test-root "invalid")
+                     :max-steps invalid
+                     :on-event (fn [event] (swap! events conj event))})
+                  nil)
+                (catch Object cause cause))]
+          (is (= "Invalid :max-steps; expected a positive integer"
+                 (ex-message error)))
+          (is (= {:category :configuration_error
+                  :option :max-steps
+                  :value invalid}
+                 (ex-data error)))
+          (is (= 0 @handler-count))
+          (is (empty? @events)))))))

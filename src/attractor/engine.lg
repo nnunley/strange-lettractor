@@ -11,6 +11,8 @@
             [attractor.interviewer :as interviewer]
             [attractor.status :as status]))
 
+(def default-max-steps 10000)
+
 (defn- write-stage-status! [logs-root node-id outcome]
   (let [stage-dir (str logs-root "/" node-id)]
     (os/sh "mkdir" "-p" stage-dir)
@@ -783,6 +785,8 @@
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
          fidelity-threads (or (:fidelity-threads options) (atom {}))
+         step-counter (or (:step-counter options) (atom 0))
+         max-steps (or (:max-steps options) default-max-steps)
          retry-options (assoc options :retry-counts retry-counts)
          parallel-executor (get @registry handlers/parallel-executor-key)
          manager-runtime (get @registry handlers/manager-runtime-key)
@@ -834,9 +838,11 @@
                       :completed_nodes completed-nodes})
            res)
 
-         ;; Safety limit on steps to avoid infinite loops (10,000 steps max)
-         (> step-count 10000)
-         (let [res {:status :fail :failure_reason "Pipeline step limit exceeded (10000 steps)" :completed_nodes completed-nodes}]
+         ;; The public driver shares this counter across restart segments.
+         (>= @step-counter max-steps)
+         (let [reason (str "Pipeline step limit exceeded (" max-steps " steps)")
+               res {:status :fail :failure_reason reason
+                    :completed_nodes completed-nodes}]
            (on-event {:type :pipeline.failed :error (:failure_reason res)})
            res)
 
@@ -851,6 +857,7 @@
                  (let [retry-id (resolve-retry-target failed-gate graph)]
                    (if (and retry-id (parser/find-node graph retry-id))
                      (do
+                       (swap! step-counter inc)
                        (on-event {:type :goal_gate.retrying :unsatisfied_node (:id failed-gate) :target retry-id})
                        (recur (parser/find-node graph retry-id)
                               completed-nodes
@@ -881,7 +888,8 @@
                    success-res)))
 
              ;; Step 2: Execute node handler with retry policy
-             (let [prepared-node
+             (let [_step (swap! step-counter inc)
+                   prepared-node
                    (execution-node
                      current-node incoming-edge graph ctx completed-nodes
                      node-outcomes fidelity-threads
@@ -965,16 +973,10 @@
 
                      ;; Step 7: Handle loop_restart
                      (if (:loop_restart next-edge)
-                       (let [fresh-logs (str logs-root "_restart_" (System/currentTimeMillis))]
-                         (on-event {:type :pipeline.restarting :target (:to next-edge) :new_logs fresh-logs})
-                         (close-fidelity-threads! fidelity-threads)
-                         (run-pipeline
-                           graph
-                           (assoc (dissoc options :fidelity-threads)
-                                  :start-at (:to next-edge)
-                                  :logs-root fresh-logs
-                                  :initial-incoming-edge next-edge
-                                  :retry-counts retry-counts)))
+                       {:attractor.engine/restart true
+                        :target (:to next-edge)
+                        :edge next-edge
+                        :old_logs_root logs-root}
 
                        ;; Step 8: Advance to next node
                        (let [next-node (parser/find-node graph (:to next-edge))]
@@ -996,17 +998,99 @@
       (close-fn)))
   (reset! threads {}))
 
+(defn- max-steps-option [options]
+  (let [value (if (contains? options :max-steps)
+                (:max-steps options)
+                default-max-steps)]
+    (when-not (and (integer? value) (pos? value))
+      (throw
+        (ex-info "Invalid :max-steps; expected a positive integer"
+                 {:category :configuration_error
+                  :option :max-steps
+                  :value value})))
+    value))
+
+(defn- allocate-restart-root [root-base allocated-roots]
+  (loop []
+    (let [candidate (str root-base "_restart_" (random-uuid))]
+      (if (or (contains? @allocated-roots candidate)
+              (some? (os/stat candidate)))
+        (recur)
+        (do
+          (swap! allocated-roots conj candidate)
+          candidate)))))
+
+(defn- restarted-segment-options [base-options target edge logs-root]
+  (assoc
+    (dissoc base-options
+            :completed-nodes
+            :node-outcomes
+            :node-retries
+            :retry-counts
+            :first-node-fidelity-override)
+    :start-at target
+    :logs-root logs-root
+    :initial-incoming-edge edge))
+
 (defn run-pipeline
-  "Low-level execution API for an already parsed, transformed, and validated graph."
+  "Low-level execution API for an already parsed, transformed, and validated graph.
+
+  :max-steps must be a positive integer and defaults to default-max-steps. The
+  limit applies to this entire invocation, including every restart segment."
   ([graph] (run-pipeline graph {}))
   ([graph options]
-   (let [owns-threads? (nil? (:fidelity-threads options))
-         threads (or (:fidelity-threads options) (atom {}))]
-     (try
-       (run-pipeline* graph (assoc options :fidelity-threads threads))
-       (finally
-         (when owns-threads?
-           (close-fidelity-threads! threads)))))))
+   (let [max-steps (max-steps-option options)
+         ctx (or (:context options) (context/make-context))
+         registry (or (:registry options) (handlers/make-handler-registry))
+         on-event (or (:on-event options) (fn [_] nil))
+         root-base (or (:logs-root options) "attractor_runs/run_latest")
+         allocated-roots (atom #{root-base})
+         step-counter (atom 0)
+         caller-threads (:fidelity-threads options)
+         first-threads (or caller-threads (atom {}))
+         base-options
+         (assoc (dissoc options :fidelity-threads)
+                :max-steps max-steps
+                :step-counter step-counter
+                :context ctx
+                :registry registry
+                :on-event on-event)]
+     (loop [segment-options base-options
+            threads first-threads
+            owns-threads? (nil? caller-threads)]
+       (let [execution
+             (try
+               {:result
+                (run-pipeline*
+                  graph
+                  (assoc segment-options :fidelity-threads threads))}
+               (catch Object error
+                 {:error error}))]
+         (if-let [error (:error execution)]
+           (do
+             (when owns-threads?
+               (close-fidelity-threads! threads))
+             (throw error))
+           (let [result (:result execution)]
+             (if (:attractor.engine/restart result)
+               (let [new-root
+                     (allocate-restart-root root-base allocated-roots)]
+                 ;; A restart always ends the current segment's sessions,
+                 ;; including caller-provided session state.
+                 (close-fidelity-threads! threads)
+                 (on-event {:type :pipeline.restarting
+                            :old_logs_root (:old_logs_root result)
+                            :new_logs_root new-root
+                            :target (:target result)})
+                 (recur
+                   (restarted-segment-options
+                     base-options (:target result) (:edge result) new-root)
+                   (atom {})
+                   true))
+               (do
+                 (when owns-threads?
+                   (close-fidelity-threads! threads))
+                 result)))))))))
 
 ;; Resume pipeline execution from a saved checkpoint (Section 5.3)
 (defn resume-pipeline [checkpoint-path graph options]
