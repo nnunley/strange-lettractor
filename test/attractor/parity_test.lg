@@ -1,5 +1,6 @@
 (ns attractor.parity-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
             [clojure.string :as str]
             [os :as os]
             [io :as io]
@@ -424,3 +425,48 @@
     (is (= :success (:status res)))
     (is (= 12 (count (:completed_nodes res))))
     (os/sh "rm" "-rf" logs)))
+
+;; Parity Matrix Case 23: inherited node deadlines stop a real pipeline.
+(deftest test-parity-23-inherited-node-timeout-stops-success-edge
+  (let [g (p/parse-dot
+            "digraph G {
+               node [timeout=\"20ms\"]
+               start [shape=Mdiamond]
+               work [type=\"cooperative.timeout\"]
+               success [shape=box]
+               exit [shape=Msquare]
+               start -> work -> success -> exit
+             }")
+        entered (atom false)
+        advanced (atom false)
+        events (atom [])
+        registry (h/make-handler-registry)
+        _ (h/register-handler!
+            registry "cooperative.timeout"
+            (fn [node _ _ _]
+              (reset! entered true)
+              (loop []
+                (if ((:cancelled? node))
+                  {:status :success :context_updates {"timeout.partial" "kept"}}
+                  (do
+                    (core/sleep 1)
+                    (recur))))))
+        _ (h/register-handler!
+            registry "codergen"
+            (fn [node _ _ _]
+              (when (= "success" (:id node))
+                (reset! advanced true))
+              {:status :success}))
+        logs (str (os/temp-dir) "/attractor-parity-timeout-" (random-uuid))
+        result (e/run-pipeline g {:registry registry
+                                  :logs-root logs
+                                  :on-event #(swap! events conj %)})
+        timed-event (first (filter #(and (= :stage.failed (:type %))
+                                        (= "work" (:node_id %)))
+                                   @events))]
+    (is (true? @entered))
+    (is (= :fail (:status result)))
+    (is (some #{"work"} (:completed_nodes result)))
+    (is (= :timeout_error (get-in timed-event [:outcome :category])))
+    (is (not (some #{"success"} (:completed_nodes result))))
+    (is (false? @advanced))))
