@@ -25,6 +25,16 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Then every stage executes at most as specified and the selected path, context, events, and final outcome agree
 - Seam: engine integration
 
+### SCN-PUBLIC-LIFECYCLE — DOT source to gated execution
+
+- Given DOT source, two registered custom transforms, custom validation rules, and a deterministic handler registry
+- When `attractor.pipeline/run` is called
+- Then `prepare` returns the final graph and ordered diagnostics without execution; `run` parses once, runs built-ins before custom transforms in registration order, validates the final graph, exposes warnings on its outcome, mirrors graph attributes, and produces an agreeing handler path, event stream, checkpoint, and final outcome
+- Given a built-in or custom ERROR diagnostic
+- Then `run` throws category `:validation_error` with the complete diagnostics vector and no handler, run directory, initial checkpoint, or pipeline-start event is created
+- CLI run/validate/graph and server submission prepare or execute through the same lifecycle API; `attractor.engine/run-pipeline` is documented and tested as the low-level already-prepared-graph seam
+- Seam: public pipeline/CLI/server integration
+
 ### SCN-TIMEOUT — Deadline cancellation and quiescence
 
 - Given a timed stage that invokes tools, nested agents, or parallel children
@@ -61,30 +71,37 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 ### SCN-CONTEXT-ISOLATION — Deep branch isolation
 
-- Given parent context containing nested mutable data
-- When two branch clones mutate nested values
-- Then neither sibling nor parent observes the other mutation
+- Given a parent context containing nested EDN maps, vectors, sets, and lists
+- When a snapshot and two branch clones are made
+- Then nested containers are distinct copies, neither clone/sibling/snapshot/parent observes another copy's subsequent changes, and clone logs are independent
+- Given an opaque or mutable non-EDN value
+- Then snapshot/clone fails explicitly with category and value-path data instead of silently sharing it
 - Seam: context unit/integration
 
 ### SCN-PIPELINE-COMPOSITION — Context-mapped composition
 
-- Given two valid pipelines with explicit input/output context mappings
-- When the first invokes the second
-- Then only mapped inputs enter the child, mapped outputs return, validation applies to both, and run/checkpoint state remains isolated
+- Given a valid parent with a project-defined `subpipeline` node whose child declares explicit `input_map` and `output_map` objects
+- When the parent invokes the child through the public lifecycle
+- Then only mapped parent inputs enter the child, mapped outputs return only after SUCCESS/PARTIAL_SUCCESS, and unmapped/colliding/missing mappings are rejected with deterministic diagnostics
+- Parent and child maintain distinct contexts, run-log roots, checkpoints, completed nodes, outcomes, retries, and fidelity sessions
+- Child FAIL/CANCELLED propagates without applying outputs, and invalid parent or child DOT cannot reach a handler
 - Seam: engine end to end
 
 ### SCN-LOOP-RESTART — Fresh-run restart edge
 
 - Given a selected edge with `loop_restart=true`
 - When the source stage completes
-- Then execution targets the requested node in a fresh run-log root, records the restart, and does not leak the old attempt state
+- Then `pipeline.restarting` records old/new roots and target before the target stage starts, and execution targets that node under the fresh root
+- The prepared graph, registry, cancellation signal, event sink, current context values, and restart incoming edge are preserved; completed nodes, node outcomes, retry counters, fidelity sessions, checkpoint, and per-stage status/artifact state are reset
 - Seam: engine integration
 
 ### SCN-TRANSFORM-ORDER — Deterministic custom transforms
 
-- Given built-in transforms and two registered custom transforms
-- When a raw graph enters the public lifecycle
-- Then built-ins run first, custom transforms run in registration order, and validation observes the transformed graph
+- Given a caller-owned parsed graph, built-in transforms, and two ordered custom transforms
+- When `attractor.transforms/apply-transforms` is called directly
+- Then built-ins run first, custom transforms receive one another's returned graphs in registration order, the returned graph contains every change, and the caller's original graph remains structurally unchanged
+- Given the same transforms on the DOT-source public lifecycle
+- Then validation observes the final returned graph rather than the pre-transform graph
 - Seam: transform/validation integration
 
 ### SCN-FIRST-SUCCESS — Early parallel completion
@@ -159,7 +176,8 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 - Given malformed, unreachable, and custom-rule-invalid graphs
 - When validation runs through the public lifecycle
-- Then diagnostics have the documented severity/shape and no invalid graph reaches a handler
+- Then `validate` returns diagnostics with keyword keys `:rule`, `:severity`, and `:message` plus applicable `:node_id`, `:edge`, and `:fix`; severities use `:error`/`:warning`/`:info`; built-ins precede custom rules; reachability is ERROR; and `validate-or-raise` throws `:validation_error` with the complete diagnostics vector
+- Through the public lifecycle, ERROR diagnostics reach no handler and create no execution state, while WARNING diagnostics remain observable and permit execution
 - Seam: validation/engine integration
 
 ### SCN-CAL-LOOP — Complete local agent session
