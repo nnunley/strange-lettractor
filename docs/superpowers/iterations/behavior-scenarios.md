@@ -41,7 +41,7 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Given a RETRY file followed by an attempt that writes no file, the prior attempt's file is not reused
 - Given malformed JSON, invalid outcome enum, or an invalid type for each specified optional field (including a non-string suggested ID), resolution terminates explicitly rather than silently routing
 - Given pipeline cancellation or attempt timeout, a status file written before cancellation or late after handler quiescence cannot replace the terminal cancellation/timeout outcome
-- Prove every case through both the main pipeline and `execute-subgraph` execution paths
+- Compose proof across the shared runtime contract: exhaustive public `execute-with-retry` schema, precedence, and cancellation cases; main-pipeline integration for both routing mechanisms, context/event/checkpoint agreement, canonical persistence, retry freshness, and terminal malformed input; and representative `execute-subgraph` parity for label/suggested-ID routing, handler fallback persistence, retry freshness, malformed/type-invalid termination, cancellation, and auto-status behavior
 - Seam: engine integration
 
 ### SCN-AUTO-STATUS — Missing-status synthesis

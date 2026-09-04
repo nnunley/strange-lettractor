@@ -422,10 +422,12 @@
           persisted (json/read-json (io/slurp (status-path logs "stage")))
           checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
       (is (= :success (:status result)))
-      (is (= "success" (get persisted "outcome")))
-      (is (= "success" (get persisted "status")))
-      (is (= "handler-authored" (get persisted "notes")))
-      (is (= true (get-in persisted ["context_updates" "fallback"])))
+      (is (= {"outcome" "success"
+              "preferred_label" "Done"
+              "suggested_next_ids" ["exit"]
+              "context_updates" {"fallback" true}
+              "notes" "handler-authored"}
+             persisted))
       (is (= :success (get-in checkpoint [:node_outcomes "stage" :status])))
       (is (= "handler-authored"
              (get-in checkpoint [:node_outcomes "stage" :notes]))))))
@@ -503,9 +505,9 @@
         (is (= expected-status (:status result)) label)
         (if (= :success expected-status)
           (do
-            (is (= "success" (get persisted "outcome")))
-            (is (= "auto-status: handler completed without writing status"
-                   (get persisted "notes"))))
+            (is (= {"outcome" "success"
+                    "notes" "auto-status: handler completed without writing status"}
+                   persisted)))
           (do
             (is (= "fail" (get persisted "outcome")))
             (is (= :status_contract_error
@@ -570,6 +572,107 @@
             persisted (json/read-json (io/slurp (status-path logs "stage")))]
         (is (= expected-status (:status result)) label)
         (if (= :success expected-status)
-          (is (= "auto-status: handler completed without writing status"
-                 (get persisted "notes")))
+          (is (= {"outcome" "success"
+                  "notes" "auto-status: handler completed without writing status"}
+                 persisted))
           (is (= :status_contract_error (:category result))))))))
+
+(deftest execute-subgraph-supports-suggested-routing-and-handler-fallback
+  (let [logs (test-logs "subgraph-suggested-fallback")
+        visited (atom [])
+        graph (parser/parse-dot
+                "digraph G {
+                   stage [type=custom.file]
+                   fallback [type=custom.fallback]
+                   wrong [type=custom.wrong]
+                   join [shape=tripleoctagon]
+                   stage -> wrong
+                   stage -> fallback
+                   fallback -> join
+                   wrong -> join
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.file"
+      (fn [_ _ _ _]
+        (write-status! logs "stage"
+                       "{\"outcome\":\"success\",\"suggested_next_ids\":[\"fallback\"],\"notes\":\"file chooses fallback\"}")
+        {:status :success :suggested_next_ids ["wrong"]}))
+    (handlers/register-handler!
+      registry "custom.fallback"
+      (fn [_ _ _ _]
+        (swap! visited conj "fallback")
+        {:status "success"
+         :context_updates {"branch.fallback" true}
+         :notes "handler fallback"}))
+    (handlers/register-handler!
+      registry "custom.wrong"
+      (fn [_ _ _ _]
+        (swap! visited conj "wrong")
+        {:status :success}))
+    (let [result (engine/execute-subgraph
+                   "stage" (context/make-context) graph logs registry
+                   (fn [_] nil) {})
+          persisted (json/read-json (io/slurp (status-path logs "fallback")))]
+      (is (= :success (:status result)))
+      (is (= "join" (:boundary_node_id result)))
+      (is (= ["fallback"] @visited))
+      (is (= {"outcome" "success"
+              "context_updates" {"branch.fallback" true}
+              "notes" "handler fallback"}
+             persisted)))))
+
+(deftest execute-subgraph-retry-does-not-reuse-prior-status
+  (let [logs (test-logs "subgraph-retry-freshness")
+        attempts (atom 0)
+        graph (parser/parse-dot
+                "digraph G {
+                   stage [type=custom.retry, max_retries=1]
+                   join [shape=tripleoctagon]
+                   stage -> join
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.retry"
+      (fn [_ _ _ _]
+        (if (= 1 (swap! attempts inc))
+          (do
+            (write-status! logs "stage"
+                           {:outcome "retry" :notes "must not survive"})
+            {:status :fail})
+          {:status :success :notes "fresh handler"})))
+    (let [result (engine/execute-subgraph
+                   "stage" (context/make-context) graph logs registry
+                   (fn [_] nil) {})
+          persisted (json/read-json (io/slurp (status-path logs "stage")))]
+      (is (= :success (:status result)))
+      (is (= 2 @attempts))
+      (is (= {"outcome" "success" "notes" "fresh handler"}
+             persisted)))))
+
+(deftest execute-subgraph-treats-malformed-and-invalid-status-as-terminal
+  (doseq [[label invalid]
+          [["malformed" "{malformed"]
+           ["invalid" "{\"outcome\":\"success\",\"suggested_next_ids\":\"not-an-array\"}"]]]
+    (let [logs (test-logs (str "subgraph-terminal-" label))
+          attempts (atom 0)
+          graph (parser/parse-dot
+                  "digraph G {
+                     stage [type=custom.invalid, max_retries=2]
+                     join [shape=tripleoctagon]
+                     stage -> join
+                   }")
+          registry (handlers/make-handler-registry)]
+      (handlers/register-handler!
+        registry "custom.invalid"
+        (fn [_ _ _ _]
+          (swap! attempts inc)
+          (write-status! logs "stage" invalid)
+          {:status :success}))
+      (let [result (engine/execute-subgraph
+                     "stage" (context/make-context) graph logs registry
+                     (fn [_] nil) {})]
+        (is (= :fail (:status result)) label)
+        (is (= :status_contract_error (:category result)) label)
+        (is (= false (:retryable result)) label)
+        (is (= 1 @attempts) label)))))

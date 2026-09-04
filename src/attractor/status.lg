@@ -38,21 +38,31 @@
 
     :else value))
 
+(defn- field-present? [outcome field]
+  (or (contains? outcome field)
+      (contains? outcome (name field))))
+
+(defn- field-value [outcome field]
+  (if (contains? outcome field)
+    (get outcome field)
+    (get outcome (name field))))
+
 (defn outcome->status-map [outcome]
   (let [status-name (name (explicit-status outcome))]
-    {:outcome status-name
-     ;; `status` is retained as a compatibility alias for existing readers.
-     :status status-name
-     :preferred_label (or (:preferred_label outcome)
-                          (get outcome "preferred_label") "")
-     :suggested_next_ids (or (:suggested_next_ids outcome)
-                             (get outcome "suggested_next_ids") [])
-     :context_updates
-     (json-safe-object-keys
-       (or (:context_updates outcome) (get outcome "context_updates") {}))
-     :notes (or (:notes outcome) (get outcome "notes") "")
-     :failure_reason (or (:failure_reason outcome)
-                         (get outcome "failure_reason") "")}))
+    (cond-> {:outcome status-name}
+      (field-present? outcome :preferred_label)
+      (assoc :preferred_label (field-value outcome :preferred_label))
+
+      (field-present? outcome :suggested_next_ids)
+      (assoc :suggested_next_ids (field-value outcome :suggested_next_ids))
+
+      (field-present? outcome :context_updates)
+      (assoc :context_updates
+             (json-safe-object-keys
+               (field-value outcome :context_updates)))
+
+      (field-present? outcome :notes)
+      (assoc :notes (field-value outcome :notes)))))
 
 (defn outcome->status-json [outcome]
   (json/write-json (outcome->status-map outcome)))
