@@ -129,6 +129,45 @@
             :notes "auto-status: handler completed without writing status"}
            outcome))))
 
+(deftest auto-status-only-fills-the-absence-of-file-and-handler-outcomes
+  (doseq [[label mode expected]
+          [["current file precedes handler and synthesis"
+            :file
+            {:status :partial_success
+             :preferred_label "File"
+             :suggested_next_ids ["file-next"]
+             :context_updates {"winner" "file"}
+             :notes "file outcome"}]
+           ["handler precedes synthesis"
+            :handler
+            {:status :success
+             :preferred_label "Handler"
+             :suggested_next_ids ["handler-next"]
+             :context_updates {"winner" "handler"}
+             :notes "handler outcome"}]]]
+    (let [logs (test-logs (str "auto-precedence-" label))
+          events (atom [])
+          effective-handler
+          (if (= mode :file)
+            (fn [_ _ _ _]
+              (write-status!
+                logs "stage"
+                "{\"outcome\":\"partial_success\",\"preferred_label\":\"File\",\"suggested_next_ids\":[\"file-next\"],\"context_updates\":{\"winner\":\"file\"},\"notes\":\"file outcome\"}")
+              {:status :fail
+               :preferred_label "Handler"
+               :notes "handler must lose"})
+            (fn [_ _ _ _]
+              {:status :success
+               :preferred_label "Handler"
+               :suggested_next_ids ["handler-next"]
+               :context_updates {"winner" "handler"}
+               :notes "handler outcome"}))
+          outcome (execute effective-handler
+                           {:id "stage" :auto_status true}
+                           logs events)]
+      (testing label
+        (is (= expected outcome))))))
+
 (deftest missing-file-and-invalid-handler-outcome-fails-without-auto-status
   (let [logs (test-logs "missing")
         events (atom [])
