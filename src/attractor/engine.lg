@@ -222,6 +222,91 @@
                :attempt attempt :delay_ms delay-ms})
     ((:sleep-fn runtime) delay-ms)))
 
+(defn- resolve-node-timeout [node]
+  (let [configured-timeout (:timeout node)]
+    (if (nil? configured-timeout)
+      {:timeout-ms nil}
+      (let [parsed (parser/parse-duration-ms configured-timeout)]
+        (if (and (number? parsed) (pos? parsed))
+          {:timeout-ms (long parsed)}
+          {:error
+           (ex-info (str "Invalid non-positive node timeout for '" (:id node) "'")
+                    {:category :configuration_error
+                     :retryable false
+                     :node_id (:id node)})})))))
+
+(defn- error-outcome [error]
+  (let [details (or (ex-data error) {})]
+    (merge {:status :fail :failure_reason (str error)}
+           (select-keys details [:retryable :category :context_updates]))))
+
+(defn- signal-cancellation! [controller reason]
+  (swap! controller
+         (fn [current]
+           (cond
+             (= reason :pipeline_cancelled) :pipeline_cancelled
+             (= current :pipeline_cancelled) :pipeline_cancelled
+             (= current :running) reason
+             :else current))))
+
+(defn- execute-with-attempt-timeout
+  [handler node ctx graph logs-root options timeout-ms]
+  (let [controller (atom :running)
+        pipeline-cancelled? (or (:cancelled? options) (fn [] false))
+        timed-node (assoc node
+                          :cancelled? (fn [] (not= :running @controller))
+                          :cancellation_reason (fn [] @controller))
+        task (core/future
+               (try
+                 {:outcome (handler timed-node ctx graph logs-root)}
+                 (catch Object e {:error e})))
+        deadline (+ (System/currentTimeMillis) timeout-ms)
+        pending ::pending]
+    (loop []
+      (when (pipeline-cancelled?)
+        (signal-cancellation! controller :pipeline_cancelled))
+      (let [execution (deref task 5 pending)]
+        (when (pipeline-cancelled?)
+          (signal-cancellation! controller :pipeline_cancelled))
+        (cond
+          (= :pipeline_cancelled @controller)
+          (do
+            ;; A handler may own resources beyond the engine's reach; join it
+            ;; after signal before the pipeline moves on.
+            @task
+            {:outcome {:status :cancelled
+                       :failure_reason "Pipeline cancelled"}})
+
+          (not= pending execution)
+          execution
+
+          (>= (System/currentTimeMillis) deadline)
+          (do
+            (signal-cancellation! controller :deadline)
+            (let [joined @task]
+              ;; A concurrent pipeline cancellation overrides a deadline,
+              ;; including one detected while waiting for handler quiescence.
+              (when (pipeline-cancelled?)
+                (signal-cancellation! controller :pipeline_cancelled))
+              (if (= :pipeline_cancelled @controller)
+                {:outcome {:status :cancelled
+                           :failure_reason "Pipeline cancelled"}}
+                (let [joined-outcome (:outcome joined)
+                      joined-error (:error joined)
+                      context-updates
+                      (or (:context_updates joined-outcome)
+                          (:context_updates (or (ex-data joined-error) {})))]
+                  {:error
+                   (ex-info (str "Node '" (:id node) "' timed out")
+                            (cond-> {:category :timeout_error
+                                     :retryable true
+                                     :node_id (:id node)}
+                              context-updates
+                              (assoc :context_updates context-updates)))}))))
+
+          :else
+          (recur))))))
+
 ;; Execute node with retry logic (Section 3.5 & 3.6)
 (defn execute-with-retry
   ([handler node ctx graph logs-root on-event]
@@ -234,18 +319,24 @@
          runtime {:retry-counts retry-counts
                   :sleep-fn (or (:sleep-fn options) core/sleep)
                   :random-fn (or (:random-fn options) rand)}
+         timeout-config (resolve-node-timeout node)
          prior-retries (or (get @retry-counts node-id)
                            (get @retry-counts (keyword node-id))
                            0)]
 
     (loop [attempt (inc prior-retries)]
       (on-event {:type :stage.started :node_id node-id :attempt attempt :max_attempts max-attempts})
-      (let [execution (try
-                        {:outcome (handler node ctx graph logs-root)}
-                        (catch Object e {:error e}))
+      (let [execution (if-let [configuration-error (:error timeout-config)]
+                        {:error configuration-error}
+                        (if-let [timeout-ms (:timeout-ms timeout-config)]
+                          (execute-with-attempt-timeout handler node ctx graph logs-root
+                                                        options timeout-ms)
+                          (try
+                            {:outcome (handler node ctx graph logs-root)}
+                            (catch Object e {:error e}))))
             error (:error execution)
             outcome (or (:outcome execution)
-                        {:status :fail :failure_reason (str error)})
+                        (error-outcome error))
             st (:status outcome)]
 
         (cond

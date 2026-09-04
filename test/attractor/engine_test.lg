@@ -194,6 +194,76 @@ digraph Gate {
     (is (= 1 @attempts))
     (os/sh "rm" "-rf" logs)))
 
+(deftest test-node-timeout-signals-cooperative-handler-and-keeps-partial-updates
+  (let [saw-cancellation (atom false)
+        started (System/currentTimeMillis)
+        outcome
+        (e/execute-with-retry
+          (fn [node _ _ _]
+            (let [cancelled? (:cancelled? node)
+                  stop-at (+ (System/currentTimeMillis) 200)]
+              (loop []
+                (if (or (and cancelled? (cancelled?))
+                        (>= (System/currentTimeMillis) stop-at))
+                  (do
+                    (reset! saw-cancellation (boolean (and cancelled? (cancelled?))))
+                    {:status :success :context_updates {"partial.output" "retained"}})
+                  (do
+                    (core/sleep 5)
+                    (recur))))))
+          {:id "timed" :timeout "20ms"}
+          (c/make-context) {} "" (fn [_] nil) {})
+        elapsed (- (System/currentTimeMillis) started)]
+    (is (= :fail (:status outcome)))
+    (is (true? @saw-cancellation))
+    (is (= {"partial.output" "retained"} (:context_updates outcome)))
+    (is (< elapsed 150))))
+
+(deftest test-numeric-node-timeout-is-milliseconds
+  (let [saw-cancellation (atom false)
+        outcome
+        (e/execute-with-retry
+          (fn [node _ _ _]
+            (loop []
+              (if ((:cancelled? node))
+                (do
+                  (reset! saw-cancellation true)
+                  {:status :success})
+                (do
+                  (core/sleep 5)
+                  (recur)))))
+          {:id "timed" :timeout 20}
+          (c/make-context) {} "" (fn [_] nil) {})]
+    (is (= :fail (:status outcome)))
+    (is (true? @saw-cancellation))))
+
+(deftest test-invalid-or-non-positive-node-timeout-is-terminal-before-handler
+  (doseq [timeout ["invalid" "0ms" 0 -1]]
+    (let [attempts (atom 0)
+          outcome
+          (e/execute-with-retry
+            (fn [_ _ _ _]
+              (swap! attempts inc)
+              {:status :success})
+            {:id "invalid-timeout" :timeout timeout :max_retries 3}
+            (c/make-context) {} "" (fn [_] nil) {})]
+      (is (= :fail (:status outcome)))
+      (is (= false (:retryable outcome)))
+      (is (= 0 @attempts)))))
+
+(deftest test-node-without-timeout-runs-synchronously-without-cancellation-hooks
+  (let [received-node (atom nil)
+        outcome
+        (e/execute-with-retry
+          (fn [node _ _ _]
+            (reset! received-node node)
+            {:status :success})
+          {:id "untimed"}
+          (c/make-context) {} "" (fn [_] nil) {})]
+    (is (= :success (:status outcome)))
+    (is (nil? (:cancelled? @received-node)))
+    (is (nil? (:cancellation_reason @received-node)))))
+
 (deftest test-named-retry-policies-respect-explicit-node-limits
   (let [graph (p/parse-dot
                 "digraph G {
