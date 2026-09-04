@@ -55,97 +55,79 @@
   (swap! ctx update :logs conj (str entry))
   ctx)
 
-(defn- edn-round-trippable? [value]
-  (try
-    (= value (edn/read-string (pr-str value)))
-    (catch Object _
-      false)))
-
 (defn- unsupported-context-value! [path]
   (throw (ex-info "Context contains a value that cannot round-trip through EDN"
                   {:category :unsupported-context-value
                    :path path})))
 
-(declare context-value-supported?)
-(declare validate-context-value!)
-(declare copy-context-value)
-
-(defn- context-value-supported? [value]
-  (cond
-    (map? value)
-    (every? (fn [[key nested-value]]
-              (and (context-value-supported? key)
-                   (context-value-supported? nested-value)))
-            value)
-
-    (or (vector? value) (list? value) (set? value))
-    (every? context-value-supported? value)
-
-    :else (edn-round-trippable? value)))
-
-(defn- validate-map! [value path]
-  (doseq [[key nested-value] value]
-    (when-not (context-value-supported? key)
-      (unsupported-context-value! (conj path :map-key)))
-    (validate-context-value! nested-value (conj path key))))
-
-(defn- validate-sequence! [value path]
-  (doseq [[index nested-value] (map-indexed vector value)]
-    (validate-context-value! nested-value (conj path index))))
-
-(defn- validate-set! [value path]
-  (doseq [member value]
-    (when-not (context-value-supported? member)
-      (unsupported-context-value! (conj path :set-member)))))
-
-(defn- validate-context-value! [value path]
-  (cond
-    (map? value) (validate-map! value path)
-    (or (vector? value) (list? value)) (validate-sequence! value path)
-    (set? value) (validate-set! value path)
-    (not (edn-round-trippable? value)) (unsupported-context-value! path))
-  value)
-
-(defn- copy-context-value [value]
+(defn- copy-context-value [value path]
   (cond
     (map? value)
     (reduce (fn [copied [key nested-value]]
-              (assoc copied
-                     (copy-context-value key)
-                     (copy-context-value nested-value)))
+              (let [key-path (conj path :map-key)
+                    copied-key
+                    (try
+                      (copy-context-value key key-path)
+                      (catch Object error
+                        (if (= :unsupported-context-value
+                               (:category (ex-data error)))
+                          (unsupported-context-value! key-path)
+                          (throw error))))]
+                (assoc copied
+                       copied-key
+                       (copy-context-value nested-value (conj path key)))))
             {}
             value)
 
     (vector? value)
-    (reduce (fn [copied nested-value]
-              (conj copied (copy-context-value nested-value)))
+    (reduce (fn [copied [index nested-value]]
+              (conj copied
+                    (copy-context-value nested-value (conj path index))))
             []
-            value)
+            (map-indexed vector value))
 
     (list? value)
-    (apply list (map copy-context-value value))
+    (apply list
+           (map-indexed
+             (fn [index nested-value]
+               (copy-context-value nested-value (conj path index)))
+             value))
 
     (set? value)
     (reduce (fn [copied member]
-              (conj copied (copy-context-value member)))
+              (let [member-path (conj path :set-member)
+                    copied-member
+                    (try
+                      (copy-context-value member member-path)
+                      (catch Object error
+                        (if (= :unsupported-context-value
+                               (:category (ex-data error)))
+                          (unsupported-context-value! member-path)
+                          (throw error))))]
+                (conj copied copied-member)))
             (hash-set)
             value)
 
-    :else (edn/read-string (pr-str value))))
-
-(defn- deep-copy-context-value [value path]
-  (validate-context-value! value path)
-  (copy-context-value value))
+    :else
+    (try
+      (let [copied (edn/read-string (pr-str value))]
+        (if (= value copied)
+          copied
+          (unsupported-context-value! path)))
+      (catch Object error
+        (if (= :unsupported-context-value (:category (ex-data error)))
+          (throw error)
+          (unsupported-context-value! path))))))
 
 ;; Deep snapshot of context values
 (defn ctx-snapshot [ctx]
-  (deep-copy-context-value (:values @ctx) [:values]))
+  (copy-context-value (:values @ctx) [:values]))
 
 ;; Deep clone of context (for parallel branch isolation)
 (defn ctx-clone [ctx]
   (let [cur @ctx]
-    (atom {:values (deep-copy-context-value (:values cur) [:values])
-           :logs (deep-copy-context-value (:logs cur) [:logs])})))
+    (atom {:values (copy-context-value (:values cur) [:values])
+           :logs (copy-context-value (:logs cur) [:logs])})))
 
 ;; Mirror graph attributes into context at initialization (Section 3.2 & 5.1)
 (defn mirror-graph-attributes! [graph ctx]
