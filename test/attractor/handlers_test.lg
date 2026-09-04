@@ -1,10 +1,11 @@
 (ns attractor.handlers-test
   (:require [clojure.test :refer [deftest is]]
             [attractor.context :as context]
-            [attractor.handlers :as handlers]))
+            [attractor.handlers :as handlers]
+            [os :as os]))
 
 (deftest test-tool-handler-evaluates-complete-command-through-shell
-  (let [output-path (str "/private/tmp/attractor-tool-handler-shell-" (System/nanoTime))
+  (let [output-path (str (os/temp-dir) "/attractor-tool-handler-shell-" (System/nanoTime))
         command (str "printf '%s\n' 'quoted value' | tr ' ' '_' > " output-path
                      " && cat " output-path)
         result (handlers/handle-tool {:attrs {:tool_command command}} nil nil nil)]
