@@ -122,15 +122,21 @@
     (doseq [[target expected-root] [["second" (second roots)]
                                     ["third" (nth roots 2)]]]
       (let [restart-index (first-event-index @events :pipeline.restarting target)
-            pipeline-started (nth @events (inc restart-index))
-            stage-started (nth @events (+ restart-index 2))]
-        (is (= {:type :pipeline.started
-                :id (:id graph)
-                :goal (:goal graph)
-                :logs_root expected-root}
-               pipeline-started))
-        (is (= :stage.started (:type stage-started)))
-        (is (= target (:node_id stage-started)))))))
+            pipeline-started-index
+            (first
+              (for [[index event] (map-indexed vector @events)
+                    :when (and (> index restart-index)
+                               (= :pipeline.started (:type event))
+                               (= expected-root (:logs_root event)))]
+                index))
+            stage-started-index
+            (first
+              (for [[index event] (map-indexed vector @events)
+                    :when (and (> index restart-index)
+                               (= :stage.started (:type event))
+                               (= target (:node_id event)))]
+                index))]
+        (is (< restart-index pipeline-started-index stage-started-index))))))
 
 (deftest restart-cycle-uses-one-invocation-wide-step-budget
   (let [limit 4
@@ -219,3 +225,178 @@
                  (ex-data error)))
           (is (= 0 @handler-count))
           (is (empty? @events)))))))
+
+(deftest max-steps-allows-a-satisfied-terminal-after-the-exact-budget
+  (let [one-handler-graph
+        (parser/parse-dot
+          "digraph ExactBudget {
+             start [shape=Mdiamond, type=budget.probe]
+             exit [shape=Msquare]
+             start -> exit
+           }")
+        two-handler-graph
+        (parser/parse-dot
+          "digraph OverBudget {
+             start [shape=Mdiamond, type=budget.probe]
+             extra [type=budget.probe]
+             exit [shape=Msquare]
+             start -> extra -> exit
+           }")
+        registry
+        (handlers/make-handler-registry
+          (interviewer/make-auto-approve-interviewer) nil)
+        handler-count (atom 0)
+        _ (handlers/register-handler!
+            registry "budget.probe"
+            (fn [_ _ _ _]
+              (swap! handler-count inc)
+              {:status :success}))
+        exact-events (atom [])
+        exact-result
+        (engine/run-pipeline
+          one-handler-graph
+          {:registry registry
+           :logs-root (restart-test-root "exact-budget")
+           :max-steps 1
+           :on-event (fn [event] (swap! exact-events conj event))})
+        _ (reset! handler-count 0)
+        over-events (atom [])
+        over-result
+        (engine/run-pipeline
+          two-handler-graph
+          {:registry registry
+           :logs-root (restart-test-root "over-budget")
+           :max-steps 1
+           :on-event (fn [event] (swap! over-events conj event))})
+        reason "Pipeline step limit exceeded (1 steps)"]
+    (is (= :success (:status exact-result)))
+    (is (= ["start" "exit"] (:completed_nodes exact-result)))
+    (is (empty? (filter (fn [event] (= :pipeline.failed (:type event)))
+                        @exact-events)))
+    (is (= :fail (:status over-result)))
+    (is (= reason (:failure_reason over-result)))
+    (is (= 1 @handler-count))
+    (is (= 1 (count (filter (fn [event] (= :stage.started (:type event)))
+                            @over-events))))
+    (is (= [{:type :pipeline.failed :error reason}]
+           (filterv (fn [event] (= :pipeline.failed (:type event)))
+                    @over-events)))))
+
+(deftest goal-gate-reroutes-consume-the-shared-step-budget
+  (let [graph
+        (parser/parse-dot
+          "digraph GateBudget {
+             start [shape=Mdiamond, type=gate.probe,
+                    goal_gate=true, retry_target=retry]
+             retry [type=gate.probe]
+             exit [shape=Msquare]
+             start -> exit [condition=\"outcome=fail\"]
+             retry -> exit
+           }")
+        run-case
+        (fn [limit]
+          (let [handler-nodes (atom [])
+                events (atom [])
+                registry
+                (handlers/make-handler-registry
+                  (interviewer/make-auto-approve-interviewer) nil)
+                _ (handlers/register-handler!
+                    registry "gate.probe"
+                    (fn [node _ _ _]
+                      (swap! handler-nodes conj (:id node))
+                      (if (= "start" (:id node))
+                        {:status :fail :failure_reason "goal not met"}
+                        {:status :success})))
+                result
+                (engine/run-pipeline
+                  graph
+                  {:registry registry
+                   :logs-root (restart-test-root (str "gate-" limit))
+                   :max-steps limit
+                   :on-event (fn [event] (swap! events conj event))})]
+            {:result result :handler-nodes @handler-nodes :events @events}))
+        at-limit (run-case 1)
+        with-reroute (run-case 2)]
+    (is (= "Pipeline step limit exceeded (1 steps)"
+           (get-in at-limit [:result :failure_reason])))
+    (is (= ["start"] (:handler-nodes at-limit)))
+    (is (empty? (filter (fn [event]
+                          (= :goal_gate.retrying (:type event)))
+                        (:events at-limit))))
+    (is (= [{:type :pipeline.failed
+             :error "Pipeline step limit exceeded (1 steps)"}]
+           (filterv (fn [event] (= :pipeline.failed (:type event)))
+                    (:events at-limit))))
+    (is (= "Pipeline step limit exceeded (2 steps)"
+           (get-in with-reroute [:result :failure_reason])))
+    (is (= ["start"] (:handler-nodes with-reroute)))
+    (is (= 1 (count (filter (fn [event]
+                              (= :goal_gate.retrying (:type event)))
+                            (:events with-reroute)))))
+    (is (= 1 (count (filter (fn [event]
+                              (= :stage.started (:type event)))
+                            (:events with-reroute)))))))
+
+(deftest fidelity-cleanup-attempts-all-closes-and-preserves-primary-errors
+  (let [graph
+        (parser/parse-dot
+          "digraph Cleanup {
+             start [shape=Mdiamond, type=cleanup.probe]
+             exit [shape=Msquare]
+             start -> exit
+           }")
+        primary-error (ex-info "primary transition failure" {:kind :primary})
+        cleanup-error (ex-info "cleanup failure" {:kind :cleanup})
+        run-case
+        (fn [throw-primary?]
+          (let [attempts (atom [])
+                threads-seen (atom nil)
+                registry
+                (handlers/make-handler-registry
+                  (interviewer/make-auto-approve-interviewer) nil)
+                _ (handlers/register-handler!
+                    registry "cleanup.probe"
+                    (fn [node _ _ _]
+                      (let [threads (:fidelity_threads node)]
+                        (reset! threads-seen threads)
+                        (reset! threads
+                                (array-map
+                                  "broken"
+                                  {:close (fn []
+                                            (swap! attempts conj "broken")
+                                            (throw cleanup-error))}
+                                  "healthy"
+                                  {:close (fn []
+                                            (swap! attempts conj "healthy"))}))
+                        (if throw-primary?
+                          (throw primary-error)
+                          {:status :success}))))
+                escaped
+                (try
+                  (do
+                    (engine/run-pipeline
+                      graph
+                      {:registry registry
+                       :logs-root
+                       (restart-test-root
+                         (if throw-primary? "primary-cleanup" "cleanup-only"))
+                       :on-event
+                       (fn [event]
+                         (when (and throw-primary?
+                                    (= :stage.failed (:type event)))
+                           (throw primary-error)))})
+                    nil)
+                  (catch Object error error))]
+            {:escaped escaped
+             :attempts @attempts
+             :threads @threads-seen}))
+        with-primary (run-case true)
+        cleanup-only (run-case false)]
+    (is (identical? primary-error (:escaped with-primary)))
+    (is (= #{"broken" "healthy"} (set (:attempts with-primary))))
+    (is (= 2 (count (:attempts with-primary))))
+    (is (empty? @(:threads with-primary)))
+    (is (identical? cleanup-error (:escaped cleanup-only)))
+    (is (= #{"broken" "healthy"} (set (:attempts cleanup-only))))
+    (is (= 2 (count (:attempts cleanup-only))))
+    (is (empty? @(:threads cleanup-only)))))

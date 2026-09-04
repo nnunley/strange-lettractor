@@ -768,6 +768,14 @@
            (core/sleep chunk)
            (recur (- remaining chunk))))))})
 
+(defn- step-limit-failure [max-steps completed-nodes on-event]
+  (let [reason (str "Pipeline step limit exceeded (" max-steps " steps)")
+        result {:status :fail
+                :failure_reason reason
+                :completed_nodes completed-nodes}]
+    (on-event {:type :pipeline.failed :error reason})
+    result))
+
 ;; Main execution loop (Section 3.2)
 (defn- run-pipeline*
   ([graph] (run-pipeline* graph {}))
@@ -838,13 +846,10 @@
                       :completed_nodes completed-nodes})
            res)
 
-         ;; The public driver shares this counter across restart segments.
-         (>= @step-counter max-steps)
-         (let [reason (str "Pipeline step limit exceeded (" max-steps " steps)")
-               res {:status :fail :failure_reason reason
-                    :completed_nodes completed-nodes}]
-           (on-event {:type :pipeline.failed :error (:failure_reason res)})
-           res)
+         ;; A satisfied terminal is free; nonterminal handler execution is not.
+         (and (>= @step-counter max-steps)
+              (not (terminal-node? current-node)))
+         (step-limit-failure max-steps completed-nodes on-event)
 
          :else
          (let [node-id (:id current-node)]
@@ -854,22 +859,25 @@
            (if (terminal-node? current-node)
              (let [[gates-ok? failed-gate] (check-goal-gates graph node-outcomes)]
                (if (not gates-ok?)
-                 (let [retry-id (resolve-retry-target failed-gate graph)]
-                   (if (and retry-id (parser/find-node graph retry-id))
-                     (do
-                       (swap! step-counter inc)
-                       (on-event {:type :goal_gate.retrying :unsatisfied_node (:id failed-gate) :target retry-id})
-                       (recur (parser/find-node graph retry-id)
-                              completed-nodes
-                              node-outcomes
-                              nil
-                              (inc step-count)))
-                     (let [fail-res {:status :fail
-                                     :failure_reason "Goal gate unsatisfied and no retry target"
-                                     :unsatisfied_gate (:id failed-gate)
-                                     :completed_nodes completed-nodes}]
-                       (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
-                       fail-res)))
+                 (if (>= @step-counter max-steps)
+                   (step-limit-failure max-steps completed-nodes on-event)
+                   (let [retry-id (resolve-retry-target failed-gate graph)]
+                     (if (and retry-id (parser/find-node graph retry-id))
+                       (do
+                         ;; A goal-gate reroute is one invocation step.
+                         (swap! step-counter inc)
+                         (on-event {:type :goal_gate.retrying :unsatisfied_node (:id failed-gate) :target retry-id})
+                         (recur (parser/find-node graph retry-id)
+                                completed-nodes
+                                node-outcomes
+                                nil
+                                (inc step-count)))
+                       (let [fail-res {:status :fail
+                                       :failure_reason "Goal gate unsatisfied and no retry target"
+                                       :unsatisfied_gate (:id failed-gate)
+                                       :completed_nodes completed-nodes}]
+                         (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                         fail-res))))
                  ;; Terminal node reached, goal gates satisfied!
                  (let [success-res {:status :success
                                     :notes "Pipeline completed"
@@ -993,10 +1001,19 @@
                                   (inc step-count)))))))))))))))))
 
 (defn- close-fidelity-threads! [threads]
-  (doseq [[_ entry] @threads]
-    (when-let [close-fn (:close entry)]
-      (close-fn)))
-  (reset! threads {}))
+  (let [first-error (atom nil)]
+    (try
+      (doseq [[_ entry] @threads]
+        (when-let [close-fn (:close entry)]
+          (try
+            (close-fn)
+            (catch Object error
+              (when (nil? @first-error)
+                (reset! first-error error))))))
+      (finally
+        (reset! threads {})))
+    (when-let [error @first-error]
+      (throw error))))
 
 (defn- max-steps-option [options]
   (let [value (if (contains? options :max-steps)
@@ -1039,7 +1056,10 @@
   "Low-level execution API for an already parsed, transformed, and validated graph.
 
   :max-steps must be a positive integer and defaults to default-max-steps. The
-  limit applies to this entire invocation, including every restart segment."
+  limit applies to this entire invocation, including every restart segment. A
+  step is one nonterminal handler execution or one goal-gate reroute; recognizing
+  a satisfied terminal is free. Restart closes and clears even caller-provided
+  :fidelity-threads. Ordinary non-restart completion retains caller ownership."
   ([graph] (run-pipeline graph {}))
   ([graph options]
    (let [max-steps (max-steps-option options)
@@ -1072,24 +1092,27 @@
          (if-let [error (:error execution)]
            (do
              (when owns-threads?
-               (close-fidelity-threads! threads))
+               (try
+                 (close-fidelity-threads! threads)
+                 (catch Object _ nil)))
              (throw error))
            (let [result (:result execution)]
              (if (:attractor.engine/restart result)
-               (let [new-root
-                     (allocate-restart-root root-base allocated-roots)]
+               (do
                  ;; A restart always ends the current segment's sessions,
                  ;; including caller-provided session state.
                  (close-fidelity-threads! threads)
-                 (on-event {:type :pipeline.restarting
-                            :old_logs_root (:old_logs_root result)
-                            :new_logs_root new-root
-                            :target (:target result)})
-                 (recur
-                   (restarted-segment-options
-                     base-options (:target result) (:edge result) new-root)
-                   (atom {})
-                   true))
+                 (let [new-root
+                       (allocate-restart-root root-base allocated-roots)]
+                   (on-event {:type :pipeline.restarting
+                              :old_logs_root (:old_logs_root result)
+                              :new_logs_root new-root
+                              :target (:target result)})
+                   (recur
+                     (restarted-segment-options
+                       base-options (:target result) (:edge result) new-root)
+                     (atom {})
+                     true)))
                (do
                  (when owns-threads?
                    (close-fidelity-threads! threads))
