@@ -262,8 +262,10 @@
       {:error (timeout-configuration-error node)}
       (let [controller (atom :running)
             pipeline-cancelled? (or (:cancelled? options) (fn [] false))
+            inherited-cancelled? (or (:cancelled? node) (fn [] false))
             timed-node (assoc node
-                              :cancelled? (fn [] (not= :running @controller))
+                              :cancelled? (fn [] (or (inherited-cancelled?)
+                                                     (not= :running @controller)))
                               :cancellation_reason (fn [] @controller))
             deadline (+ started-at timeout-ms)
             task (core/future
@@ -477,6 +479,11 @@
             (execution-node current-node incoming-edge graph ctx completed-nodes
                             node-outcomes
                             (or (:fidelity-threads retry-options) (atom {})) nil)
+            prepared-node (assoc prepared-node
+                                 :cancelled? (fn [] (or (when-let [cancelled? (:cancelled? retry-options)]
+                                                          (cancelled?))
+                                                        (when-let [branch-cancelled? (:branch-cancelled? retry-options)]
+                                                          (branch-cancelled?)))))
             handler (handlers/resolve-handler registry prepared-node)
             outcome (execute-with-retry handler prepared-node ctx graph logs-root
                                         on-event retry-options)
@@ -520,9 +527,9 @@
         manager-runtime (atom {})
         parallel-handler
         (handlers/make-parallel-handler
-          (fn [branch-edge branch-ctx graph logs-root]
+          (fn [branch-edge branch-ctx graph logs-root branch-cancelled?]
             (if-let [execute-fn @branch-executor]
-              (execute-fn branch-edge branch-ctx graph logs-root)
+              (execute-fn branch-edge branch-ctx graph logs-root branch-cancelled?)
               {:status :fail
                :failure_reason
                "Parallel branch executor is not initialized"}))
@@ -684,7 +691,7 @@
          manager-runtime (get @registry handlers/manager-runtime-key)
          _parallel-init (when parallel-executor
                           (reset! parallel-executor
-                                  (fn [branch-edge branch-ctx branch-graph branch-logs]
+                                  (fn [branch-edge branch-ctx branch-graph branch-logs branch-cancelled?]
                                     (let [branch-threads (atom {})]
                                       (try
                                         (execute-subgraph
@@ -692,6 +699,8 @@
                                           branch-logs registry on-event
                                           (assoc retry-options
                                                  :retry-counts (atom {})
+                                                 :branch-cancelled? (fn [] (or (cancelled?)
+                                                                                (branch-cancelled?)))
                                                  :fidelity-threads branch-threads))
                                         (finally
                                           (close-fidelity-threads!

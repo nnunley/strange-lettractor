@@ -252,6 +252,7 @@
 (defn- make-parallel-handler* [execute-branch-fn pass-edge?]
   (fn [node ctx graph logs-root]
     (let [branches (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
+          cancelled? (or (:cancelled? node) (fn [] false))
           join-policy (or (get-in node [:attrs :join_policy]) "wait_all")
           max-parallel (let [mp (get-in node [:attrs :max_parallel])]
                          (if (and (number? mp) (> mp 0)) mp 4))]
@@ -260,7 +261,7 @@
         (let [results
               (loop [remaining branches
                      accumulated []]
-                (if (empty? remaining)
+                (if (or (empty? remaining) (cancelled?))
                   accumulated
                   (let [batch (vec (take max-parallel remaining))
                         batch-results
@@ -270,7 +271,7 @@
                                         branch-ctx (context/ctx-clone ctx)
                                         branch-logs (str logs-root "/branches/" target-id)
                                         branch-start (if pass-edge? branch-edge target-id)
-                                        result (execute-branch-fn branch-start branch-ctx graph branch-logs)]
+                                        result (execute-branch-fn branch-start branch-ctx graph branch-logs cancelled?)]
                                     (assoc result :id target-id :node_id target-id)))
                                 batch))]
                     (recur (drop max-parallel remaining)
@@ -281,14 +282,16 @@
               fail-count (count (filter (fn [r] (= (:status r) :fail)) results))
               base {:context_updates {"parallel.results" (vec results)}}
               base (if next-node-id (assoc base :next_node_id next-node-id) base)]
-          (if (= join-policy "first_success")
+          (if (cancelled?)
+            (merge base {:status :cancelled :failure_reason "Pipeline cancelled"})
+            (if (= join-policy "first_success")
             (if (> success-count 0)
               (merge base {:status :success :notes "Parallel first_success satisfied"})
               (merge base {:status :fail :failure_reason "All parallel branches failed"}))
             (if (= fail-count 0)
               (merge base {:status :success :notes "All parallel branches succeeded"})
               (merge base {:status :partial_success
-                           :notes (str fail-count " parallel branch(es) failed")}))))))))
+                           :notes (str fail-count " parallel branch(es) failed")})))))))))
 
 (defn make-parallel-handler
   ([execute-branch-fn]
@@ -397,9 +400,20 @@
                       (manager-setting node graph :manager.actions
                                        "observe,wait"))
             start-child (:start-child callbacks)
-            cancelled? (or (:cancelled? callbacks) (fn [] false))
+            runtime-cancelled? (or (:cancelled? callbacks) (fn [] false))
+            cancelled? (fn [] (or (runtime-cancelled?)
+                                  (when-let [attempt-cancelled? (:cancelled? node)]
+                                    (attempt-cancelled?))))
             stop-child (:stop-child callbacks)
             now-fn (or (:now-fn callbacks) #(System/currentTimeMillis))
+            sleep-fn (or (:sleep-fn callbacks) core/sleep)
+            cooperative-sleep
+            (fn [duration]
+              (loop [remaining duration]
+                (when (and (> remaining 0) (not (cancelled?)))
+                  (let [chunk (min remaining 100)]
+                    (sleep-fn chunk)
+                    (recur (- remaining chunk))))))
             existing-child (or (:child callbacks)
                                (when-let [get-child (:get-child callbacks)]
                                  (get-child)))
@@ -415,8 +429,9 @@
         (if validation-error
           {:status :fail :failure_reason validation-error}
           (let [child-logs (str logs-root "/" (:id node) "/child")
+                child-node (assoc node :cancelled? cancelled?)
                 child (if autostart?
-                        (start-child child-dotfile child-logs node)
+                        (start-child child-dotfile child-logs child-node)
                         existing-child)
                 stop-owned-child
                 (fn []
@@ -482,7 +497,7 @@
                               now)
                             last-steered-at)]
                       (when (contains? actions "wait")
-                        ((or (:sleep-fn callbacks) core/sleep) poll-ms))
+                        (cooperative-sleep poll-ms))
                       (recur (inc cycle) next-last-steered-at)))))))))
       (catch Object e
         {:status :fail
@@ -498,9 +513,9 @@
          manager-runtime (atom {})
          parallel-handler
          (make-parallel-handler
-           (fn [branch-edge branch-ctx graph logs-root]
+           (fn [branch-edge branch-ctx graph logs-root branch-cancelled?]
              (if-let [execute-fn @branch-executor]
-               (execute-fn branch-edge branch-ctx graph logs-root)
+               (execute-fn branch-edge branch-ctx graph logs-root branch-cancelled?)
                {:status :fail
                 :failure_reason "Parallel branch executor is not initialized"}))
            true)

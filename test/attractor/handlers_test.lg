@@ -232,9 +232,12 @@
 (deftest test-manager-loop-cancels-owned-child-when-parent-cancels
   (let [cancelled (atom false)
         stops (atom 0)
+        child-cancelled (atom nil)
         handler
         (handlers/make-manager-loop-handler
-          {:start-child (fn [_ _ _] :child)
+          {:start-child (fn [_ _ node]
+                          (reset! child-cancelled (:cancelled? node))
+                          :child)
            :observe-child (fn [_] {:status :running})
            :cancelled? (fn [] @cancelled)
            :stop-child (fn [_] (swap! stops inc))
@@ -248,7 +251,56 @@
           {:attrs {:stack.child_dotfile "child.dot"}}
           "run")]
     (is (= :cancelled (:status result)))
-    (is (= 1 @stops))))
+    (is (= 1 @stops))
+    (is (true? (@child-cancelled)))))
+
+(deftest test-manager-loop-combines-attempt-cancellation-with-runtime-cancellation
+  (let [attempt-cancelled (atom false)
+        child-cancelled (atom false)
+        stops (atom 0)
+        handler (handlers/make-manager-loop-handler
+                  {:start-child (fn [_ _ node]
+                                  (reset! child-cancelled (:cancelled? node))
+                                  :child)
+                   :observe-child (fn [_] {:status :running})
+                   :stop-child (fn [_] (swap! stops inc))
+                   :sleep-fn (fn [_] (reset! attempt-cancelled true))})
+        result (handler {:id "manager"
+                         :cancelled? (fn [] @attempt-cancelled)
+                         :attrs {:manager.actions "observe,wait"
+                                 :manager.poll_interval "1ms"}}
+                        (context/make-context)
+                        {:attrs {:stack.child_dotfile "child.dot"}}
+                        "run")]
+    (is (= :cancelled (:status result)))
+    (is (= 1 @stops))
+    (is (true? (@child-cancelled)))))
+
+(deftest test-manager-loop-chunks-wait-for-attempt-cancellation
+  (let [attempt-cancelled (atom false)
+        child-cancelled (atom nil)
+        sleeps (atom [])
+        handler (handlers/make-manager-loop-handler
+                  {:cancelled? (fn [] false)
+                   :start-child (fn [_ _ node]
+                                  (reset! child-cancelled (:cancelled? node))
+                                  :child)
+                   :observe-child (fn [_] {:status :running})
+                   :stop-child (fn [_] nil)
+                   :sleep-fn (fn [delay]
+                               (swap! sleeps conj delay)
+                               (reset! attempt-cancelled true))})
+        result (handler {:id "manager"
+                         :cancelled? (fn [] @attempt-cancelled)
+                         :attrs {:manager.actions "observe,wait"
+                                 :manager.poll_interval "45s"}}
+                        (context/make-context)
+                        {:attrs {:stack.child_dotfile "child.dot"}}
+                        "run")]
+    (is (= :cancelled (:status result)))
+    (is (= 1 (count @sleeps)))
+    (is (<= (first @sleeps) 100))
+    (is (true? (@child-cancelled)))))
 
 (deftest test-manager-loop-requires-child-runtime-and-dotfile
   (let [handler (handlers/make-manager-loop-handler {})]
@@ -261,7 +313,7 @@
   (let [received (atom [])
         handler
         (handlers/make-parallel-handler
-          (fn [target-id _ _ _]
+          (fn [target-id _ _ _ _]
             (swap! received conj target-id)
             {:status :success :boundary_node_id "join"}))
         result
@@ -271,3 +323,46 @@
                  "run")]
     (is (= :success (:status result)))
     (is (= ["branch"] @received))))
+
+(deftest test-parallel-handler-stops-scheduling-after-cancellation
+  (let [cancelled (atom false)
+        received (atom [])
+        handler (handlers/make-parallel-handler
+                  (fn [target-id _ _ _ branch-cancelled?]
+                    (swap! received conj target-id)
+                    (reset! cancelled true)
+                    (is (true? (branch-cancelled?)))
+                    {:status :success})
+                  false)
+        result (handler {:id "fork"
+                         :cancelled? (fn [] @cancelled)
+                         :attrs {:max_parallel 1}}
+                        (context/make-context)
+                        {:edges [{:from "fork" :to "a"}
+                                 {:from "fork" :to "b"}]}
+                        "run")]
+    (is (= :cancelled (:status result)))
+    (is (= ["a"] @received))))
+
+(deftest test-parallel-handler-joins-active-branch-on-cancellation
+  (let [cancelled (atom false)
+        started (promise)
+        release (promise)
+        task (core/future
+               ((handlers/make-parallel-handler
+                  (fn [_ _ _ _ branch-cancelled?]
+                    (deliver started branch-cancelled?)
+                    (loop []
+                      (if (branch-cancelled?)
+                        (do @release {:status :cancelled})
+                        (do (core/sleep 1) (recur)))))
+                  false)
+                {:id "fork" :cancelled? (fn [] @cancelled)
+                 :attrs {:max_parallel 1}}
+                (context/make-context)
+                {:edges [{:from "fork" :to "a"}]}
+                "run"))]
+    (is (fn? (deref started 1000 :timeout)))
+    (reset! cancelled true)
+    (deliver release :released)
+    (is (= :cancelled (:status (deref task 1000 :timeout))))))
