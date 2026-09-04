@@ -403,6 +403,7 @@
          runtime {:retry-counts retry-counts
                   :sleep-fn (or (:sleep-fn options) core/sleep)
                   :random-fn (or (:random-fn options) rand)}
+         handler-node (assoc node :attractor.engine/status-managed true)
          pipeline-cancelled? (or (:cancelled? options) (fn [] false))
          timeout-config (resolve-node-timeout node)
          prior-retries (or (get @retry-counts node-id)
@@ -420,10 +421,10 @@
                         (if-let [configuration-error (:error timeout-config)]
                           {:error configuration-error}
                           (if-let [timeout-ms (:timeout-ms timeout-config)]
-                            (execute-with-attempt-timeout handler node ctx graph logs-root
+                            (execute-with-attempt-timeout handler handler-node ctx graph logs-root
                                                           options timeout-ms)
                             (try
-                              {:outcome (handler node ctx graph logs-root)}
+                              {:outcome (handler handler-node ctx graph logs-root)}
                               (catch Object e {:error e})))))
             error (:error execution)
             handler-outcome (:outcome execution)

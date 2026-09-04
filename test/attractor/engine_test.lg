@@ -742,7 +742,7 @@ digraph Gate {
                  (test-logs "subgraph-retry-target") registry (fn [_] nil)
                  {:retry-counts (atom {}) :sleep-fn (fn [_] nil)})]
     (is (= :success (:status result)))
-    (is (= "join" (:boundary_node_id result))))
+    (is (= "join" (:boundary_node_id result)))))
 
 (deftest test-execute-subgraph-skips-pre-cancelled-branch
   (let [invoked (atom 0)
@@ -826,7 +826,8 @@ digraph Gate {
       (is (= "manager" (:manager_node_id child-event)))
       (is (= (str logs "/manager/child") (:child_logs child-event))))
     (is (= ["report.edn"]
-           (get (:context result) "context.stack.child.artifacts")))
+           (get (:context result) "context.stack.child.artifacts"))
+        (str "child context: " (pr-str (:context result))))
     (io/delete-file child-dotfile)))
 
 (deftest test-manager-real-child-observes-attempt-cancellation

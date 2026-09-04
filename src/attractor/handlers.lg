@@ -157,6 +157,7 @@
            prompt (if (str/blank? preamble)
                     base-prompt
                     (str preamble "\n" base-prompt))
+           engine-managed-status? (:attractor.engine/status-managed node)
            stage-dir (str (or logs-root "attractor_runs/run_latest") "/" node-id)]
 
        (os/sh "mkdir" "-p" stage-dir)
@@ -173,8 +174,9 @@
                (do
                  (when-not (os/stat (str stage-dir "/response.md"))
                    (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
-                 (io/spit (str stage-dir "/status.json")
-                          (status/outcome->status-json backend-result))
+                 (when-not engine-managed-status?
+                   (io/spit (str stage-dir "/status.json")
+                            (status/outcome->status-json backend-result)))
                  backend-result))
 
              ;; Backend returned a response string
@@ -185,13 +187,15 @@
                             :context_updates {"last_stage" node-id
                                               "last_response" truncated-resp}}]
                (io/spit (str stage-dir "/response.md") resp-str)
-               (io/spit (str stage-dir "/status.json")
-                        (status/outcome->status-json outcome))
+               (when-not engine-managed-status?
+                 (io/spit (str stage-dir "/status.json")
+                          (status/outcome->status-json outcome)))
                outcome)))
          (catch Object e
            (let [fail-outcome {:status :fail :failure_reason (str e)}]
-             (io/spit (str stage-dir "/status.json")
-                      (status/outcome->status-json fail-outcome))
+             (when-not engine-managed-status?
+               (io/spit (str stage-dir "/status.json")
+                        (status/outcome->status-json fail-outcome)))
              (throw e))))))))
 
 ;; Wait.human Handler (Section 4.6)

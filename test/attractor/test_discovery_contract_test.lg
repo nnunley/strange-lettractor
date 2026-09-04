@@ -1,0 +1,10 @@
+(ns attractor.test-discovery-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.engine-test]))
+
+(deftest engine-test-source-loads-through-final-sentinel
+  (let [publics (ns-publics 'attractor.engine-test)]
+    (is (= 43 (count publics)))
+    (is (some? (get publics 'test-fidelity-uses-the-exact-selected-edge)))))
+
+;; SCN-TEST-DISCOVERY COMPLETE
