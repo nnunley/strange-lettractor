@@ -256,11 +256,12 @@
         timed-node (assoc node
                           :cancelled? (fn [] (not= :running @controller))
                           :cancellation_reason (fn [] @controller))
+        now-ms (or (:now-ms options) (fn [] (System/currentTimeMillis)))
+        deadline (+ (now-ms) timeout-ms)
         task (core/future
                (try
                  {:outcome (handler timed-node ctx graph logs-root)}
                  (catch Object e {:error e})))
-        deadline (+ (System/currentTimeMillis) timeout-ms)
         pending ::pending]
     (loop []
       (when (pipeline-cancelled?)
@@ -277,10 +278,9 @@
             {:outcome {:status :cancelled
                        :failure_reason "Pipeline cancelled"}})
 
-          (not= pending execution)
-          execution
-
-          (>= (System/currentTimeMillis) deadline)
+          ;; Check the clock before accepting a completed future.  A future
+          ;; that completes during the final polling interval is still late.
+          (>= (now-ms) deadline)
           (do
             (signal-cancellation! controller :deadline)
             (let [joined @task]
@@ -303,6 +303,9 @@
                                      :node_id (:id node)}
                               context-updates
                               (assoc :context_updates context-updates)))}))))
+
+          (not= pending execution)
+          execution
 
           :else
           (recur))))))

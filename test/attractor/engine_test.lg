@@ -195,11 +195,15 @@ digraph Gate {
     (os/sh "rm" "-rf" logs)))
 
 (deftest test-node-timeout-signals-cooperative-handler-and-keeps-partial-updates
-  (let [saw-cancellation (atom false)
+  (let [attempts (atom 0)
+        saw-cancellation (atom false)
+        cancellation-reason (atom nil)
+        events (atom [])
         started (System/currentTimeMillis)
         outcome
         (e/execute-with-retry
           (fn [node _ _ _]
+            (swap! attempts inc)
             (let [cancelled? (:cancelled? node)
                   stop-at (+ (System/currentTimeMillis) 200)]
               (loop []
@@ -207,16 +211,23 @@ digraph Gate {
                         (>= (System/currentTimeMillis) stop-at))
                   (do
                     (reset! saw-cancellation (boolean (and cancelled? (cancelled?))))
+                    (reset! cancellation-reason ((:cancellation_reason node)))
                     {:status :success :context_updates {"partial.output" "retained"}})
                   (do
                     (core/sleep 5)
                     (recur))))))
           {:id "timed" :timeout "20ms"}
-          (c/make-context) {} "" (fn [_] nil) {})
+          (c/make-context) {} "" #(swap! events conj %) {})
         elapsed (- (System/currentTimeMillis) started)]
     (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (= true (:retryable outcome)))
+    (is (= 1 @attempts))
     (is (true? @saw-cancellation))
+    (is (= :deadline @cancellation-reason))
     (is (= {"partial.output" "retained"} (:context_updates outcome)))
+    (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
+    (is (empty? (filter #(= :stage.retrying (:type %)) @events)))
     (is (< elapsed 150))))
 
 (deftest test-numeric-node-timeout-is-milliseconds
@@ -240,16 +251,65 @@ digraph Gate {
 (deftest test-invalid-or-non-positive-node-timeout-is-terminal-before-handler
   (doseq [timeout ["invalid" "0ms" 0 -1]]
     (let [attempts (atom 0)
+          events (atom [])
           outcome
           (e/execute-with-retry
             (fn [_ _ _ _]
               (swap! attempts inc)
               {:status :success})
             {:id "invalid-timeout" :timeout timeout :max_retries 3}
-            (c/make-context) {} "" (fn [_] nil) {})]
+            (c/make-context) {} "" #(swap! events conj %) {})]
       (is (= :fail (:status outcome)))
       (is (= false (:retryable outcome)))
-      (is (= 0 @attempts)))))
+      (is (= 0 @attempts))
+      (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
+      (is (= 1 (count (filter #(= :stage.failed (:type %)) @events))))
+      (is (empty? (filter #(= :stage.retrying (:type %)) @events))))))
+
+(deftest test-node-timeout-does-not-accept-completion-after-deadline
+  (let [clock (atom 0)
+        outcome
+        (e/execute-with-retry
+          (fn [_ _ _ _]
+            (reset! clock 21)
+            {:status :success})
+          {:id "late" :timeout 20}
+          (c/make-context) {} "" (fn [_] nil) {:now-ms (fn [] @clock)})]
+    (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (= true (:retryable outcome)))))
+
+(deftest test-pipeline-cancellation-during-timed-attempt-is-terminal-and-not-retried
+  (let [cancelled (atom false)
+        started (promise)
+        attempts (atom 0)
+        reason (atom nil)
+        events (atom [])
+        _ (core/future
+            (deref started 1000 :not-started)
+            (reset! cancelled true))
+        outcome
+        (e/execute-with-retry
+          (fn [node _ _ _]
+            (swap! attempts inc)
+            (deliver started :running)
+            (loop []
+              (if ((:cancelled? node))
+                (do
+                  (reset! reason ((:cancellation_reason node)))
+                  {:status :success})
+                (do
+                  (core/sleep 2)
+                  (recur)))))
+          {:id "cancelled" :timeout "100ms" :max_retries 3}
+          (c/make-context) {} "" #(swap! events conj %)
+          {:cancelled? (fn [] @cancelled)
+           :sleep-fn (fn [_] nil)})]
+    (is (= :cancelled (:status outcome)))
+    (is (= 1 @attempts))
+    (is (= :pipeline_cancelled @reason))
+    (is (= 1 (count (filter #(= :stage.started (:type %)) @events))))
+    (is (empty? (filter #(= :stage.retrying (:type %)) @events)))))
 
 (deftest test-node-without-timeout-runs-synchronously-without-cancellation-hooks
   (let [received-node (atom nil)
