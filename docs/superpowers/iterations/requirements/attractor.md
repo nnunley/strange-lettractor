@@ -1,0 +1,37 @@
+# Attractor Runtime Requirements
+
+Source: [`docs/upstream/strongdm-attractor/attractor-spec.md`](../../../upstream/strongdm-attractor/attractor-spec.md)
+
+Status values are `proved`, `partial`, `missing`, or `deferred`. “Proved” means the repository has automated behavior evidence at the required seam; it does not imply live-provider parity.
+
+| Story | Status | Requirement and acceptance proof |
+|---|---|---|
+| ATTR-DOT-01 | proved | Parse the strict DOT subset: graph/node/edge attributes, comments, quoted and unquoted values, chains, defaults, and subgraphs ([§2.1–2.12](../../../upstream/strongdm-attractor/attractor-spec.md#2-dot-dsl-schema)). `SCN-ATTR-PARSE` exercises the currently proved parser contract. |
+| ATTR-DOT-02 | proved | Apply graph, node, edge, timeout, fidelity, and thread attributes with correct inheritance. Covered by parser/parity tests. |
+| ATTR-DOT-03 | partial | Derive a stylesheet class from every subgraph label regardless of whether the label precedes or follows its nodes ([§2.10](../../../upstream/strongdm-attractor/attractor-spec.md#210-subgraphs)). `SCN-SUBGRAPH-LABEL` is the missing label-after-node regression. |
+| ATTR-ENG-01 | proved | Traverse nodes and select edges deterministically, including preferred labels, suggested IDs, conditions, goal gates, and failure routing. `SCN-ATTR-ENGINE`. |
+| ATTR-ENG-02 | proved | Enforce inherited and explicit per-attempt deadlines, retries, cooperative cancellation, timeout events, and partial-output preservation. `SCN-TIMEOUT`. |
+| ATTR-ENG-03 | partial | The public pipeline lifecycle must transform and validate before executing; invalid graphs cannot reach a handler. Any raw execution function must be explicitly low-level. |
+| ATTR-ENG-04 | partial | Resolve the upstream conflict between §3.5 (returned FAIL is terminal) and the Definition of Done (FAIL may retry), document the chosen contract, and lock it with a regression. Current behavior follows §3.5. |
+| ATTR-ENG-05 | partial | `loop_restart=true` starts a new run-log root and records the restart before targeting the requested node. Add focused evidence. |
+| ATTR-STATUS-01 | missing | A valid `status.json` written during the current attempt is authoritative for outcome, notes, preferred edge label, suggested node IDs, context updates, and retry routing ([Appendix C](../../../upstream/strongdm-attractor/attractor-spec.md#appendix-c-status-file-contract)). Before every retry/subgraph attempt, remove or ignore stale status. Validate required outcome/type/enum; malformed current files terminate explicitly. If no file exists, accept a valid handler outcome. Events, checkpoint, and routing must all use the same resolved outcome. `SCN-STATUS-FILE`. |
+| ATTR-STATUS-02 | missing | When neither a current status file nor valid handler outcome exists and `auto_status=true`, synthesize and persist the specification's exact success/note ([Appendix C](../../../upstream/strongdm-attractor/attractor-spec.md#appendix-c-status-file-contract)). Explicit `auto_status=false` overrides inherited true. Prove main-run and `execute-subgraph` parity. `SCN-AUTO-STATUS`. |
+| ATTR-CP-01 | proved | Persist and resume checkpoints and artifacts. Project decision: internal persistence remains EDN (`checkpoint.edn` and `.edn` artifacts), with migration reads where useful; explicitly external `status.json` remains JSON. `SCN-CHECKPOINT`. |
+| ATTR-CTX-01 | partial | Snapshot and clone context deeply enough that nested branch mutation cannot affect the parent or siblings. `SCN-CONTEXT-ISOLATION`. |
+| ATTR-CTX-02 | proved | Resolve full, truncate, compact, summary, and edge/node/thread fidelity semantics, including safe resume degradation ([§5.4](../../../upstream/strongdm-attractor/attractor-spec.md#54-context-fidelity)). Covered by engine fidelity/session tests. |
+| ATTR-ART-01 | partial | Expose artifact lifecycle and threshold backing through pipeline outcomes/manifests, including discoverability of handler-produced artifacts. |
+| ATTR-HND-01 | partial | Start, exit, codergen, conditional, tool, parallel, fan-in, manager, and registered custom handlers exist and have direct or engine tests ([§4](../../../upstream/strongdm-attractor/attractor-spec.md#4-node-handlers)). Add one registry-to-engine matrix proving each shape/type dispatches through the engine. `SCN-HANDLER-MATRIX`. |
+| ATTR-HUM-01 | partial | Human choices and queue/auto-approve routing are proved ([§6](../../../upstream/strongdm-attractor/attractor-spec.md#6-human-in-the-loop-interviewer-pattern)); add callback, recording, accelerator, default, and answer-shape evidence. `SCN-INTERVIEWERS`. |
+| ATTR-HUM-02 | missing | Console questions honor `timeout_seconds` without indefinitely blocking on stdin. `SCN-HUMAN-TIMEOUT`. |
+| ATTR-PAR-01 | proved | `wait_all` runs isolated, bounded branches and fans them in once. |
+| ATTR-PAR-02 | missing | `first_success` returns when the first branch succeeds, then cancels and joins losers without waiting for their normal completion. `SCN-FIRST-SUCCESS`. |
+| ATTR-FANIN-01 | missing | A non-empty fan-in prompt uses an injected LLM ranker; an empty prompt retains deterministic heuristic selection. |
+| ATTR-VAL-01 | partial | Basic valid/missing-start-exit/unreachable validation is proved ([§7](../../../upstream/strongdm-attractor/attractor-spec.md#7-validation-and-linting)); add custom-rule, diagnostic-shape, `validate-or-raise`, and invalid-graph-never-handler evidence. Resolve the upstream reachability severity conflict (§7.2 says error; parity matrix says orphan warning) and document the choice. `SCN-VALIDATION`. |
+| ATTR-STYLE-01 | proved | Stylesheet selectors, specificity, inheritance, and explicit node overrides work. |
+| ATTR-XFORM-01 | partial | Custom transforms are registerable and run in deterministic order after built-ins. |
+| ATTR-COMPOSE-01 | partial | Compose pipelines with explicit input/output context mapping while preserving validation and run isolation ([§9.4](../../../upstream/strongdm-attractor/attractor-spec.md#94-pipeline-composition)). Add a cross-pipeline context-mapping journey. `SCN-PIPELINE-COMPOSITION`. |
+| ATTR-SERVER-01 | partial | Pipeline endpoints, cancellation, questions, checkpoint/context, and graph work; `/events` must remain connected and deliver later events as real SSE. `SCN-SSE-LIVE`. |
+| ATTR-OBS-01 | partial | Emit ordered pipeline, stage, checkpoint, parallel, and interview event families with timeout/failure detail. |
+| ATTR-HOOK-01 | missing | Run `tool_hooks.pre` and `.post` around every LLM tool call. A failing pre-hook skips execution; a failing post-hook preserves the tool result while recording the failure. `SCN-TOOL-HOOKS`. |
+| ATTR-COND-01 | proved | Parse, validate, and evaluate equality/inequality, conjunction, literals, and outcome/context variable resolution ([§10](../../../upstream/strongdm-attractor/attractor-spec.md#10-condition-expression-language)). Covered by condition and routing tests. |
+| ATTR-SMOKE-01 | partial | The deterministic mock smoke proves the complete local journey; add an opt-in credential-gated real-provider smoke with the same assertions. `SCN-ATTR-SMOKE-LIVE`. |

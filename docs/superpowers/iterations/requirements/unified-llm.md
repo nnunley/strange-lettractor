@@ -1,0 +1,18 @@
+# Unified LLM Requirements
+
+Source: [`docs/upstream/strongdm-attractor/unified-llm-spec.md`](../../../upstream/strongdm-attractor/unified-llm-spec.md)
+
+| Story | Status | Requirement and acceptance proof |
+|---|---|---|
+| ULLM-CORE-01 | partial | Provide environment/programmatic configuration, provider routing/default selection, module-level default client, concurrency isolation, and a model catalog ([§2.2, §2.5–2.6, §2.9](../../../upstream/strongdm-attractor/unified-llm-spec.md#2-architecture)). Unit coverage is broad; catalog freshness/discovery remain. `SCN-ULLM-CLIENT`. |
+| ULLM-MIDDLEWARE-01 | partial | Middleware wraps complete requests in deterministic onion order and wraps streaming iterators so it can observe/modify ordered stream events, without leaking state ([§2.3](../../../upstream/strongdm-attractor/unified-llm-spec.md#23-middleware--interceptor-pattern)). Close with `SCN-ULLM-CLIENT`. |
+| ULLM-ADAPTER-01 | partial | Native OpenAI, Anthropic, and Gemini adapters serialize messages, tools, reasoning, caching, and errors according to each provider contract. Fixture proof exists; add HTTP/native-wire evidence. |
+| ULLM-CONTENT-01 | partial | Preserve all five roles; text, image URL/base64/path, tool results, thinking/redacted thinking; finish reason, usage, warning, rate-limit, and provider metadata without invalid reorderings ([§3](../../../upstream/strongdm-attractor/unified-llm-spec.md#3-data-model)). Audio/document rejection must be graceful. `SCN-ULLM-ADAPTERS`. |
+| ULLM-COMPLETE-01 | partial | Low-level complete/stream and high-level generate/stream produce equivalent accumulated responses, usage, finish reasons, tool calls, and ordered events ([§4.1–4.4](../../../upstream/strongdm-attractor/unified-llm-spec.md#4-generation-and-streaming)). Unit proof exists; add native streaming evidence. `SCN-ULLM-HIGHLEVEL`. |
+| ULLM-STRUCTURED-01 | partial | `generate_object` and `stream_object` enforce prompt-versus-messages exclusivity, schema/response-format translation, parsing, and normalized structured-output failures ([§4.5–4.6](../../../upstream/strongdm-attractor/unified-llm-spec.md#45-high-level-generate_object)). `SCN-ULLM-HIGHLEVEL`. |
+| ULLM-CANCEL-01 | partial | Cancellation and deadlines interrupt request bodies, stalled responses, and streams promptly while preserving partial output and one terminal outcome. Mock proof is strong; add a real local socket server. `SCN-ULLM-CANCEL`. |
+| ULLM-TOOLS-01 | partial | ToolChoice, active/passive tools, execute handlers, bounded multi-step rounds, validation/repair, parallel ordered execution, streaming calls, and continuation messages round-trip through every adapter ([§5](../../../upstream/strongdm-attractor/unified-llm-spec.md#5-tool-calling)). Strengthen timing/native continuation evidence with `SCN-ULLM-TOOLS`. |
+| ULLM-ERROR-01 | partial | Normalize provider errors and retry status/header/drop conditions with bounded policy. Unit proof exists; add controllable HTTP-server cases. `SCN-ULLM-HTTP-ERRORS`. |
+| ULLM-QUIRKS-01 | partial | Preserve provider-specific reasoning, cache controls, beta flags, and compatibility quirks without leaking them into unrelated providers. Add live cache/reasoning evidence. |
+| ULLM-COMPAT-01 | partial | Support OpenAI-compatible endpoints through explicit base URL/auth/model configuration without weakening native OpenAI behavior ([§7.10](../../../upstream/strongdm-attractor/unified-llm-spec.md#710-openai-compatible-endpoints)). `SCN-OPENAI-COMPAT`. |
+| ULLM-RELEASE-01 | missing | A release gate records equivalent smoke results for OpenAI, Anthropic, and Gemini. `SCN-PROVIDER-MATRIX`. |
