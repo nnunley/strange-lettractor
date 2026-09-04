@@ -819,6 +819,18 @@
                                  (or (:manager-runtime options)
                                      (make-child-runtime registry on-event
                                                          cancelled? options))))
+         ;; Private integration seam for proving per-segment runtime ownership.
+         ;; It is deliberately option-namespaced and never enters results/events.
+         _segment-observer
+         (when-let [observer (:attractor.engine/on-segment-initialized options)]
+           (observer {:logs-root logs-root
+                      :registry registry
+                      :parallel-executor parallel-executor
+                      :manager-runtime manager-runtime
+                      :retry-counts retry-counts
+                      :retry-counts-value @retry-counts
+                      :fidelity-threads fidelity-threads
+                      :fidelity-threads-value @fidelity-threads}))
          initial-start-node (if (:start-at options)
                               (parser/find-node graph (:start-at options))
                               (val (parser/find-start-node graph)))]
@@ -1108,6 +1120,7 @@
                               :old_logs_root (:old_logs_root result)
                               :new_logs_root new-root
                               :target (:target result)})
+                   (context/ctx-reset-for-restart! ctx)
                    (recur
                      (restarted-segment-options
                        base-options (:target result) (:edge result) new-root)

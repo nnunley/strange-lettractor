@@ -1,5 +1,7 @@
 (ns attractor.loop-restart-contract-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [attractor.agent :as agent]
             [attractor.context :as context]
             [attractor.engine :as engine]
             [attractor.handlers :as handlers]
@@ -18,6 +20,20 @@
           :when (and (= event-type (:type event))
                      (= target (:target event)))]
       index)))
+
+(def restart-bookkeeping-names
+  #{"run.id" "current_node" "outcome" "preferred_label"})
+
+(defn context-key-name [key]
+  (if (keyword? key) (name key) (str key)))
+
+(defn stale-restart-bookkeeping-keys [values]
+  (filterv
+    (fn [key]
+      (let [key-name (context-key-name key)]
+        (or (contains? restart-bookkeeping-names key-name)
+            (str/starts-with? key-name "internal.retry_count."))))
+    (keys values)))
 
 (deftest restart-driver-preserves-run-inputs-and-orders-fresh-segments
   (let [graph
@@ -400,3 +416,257 @@
     (is (= #{"broken" "healthy"} (set (:attempts cleanup-only))))
     (is (= 2 (count (:attempts cleanup-only))))
     (is (empty? @(:threads cleanup-only)))))
+
+(deftest restart-exhaustively-isolates-segment-state-and-artifacts
+  (let [semantic {:nested {:items [1 2 3]}}
+        first-produced {:from "start" :nested ["a"]}
+        second-produced {:from "second" :nested ["b"]}
+        graph
+        (parser/parse-dot
+          "digraph Isolation {
+             graph [goal=\"Keep the mission\", label=\"Stable label\", owner=stable]
+             start [shape=Mdiamond, type=restart.matrix]
+             second [type=restart.matrix]
+             third [type=restart.matrix]
+             exit [shape=Msquare]
+             start -> second [loop_restart=true, fidelity=full, thread_id=\"edge-one\"]
+             second -> third [loop_restart=true, fidelity=full, thread_id=\"edge-two\"]
+             third -> exit
+           }")
+        registry
+        (handlers/make-handler-registry
+          (interviewer/make-auto-approve-interviewer) nil)
+        template-parallel (get @registry handlers/parallel-executor-key)
+        template-manager (get @registry handlers/manager-runtime-key)
+        template-parallel-value @template-parallel
+        template-manager-value @template-manager
+        ctx
+        (context/make-context
+          {"semantic" semantic
+           "preserve.internal.retry_count.value" "yes"
+           "run.id" "old-string-run"
+           :run.id "old-keyword-run"
+           "current_node" "old-string-node"
+           :current_node "old-keyword-node"
+           "outcome" "old-string-outcome"
+           :outcome "old-keyword-outcome"
+           "preferred_label" "old-string-label"
+           :preferred_label "old-keyword-label"
+           "internal.retry_count.string" 1
+           :internal.retry_count.keyword 2})
+        cancelled? (fn [] false)
+        root (restart-test-root "matrix")
+        events (atom [])
+        calls (atom [])
+        segment-inits (atom [])
+        restart-files (atom [])
+        manager-config {:configured true}
+        _
+        (handlers/register-handler!
+          registry "restart.matrix"
+          (fn [node handler-ctx handler-graph logs-root]
+            (let [node-id (:id node)
+                  values (:values @handler-ctx)
+                  earlier-node-ids
+                  (case node-id
+                    "start" []
+                    "second" ["start"]
+                    "third" ["start" "second"])
+                  stage-dir (str logs-root "/" node-id)
+                  produced (if (= node-id "start") first-produced second-produced)]
+              (swap! calls conj
+                     {:node node-id
+                      :logs-root logs-root
+                      :context handler-ctx
+                      :graph handler-graph
+                      :cancelled? (:cancelled? node)
+                      :values values
+                      :logs (:logs @handler-ctx)
+                      :semantic (get values "semantic")
+                      :fidelity (:resolved_fidelity node)
+                      :thread (:resolved_thread_id node)
+                      :clean-at-entry?
+                      (and (nil? (os/stat (str logs-root "/checkpoint.edn")))
+                           (every?
+                             (fn [earlier]
+                               (nil? (os/stat (str logs-root "/" earlier))))
+                             earlier-node-ids))})
+              (os/sh "mkdir" "-p" stage-dir)
+              (io/spit (str stage-dir "/artifact.txt")
+                       (str "artifact-" node-id))
+              (context/ctx-append-log! handler-ctx (str "log-" node-id))
+              (when-not (= node-id "third")
+                (swap! handler-ctx update :values assoc
+                       :run.id "bad-keyword-run"
+                       :current_node "bad-keyword-node"
+                       :outcome "bad-keyword-outcome"
+                       :preferred_label "bad-keyword-label"
+                       :internal.retry_count.bad 99))
+              {:status :success
+               :preferred_label "bad-string-label"
+               :context_updates
+               {(str "produced." node-id) produced
+                "graph.id" "corrupt-id"
+                "graph.goal" "corrupt-goal"
+                "graph.label" "corrupt-label"
+                "graph.owner" "corrupt-owner"
+                "internal.retry_count.bad" 99}})))
+        result
+        (engine/run-pipeline
+          graph
+          {:registry registry
+           :context ctx
+           :cancelled? cancelled?
+           :logs-root root
+           :manager-runtime manager-config
+           :first-node-fidelity-override "summary:high"
+           :completed-nodes ["prior"]
+           :node-outcomes {"prior" {:status :success}}
+           :node-retries {"prior" 2}
+           :attractor.engine/on-segment-initialized
+           (fn [state] (swap! segment-inits conj state))
+           :on-event
+           (fn [event]
+             (when (= :pipeline.restarting (:type event))
+               (let [old-root (:old_logs_root event)
+                     old-node (get {"second" "start" "third" "second"}
+                                   (:target event))]
+                 (swap! restart-files conj
+                        (mapv
+                          (fn [path]
+                            {:path path :contents (io/slurp path)})
+                          [(str old-root "/checkpoint.edn")
+                           (str old-root "/" old-node "/status.json")
+                           (str old-root "/" old-node "/artifact.txt")]))))
+             (when (= :pipeline.started (:type event))
+               (swap! events conj
+                      {:event event
+                       :values (:values @ctx)
+                       :logs (:logs @ctx)})))})
+        call-data @calls
+        roots (mapv :logs-root call-data)
+        checkpoints (mapv (fn [segment-root]
+                            (context/load-checkpoint
+                              (str segment-root "/checkpoint.edn")))
+                          roots)
+        started @events]
+    (is (= :success (:status result)))
+    (is (= ["start" "second" "third"] (mapv :node call-data)))
+    (is (= 3 (count (set roots))))
+    (is (every? :clean-at-entry? call-data))
+    (is (every? (fn [call] (identical? ctx (:context call))) call-data))
+    (is (every? (fn [call] (identical? graph (:graph call))) call-data))
+    (is (every? (fn [call] (identical? cancelled? (:cancelled? call))) call-data))
+    (is (every? (fn [call] (identical? semantic (:semantic call))) call-data))
+    (is (= [[] ["log-start"] ["log-start" "log-second"]]
+           (mapv :logs call-data)))
+    (is (= ["log-start" "log-second" "log-third"] (:logs @ctx)))
+    (is (= "yes" (context/ctx-get ctx "preserve.internal.retry_count.value")))
+    (is (identical? first-produced (context/ctx-get ctx "produced.start")))
+    (is (identical? second-produced (context/ctx-get ctx "produced.second")))
+    (doseq [index [1 2]]
+      (let [started-state (nth started index)
+            values (:values started-state)
+            handler-values (:values (nth call-data index))
+            node-id (:node (nth call-data index))]
+        (is (= (nth roots index) (get values "run.id")))
+        (is (empty? (stale-restart-bookkeeping-keys
+                      (dissoc values "run.id"))))
+        (is (nil? (get values "current_node")))
+        (is (= (nth roots index) (get handler-values "run.id")))
+        (is (= node-id (get handler-values "current_node")))
+        (is (empty?
+              (stale-restart-bookkeeping-keys
+                (dissoc handler-values "run.id" "current_node"))))
+        (is (= "Isolation" (get handler-values "graph.id")))
+        (is (= "Keep the mission" (get handler-values "graph.goal")))
+        (is (= "Stable label" (get handler-values "graph.label")))
+        (is (= "stable" (get handler-values "graph.owner")))))
+    (is (= "summary:high" (:fidelity (first call-data))))
+    (is (= [["full" "edge-one"] ["full" "edge-two"]]
+           (mapv (fn [call] [(:fidelity call) (:thread call)])
+                 (rest call-data))))
+    (is (= [["prior" "start"] ["second"] ["third" "exit"]]
+           (mapv :completed_nodes checkpoints)))
+    (is (= [#{"prior" "start"} #{"second"} #{"third"}]
+           (mapv (fn [checkpoint] (set (keys (:node_outcomes checkpoint))))
+                 checkpoints)))
+    (is (= [{"prior" 2 "start" 0} {"second" 0} {"third" 0}]
+           (mapv :node_retries checkpoints)))
+    (doseq [recorded-files @restart-files
+            recorded recorded-files]
+      (is (some? (os/stat (:path recorded))))
+      (is (= (:contents recorded) (io/slurp (:path recorded)))))
+    (doseq [[index own-node] [[0 "start"] [1 "second"] [2 "third"]]
+            candidate ["start" "second" "third"]]
+      (let [path (str (nth roots index) "/" candidate)]
+        (if (= candidate own-node)
+          (do
+            (is (some? (os/stat (str path "/status.json"))))
+            (is (= (str "artifact-" candidate)
+                   (io/slurp (str path "/artifact.txt")))))
+          (is (nil? (os/stat path))))))
+    (is (= 3 (count @segment-inits)))
+    (is (= 3 (count (set (map :parallel-executor @segment-inits)))))
+    (is (= 3 (count (set (map :manager-runtime @segment-inits)))))
+    (is (= 3 (count (set (map :retry-counts @segment-inits)))))
+    (is (= 3 (count (set (map :fidelity-threads @segment-inits)))))
+    (is (every? (fn [state] (fn? @(:parallel-executor state)))
+                @segment-inits))
+    (is (every? (fn [state] (= manager-config @(:manager-runtime state)))
+                @segment-inits))
+    (is (= [{"prior" 2} {} {}]
+           (mapv :retry-counts-value @segment-inits)))
+    (is (= [{} {} {}]
+           (mapv :fidelity-threads-value @segment-inits)))
+    (is (nil? template-parallel-value))
+    (is (= {} template-manager-value))
+    (is (nil? @template-parallel))
+    (is (= {} @template-manager))))
+
+(deftest two-restarts-create-three-fresh-full-fidelity-sessions
+  (let [requests (atom [])
+        session-starts (atom [])
+        session-ends (atom [])
+        backend
+        (agent/make-agent-codergen-backend
+          {:model "mock/test"
+           :project_docs []
+           :complete_fn
+           (fn [request]
+             (swap! requests conj request)
+             {:id (str "response-" (count @requests))
+              :content "ok" :tool_calls []})
+           :on_event
+           (fn [event]
+             (case (:type event)
+               :session_start (swap! session-starts conj (:session_id event))
+               :session_end (swap! session-ends conj (:session_id event))
+               nil))})
+        registry (handlers/make-handler-registry
+                   (interviewer/make-auto-approve-interviewer) backend)
+        graph
+        (parser/parse-dot
+          "digraph FidelityRestart {
+             graph [default_fidelity=full, thread_id=shared]
+             start [shape=Mdiamond]
+             first [shape=box]
+             second [shape=box]
+             third [shape=box]
+             exit [shape=Msquare]
+             start -> first
+             first -> second [loop_restart=true]
+             second -> third [loop_restart=true]
+             third -> exit
+           }")
+        result
+        (engine/run-pipeline
+          graph {:registry registry
+                 :logs-root (restart-test-root "three-fidelity")})]
+    (is (= :success (:status result)))
+    (is (= [2 2 2] (mapv (comp count :messages) @requests)))
+    (is (= 3 (count (set @session-starts))))
+    (is (= (set @session-starts) (set @session-ends)))
+    (is (= 3 (count @session-ends)))))
+
+;; SCN-LOOP-RESTART COMPLETE

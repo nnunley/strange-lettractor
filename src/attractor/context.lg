@@ -55,6 +55,23 @@
   (swap! ctx update :logs conj (str entry))
   ctx)
 
+(defn- restart-bookkeeping-key? [key]
+  (let [key-name (if (keyword? key) (name key) (str key))]
+    (or (contains? #{"run.id" "current_node" "outcome" "preferred_label"}
+                   key-name)
+        (str/starts-with? key-name "internal.retry_count."))))
+
+(defn ctx-reset-for-restart!
+  "Remove run-segment bookkeeping while retaining the context atom, semantic
+  values (including their identities), and accumulated logs."
+  [ctx]
+  (swap! ctx update :values
+         (fn [values]
+           (into {}
+                 (remove (fn [[key _]] (restart-bookkeeping-key? key))
+                         values))))
+  ctx)
+
 (defn- unsupported-context-value! [path]
   (throw (ex-info "Context contains a value that cannot round-trip through EDN"
                   {:category :unsupported-context-value
