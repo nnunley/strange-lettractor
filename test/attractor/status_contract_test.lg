@@ -290,3 +290,40 @@
                                        {:logs-root logs :registry registry})]
       (is (= :cancelled (:status outcome)))
       (is (nil? (os/stat (status-path logs "stage")))))))
+
+(deftest codergen-backend-cancellation-is-not-converted-to-failure
+  (let [logs (test-logs "codergen-cancelled")
+        handler (handlers/make-codergen-handler
+                  (fn [_ _ _]
+                    {:status :cancelled
+                     :failure_reason "Pipeline cancelled"}))
+        result (try
+                 {:outcome (handler {:id "stage" :prompt "work"}
+                                    (context/make-context) {} logs)}
+                 (catch Object error {:error error}))]
+    (is (nil? (:error result)))
+    (is (= :cancelled (get-in result [:outcome :status])))
+    (is (= "Pipeline cancelled"
+           (get-in result [:outcome :failure_reason])))
+    (is (nil? (os/stat (status-path logs "stage"))))))
+
+(deftest execute-subgraph-cancellation-clears-handler-status
+  (let [logs (test-logs "subgraph-cancelled-status")
+        graph (parser/parse-dot
+                "digraph G {
+                   stage [type=custom.cancel]
+                   join [shape=tripleoctagon]
+                   stage -> join
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.cancel"
+      (fn [_ _ _ handler-logs]
+        (write-status! handler-logs "stage"
+                       {:outcome "success" :notes "stale branch audit"})
+        {:status :cancelled :failure_reason "Pipeline cancelled"}))
+    (let [outcome (engine/execute-subgraph
+                    "stage" (context/make-context) graph logs registry
+                    (fn [_] nil) {})]
+      (is (= :cancelled (:status outcome)))
+      (is (nil? (os/stat (status-path logs "stage")))))))

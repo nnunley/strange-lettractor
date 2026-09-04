@@ -168,12 +168,14 @@
                                 (str "[Simulated] Response for stage: " node-id))]
            (if (and (map? backend-result) (:status backend-result))
              ;; Backend returned an Outcome directly
-             (do
-               (when-not (os/stat (str stage-dir "/response.md"))
-                 (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
-               (io/spit (str stage-dir "/status.json")
-                        (status/outcome->status-json backend-result))
-               backend-result)
+             (if (= :cancelled (:status backend-result))
+               backend-result
+               (do
+                 (when-not (os/stat (str stage-dir "/response.md"))
+                   (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
+                 (io/spit (str stage-dir "/status.json")
+                          (status/outcome->status-json backend-result))
+                 backend-result))
 
              ;; Backend returned a response string
              (let [resp-str (str backend-result)
