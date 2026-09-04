@@ -61,7 +61,7 @@
       (let [start-id (first start-node)
             incoming (filter (fn [e] (= (:to e) start-id)) (:edges graph))]
         (if (seq incoming)
-          [{:rule "start_no_incoming" :severity :error :node-id start-id :message (str "Start node '" start-id "' must have no incoming edges")}]
+          [{:rule "start_no_incoming" :severity :error :node_id start-id :message (str "Start node '" start-id "' must have no incoming edges")}]
           []))
       [])))
 
@@ -73,7 +73,7 @@
       (let [exit-id (first exit-node)
             outgoing (filter (fn [e] (= (:from e) exit-id)) (:edges graph))]
         (if (seq outgoing)
-          [{:rule "exit_no_outgoing" :severity :error :node-id exit-id :message (str "Exit node '" exit-id "' must have no outgoing edges")}]
+          [{:rule "exit_no_outgoing" :severity :error :node_id exit-id :message (str "Exit node '" exit-id "' must have no outgoing edges")}]
           []))
       [])))
 
@@ -103,7 +103,7 @@
             all-ids (set (keys (:nodes graph)))
             unreachable (set/difference all-ids reachable)]
         (map (fn [nid]
-               {:rule "reachability" :severity :error :node-id nid
+               {:rule "reachability" :severity :error :node_id nid
                 :message (str "Node '" nid "' is not reachable from start node '" start-id "'")})
              unreachable))
       [])))
@@ -140,7 +140,7 @@
      (reduce (fn [acc [nid node]]
                (let [t (:type node)]
                  (if (and (not (str/blank? t)) (not (contains? known t)))
-                   (conj acc {:rule "type_known" :severity :warning :node-id nid
+                   (conj acc {:rule "type_known" :severity :warning :node_id nid
                               :message (str "Unknown node type: '" t "' on node '" nid "'")})
                    acc)))
              []
@@ -156,7 +156,7 @@
         node-diags (reduce (fn [acc [nid node]]
                              (let [fid (:fidelity node)]
                                (if (and (not (str/blank? fid)) (not (contains? valid-fidelity-modes fid)))
-                                 (conj acc {:rule "fidelity_valid" :severity :warning :node-id nid
+                                 (conj acc {:rule "fidelity_valid" :severity :warning :node_id nid
                                             :message (str "Invalid fidelity mode '" fid "' on node '" nid "'")})
                                  acc)))
                            []
@@ -170,10 +170,10 @@
               (let [rt (:retry_target node)
                     frt (:fallback_retry_target node)
                     rt-err (when (and (not (str/blank? rt)) (not (contains? node-ids rt)))
-                             {:rule "retry_target_exists" :severity :warning :node-id nid
+                             {:rule "retry_target_exists" :severity :warning :node_id nid
                               :message (str "retry_target '" rt "' on node '" nid "' does not exist")})
                     frt-err (when (and (not (str/blank? frt)) (not (contains? node-ids frt)))
-                              {:rule "retry_target_exists" :severity :warning :node-id nid
+                              {:rule "retry_target_exists" :severity :warning :node_id nid
                                :message (str "fallback_retry_target '" frt "' on node '" nid "' does not exist")})]
                 (cond-> acc
                   rt-err (conj rt-err)
@@ -191,7 +191,7 @@
                                       (not (str/blank? (:fallback_retry_target node)))
                                       graph-has-target?)]
                   (if (not has-target?)
-                    (conj acc {:rule "goal_gate_has_retry" :severity :warning :node-id nid
+                    (conj acc {:rule "goal_gate_has_retry" :severity :warning :node_id nid
                                :message (str "Node '" nid "' has goal_gate=true but no retry_target or fallback_retry_target configured")})
                     acc))
                 acc))
@@ -205,7 +205,7 @@
                   t (or (:type node) "")
                   is-codergen? (or (= t "codergen") (and (str/blank? t) (= shape "box")))]
               (if (and is-codergen? (str/blank? (:prompt node)) (str/blank? (:label node)))
-                (conj acc {:rule "prompt_on_llm_nodes" :severity :warning :node-id nid
+                (conj acc {:rule "prompt_on_llm_nodes" :severity :warning :node_id nid
                            :message (str "Codergen node '" nid "' should have a prompt or label attribute")})
                 acc)))
           []
@@ -240,5 +240,8 @@
      (if (seq errors)
        (let [msgs (map (fn [e] (str "[" (:rule e) "] " (:message e))) errors)]
          (throw (ex-info (str "Pipeline validation failed with " (count errors) " error(s):\n"
-                              (str/join "\n" msgs)) {:errors errors})))
+                              (str/join "\n" msgs))
+                         {:category :validation_error
+                          :diagnostics diags
+                          :errors (vec errors)})))
        diags))))

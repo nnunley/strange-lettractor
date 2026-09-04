@@ -1,7 +1,8 @@
 (ns attractor.lifecycle-contract-test
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.parser :as parser]
-            [attractor.stylesheet :as stylesheet]))
+            [attractor.stylesheet :as stylesheet]
+            [attractor.validation :as validation]))
 
 (deftest subgraph-label-derivation-is-order-independent
   (let [graph
@@ -48,7 +49,17 @@
         props-for (fn [node-id]
                     (stylesheet/resolve-node-model-props
                       (parser/find-node graph node-id) rules (:attrs graph)))
-        model-for (fn [node-id] (:llm_model (props-for node-id)))]
+        model-for (fn [node-id] (:llm_model (props-for node-id)))
+        validation-graph
+        (parser/parse-dot
+          "digraph Invalid {
+             graph [model_stylesheet=\"not a stylesheet\"]
+             start [shape=Mdiamond]
+             invalid [type=unknown, fidelity=invalid, retry_target=missing]
+             exit [shape=Msquare]
+             start -> exit
+             exit -> start [condition=\"a==b\"]
+           }")]
     (testing "label-after updates explicit and edge-introduced nodes"
       (is (= "explicit,late-label" (:class (parser/find-node graph "before"))))
       (is (= "late-label" (:class (parser/find-node graph "chained"))))
@@ -97,6 +108,88 @@
       (is (= "outer-scope" (:class (parser/find-node graph "outer_after"))))
       (is (= "outer-scope"
              (:subgraph_class (parser/find-node graph "outer_after"))))
-      (is (= "outer-model" (model-for "outer_after"))))))
+      (is (= "outer-model" (model-for "outer_after"))))
+    (testing "built-in diagnostics use the canonical public schema"
+      (let [built-ins (validation/validate validation-graph)
+        allowed-keys #{:rule :severity :message :node_id :edge :fix}
+        reachability (first (filter (fn [diag]
+                                      (= "reachability" (:rule diag)))
+                                    built-ins))]
+        (is (seq built-ins))
+        (is (every? (fn [diag]
+                      (and (every? allowed-keys (keys diag))
+                           (contains? diag :rule)
+                           (contains? diag :severity)
+                           (contains? diag :message)
+                           (string? (:rule diag))
+                           (contains? #{:error :warning :info} (:severity diag))
+                           (string? (:message diag))))
+                    built-ins))
+        (is (some (fn [diag] (= "stylesheet_syntax" (:rule diag))) built-ins))
+        (is (some (fn [diag] (= "condition_syntax" (:rule diag))) built-ins))
+        (is (= :error (:severity reachability)))
+        (is (= "invalid" (:node_id reachability)))
+        (is (not (contains? reachability :node-id)))))
+    (testing "custom rules run after built-ins in registration and result order"
+      (let [built-ins (validation/validate validation-graph)
+            calls (atom [])
+            custom-diags [{:rule "custom_first"
+                           :severity :warning
+                           :message "first warning"
+                           :node_id "invalid"
+                           :edge ["start" "invalid"]
+                           :fix "Connect the node"}
+                          {:rule "custom_first_info"
+                           :severity :info
+                           :message "first info"}
+                          {:rule "custom_second"
+                           :severity :warning
+                           :message "second warning"}]
+            first-rule (fn [_]
+                         (swap! calls conj :first)
+                         (subvec custom-diags 0 2))
+            second-rule (fn [_]
+                          (swap! calls conj :second)
+                          [(nth custom-diags 2)])
+            diagnostics (validation/validate validation-graph [first-rule second-rule])]
+        (is (= [:first :second] @calls))
+        (is (= (vec (concat built-ins custom-diags)) diagnostics))))
+    (testing "errors carry the complete diagnostics vector"
+      (let [custom-rules [(fn [_]
+                            [{:rule "custom_warning"
+                              :severity :warning
+                              :message "keep warning"}])
+                          (fn [_]
+                            [{:rule "custom_info"
+                              :severity :info
+                              :message "keep info"}])]
+            expected (validation/validate validation-graph custom-rules)
+            error (try
+                    (do (validation/validate-or-raise validation-graph custom-rules) nil)
+                    (catch Object caught caught))]
+        (is (= :validation_error (:category (ex-data error))))
+        (is (= expected (:diagnostics (ex-data error))))
+        (is (= [:warning :info]
+               (mapv :severity (take-last 2 (:diagnostics (ex-data error))))))))
+    (testing "no-error validation returns the complete diagnostics vector"
+      (let [valid-graph (parser/parse-dot
+                          "digraph Valid {
+                             start [shape=Mdiamond]
+                             exit [shape=Msquare]
+                             start -> exit
+                           }")
+            custom-rules [(fn [_]
+                            [{:rule "custom_warning"
+                              :severity :warning
+                              :message "keep warning"}])
+                          (fn [_]
+                            [{:rule "custom_info"
+                              :severity :info
+                              :message "keep info"}])]
+            expected (validation/validate valid-graph custom-rules)]
+        (is (= expected
+               (validation/validate-or-raise valid-graph custom-rules)))))))
 
 ;; SCN-SUBGRAPH-LABEL COMPLETE
+
+;; SCN-VALIDATION PARTIAL
