@@ -827,6 +827,47 @@ digraph Gate {
     (os/sh "rm" "-rf" logs)
     (os/sh "rm" "-f" child-dotfile)))
 
+(deftest test-manager-real-child-observes-attempt-cancellation
+  (let [stamp (System/currentTimeMillis)
+        child-dotfile (str (os/temp-dir) "/lettractor-manager-cancel-" stamp ".dot")
+        logs (str (os/temp-dir) "/lettractor-manager-logs-" stamp)
+        started (promise)
+        observed-cancel (promise)
+        _ (io/spit child-dotfile
+                   (str "digraph Child {\n"
+                        "start [shape=Mdiamond]\n"
+                        "work [shape=box]\n"
+                        "exit [shape=Msquare]\n"
+                        "start -> work -> exit\n}"))
+        parent (p/parse-dot
+                 (str "digraph Parent {\n"
+                      "start [shape=Mdiamond]\n"
+                      "manager [shape=house,\n"
+                      "         stack.child_dotfile=\"" child-dotfile "\",\n"
+                      "         timeout=\"100ms\",\n"
+                      "         manager.poll_interval=\"50ms\"]\n"
+                      "exit [shape=Msquare]\n"
+                      "start -> manager -> exit\n}"))
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer)
+                   (fn [node _ _]
+                     (if (= "work" (:id node))
+                       (do
+                         (deliver started true)
+                         (loop []
+                           (if ((:cancelled? node))
+                             (do (deliver observed-cancel true) {:status :cancelled})
+                             (do (core/sleep 1) (recur)))))
+                       {:status :success})))
+        task (core/future
+               (e/run-pipeline parent {:registry registry :logs-root logs}))]
+    (try
+      (is (= true (deref started 1000 false)))
+      (is (= true (deref observed-cancel 3000 false)))
+      (is (= :fail (:status (deref task 3000 {:status :timeout}))))
+      (finally
+        (io/delete-file child-dotfile)))))
+
 (deftest test-manager-node-can-observe-an-existing-child
   (let [parent
         (p/parse-dot

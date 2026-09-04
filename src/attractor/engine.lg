@@ -798,6 +798,7 @@
                      (when (and (zero? step-count)
                                 (:first-node-fidelity-override options))
                        (:first-node-fidelity-override options)))
+                   prepared-node (assoc prepared-node :cancelled? cancelled?)
                    handler (handlers/resolve-handler registry prepared-node)
                    outcome (execute-with-retry handler prepared-node ctx graph logs-root
                                                on-event retry-options)
