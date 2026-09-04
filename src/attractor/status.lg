@@ -1,6 +1,29 @@
 (ns attractor.status
   (:require [json :as json]))
 
+(def ^:private allowed-statuses
+  #{:success :retry :fail :partial_success})
+
+(defn- explicit-status [outcome]
+  (let [present? (and (map? outcome)
+                      (or (contains? outcome :status)
+                          (contains? outcome "status")))
+        value (when present?
+                (if (contains? outcome :status)
+                  (:status outcome)
+                  (get outcome "status")))
+        normalized (cond
+                     (keyword? value) value
+                     (string? value) (keyword value)
+                     :else nil)]
+    (if (and present? (contains? allowed-statuses normalized))
+      normalized
+      (throw
+        (ex-info "Outcome requires an explicit allowed status"
+                 {:category :status_contract_error
+                  :retryable false
+                  :status value})))))
+
 (defn json-safe-object-keys [value]
   (cond
     (map? value)
@@ -16,8 +39,7 @@
     :else value))
 
 (defn outcome->status-map [outcome]
-  (let [status (or (:status outcome) (get outcome "status") :success)
-        status-name (if (keyword? status) (name status) (str status))]
+  (let [status-name (name (explicit-status outcome))]
     {:outcome status-name
      ;; `status` is retained as a compatibility alias for existing readers.
      :status status-name

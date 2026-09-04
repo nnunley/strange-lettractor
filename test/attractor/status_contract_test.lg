@@ -7,6 +7,7 @@
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
             [attractor.parser :as parser]
+            [attractor.status :as status]
             [json :as json]
             [io :as io]
             [os :as os]))
@@ -237,3 +238,55 @@
     (let [status (json/read-json (io/slurp (status-path logs "stage")))]
       (is (= "engine"
              (get-in status ["context_updates" "outer" "inner"]))))))
+
+(deftest status-codec-requires-an-explicit-allowed-status
+  (doseq [[label outcome]
+          [["nil outcome" nil]
+           ["empty outcome" {}]
+           ["missing keyword status" {:notes "missing"}]
+           ["missing string status" {"notes" "missing"}]
+           ["nil keyword status" {:status nil}]
+           ["nil string status" {"status" nil}]
+           ["non-string-or-keyword status" {:status 1}]
+           ["invalid string status" {:status "unknown"}]
+           ["invalid keyword status" {:status :skipped}]]]
+    (testing label
+      (let [result (try
+                     {:json (status/outcome->status-json outcome)}
+                     (catch Object error {:error error}))]
+        (is (= :status_contract_error
+               (:category (ex-data (:error result)))))
+        (is (= false (:retryable (ex-data (:error result)))))
+        (is (nil? (:json result)))))))
+
+(deftest stage-artifact-writer-does-not-persist-an-implicit-success
+  (let [logs (test-logs "artifact-invalid-status")
+        result (try
+                 (context/write-stage-artifacts logs "stage" nil nil {})
+                 {:returned true}
+                 (catch Object error {:error error}))]
+    (is (= :status_contract_error
+           (:category (ex-data (:error result)))))
+    (is (= false (:retryable (ex-data (:error result)))))
+    (is (nil? (os/stat (status-path logs "stage"))))))
+
+(deftest engine-cancellation-clears-a-handler-authored-status-file
+  (let [logs (test-logs "cancelled-status-audit")
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   stage [type=custom.cancel]
+                   exit [shape=Msquare]
+                   start -> stage -> exit
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.cancel"
+      (fn [_ _ _ _]
+        (write-status! logs "stage"
+                       {:outcome "success" :notes "stale after cancellation"})
+        {:status :cancelled :failure_reason "Pipeline cancelled"}))
+    (let [outcome (engine/run-pipeline graph
+                                       {:logs-root logs :registry registry})]
+      (is (= :cancelled (:status outcome)))
+      (is (nil? (os/stat (status-path logs "stage")))))))

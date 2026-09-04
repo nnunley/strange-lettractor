@@ -626,7 +626,9 @@
             node-id (:id current-node)
             next-completed (conj completed-nodes node-id)
             next-outcomes (assoc node-outcomes node-id outcome)]
-        (write-stage-status! logs-root node-id outcome)
+        (if (= :cancelled (:status outcome))
+          (clear-attempt-status! logs-root node-id)
+          (write-stage-status! logs-root node-id outcome))
         (context/ctx-apply-updates! ctx (:context_updates outcome))
         (context/ctx-set! ctx "outcome"
                           (if (keyword? (:status outcome))
@@ -938,7 +940,9 @@
 
                ;; The engine owns the status-file contract for every handler,
                ;; including no-op, human, tool, and custom handlers.
-               (write-stage-status! logs-root node-id outcome)
+               (if (= :cancelled st)
+                 (clear-attempt-status! logs-root node-id)
+                 (write-stage-status! logs-root node-id outcome))
 
                (if (= st :cancelled)
                  (let [cancelled-result
