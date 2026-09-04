@@ -51,3 +51,21 @@
 - Safety: no `TODO(ITER-0002)` markers remain, and server timeout abandonment prevents late registration or execution.
 - Reviews: every implementation task passed paired acceptance/evidence review and paired code-quality/boxing-in review before wrap-up.
 - Audit: paired three-tier auditors returned CLEAN for ATTR-DOT-03, ATTR-ENG-03, ATTR-VAL-01, ATTR-XFORM-01, all five impacted scenarios, and all four sentinel scenarios.
+
+## ITER-0003 — Run isolation and re-entry
+
+**Completed:** 2026-09-04
+
+**Stories delivered:** ATTR-CTX-01 and ATTR-ENG-05.
+
+**Tasks executed:** defined the run-isolation contracts; implemented one-pass deep copying for context snapshots and branch clones; replaced recursive loop-restart re-entry with an invocation-wide iterative driver; isolated restart bookkeeping, files, handler runtimes, retries, and fidelity sessions while preserving semantic context and caller inputs; hardened step-budget and cleanup-error boundaries; restored complete engine-test discovery and separated internal codergen Outcomes from canonical external status persistence.
+
+**Scenarios:** SCN-CONTEXT-ISOLATION and SCN-LOOP-RESTART.
+
+**Summary:** Snapshots and clones rebuild the supported EDN container domain, including composite map keys and set members, reject unsupported values at deterministic paths, and keep branch logs independent. A selected `loop_restart=true` edge now re-enters iteratively under a pairwise-unique fresh root with exact event ordering, preserved graph/edge/caller identity, remirrored graph values, narrowly scrubbed bookkeeping, fresh run-scoped runtime state, unchanged prior files, and one invocation-wide positive step budget. Fidelity cleanup attempts every session close, honors ownership, and preserves primary errors.
+
+- Evidence at revision `2307790` on 2026-09-04: the context-isolation suite reported 2 tests, 91 assertions, zero failures; the loop-restart suite reported 10 tests, 198 assertions, zero failures; all 43 engine tests were enumerated and passed with 195 assertions; the separate discovery sentinel reported 1 test, 2 assertions, zero failures; the full suite reported 334 tests, 1,918 assertions, zero failures; `LGX_LG=/Users/ndn/development/let-go/lg lgx build` completed successfully.
+- Commits: `17e4ed8` through `2307790`.
+- Audit remediation: the first paired audit found that an unmatched closing delimiter caused let-go's namespace loader to stop cleanly after engine test 26. Fixing the source exposed a real manager-artifact loss: codergen's self-written JSON status file narrowed its richer internal Outcome. The engine now marks managed invocations so codergen returns the complete internal Outcome while the engine persists canonical JSON; direct handler status behavior and custom file authority remain unchanged. A separate sentinel asserts all 43 engine test vars, including the final test, are loaded.
+- Safety and policy: no `TODO(ITER-0003)` or `FIXME` markers remain; no recursive deletion command was introduced; EDN remains the internal persistence format and JSON remains limited to external contracts.
+- Reviews: every implementation task passed paired acceptance/evidence review and paired code-quality/boxing-in review. After remediation, two independent three-tier auditors returned CLEAN for ATTR-CTX-01, ATTR-ENG-05, all impacted engine/status/manager/fidelity/resume/cancellation behavior, and the four sentinel scenarios.

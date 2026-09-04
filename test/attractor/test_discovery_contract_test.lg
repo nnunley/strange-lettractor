@@ -7,4 +7,4 @@
     (is (= 43 (count publics)))
     (is (some? (get publics 'test-fidelity-uses-the-exact-selected-edge)))))
 
-;; SCN-TEST-DISCOVERY COMPLETE
+;; Engine-test discovery sentinel: keep this namespace separate from engine-test.
