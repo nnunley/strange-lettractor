@@ -34,16 +34,22 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 ### SCN-STATUS-FILE — Handler-authored status routing
 
-- Given a handler that writes valid `status.json` during its current attempt
-- When the handler returns a conflicting or absent in-memory outcome
-- Then the file outcome is authoritative and its fields drive context and edge routing; stale or malformed files cannot silently route
+- Given a handler that writes valid `status.json` during its current attempt, including all four optional fields plus an unknown field
+- When the handler returns a conflicting in-memory outcome
+- Then the file outcome is authoritative; preferred label/suggested IDs drive routing, context updates merge, notes survive, event and checkpoint outcomes agree, and the unknown field is ignored
+- Given no file and a valid handler outcome, the handler outcome is persisted and used
+- Given a RETRY file followed by an attempt that writes no file, the prior attempt's file is not reused
+- Given malformed JSON, invalid outcome enum, or an invalid type for each specified optional field (including a non-string suggested ID), resolution terminates explicitly rather than silently routing
+- Given pipeline cancellation or attempt timeout, a status file written before cancellation or late after handler quiescence cannot replace the terminal cancellation/timeout outcome
+- Prove every case through both the main pipeline and `execute-subgraph` execution paths
 - Seam: engine integration
 
 ### SCN-AUTO-STATUS — Missing-status synthesis
 
-- Given a handler that produces neither a status file nor a valid outcome
+- Given a handler that produces neither a status file nor a valid outcome in the main or subgraph execution path
 - When `auto_status=true`
-- Then the engine persists and routes a synthesized success; when explicitly false, it fails rather than inheriting true
+- Then the engine persists and routes exact JSON equivalent to `{"outcome":"success","notes":"auto-status: handler completed without writing status"}`
+- When an explicit node `auto_status=false` overrides an inherited true default, resolution fails instead of synthesizing success in both paths
 - Seam: parser/engine integration
 
 ### SCN-CHECKPOINT — EDN persistence and resume
