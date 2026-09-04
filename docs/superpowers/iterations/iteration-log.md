@@ -32,3 +32,22 @@
 - Commits: `31c8af7`, `f869d5f`, `0cf0247`, `0606ab0`, `83eeae9`, `d2b7675`, `9fc6846`, `55d5ff5`, `37315ca`, `721d588`.
 - Safety: exact-file cleanup uses the file API; no recursive deletion command is present in source, tests, or iteration documentation.
 - Audit: paired three-tier auditors returned CLEAN for ATTR-STATUS-01/02, SCN-STATUS-FILE/AUTO-STATUS, and all four sentinel scenarios.
+
+## ITER-0002 — Public lifecycle preparation
+
+**Completed:** 2026-09-04
+
+**Stories delivered:** ATTR-DOT-03, ATTR-ENG-03, ATTR-VAL-01, and ATTR-XFORM-01.
+
+**Tasks executed:** made subgraph-derived classes independent of declaration order and compositional across nesting; canonicalized all built-in and custom validation diagnostics; added the DOT-source `attractor.pipeline/prepare` and `attractor.pipeline/run` lifecycle; routed CLI and server entrypoints through that lifecycle; hardened the server's asynchronous preparation handoff against registration failures and late completion after timeout.
+
+**Scenarios:** SCN-SUBGRAPH-LABEL, SCN-PUBLIC-LIFECYCLE, SCN-TRANSFORM-ORDER, and SCN-VALIDATION were completed; SCN-ATTR-ENGINE remained covered by the sentinel suite.
+
+**Summary:** Subgraph labels now classify ordinary, repeated, pre-existing, edge-introduced, and transitively nested nodes without erasing explicit attributes or classes. Public preparation applies built-ins before ordered caller transforms, validates the final graph, and returns diagnostics without executing. Public run shares the complete-vector error gate, propagates non-error diagnostics, and is the single lifecycle used by CLI and server submission. Invalid and timed-out server preparations cannot create registry or engine side effects.
+
+- Evidence at revision `5aeab8e` on 2026-09-04: all four exact scenario markers were present; the focused lifecycle suite reported 5 tests, 134 assertions, zero failures; the impacted and four sentinel scenarios passed in the full suite at 304 tests, 1,576 assertions, zero failures; `LGX_LG=/Users/ndn/development/let-go/lg lgx build` completed successfully.
+- Commits: scope and implementation from `c2cce3d` through `5aeab8e`.
+- Toolchain: `lgx.edn` requires let-go 1.12.2; the configured local compiler identifies as `v1.12.2-95-gbdd8268c9`.
+- Safety: no `TODO(ITER-0002)` markers remain, and server timeout abandonment prevents late registration or execution.
+- Reviews: every implementation task passed paired acceptance/evidence review and paired code-quality/boxing-in review before wrap-up.
+- Audit: paired three-tier evidence audit pending.
