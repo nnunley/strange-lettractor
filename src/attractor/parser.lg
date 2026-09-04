@@ -373,7 +373,12 @@
                           ;; Keep unset distinct from the system default so a
                           ;; stylesheet can supply this property.
                           :reasoning_effort (or (:reasoning_effort explicit-attrs) (:reasoning_effort effective-defaults))
-                          :auto_status (boolean (or (:auto_status explicit-attrs) (:auto_status effective-defaults) false))
+                          :auto_status (boolean
+                                         (if (contains? explicit-attrs :auto_status)
+                                           (:auto_status explicit-attrs)
+                                           (if (contains? effective-defaults :auto_status)
+                                             (:auto_status effective-defaults)
+                                             false)))
                           :allow_partial (boolean (or (:allow_partial explicit-attrs) (:allow_partial effective-defaults) false))
                           :attrs (assoc merged-attrs
                                         :class combined-class

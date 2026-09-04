@@ -30,7 +30,7 @@
                              #(swap! events conj %)
                              {:sleep-fn (fn [_] nil)}))
 
-;; SCN-STATUS-FILE PARTIAL
+;; SCN-STATUS-FILE COMPLETE
 (deftest status-file-is-authoritative-and-normalized
   (let [logs (test-logs "authoritative")
         events (atom [])
@@ -119,7 +119,7 @@
         (is (= 1 @attempts))
         (is (= [:stage.started :stage.failed] (mapv :type @events)))))))
 
-;; SCN-AUTO-STATUS PARTIAL
+;; SCN-AUTO-STATUS COMPLETE
 (deftest auto-status-synthesizes-the-exact-success-outcome
   (let [logs (test-logs "auto")
         events (atom [])
@@ -327,3 +327,249 @@
                     (fn [_] nil) {})]
       (is (= :cancelled (:status outcome)))
       (is (nil? (os/stat (status-path logs "stage")))))))
+
+(deftest main-pipeline-routes-and-persists-the-file-resolved-outcomes
+  (let [logs (test-logs "main-routing")
+        events (atom [])
+        visited (atom [])
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   file_stage [type=custom.file]
+                   preferred [type=custom.preferred]
+                   wrong_label [type=custom.wrong]
+                   suggested [type=custom.suggested]
+                   wrong_id [type=custom.wrong]
+                   exit [shape=Msquare]
+                   start -> file_stage
+                   file_stage -> preferred [label=Review]
+                   file_stage -> wrong_label [label=Wrong]
+                   preferred -> suggested
+                   preferred -> wrong_id
+                   suggested -> exit
+                   wrong_label -> exit
+                   wrong_id -> exit
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.file"
+      (fn [_ _ _ _]
+        (swap! visited conj "file_stage")
+        (write-status!
+          logs "file_stage"
+          "{\"outcome\":\"partial_success\",\"preferred_label\":\"Review\",\"context_updates\":{\"file.value\":42},\"notes\":\"file-authored\"}")
+        {:status :fail :preferred_label "Wrong" :notes "handler loses"}))
+    (handlers/register-handler!
+      registry "custom.preferred"
+      (fn [_ _ _ _]
+        (swap! visited conj "preferred")
+        (write-status!
+          logs "preferred"
+          "{\"outcome\":\"success\",\"suggested_next_ids\":[\"suggested\"],\"context_updates\":{\"suggested.value\":\"chosen\"},\"notes\":\"suggested route\"}")
+        {:status :success :suggested_next_ids ["wrong_id"]}))
+    (handlers/register-handler!
+      registry "custom.suggested"
+      (fn [_ _ _ _]
+        (swap! visited conj "suggested")
+        {:status :success :notes "chosen handler"}))
+    (handlers/register-handler!
+      registry "custom.wrong"
+      (fn [node _ _ _]
+        (swap! visited conj (:id node))
+        {:status :success}))
+    (let [result (engine/run-pipeline graph {:logs-root logs
+                                              :registry registry
+                                              :on-event #(swap! events conj %)})
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))
+          file-outcome (get-in checkpoint [:node_outcomes "file_stage"])
+          preferred-outcome (get-in checkpoint [:node_outcomes "preferred"])
+          completed (filter #(= :stage.completed (:type %)) @events)]
+      (is (= :success (:status result)))
+      (is (= ["file_stage" "preferred" "suggested"] @visited))
+      (is (= 42 (get-in result [:context "file.value"])))
+      (is (= "chosen" (get-in result [:context "suggested.value"])))
+      (is (= :partial_success (:status file-outcome)))
+      (is (= "file-authored" (:notes file-outcome)))
+      (is (= "Review" (:preferred_label file-outcome)))
+      (is (= ["suggested"] (:suggested_next_ids preferred-outcome)))
+      (is (= file-outcome
+             (:outcome (first (filter #(= "file_stage" (:node_id %)) completed)))))
+      (is (= preferred-outcome
+             (:outcome (first (filter #(= "preferred" (:node_id %)) completed)))))
+      (is (= "file-authored"
+             (get (json/read-json (io/slurp (status-path logs "file_stage")))
+                  "notes"))))))
+
+(deftest main-pipeline-persists-canonical-handler-fallback
+  (let [logs (test-logs "main-handler-fallback")
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   stage [type=custom.fallback]
+                   exit [shape=Msquare]
+                   start -> stage -> exit
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.fallback"
+      (fn [_ _ _ _]
+        {:status "success"
+         :preferred_label "Done"
+         :suggested_next_ids ["exit"]
+         :context_updates {"fallback" true}
+         :notes "handler-authored"}))
+    (let [result (engine/run-pipeline graph {:logs-root logs :registry registry})
+          persisted (json/read-json (io/slurp (status-path logs "stage")))
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+      (is (= :success (:status result)))
+      (is (= "success" (get persisted "outcome")))
+      (is (= "success" (get persisted "status")))
+      (is (= "handler-authored" (get persisted "notes")))
+      (is (= true (get-in persisted ["context_updates" "fallback"])))
+      (is (= :success (get-in checkpoint [:node_outcomes "stage" :status])))
+      (is (= "handler-authored"
+             (get-in checkpoint [:node_outcomes "stage" :notes]))))))
+
+(deftest main-pipeline-retry-does-not-reuse-the-prior-attempt-file
+  (let [logs (test-logs "main-retry-freshness")
+        attempts (atom 0)
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   stage [type=custom.retry, max_retries=1]
+                   exit [shape=Msquare]
+                   start -> stage -> exit
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.retry"
+      (fn [_ _ _ _]
+        (if (= 1 (swap! attempts inc))
+          (do (write-status! logs "stage"
+                             {:outcome "retry" :notes "first attempt only"})
+              {:status :fail})
+          {:status :success :notes "second attempt handler"})))
+    (let [result (engine/run-pipeline graph {:logs-root logs :registry registry})
+          persisted (json/read-json (io/slurp (status-path logs "stage")))]
+      (is (= :success (:status result)))
+      (is (= 2 @attempts))
+      (is (= "success" (get persisted "outcome")))
+      (is (= "second attempt handler" (get persisted "notes"))))))
+
+(deftest malformed-file-is-terminal-through-main-pipeline
+  (let [logs (test-logs "main-malformed")
+        attempts (atom 0)
+        events (atom [])
+        graph (parser/parse-dot
+                "digraph G {
+                   start [shape=Mdiamond]
+                   stage [type=custom.invalid, max_retries=2]
+                   exit [shape=Msquare]
+                   start -> stage -> exit
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.invalid"
+      (fn [_ _ _ _]
+        (swap! attempts inc)
+        (write-status! logs "stage" "{malformed")
+        {:status :success}))
+    (let [result (engine/run-pipeline graph {:logs-root logs
+                                              :registry registry
+                                              :on-event #(swap! events conj %)})
+          stage-failure (first (filter #(and (= :stage.failed (:type %))
+                                             (= "stage" (:node_id %)))
+                                       @events))]
+      (is (= :fail (:status result)))
+      (is (= 1 @attempts))
+      (is (= :status_contract_error
+             (get-in stage-failure [:outcome :category])))
+      (is (= false (get-in stage-failure [:outcome :retryable]))))))
+
+(deftest auto-status-and-explicit-false-have-main-pipeline-parity
+  (doseq [[label node-source expected-status]
+          [["enabled" "node [auto_status=true] stage [type=custom.nil]" :success]
+           ["explicit-false" "node [auto_status=true] stage [type=custom.nil, auto_status=false]" :fail]]]
+    (let [logs (test-logs (str "main-auto-" label))
+          graph (parser/parse-dot
+                  (str "digraph G { " node-source
+                       " start [shape=Mdiamond] exit [shape=Msquare] "
+                       " start -> stage -> exit }"))
+          registry (handlers/make-handler-registry)]
+      (handlers/register-handler! registry "custom.nil" (fn [_ _ _ _] nil))
+      (let [result (engine/run-pipeline graph {:logs-root logs :registry registry})
+            persisted (json/read-json (io/slurp (status-path logs "stage")))
+            checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+        (is (= expected-status (:status result)) label)
+        (if (= :success expected-status)
+          (do
+            (is (= "success" (get persisted "outcome")))
+            (is (= "auto-status: handler completed without writing status"
+                   (get persisted "notes"))))
+          (do
+            (is (= "fail" (get persisted "outcome")))
+            (is (= :status_contract_error
+                   (get-in checkpoint [:node_outcomes "stage" :category])))))))))
+
+(deftest execute-subgraph-resolves-file-routing-context-events-and-auto-status
+  (let [logs (test-logs "subgraph-contract")
+        ctx (context/make-context)
+        events (atom [])
+        visited (atom [])
+        graph (parser/parse-dot
+                "digraph G {
+                   stage [type=custom.file]
+                   selected [type=custom.selected]
+                   wrong [type=custom.wrong]
+                   join [shape=tripleoctagon]
+                   stage -> selected [label=Take]
+                   stage -> wrong [label=Wrong]
+                   selected -> join
+                   wrong -> join
+                 }")
+        registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "custom.file"
+      (fn [_ _ _ _]
+        (write-status! logs "stage"
+                       "{\"outcome\":\"success\",\"preferred_label\":\"Take\",\"context_updates\":{\"branch.value\":\"file\"},\"notes\":\"branch file\"}")
+        {:status :fail :preferred_label "Wrong"}))
+    (handlers/register-handler!
+      registry "custom.selected"
+      (fn [_ _ _ _]
+        (swap! visited conj "selected")
+        {:status :success :notes "selected"}))
+    (handlers/register-handler!
+      registry "custom.wrong"
+      (fn [_ _ _ _]
+        (swap! visited conj "wrong")
+        {:status :success}))
+    (let [result (engine/execute-subgraph
+                   "stage" ctx graph logs registry
+                   #(swap! events conj %) {})
+          completed (first (filter #(and (= :stage.completed (:type %))
+                                         (= "stage" (:node_id %)))
+                                   @events))]
+      (is (= :success (:status result)))
+      (is (= "join" (:boundary_node_id result)))
+      (is (= ["selected"] @visited))
+      (is (= "file" (context/ctx-get ctx "branch.value")))
+      (is (= "branch file" (get-in completed [:outcome :notes])))))
+  (doseq [[label node-source expected-status]
+          [["enabled" "node [auto_status=true] stage [type=custom.nil]" :success]
+           ["explicit-false" "node [auto_status=true] stage [type=custom.nil, auto_status=false]" :fail]]]
+    (let [logs (test-logs (str "subgraph-auto-" label))
+          graph (parser/parse-dot
+                  (str "digraph G { " node-source
+                       " join [shape=tripleoctagon] stage -> join }"))
+          registry (handlers/make-handler-registry)]
+      (handlers/register-handler! registry "custom.nil" (fn [_ _ _ _] nil))
+      (let [result (engine/execute-subgraph
+                     "stage" (context/make-context) graph logs registry
+                     (fn [_] nil) {})
+            persisted (json/read-json (io/slurp (status-path logs "stage")))]
+        (is (= expected-status (:status result)) label)
+        (if (= :success expected-status)
+          (is (= "auto-status: handler completed without writing status"
+                 (get persisted "notes")))
+          (is (= :status_contract_error (:category result))))))))

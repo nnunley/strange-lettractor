@@ -102,3 +102,13 @@ digraph Chaining {
     (is (= "inner" (:thread_id (p/find-node graph "Inside"))))
     (is (= "outer" (:thread_id (p/find-node graph "After"))))
     (is (= 2 (count (:subgraphs graph))))))
+
+(deftest test-explicit-false-auto-status-overrides-inherited-true
+  (let [graph (p/parse-dot
+                "digraph G {
+                   node [auto_status=true]
+                   inherited
+                   disabled [auto_status=false]
+                 }")]
+    (is (true? (:auto_status (p/find-node graph "inherited"))))
+    (is (false? (:auto_status (p/find-node graph "disabled"))))))
