@@ -1,0 +1,55 @@
+(ns attractor.lifecycle-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.parser :as parser]
+            [attractor.stylesheet :as stylesheet]))
+
+(deftest subgraph-label-derivation-is-order-independent
+  (let [graph
+        (parser/parse-dot
+          "digraph G {
+             graph [model_stylesheet=\".late-label { llm_model: late-model; } .early-label { llm_model: early-model; } .outer-scope { llm_model: outer-model; } .inner-scope { llm_model: inner-model; }\"]
+             subgraph late {
+               before [class=explicit]
+               chained -> edge_node
+               duplicate [class=\"late-label\"]
+               label = \" Late   Label!! \"
+             }
+             subgraph early {
+               label = \"Early Label\"
+               early_node [class=manual]
+             }
+             subgraph outer {
+               label = \"Outer Scope\"
+               node [thread_id=outer]
+               outer_before
+               subgraph inner {
+                 inner_before
+                 label = \"Inner Scope\"
+               }
+               outer_after
+             }
+           }")
+        rules (stylesheet/parse-stylesheet (:model_stylesheet graph))
+        model-for (fn [node-id]
+                    (:llm_model
+                      (stylesheet/resolve-node-model-props
+                        (parser/find-node graph node-id) rules (:attrs graph))))]
+    (testing "label-after updates explicit and edge-introduced nodes"
+      (is (= "explicit,late-label" (:class (parser/find-node graph "before"))))
+      (is (= "late-label" (:class (parser/find-node graph "chained"))))
+      (is (= "late-label" (:class (parser/find-node graph "edge_node"))))
+      (is (= "late-model" (model-for "before")))
+      (is (= "late-model" (model-for "edge_node"))))
+    (testing "derived class is composed exactly once"
+      (is (= "late-label" (:class (parser/find-node graph "duplicate")))))
+    (testing "label-before behavior remains styled"
+      (is (= "manual,early-label" (:class (parser/find-node graph "early_node"))))
+      (is (= "early-model" (model-for "early_node"))))
+    (testing "scoped defaults and nested scope restoration remain intact"
+      (is (= "outer" (:thread_id (parser/find-node graph "inner_before"))))
+      (is (= "inner-scope" (:class (parser/find-node graph "inner_before"))))
+      (is (= "inner-model" (model-for "inner_before")))
+      (is (= "outer-scope" (:class (parser/find-node graph "outer_after"))))
+      (is (= "outer-model" (model-for "outer_after"))))))
+
+;; SCN-SUBGRAPH-LABEL COMPLETE

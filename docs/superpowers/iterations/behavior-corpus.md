@@ -8,7 +8,7 @@ Commands are run from the repository root with let-go 1.12.2 or newer. Pending l
 | SCN-ATTR-ENGINE | engine integration | sentinel | `LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in full suite |
 | SCN-TIMEOUT | engine/agent integration | sentinel | `LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in full suite |
 | SCN-CHECKPOINT | engine integration | sentinel | `LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in full suite |
-| SCN-SUBGRAPH-LABEL | parser/stylesheet integration | impacted | `rg -q 'SCN-SUBGRAPH-LABEL' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0002 |
+| SCN-SUBGRAPH-LABEL | parser/stylesheet integration | impacted | `rg -q '^;; SCN-SUBGRAPH-LABEL COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg` | passing in ITER-0002 |
 | SCN-PUBLIC-LIFECYCLE | public pipeline/CLI/server integration | impacted | `rg -q 'SCN-PUBLIC-LIFECYCLE' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0002 |
 | SCN-STATUS-FILE | engine integration | impacted | `rg -q '^;; SCN-STATUS-FILE COMPLETE$' test/attractor/status_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in ITER-0001 |
 | SCN-AUTO-STATUS | parser/engine integration | impacted | `rg -q '^;; SCN-AUTO-STATUS COMPLETE$' test/attractor/status_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in ITER-0001 |
