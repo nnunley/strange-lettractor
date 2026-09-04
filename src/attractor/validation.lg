@@ -231,17 +231,22 @@
          all-rules (concat built-in-rules custom-rules)]
      (vec (mapcat (fn [r] (r graph)) all-rules)))))
 
+(defn raise-on-errors
+  "Return diagnostics unchanged, or raise with the complete vector when any are errors."
+  [diagnostics]
+  (let [diags (vec diagnostics)
+        errors (filter (fn [d] (= (:severity d) :error)) diags)]
+    (if (seq errors)
+      (let [msgs (map (fn [e] (str "[" (:rule e) "] " (:message e))) errors)]
+        (throw (ex-info (str "Pipeline validation failed with " (count errors) " error(s):\n"
+                             (str/join "\n" msgs))
+                        {:category :validation_error
+                         :diagnostics diags
+                         :errors (vec errors)})))
+      diags)))
+
 ;; Validate and throw exception if any errors
 (defn validate-or-raise
   ([graph] (validate-or-raise graph []))
   ([graph custom-rules]
-   (let [diags (validate graph custom-rules)
-         errors (filter (fn [d] (= (:severity d) :error)) diags)]
-     (if (seq errors)
-       (let [msgs (map (fn [e] (str "[" (:rule e) "] " (:message e))) errors)]
-         (throw (ex-info (str "Pipeline validation failed with " (count errors) " error(s):\n"
-                              (str/join "\n" msgs))
-                         {:category :validation_error
-                          :diagnostics diags
-                          :errors (vec errors)})))
-       diags))))
+   (raise-on-errors (validate graph custom-rules))))

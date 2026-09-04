@@ -1,0 +1,27 @@
+(ns attractor.pipeline
+  (:require [attractor.engine :as engine]
+            [attractor.parser :as parser]
+            [attractor.transforms :as transforms]
+            [attractor.validation :as validation]))
+
+(defn prepare
+  "Parse, transform, and validate DOT source without starting execution."
+  ([dot-source] (prepare dot-source {}))
+  ([dot-source options]
+   (let [graph (parser/parse-dot dot-source)
+         prepared-graph (transforms/apply-transforms
+                          graph (or (:custom-transforms options) []))
+         diagnostics (validation/validate
+                       prepared-graph (or (:custom-rules options) []))]
+     {:graph prepared-graph
+      :diagnostics diagnostics})))
+
+(defn run
+  "Prepare DOT source, reject validation errors, then execute the prepared graph."
+  ([dot-source] (run dot-source {}))
+  ([dot-source options]
+   (let [{:keys [graph diagnostics]} (prepare dot-source options)
+         diagnostics (validation/raise-on-errors diagnostics)
+         engine-options (dissoc options :custom-transforms :custom-rules)
+         outcome (engine/run-pipeline graph engine-options)]
+     (assoc outcome :diagnostics diagnostics))))

@@ -997,6 +997,7 @@
   (reset! threads {}))
 
 (defn run-pipeline
+  "Low-level execution API for an already parsed, transformed, and validated graph."
   ([graph] (run-pipeline graph {}))
   ([graph options]
    (let [owns-threads? (nil? (:fidelity-threads options))

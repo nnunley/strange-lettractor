@@ -1,7 +1,12 @@
 (ns attractor.lifecycle-contract-test
   (:require [clojure.test :refer [deftest is testing]]
+            [os :as os]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
             [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
             [attractor.stylesheet :as stylesheet]
+            [attractor.transforms :as transforms]
             [attractor.validation :as validation]))
 
 (deftest subgraph-label-derivation-is-order-independent
@@ -242,4 +247,213 @@
         (is (= expected
                (validation/validate-or-raise valid-graph custom-rules)))))))
 
-;; SCN-VALIDATION PARTIAL
+(def lifecycle-dot
+  "digraph Lifecycle {
+     graph [goal=\"Ship it\", owner=platform, model_stylesheet=\".styled { llm_model: prepared-model; }\"]
+     start [shape=Mdiamond]
+     work [shape=box, class=styled, prompt=\"Deliver $goal\"]
+     exit [shape=Msquare]
+     start -> work -> exit
+   }")
+
+(defn- lifecycle-extensions [calls diagnostics]
+  (let [first-transform
+        (fn [graph]
+          (swap! calls conj [:transform-1
+                             (get-in graph [:nodes "work" :prompt])
+                             (get-in graph [:nodes "work" :llm_model])])
+          (-> graph
+              (assoc-in [:attrs :transform_marker] "first")
+              (assoc-in [:nodes "work" :transform_marker] "first")))
+        second-transform
+        (fn [graph]
+          (swap! calls conj [:transform-2
+                             (get-in graph [:nodes "work" :transform_marker])])
+          (-> graph
+              (assoc-in [:attrs :transform_marker] "second")
+              (assoc-in [:nodes "work" :transform_marker] "second")))
+        custom-rule
+        (fn [graph]
+          (swap! calls conj [:rule
+                             (get-in graph [:nodes "work" :transform_marker])])
+          diagnostics)]
+    {:custom-transforms [first-transform second-transform]
+     :custom-rules [custom-rule]}))
+
+(deftest transform-order-and-public-prepare-contract
+  (testing "direct transforms preserve input and compose built-ins before custom transforms"
+    (let [parsed (parser/parse-dot lifecycle-dot)
+          before parsed
+          calls (atom [])
+          options (lifecycle-extensions calls [])
+          prepared (transforms/apply-transforms parsed (:custom-transforms options))]
+      (is (= before parsed))
+      (is (not= parsed prepared))
+      (is (= [[:transform-1 "Deliver Ship it" "prepared-model"]
+              [:transform-2 "first"]]
+             @calls))
+      (is (= "second" (get-in prepared [:nodes "work" :transform_marker])))))
+  (testing "prepare validates the last custom graph without starting execution"
+    (let [calls (atom [])
+          handler-calls (atom 0)
+          events (atom [])
+          ctx (context/make-context {"untouched" true})
+          logs (str (os/temp-dir) "/attractor-prepare-" (System/nanoTime))
+          registry (handlers/make-handler-registry)
+          diagnostics [{:rule "prepared_warning"
+                        :severity :warning
+                        :message "prepared warning"}]
+          extensions (lifecycle-extensions calls diagnostics)
+          _ (handlers/register-handler!
+              registry "codergen"
+              (fn [_ _ _ _]
+                (swap! handler-calls inc)
+                {:status :success}))
+          result (pipeline/prepare
+                   lifecycle-dot
+                   (merge extensions
+                          {:registry registry
+                           :context ctx
+                           :logs-root logs
+                           :on-event #(swap! events conj %)}))]
+      (is (= "second" (get-in result [:graph :nodes "work" :transform_marker])))
+      (is (= diagnostics (:diagnostics result)))
+      (is (= [[:transform-1 "Deliver Ship it" "prepared-model"]
+              [:transform-2 "first"]
+              [:rule "second"]]
+             @calls))
+      (is (= 0 @handler-calls))
+      (is (= [] @events))
+      (is (= {:values {"untouched" true} :logs []} @ctx))
+      (is (nil? (os/stat logs))))))
+
+;; SCN-TRANSFORM-ORDER COMPLETE
+
+(deftest public-run-gates-errors-and-preserves-success-diagnostics
+  (testing "valid runs execute the prepared graph once and return diagnostics"
+    (let [calls (atom [])
+          handler-observations (atom [])
+          events (atom [])
+          ctx (context/make-context {"seed" "present"})
+          logs (str (os/temp-dir) "/attractor-public-run-" (System/nanoTime))
+          registry (handlers/make-handler-registry)
+          diagnostics [{:rule "prepared_warning"
+                        :severity :warning
+                        :message "keep warning"}
+                       {:rule "prepared_info"
+                        :severity :info
+                        :message "keep info"}]
+          extensions (lifecycle-extensions calls diagnostics)
+          _ (handlers/register-handler!
+              registry "codergen"
+              (fn [node _ctx graph _logs-root]
+                (swap! handler-observations conj
+                       {:node (:id node)
+                        :prompt (:prompt node)
+                        :model (:llm_model node)
+                        :marker (get-in graph [:attrs :transform_marker])})
+                {:status :success
+                 :context_updates {"handler.marker" (:transform_marker node)}}))
+          result (pipeline/run
+                   lifecycle-dot
+                   (merge extensions
+                          {:registry registry
+                           :context ctx
+                           :logs-root logs
+                           :on-event #(swap! events conj %)}))
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+      (is (= [[:transform-1 "Deliver Ship it" "prepared-model"]
+              [:transform-2 "first"]
+              [:rule "second"]]
+             @calls))
+      (is (= [{:node "work"
+               :prompt "Deliver Ship it"
+               :model "prepared-model"
+               :marker "second"}]
+             @handler-observations))
+      (is (= diagnostics (:diagnostics result)))
+      (is (= :success (:status result)))
+      (is (= ["start" "work" "exit"] (:completed_nodes result)))
+      (is (= "Ship it" (context/ctx-get ctx "graph.goal")))
+      (is (= "platform" (context/ctx-get ctx "graph.owner")))
+      (is (= "second" (context/ctx-get ctx "graph.transform_marker")))
+      (is (= "second" (context/ctx-get ctx "handler.marker")))
+      (is (= (:context result) (context/ctx-snapshot ctx)))
+      (is (= (:completed_nodes result) (:completed_nodes checkpoint)))
+      (is (= (:context result) (:context_values checkpoint)))
+      (is (= "exit" (:current_node checkpoint)))
+      (is (= :pipeline.started (:type (first @events))))
+      (is (= ["start" "work"]
+             (mapv :node_id
+                   (filter #(= :stage.completed (:type %)) @events))))
+      (is (= :pipeline.completed (:type (last @events))))
+      (is (= (:completed_nodes result)
+             (:completed_nodes (last @events))))))
+  (testing "errors from the final transformed graph block every engine side effect"
+    (let [transform-calls (atom 0)
+          rule-calls (atom 0)
+          handler-calls (atom 0)
+          events (atom [])
+          ctx (context/make-context {"seed" "unchanged"})
+          before @ctx
+          logs (str (os/temp-dir) "/attractor-public-invalid-" (System/nanoTime))
+          registry (handlers/make-handler-registry)
+          invalid-transform
+          (fn [graph]
+            (swap! transform-calls inc)
+            (assoc-in graph [:nodes "orphan"]
+                      {:id "orphan"
+                       :shape "box"
+                       :type "codergen"
+                       :label ""
+                       :prompt "Created by final transform"
+                       :attrs {:shape "box"
+                               :type "codergen"
+                               :label ""
+                               :prompt "Created by final transform"}}))
+          custom-rule
+          (fn [graph]
+            (swap! rule-calls inc)
+            (is (= "Created by final transform"
+                   (get-in graph [:nodes "orphan" :prompt])))
+            [{:rule "custom_warning"
+              :severity :warning
+              :message "keep warning"}
+             {:rule "custom_info"
+              :severity :info
+              :message "keep info"}
+             {:rule "custom_error"
+              :severity :error
+              :message "block execution"}])
+          _ (handlers/register-handler!
+              registry "codergen"
+              (fn [_ _ _ _]
+                (swap! handler-calls inc)
+                {:status :success}))
+          error (try
+                  (do
+                    (pipeline/run
+                      lifecycle-dot
+                      {:custom-transforms [invalid-transform]
+                       :custom-rules [custom-rule]
+                       :registry registry
+                       :context ctx
+                       :logs-root logs
+                       :on-event #(swap! events conj %)})
+                    nil)
+                  (catch Object caught caught))
+          diagnostics (:diagnostics (ex-data error))]
+      (is (= :validation_error (:category (ex-data error))))
+      (is (= [:error :warning :info :error]
+             (mapv :severity diagnostics)))
+      (is (= ["reachability" "custom_warning" "custom_info" "custom_error"]
+             (mapv :rule diagnostics)))
+      (is (= 1 @transform-calls))
+      (is (= 1 @rule-calls))
+      (is (= 0 @handler-calls))
+      (is (= [] @events))
+      (is (= before @ctx))
+      (is (nil? (os/stat logs))))))
+
+;; SCN-VALIDATION COMPLETE
+;; SCN-PUBLIC-LIFECYCLE PARTIAL
