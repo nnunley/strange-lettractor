@@ -819,13 +819,13 @@
                                  (or (:manager-runtime options)
                                      (make-child-runtime registry on-event
                                                          cancelled? options))))
-         ;; Private integration seam for proving per-segment runtime ownership.
-         ;; It is deliberately option-namespaced and never enters results/events.
+         ;; Unstable internal diagnostic/test hook for per-segment identity proof.
+         ;; It runs synchronously, exceptions abort segment initialization, and
+         ;; deliberately exposes only identity-bearing atoms and init snapshots.
+         ;; The observation never enters public results or events.
          _segment-observer
          (when-let [observer (:attractor.engine/on-segment-initialized options)]
-           (observer {:logs-root logs-root
-                      :registry registry
-                      :parallel-executor parallel-executor
+           (observer {:parallel-executor parallel-executor
                       :manager-runtime manager-runtime
                       :retry-counts retry-counts
                       :retry-counts-value @retry-counts

@@ -12,7 +12,7 @@
 
 (defn restart-test-root [label]
   (str (os/temp-dir) "/attractor-loop-restart-" label "-"
-       (System/nanoTime)))
+       (random-uuid)))
 
 (defn first-event-index [events event-type target]
   (first
@@ -37,6 +37,30 @@
         (or (contains? restart-bookkeeping-names key-name)
             (str/starts-with? key-name "internal.retry_count."))))
     (keys values)))
+
+(deftest restart-context-scrub-preserves-custom-map-semantics
+  (let [semantic-value {:nested [1 2 3]}
+        reverse-compare (fn [left right] (compare right left))
+        original-values
+        (with-meta
+          (sorted-map-by reverse-compare
+                         "z-semantic" semantic-value
+                         "run.id" "old-run"
+                         "outcome" "old-outcome"
+                         "a-semantic" :keep)
+          {:context-map :custom-sorted})
+        ctx (context/make-context original-values)
+        _ (context/ctx-reset-for-restart! ctx)
+        reset-values (:values @ctx)
+        extended-values (assoc reset-values "m-semantic" :added)]
+    (is (nil? (get reset-values "run.id")))
+    (is (nil? (get reset-values "outcome")))
+    (is (sorted? reset-values))
+    (is (= ["z-semantic" "a-semantic"] (vec (keys reset-values))))
+    (is (= ["z-semantic" "m-semantic" "a-semantic"]
+           (vec (keys extended-values))))
+    (is (= {:context-map :custom-sorted} (meta reset-values)))
+    (is (identical? semantic-value (get reset-values "z-semantic")))))
 
 (deftest restart-driver-preserves-run-inputs-and-orders-fresh-segments
   (let [graph

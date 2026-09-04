@@ -68,13 +68,21 @@
 
 (defn ctx-reset-for-restart!
   "Remove run-segment bookkeeping while retaining the context atom, semantic
-  values (including their identities), and accumulated logs."
+  values (including their identities), and accumulated logs. Bookkeeping keys
+  are strings or unnamespaced keywords spelling exactly run.id, current_node,
+  outcome, or preferred_label, or beginning internal.retry_count.; every other
+  key is preserved."
   [ctx]
   (swap! ctx update :values
          (fn [values]
-           (into {}
-                 (remove (fn [[key _]] (restart-bookkeeping-key? key))
-                         values))))
+           (with-meta
+             (reduce (fn [remaining key]
+                       (if (restart-bookkeeping-key? key)
+                         (dissoc remaining key)
+                         remaining))
+                     values
+                     (keys values))
+             (meta values))))
   ctx)
 
 (defn- unsupported-context-value! [path]
