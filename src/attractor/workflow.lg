@@ -1,4 +1,5 @@
-(ns attractor.workflow)
+(ns attractor.workflow
+  (:require [clojure.edn :as edn]))
 
 (defn- not-serializable! [path]
   (throw
@@ -7,6 +8,14 @@
               :path path})))
 
 (declare canonical-tree-at)
+
+(defn- canonical-scalar [value path tree]
+  (try
+    (when-not (= value (edn/read-string (pr-str value)))
+      (not-serializable! path))
+    tree
+    (catch Object _
+      (not-serializable! path))))
 
 (defn- canonical-sequence [tag value path]
   [tag
@@ -70,15 +79,19 @@
 
 (defn- canonical-tree-at [value path]
   (cond
-    (nil? value) ["nil"]
-    (or (true? value) (false? value)) ["bool" value]
-    (integer? value) ["int" (str value)]
+    (nil? value) (canonical-scalar value path ["nil"])
+    (or (true? value) (false? value))
+    (canonical-scalar value path ["bool" value])
+    (integer? value) (canonical-scalar value path ["int" (str value)])
     (float? value) (if (or (NaN? value) (infinite? value))
                      (not-serializable! path)
-                     ["decimal" (pr-str value)])
-    (string? value) ["string" value]
-    (keyword? value) ["keyword" (namespace value) (name value)]
-    (symbol? value) ["symbol" (namespace value) (name value)]
+                     (canonical-scalar value path
+                                       ["decimal" (pr-str value)]))
+    (string? value) (canonical-scalar value path ["string" value])
+    (keyword? value)
+    (canonical-scalar value path ["keyword" (namespace value) (name value)])
+    (symbol? value)
+    (canonical-scalar value path ["symbol" (namespace value) (name value)])
     (vector? value) (canonical-sequence "vector" value path)
     (list? value) (canonical-sequence "list" value path)
     (map? value) (canonical-map value path)

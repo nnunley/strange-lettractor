@@ -1,5 +1,6 @@
 (ns attractor.workflow-recovery-contract-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.edn :as edn]
             [attractor.workflow :as workflow]))
 
 (defn- serialization-error [value]
@@ -66,6 +67,13 @@
   (doseq [value [##NaN ##Inf ##-Inf]]
     (is (= {:category :workflow_not_serializable :path [:graph]}
            (serialization-error value)))))
+
+(deftest canonical-tree-rejects-scalars-that-fail-edn-round-trip
+  (doseq [reader [(fn [_] "different")
+                  (fn [_] (throw (ex-info "reader failed" {})))]]
+    (is (= {:category :workflow_not_serializable :path [:graph 0]}
+           (with-redefs [edn/read-string reader]
+             (serialization-error ["original"]))))))
 
 (deftest sha256-text-locks-utf8-byte-digests
   (is (= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
