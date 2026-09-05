@@ -22,11 +22,11 @@ This iteration implements only the approved `:pinned` policy. Strict comparison/
 
 ## Source Resolution and Capture
 
-`pipeline/prepare` retains its existing source-only arity and accepts optional `:source-path`, `:base-dir`, `:workflow-roots`, and injectable `:source-loader` values. The loader receives the containing source record and child reference and returns `{:logical-id string :physical-id string :source string}`.
+`pipeline/prepare` retains its existing source-only arity and accepts optional `:source-path`, `:base-dir`, `:workflow-roots`, and injectable `:source-loader` values. `:workflow-roots` is an ordered vector of `{:id string :path string}` records with unique IDs; it defaults to `[{:id "root" :path <root-source-directory-or-base-dir>}]`. Duplicate IDs with different paths are configuration errors. The loader receives the containing source record and child reference and returns `{:logical-id string :physical-id string :source string}`; logical IDs must be unique within the closure or preparation fails with `:workflow_identity_collision`.
 
-The default loader resolves a child reference relative to its containing file, lexically cleans it, resolves symlinks, and requires the result to remain beneath one of the symlink-resolved workflow roots. Roots default to the root source directory or `:base-dir`. Absolute paths and `..` are accepted only when the resolved result remains in an allowed root. Non-`.dot` children are rejected. Authorization precedes reading.
+The default loader resolves a child reference relative to its containing file, lexically cleans it, resolves symlinks, and requires the result to remain beneath one of the symlink-resolved workflow roots. The longest resolved containing root wins; equal resolved paths choose the lexicographically smallest root ID. Absolute paths and `..` are accepted only when the resolved result remains in an allowed root. Non-`.dot` children are rejected. Authorization precedes reading.
 
-The root logical identity is `workflow://root`. Child logical identities are normalized slash-separated paths relative to their matched workflow root. Physical identities deduplicate aliases and detect cycles; logical identities and references remain in the manifest, so changing a reference changes the closure fingerprint. An in-memory root without `:source-path` requires `:base-dir` for children.
+The root logical identity is `workflow://root`. A child logical identity is `workflow://<root-id>/<normalized-relative-path>` under its selected root. Physical identities deduplicate source preparation and detect cycles; multiple logical aliases of the same physical source are allowed. The first depth-first encounter is the primary plan, while every alias and reference remains in the index, so adding or changing an alias changes the closure fingerprint. An in-memory root without `:source-path` requires `:base-dir` for children.
 
 DOT source is UTF-8 text. Hashing uses the exact string bytes supplied to the parser, including whitespace and line endings. Invalid filesystem UTF-8 is rejected before parsing.
 
@@ -46,30 +46,42 @@ Root diagnostics retain existing order. Composition diagnostics append in depth-
 
 Prepared graphs must round-trip through the project EDN domain. Unsupported values fail with category `:workflow_not_serializable` and an exact structural path; capture never hashes printed object addresses.
 
-Version-1 canonical encoding is type-tagged and deterministic:
+Version-1 first converts every value to this exact canonical EDN tree, then hashes the UTF-8 bytes of let-go 1.12.2-or-newer `pr-str` over that tree:
 
-- nil, booleans, finite integers, finite decimals, strings, keywords, and symbols use a type tag plus EDN scalar representation;
-- vectors and lists retain order and use distinct tags;
-- map entries sort by canonical key bytes and then value bytes;
-- set elements sort by canonical bytes;
-- metadata is excluded;
-- keys in namespace `attractor.runtime` are excluded; every other prepared-graph field is included.
+```edn
+["nil"]
+["bool" true]
+["int" "-12"]
+["decimal" "1.50"]
+["string" "text"]
+["keyword" "optional.namespace-or-nil" "name"]
+["symbol" "optional.namespace-or-nil" "name"]
+["vector" [<encoded-values-in-order>]]
+["list" [<encoded-values-in-order>]]
+["map" [[<encoded-key> <encoded-value>] ...]]
+["set" [<encoded-values> ...]]
+```
+
+Integer payloads are base-10 ASCII with one optional leading minus, no plus, and no leading zero except `"0"`. Decimal payloads are the exact scalar `pr-str`; positive and negative zero remain distinct when the runtime printer distinguishes them. Keyword and symbol namespace slots are EDN nil when absent, not the string `"nil"`. Map pairs sort lexicographically by encoded-key bytes and then encoded-value bytes. Set elements sort by encoded bytes. Vectors and lists retain order. Metadata is excluded. Every prepared-graph key and value is included; runtime data must not enter the prepared graph. Any change to this tree or scalar printer contract requires a workflow format-version bump.
+
+An unsupported value fails as `{:category :workflow_not_serializable :path vector}`. The path starts `[:graph]`; vector/list values append their zero-based integer index, map values append their original serializable key, a bad map key appends the keyword `:map-key`, and a bad set element appends the keyword `:set-element`. For example, an opaque value under graph node `"work"` attribute `:handler` reports `[:graph :nodes "work" :attrs :handler]`.
 
 NaN, infinities, opaque objects, mutable references, and duplicate canonical map keys are rejected. `canonical-edn` and `plan-fingerprint` are testable workflow utilities. Golden vectors lock scalar/container distinctions and the version-1 digest.
 
-The version-1 closure index contains deterministic data only:
+The runtime bundle has exact shape `{:format-version 1 :fingerprint string :root-plan-id "workflow://root" :plans map :index map}`. `:plans` maps every logical plan ID to `{:graph prepared-graph :plan-sha256 string :source-sha256 string :primary-plan-id string :references vector}`; aliases share their primary plan digest and graph. Each reference is exactly `{:node-id string :logical-reference string :plan-id string}`: `:logical-reference` is the exact `subpipeline.dotfile` attribute string, and `:plan-id` is its resolved logical child ID. References sort by node ID, then logical-reference, then plan ID; more than one record for the same node ID is invalid. Composition resolves a child by looking up the selected parent plan and then its reference with that node ID. `:index` is the deterministic persisted closure index below. It is derived by sorting the runtime plan map by logical plan ID and omitting graphs and physical paths:
 
 ```edn
 {:format-version 1
- :root-plan "<plan-sha256>"
+ :root-plan-id "workflow://root"
  :sources [{:logical-id "workflow://root" :source-sha256 "<sha256>"}]
  :plans [{:logical-id "workflow://root"
+          :primary-plan-id "workflow://root"
           :plan-sha256 "<sha256>"
           :source-sha256 "<sha256>"
           :references []}]}
 ```
 
-The closure fingerprint hashes the canonical index without a fingerprint field. Machine-specific physical paths appear only in diagnostic manifest records and are excluded from the fingerprint.
+The closure fingerprint hashes the canonical encoding of `:index`, which has no fingerprint field. The manifest stores the index, fingerprint, content locations, and diagnostic physical-path records. Machine-specific physical paths are excluded from the index and fingerprint.
 
 ## Publication Protocol
 
@@ -78,22 +90,25 @@ The closure fingerprint hashes the canonical index without a fingerprint field. 
 For valid `pipeline/run`, ordering is:
 
 1. call existing `:on-prepared` before writes; if it throws, stop with no publication or engine activity;
-2. create content directories;
-3. publish sources and plans through sibling temporary files and rename;
-4. verify and reuse an existing content-addressed target, or fail on mismatch;
-5. publish `workflow/manifest.edn` last as the bundle commit marker;
-6. call new `:on-published` with the prepared result and manifest path;
-7. emit engine events and execute.
+2. acquire `<logs-root>/workflow/.publish.lock` by exclusive directory creation; a valid existing manifest is verified and reused, while a lock without a manifest fails with `:workflow_publication_incomplete`;
+3. create content directories;
+4. publish sources and plans through UUID-named sibling temporary files and atomic rename;
+5. verify and reuse an existing content-addressed target, or fail on mismatch;
+6. publish `workflow/manifest.edn` last as the bundle commit marker, then release the lock;
+7. call new `:on-published` with the prepared result and manifest path; and
+8. emit engine events and execute.
 
-The server moves durable registration from `:on-prepared` to `:on-published`, so it cannot expose an unpublished run. `:on-prepared` remains a pre-publication gate. A pre-existing manifest must be byte-identical or publication fails with `:workflow_already_published`; it is never overwritten.
+The manifest is the only durable publication boundary. Content or temporary files without it are never resumed, and a stale lock without it is reported rather than guessed complete. Concurrent publishers serialize on the lock. A pre-existing manifest must be byte-identical or publication fails with `:workflow_already_published`; it is never overwritten. Orphan cleanup is future maintenance and cannot make an incomplete publication resumable.
+
+The server moves durable registration from `:on-prepared` to `:on-published`, so it cannot expose an unpublished run. `:on-prepared` remains a pre-publication gate. `:on-published` must be idempotent: if it throws, the committed bundle remains valid, engine execution does not start, and a retry verifies/reuses the bundle before invoking the callback again. The server callback performs one nonthrowing atomic registry update.
 
 ## Checkpoint and Public Resume
 
-New EDN checkpoints preserve optional `:workflow_fingerprint`, `:workflow_manifest`, and `:current_fidelity`. Existing checkpoints remain readable.
+New EDN checkpoints preserve optional `:workflow_fingerprint`, `:workflow_manifest`, and `:current_fidelity`. `:workflow_manifest` is exactly the relative path `"workflow/manifest.edn"`; resume derives the run root from the checkpoint parent and rejects absolute, escaping, or alternate manifest paths as `:workflow_snapshot_corrupt`. Existing checkpoints remain readable.
 
-`pipeline/resume checkpoint-path options` is the fingerprint-safe API. It loads the manifest relative to the checkpoint, matches checkpoint and manifest fingerprints, verifies every captured source and plan, decodes the root graph, optionally compares recorded physical source paths with current files, emits drift before pipeline start, and invokes low-level `engine/resume-pipeline` with the captured graph.
+`pipeline/resume checkpoint-path options` is the fingerprint-safe API. It loads the manifest relative to the checkpoint, matches checkpoint and manifest fingerprints, verifies every captured source and plan, decodes the root graph, compares recorded physical source paths with current files when `:check-current?` is true (the default), emits drift before pipeline start, and invokes low-level `engine/resume-pipeline` with the captured graph. `:current-source-path` optionally overrides only the root source location used for comparison; child comparisons continue to use their recorded physical paths.
 
-Current drift is a warning, not a blocker. The outcome `:diagnostics` gains one canonical `workflow_drift` warning listing logical identities and states in order. One `:workflow.drift_detected` event with the same ordered changes precedes `:pipeline.started`. No current source or transform is needed for recovery, and no current bytes replace captured bytes.
+Current drift is a warning, not a blocker. Each drift record is `{:logical-id string :state keyword :expected-sha256 string}` with optional `:actual-sha256` and `:path`; states are `:changed`, `:missing`, `:unreadable`, or `:relocated`. Equal bytes at the same normalized, symlink-resolved physical path produce no drift. Equal bytes at a different normalized, symlink-resolved `:current-source-path` override are `:relocated`; unequal bytes there are `:changed`. Records sort by logical ID. When the vector is nonempty, the outcome `:diagnostics` gains exactly `{:rule "workflow_drift" :severity :warning :message (str "Pinned workflow differs from current sources: " (pr-str changes))}` and no noncanonical field. One `{:type :workflow.drift_detected :changes changes}` event with the same vector precedes `:pipeline.started`. With no drift, neither is emitted. No current source or transform is needed for recovery, and no current bytes replace captured bytes.
 
 Missing capture fails with `{:category :workflow_snapshot_missing}`. Digest, format, plan, or checkpoint mismatch fails with `{:category :workflow_snapshot_corrupt}` and identifying fields. Both precede engine events and handlers.
 
@@ -101,6 +116,6 @@ Legacy callers retain low-level `engine/resume-pipeline checkpoint graph options
 
 ## Evidence
 
-SCN-PINNED-RECOVERY proves SHA-256 golden vectors; checkout-independent fingerprints; source whitespace sensitivity; map/set construction-order independence; exact unsupported paths; allowed-root and symlink behavior; no writes on invalid preparation or failed pre-publication callback; content-first/manifest-last commit order; collision verification; server registration after commit; checkpoint fields and legacy reads; resume after current source change/removal/invalidity; drift warning/event order with captured behavior; corrupt/missing component failures before execution; and CLI resume routing.
+SCN-PINNED-RECOVERY proves SHA-256 golden vectors including Unicode, numeric distinctions, and aliases; checkout-independent fingerprints; source whitespace sensitivity; map/set construction-order independence; exact unsupported paths; allowed-root and symlink behavior; no writes on invalid preparation or failed pre-publication callback; content-first/manifest-last commit order; concurrent publication and collision verification; callback failure/retry and server registration after commit; checkpoint fields, manifest-path confinement, and legacy reads; resume after current source change/removal/invalidity; exact drift warning/event order with captured behavior; corrupt/missing component failures before execution; and CLI resume routing.
 
 Mutation-sensitive tests alter digests, canonical ordering, current files, and callback order. Focused tests, impacted lifecycle/checkpoint/server tests, the sentinel suite, and AOT close ITER-0004.
