@@ -1,0 +1,87 @@
+(ns attractor.workflow-recovery-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.workflow :as workflow]))
+
+(defn- serialization-error [value]
+  (try
+    (do (workflow/canonical-tree value) nil)
+    (catch ExceptionInfo error
+      (ex-data error))))
+
+(deftest canonical-tree-uses-the-version-one-scalar-grammar
+  (is (= ["nil"] (workflow/canonical-tree nil)))
+  (is (= ["bool" true] (workflow/canonical-tree true)))
+  (is (= ["int" "-12"] (workflow/canonical-tree -12)))
+  (is (= ["decimal" "1.5"] (workflow/canonical-tree 1.50)))
+  (is (= ["decimal" "-0.0"] (workflow/canonical-tree -0.0)))
+  (is (= ["string" "héllo 世界"]
+         (workflow/canonical-tree "héllo 世界")))
+  (is (= ["keyword" nil "plain"]
+         (workflow/canonical-tree :plain)))
+  (is (= ["keyword" "workflow" "plan"]
+         (workflow/canonical-tree :workflow/plan)))
+  (is (= ["symbol" nil "plain"]
+         (workflow/canonical-tree 'plain)))
+  (is (= ["symbol" "δοκιμή" "λ"]
+         (workflow/canonical-tree (symbol "δοκιμή" "λ")))))
+
+(deftest canonical-tree-distinguishes-and-orders-containers
+  (is (= ["vector" [["int" "1"] ["string" "x"]]]
+         (workflow/canonical-tree [1 "x"])))
+  (is (= ["list" [["int" "1"] ["string" "x"]]]
+         (workflow/canonical-tree '(1 "x"))))
+  (is (= ["map" [[["keyword" nil "a"] ["int" "1"]]
+                 [["keyword" nil "b"] ["int" "2"]]]]
+         (workflow/canonical-tree {:b 2 :a 1})))
+  (is (= ["set" [["keyword" nil "a"] ["keyword" nil "b"]]]
+         (workflow/canonical-tree #{:b :a}))))
+
+(deftest canonical-edn-is-independent-of-map-set-order-and-metadata
+  (let [left {:values (into {} [[:z 1] [:a 2]])
+              :members (into #{} [:z :a])}
+        right {:members (into #{} [:a :z])
+               :values (into {} [[:a 2] [:z 1]])}]
+    (is (= (workflow/canonical-edn left)
+           (workflow/canonical-edn right)))
+    (is (= (workflow/canonical-edn [1 2])
+           (workflow/canonical-edn (with-meta [1 2] {:ignored true}))))))
+
+(deftest canonical-tree-reports-exact-unsupported-structural-paths
+  (let [handler-error
+        (serialization-error
+          {:nodes {"work" {:attrs {:handler (fn [] nil)}}}})
+        map-key-error (serialization-error {(fn [] nil) 1})
+        set-element-error (serialization-error #{(fn [] nil)})]
+    (is (= {:category :workflow_not_serializable
+            :path [:graph :nodes "work" :attrs :handler]}
+           handler-error))
+    (is (= {:category :workflow_not_serializable
+            :path [:graph :map-key]}
+           map-key-error))
+    (is (= {:category :workflow_not_serializable
+            :path [:graph :set-element]}
+           set-element-error))))
+
+(deftest canonical-tree-rejects-nonfinite-numbers
+  (doseq [value [##NaN ##Inf ##-Inf]]
+    (is (= {:category :workflow_not_serializable :path [:graph]}
+           (serialization-error value)))))
+
+(deftest sha256-text-locks-utf8-byte-digests
+  (is (= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+         (workflow/sha256-text "abc")))
+  (is (= "c2a59c71097b678dc5af2eb1f98ddc575b63948b0fa6740071a945673aaada4d"
+         (workflow/sha256-text "héllo wörld ✓"))))
+
+(deftest plan-and-closure-fingerprints-have-independent-golden-vectors
+  (let [graph {:greeting "héllo 世界" :count 2 :ratio 1.5}
+        index {:format-version 1
+               :root-plan-id "workflow://root"
+               :sources []
+               :plans []}]
+    (is (= "[\"map\" [[[\"keyword\" nil \"count\"] [\"int\" \"2\"]] [[\"keyword\" nil \"greeting\"] [\"string\" \"héllo 世界\"]] [[\"keyword\" nil \"ratio\"] [\"decimal\" \"1.5\"]]]]"
+           (workflow/canonical-edn graph)))
+    (is (= "bb37904c667a2ee3b51ceab617d7eb289abae4e4b61a783fc57f63052cd6e142"
+           (workflow/plan-fingerprint graph)))
+    (is (= "815856054ca24c5a33b05c9ea4391743a593e362c429e045e2e543881938483e"
+           (workflow/closure-fingerprint index)))))

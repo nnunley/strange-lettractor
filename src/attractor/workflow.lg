@@ -1,0 +1,101 @@
+(ns attractor.workflow)
+
+(defn- not-serializable! [path]
+  (throw
+    (ex-info "Workflow value cannot be serialized canonically"
+             {:category :workflow_not_serializable
+              :path path})))
+
+(declare canonical-tree-at)
+
+(defn- canonical-sequence [tag value path]
+  [tag
+   (mapv (fn [[index nested-value]]
+           (canonical-tree-at nested-value (conj path index)))
+         (map-indexed vector value))])
+
+(defn- encoded-map-key [key path]
+  (try
+    (canonical-tree-at key (conj path :map-key))
+    (catch ExceptionInfo error
+      (if (= :workflow_not_serializable (:category (ex-data error)))
+        (not-serializable! (conj path :map-key))
+        (throw error)))))
+
+(defn- canonical-map [value path]
+  (let [encoded
+        (reduce
+          (fn [{:keys [pairs key-bytes]} [key nested-value]]
+            (let [key-tree (encoded-map-key key path)
+                  key-edn (pr-str key-tree)]
+              (when (contains? key-bytes key-edn)
+                (not-serializable! (conj path :map-key)))
+              (let [value-tree (canonical-tree-at nested-value (conj path key))]
+                {:pairs (conj pairs
+                              {:key-tree key-tree
+                               :value-tree value-tree
+                               :key-bytes key-edn
+                               :value-bytes (pr-str value-tree)})
+                 :key-bytes (conj key-bytes key-edn)})))
+          {:pairs [] :key-bytes #{}}
+          value)
+        ordered
+        (sort
+          (fn [left right]
+            (let [key-order (compare (:key-bytes left) (:key-bytes right))]
+              (if (zero? key-order)
+                (compare (:value-bytes left) (:value-bytes right))
+                key-order)))
+          (:pairs encoded))]
+    ["map" (mapv (fn [entry] [(:key-tree entry) (:value-tree entry)]) ordered)]))
+
+(defn- encoded-set-element [element path]
+  (try
+    (canonical-tree-at element (conj path :set-element))
+    (catch ExceptionInfo error
+      (if (= :workflow_not_serializable (:category (ex-data error)))
+        (not-serializable! (conj path :set-element))
+        (throw error)))))
+
+(defn- canonical-set [value path]
+  (let [encoded
+        (mapv (fn [element]
+                (let [tree (encoded-set-element element path)]
+                  {:tree tree :bytes (pr-str tree)}))
+              value)
+        ordered (sort (fn [left right]
+                        (compare (:bytes left) (:bytes right)))
+                      encoded)]
+    ["set" (mapv :tree ordered)]))
+
+(defn- canonical-tree-at [value path]
+  (cond
+    (nil? value) ["nil"]
+    (or (true? value) (false? value)) ["bool" value]
+    (integer? value) ["int" (str value)]
+    (float? value) (if (or (NaN? value) (infinite? value))
+                     (not-serializable! path)
+                     ["decimal" (pr-str value)])
+    (string? value) ["string" value]
+    (keyword? value) ["keyword" (namespace value) (name value)]
+    (symbol? value) ["symbol" (namespace value) (name value)]
+    (vector? value) (canonical-sequence "vector" value path)
+    (list? value) (canonical-sequence "list" value path)
+    (map? value) (canonical-map value path)
+    (set? value) (canonical-set value path)
+    :else (not-serializable! path)))
+
+(defn canonical-tree [value]
+  (canonical-tree-at value [:graph]))
+
+(defn canonical-edn [value]
+  (pr-str (canonical-tree value)))
+
+(defn sha256-text [text]
+  (hash/sha256 text))
+
+(defn plan-fingerprint [graph]
+  (sha256-text (canonical-edn graph)))
+
+(defn closure-fingerprint [index]
+  (sha256-text (canonical-edn index)))
