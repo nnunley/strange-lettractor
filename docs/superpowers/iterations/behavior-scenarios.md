@@ -69,6 +69,15 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Then completed nodes are not rerun and execution continues with equivalent state
 - Seam: engine integration
 
+### SCN-PINNED-RECOVERY — Immutable launched workflow
+
+- Given a public run whose prepared DOT source is captured and fingerprinted
+- When the original file changes, disappears, or becomes invalid before resume
+- Then pinned public resume verifies and executes the captured prepared plan, reports deterministic drift, and never adopts current bytes
+- Given a missing, corrupt, mismatched, or partially published workflow bundle
+- Then resume fails before engine events or handlers
+- Seam: public pipeline/checkpoint/server integration
+
 ### SCN-CONTEXT-ISOLATION — Deep branch isolation
 
 - Given a parent context containing nested EDN maps, vectors, sets, and lists

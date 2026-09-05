@@ -1,19 +1,18 @@
-# Context-Mapped Composition and Pinned Recovery Design
+# Context-Mapped Composition Design
 
 **Date:** 2026-09-05
-**Iteration:** ITER-0004
-**Stories:** ATTR-COMPOSE-01, ATTR-CP-02
+**Iteration:** ITER-0005
+**Story:** ATTR-COMPOSE-01
 **Scenario:** SCN-PIPELINE-COMPOSITION
+**Depends on:** `2026-09-05-pinned-workflow-recovery-design.md`
 
-## Objective
+## Objective and Scope
 
-Implement StrongDM Attractor §9.4 sub-pipeline nodes as isolated child runs, with explicit context mappings and deterministic recovery when file-backed workflow definitions change. A launched run must execute one immutable prepared workflow closure. Resuming that run defaults to the captured closure rather than silently adopting current files.
+Implement StrongDM Attractor §9.4 sub-pipeline nodes as synchronous, isolated child runs. A parent explicitly maps inputs into a child and outputs back into the parent. Every child is prepared and captured before execution.
 
-Graph merging remains available through the existing custom-transform API. This iteration adds the runtime sub-pipeline pattern; it does not add a second graph-merging mechanism.
+This iteration does not inline graphs, add manager supervision, or promise exactly-once recovery inside a handler. If interrupted while a subpipeline handler is active, parent resume re-enters it with a fresh child attempt/root using the captured plan. External effects retain the ordinary at-least-once handler contract.
 
-## Decisions
-
-The approved public representation is a file-backed node:
+## Node Contract
 
 ```dot
 compose [
@@ -24,159 +23,49 @@ compose [
 ]
 ```
 
-`input_map` maps parent context keys to child context keys. `output_map` maps child context keys to parent context keys. Both values are quoted EDN maps whose keys and values must be strings. String-only mappings preserve the Context contract and avoid implicit keyword/name coercions.
+`input_map` maps parent string keys to child string keys. `output_map` maps child string keys to parent string keys. Blank/absent maps mean `{}`. Present values must be quoted EDN maps with string entries.
 
-Child paths resolve relative to the file that contains the referencing node. Direct callers that provide source text use `:source-path` or `:base-dir`; relative child references without either resolve from the process working directory for compatibility with existing file-oriented commands.
+Lookup uses `contains?`, distinguishing present nil from missing. Two sources cannot target one destination. Output destinations may overwrite existing nonreserved parent values, but every output is collected before returning one transactional `:context_updates` map.
 
-The default recovery policy is `:pinned`.
+Engine-owned destinations are rejected: `run.id`, `current_node`, `outcome`, `preferred_label`, `graph.*`, and `internal.retry_count.*`. This applies to child destinations in `input_map` and parent destinations in `output_map`. Source sides may read any present key.
 
-## Considered Approaches
+## Preparation and Validation
 
-### Recursive public lifecycle with isolated child execution — selected
+After transforms, the workflow preparer finds explicit `subpipeline` nodes in lexical node-ID order, parses mappings, resolves `subpipeline.dotfile`, and recursively prepares each new physical child once. Transform-added references are included. Completed sources are reused; active-stack references produce a cycle error with the logical chain.
 
-The public pipeline layer recursively captures and prepares every referenced child before execution. Each child later executes from the captured prepared plan with a fresh Context, log root, checkpoint state, handler runtime, retry state, and fidelity state. This preserves the isolation and failure semantics required by ATTR-COMPOSE-01.
+Canonical error rules are `subpipeline_config` for dotfile/mapping/destination defects, `subpipeline_source` for unauthorized/non-DOT/unreadable/invalid-UTF-8 sources, and `subpipeline_cycle` for recursion. Child diagnostics are attributed to the parent reference boundary as defined by the pinned design. Any error prevents publication and every root/child handler.
 
-### Graph inlining transform — rejected
+## Lifecycle Interfaces
 
-Inlining child nodes into the parent would reuse ordinary graph routing, but it would erase the required child Context, checkpoint, retry, log, and fidelity boundaries. It remains possible for callers to implement graph merging as an explicit custom transform, as allowed by upstream §9.4.
+`pipeline/run` calls a public `pipeline/execute-prepared prepared options` seam after bundle publication. It accepts a validated prepared result with a verified bundle, installs a run-scoped composition callback, and invokes `engine/run-pipeline` for the selected plan.
 
-### Manager-loop adaptation — rejected
+Children call `execute-prepared` with their captured plan. They do not reprepare, rerun transforms/rules, reread files, or republish the root bundle. Thus root and children pass the same preparation/validation contract once and the same prepared-execution contract.
 
-The manager handler already launches a child, but its observe/guard/steer/poll contract is supervisory. Reusing it for synchronous functional composition would expose unrelated telemetry keys and timing behavior while making transactional output mapping difficult.
+The engine receives `:workflow` and `:execute-subpipeline`. Low-level `engine/run-pipeline` remains valid for ordinary graphs. A subpipeline without those values returns non-retryable `:subpipeline_configuration_error`.
 
-## Workflow Bundle and Fingerprint
+## Handler Data Flow
 
-`attractor.pipeline/prepare` remains free of writes. After caller transforms run, it recursively loads all `subpipeline` references, parses their mappings, applies the same built-in/custom transform and validation lifecycle to each child, and returns an in-memory workflow bundle alongside the root graph and diagnostics.
+`subpipeline` is a standard handler installed in a cloned registry. Caller registry templates remain untouched. For each parent attempt it:
 
-The bundle contains:
+1. resolves the captured child by parent source identity and node ID;
+2. requires every mapped parent input before creating child state;
+3. deep-copies only mapped values into a new child Context;
+4. creates a pairwise-unique root under `<parent-root>/<node-id>/children/`;
+5. executes with cloned registry, fresh runtimes/retries/outcomes/fidelity/checkpoint, inherited cancellation/event sink, and child-local step budget;
+6. on SUCCESS/PARTIAL_SUCCESS, collects all mapped outputs before returning them together;
+7. on missing output, returns non-retryable `:subpipeline_mapping_error` with no updates; and
+8. on FAIL/CANCELLED, preserves status/category/retryability/reason/notes with no outputs.
 
-- the prepared root graph;
-- every prepared child graph, keyed by a stable logical source identity;
-- the exact source bytes and SHA-256 for every root/child DOT source;
-- normalized references and parsed mappings;
-- a deterministic dependency order;
-- a canonical prepared-plan digest for each graph; and
-- one closure fingerprint.
+One subpipeline call consumes one parent step. Cancellation wins concurrent completion, propagates to and joins the child, closes child resources, and applies no output.
 
-The closure fingerprint is SHA-256 over canonical EDN containing logical source identities, exact source digests, dependency references, and canonical prepared-plan digests in deterministic order. It intentionally fingerprints the output of transforms rather than attempting to serialize transform functions. Canonical encoding sorts map entries and set elements by their canonical representation, so map iteration order cannot change the digest.
+Child events retain order inside `{:type :subpipeline.child_event :parent_node_id ... :child_logs_root ... :child_plan_fingerprint ... :event ...}`. The parent stage event follows resolution.
 
-Cycles are rejected during recursive preparation with the complete reference chain. A source reached more than once is captured once, but each referencing node retains its own mappings.
+## Recovery
 
-After validation and the existing `:on-prepared` callback succeed, `pipeline/run` atomically publishes the bundle under the chosen run root before the first pipeline event or handler:
+Pinned resume uses captured children despite current file drift. An incomplete parent node reruns the child under a fresh root; old incomplete roots remain immutable evidence. A completed parent checkpoint skips the node and retains previously applied outputs. No current child bytes are used. Mid-child continuation and exactly-once external effects are out of scope.
 
-```text
-<logs-root>/
-  workflow/
-    manifest.edn
-    plans/<plan-fingerprint>.edn
-    sources/<source-sha256>.dot
-  checkpoint.edn
-  ...
-```
+## Evidence
 
-Temporary sibling files plus the existing move/publish pattern prevent partially written manifests or plans from looking valid. `manifest.edn` contains format version, closure fingerprint, root plan identity, source records, and plan records. Plans and sources are content-addressed and verified again when loaded.
+SCN-PIPELINE-COMPOSITION proves EDN mapping syntax/defaults/types/nil/duplicate/reserved/overwrite behavior; relative and transform-added references; deterministic traversal/reuse/cycles; child validation attribution/no-handler gating; exact input/output isolation; transactional success/partial outputs; missing-output and FAIL/CANCELLED behavior; distinct parent/child state and budgets; cancellation order; drift-proof captured launches; incomplete-child rerun under a fresh root; completed-child skip; missing low-level runtime failures; and public lifecycle/CLI call counts.
 
-Files may change after capture without affecting the launched run. Child execution never rereads the original path.
-
-## Public Lifecycle
-
-The public API gains composition-aware preparation and resume while preserving existing arities:
-
-- `pipeline/prepare dot-source options` returns `:graph`, `:diagnostics`, and `:workflow`.
-- `pipeline/run dot-source options` publishes the prepared workflow and invokes the low-level engine with it.
-- `pipeline/resume checkpoint-path options` loads and verifies the captured workflow, then resumes its root prepared graph.
-
-CLI `run`, `validate`, and `graph` pass the root source path so nested paths are stable. CLI `resume` delegates to `pipeline/resume`; the supplied DOT path is used for drift comparison or restart policy, never as an implicit replacement for the captured plan.
-
-`engine/run-pipeline` and `engine/resume-pipeline` remain documented low-level prepared-graph seams. A low-level caller that bypasses `pipeline/run` must provide a workflow bundle to execute `subpipeline` nodes; otherwise the handler returns a configuration failure.
-
-## Sub-Pipeline Execution
-
-`subpipeline` becomes a standard handler type. The engine injects a run-scoped composition callback without mutating the caller's registry template.
-
-For each parent attempt the handler:
-
-1. Parses no files; it resolves the node's captured child plan from the workflow bundle.
-2. Reads every mapped parent input. If any source key is absent, it returns FAIL before creating child state.
-3. Builds a new child Context containing only deep-copied mapped inputs plus the child's own graph bookkeeping.
-4. Creates an attempt-specific child log root and atomically records an invocation descriptor.
-5. Runs or resumes the captured child plan with a cloned registry, fresh manager/parallel runtimes, child-local retries, child-local fidelity sessions, and inherited cancellation/event sinks.
-6. On SUCCESS or PARTIAL_SUCCESS, collects all mapped outputs first. A missing output fails the composition without applying any output.
-7. Returns mapped values as one `:context_updates` map, making the parent application transactional.
-8. On FAIL or CANCELLED, returns the child's status and failure reason without parent output updates.
-
-One sub-pipeline handler attempt consumes one parent step. Child steps use the child's own invocation-wide budget. Parent and child checkpoints, completed nodes, outcomes, retries, files, and fidelity sessions never merge.
-
-Child lifecycle events are wrapped as `:subpipeline.child_event` with parent node ID, child log root, child fingerprint, and the original event. The handler's ordinary parent stage event still represents the composition boundary.
-
-## Invocation Descriptors and Interrupted Children
-
-Before a child starts, the parent writes an attempt descriptor under its stage directory. The descriptor contains a format version, parent node/attempt, child plan and closure fingerprints, child log root, mapping digests, and `:state :running`. Completion atomically replaces it with `:state :completed` and the final child outcome plus mapped output candidate.
-
-On pinned parent resume, re-entry into the same logical sub-pipeline attempt behaves as follows:
-
-- a verified completed descriptor reuses the recorded outcome and applies its recorded mapped output exactly once;
-- a verified running descriptor with a child checkpoint resumes that checkpoint against the captured child plan;
-- a verified running descriptor without a child checkpoint restarts the captured child at its existing isolated root;
-- a corrupt, mismatched, or path-escaping descriptor fails explicitly and never launches current source bytes.
-
-Parent retry advances the attempt number and creates a fresh child root and descriptor. It never reuses a failed attempt's child state.
-
-## Recovery Policies
-
-### `:pinned` — default
-
-Load and verify the captured manifest, sources, plans, and checkpoint fingerprint. Resume from the captured prepared graph. If a current root source is supplied, prepare it only for comparison; a mismatch or unreadable current closure produces a `:workflow.drift_detected` diagnostic/event but does not prevent recovery. Pinned recovery never falls back to current files when captured material is absent or corrupt.
-
-### `:strict`
-
-Require a current source, prepare its closure, and compare the closure fingerprint. A mismatch throws before engine state or handler activity with category `:workflow_changed`, including expected and actual fingerprints plus changed logical sources when determinable.
-
-### `:restart`
-
-Prepare and run the current workflow under a new root. No completed nodes, retry counts, node outcomes, fidelity sessions, or arbitrary old context cross the boundary. Callers may provide an explicit `:recovery-input-map` from old checkpoint context keys to new root context keys; missing inputs fail before the new run starts. The old run and its captured bundle remain byte-stable.
-
-## Validation and Failures
-
-Composition diagnostics use the canonical validation schema and deterministic node/reference order. Preparation rejects:
-
-- missing or blank `subpipeline.dotfile`;
-- unreadable child files;
-- malformed EDN mapping strings;
-- non-map mappings;
-- non-string mapping keys or values;
-- two inputs targeting the same child key;
-- two outputs targeting the same parent key;
-- a child parse/validation error; and
-- recursive source cycles.
-
-Runtime missing inputs/outputs and captured-bundle corruption use explicit non-retryable configuration/recovery categories. Cancellation always outranks a concurrently completing child and joins child cleanup before returning. A child failure preserves its category, retryability, failure reason, and notes where present.
-
-No validation or fingerprint error may reach a child handler. Invalid root preparation retains the existing guarantee of no run directory, checkpoint, pipeline event, or handler side effect.
-
-## Compatibility and Serialization
-
-Existing pipelines without `type="subpipeline"` retain their current graphs, outcomes, events, and public arities. Existing EDN checkpoints without fingerprint fields remain readable by `context/load-checkpoint`; legacy low-level resume continues to accept an explicitly supplied graph. Public pinned/strict recovery requires a versioned captured workflow and fails clearly when an old checkpoint has none.
-
-Workflow manifests, prepared plans, invocation descriptors, checkpoints, and mapped internal values use EDN. JSON remains limited to provider/HTTP boundaries and `status.json`.
-
-## Evidence Strategy
-
-`SCN-PIPELINE-COMPOSITION` will prove, at the public lifecycle seam:
-
-- relative nested file resolution and recursive transform/validation;
-- exact input/output mapping and absence of unmapped/colliding values;
-- transactional output application on SUCCESS/PARTIAL_SUCCESS only;
-- FAIL/CANCELLED propagation and cleanup;
-- distinct parent/child Context identities, roots, checkpoints, completed nodes, outcomes, retries, handler runtimes, and fidelity sessions;
-- duplicate destinations, malformed mappings, missing files/keys, child validation errors, and cycles fail at the specified boundary;
-- original files changed after preparation but before child launch cannot affect execution;
-- deterministic SHA-256 manifests and content-addressed snapshot verification;
-- pinned top-level resume after parent and child source drift;
-- pinned recovery of running and completed child descriptors without relaunching current files or duplicating outputs;
-- strict mismatch rejection before execution;
-- restart under a new root with only explicit recovery inputs;
-- corrupt/missing snapshot, plan, descriptor, and checkpoint-fingerprint failures; and
-- CLI run/validate/resume routing through the public lifecycle.
-
-Focused composition/fingerprint tests, impacted lifecycle/checkpoint/engine/manager/status tests, the full sentinel suite, and AOT compilation close the iteration. Mutation-sensitive checks will alter a captured digest, mapping destination, descriptor state, and post-capture source to demonstrate that each proof can fail for the intended reason.
+Mutation-sensitive tests remove mapped keys, alias destinations, substitute current bytes, share runtimes, and reorder cancellation. Focused tests, impacted pinned/lifecycle/context/engine/manager/status suites, the sentinel suite, and AOT close ITER-0005.
