@@ -1,9 +1,9 @@
 # Progress
 
 **Phase:** implementing ITER-0005
-**Task:** recursive preparation and captured workflow closure (Task 3)
+**Task:** selectable captured-plan checkpoints (Task 4)
 **Iterations:** 5 complete, 8 pending
-**Sentinel corpus:** 4 established; latest default suite at `2c06f76`: 423 tests / 2,739 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
+**Sentinel corpus:** 4 established; latest default suite at `61409c1`: 438 tests / 2,839 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0005 — context-mapped composition
 
 **Latest review:** The composition plan passed its chunk reviews. Task 1 configuration review found reader-syntax gaps. The user authorized a temporary ordinary-map path while native reader compatibility remains unresolved; do not count this as full Clojure-reader conformance. Pinned recovery was merged and pushed to public main at `f67cdc6` after both audits returned CLEAN; see [audit evidence](iter-0004-audit.md).
@@ -13,3 +13,5 @@
 **Nonblocking review follow-up:** Add exact diagnostic-key-set and multi-node lexical diagnostic-order assertions when extending composition evidence. Current implementation conforms; these are test-strengthening opportunities, not proved implementation defects.
 
 **Task 2 handoff:** `2c06f76` is pushed and passed both scope and quality review. Root independently confirmed capture 11/45/0 and the full default suite 423/2739/0. Task 3 is underway: recursive public prepare, physical-source reuse, cycles/alias identities, and bundle cross-reference verification. Read-only probes confirm the current root-only verifier accepts rehashed dangling-reference and missing-primary records; Task 3 must add permanent rejection tests and semantic validation before recursive bundles are used. Those probes do not execute workflows or write run artifacts.
+
+**Task 3 verification checkpoint:** Recursive capture is committed at `15d6609`, with review fixes at `61409c1`. Root independently ran the original recursive suite (13 tests / 83 assertions / 0 failures) and default suite (436/2822/0). Compiled CLI testing then exposed a file-origin handoff gap: `validate` and `graph` called source-only preparation, causing valid relative children to fail with `:missing-base-dir`. Spec review also found that a rehashed bundle could make the root an alias of another primary, violating root-first identity. Both fixes now pass spec and code-quality review with no remaining findings. Mutation-sensitive regression evidence includes 10 CLI assertion failures and two runtime/persisted root-alias failures before correction. Final focused results are recursive 14/85/0, CLI 6/57/0, and lifecycle 8/161/0. Root's independent post-fix default suite passes 438/2839/0, and local-compiler AOT builds successfully. The compiled executable accepts valid relative-child fixtures through `validate` and `lint`, inspects the graph successfully, and rejects a real source cycle with exit 1 and canonical `subpipeline_cycle`. Task 3 is complete; selected-plan checkpoint recovery and mapped child execution remain Tasks 4 and 5, respectively. This is not completion of ITER-0005 or the full Attractor specification.

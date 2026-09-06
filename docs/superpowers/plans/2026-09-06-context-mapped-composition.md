@@ -47,11 +47,13 @@ Task 2 evidence: `2c06f76`, scope and quality reviews approved. Capture 11 tests
 
 Files: modify `src/attractor/capture.lg`, `src/attractor/pipeline.lg`, `src/attractor/workflow.lg`; extend capture/composition/recovery tests.
 
-- [ ] Write public prepare tests proving parent then lexical-node depth-first traversal, transform-added references, exactly one parse/transform/validation per physical source, physical alias reuse, active-stack cycle rejection with logical chain, duplicate logical-ID collisions, child diagnostic attribution and ordering, and no writes/events/handlers for errors anywhere in closure.
-- [ ] Run these files separately and observe missing-child-capture failures.
-- [ ] Implement recursive prepare using a supplied single-source prepare function, avoiding capture↔pipeline namespace cycles. Track active physical stack, completed physical plans, logical aliases, and ordered diagnostics. Build references exactly `{:node-id :logical-reference :plan-id}`, sorted by node ID/reference/plan ID; first depth-first physical encounter is primary. Root remains `workflow://root`. Build sorted source/plan index via a reusable workflow bundle constructor; hash all aliases/references and exclude physical paths. Validate every reference target, primary alias relation, source/plan binding, and duplicate reference node before publication and on resume.
-- [ ] Run capture, composition, recovery, lifecycle, parser, and validation files. Assert unchanged root-only fingerprints/golden vectors and existing source-only prepare arity.
-- [ ] Commit `feat(capture): snapshot recursive prepared workflow closures`.
+- [x] Write public prepare tests proving parent then lexical-node depth-first traversal, transform-added references, exactly one parse/transform/validation per physical source, physical alias reuse, active-stack cycle rejection with logical chain, duplicate logical-ID collisions, child diagnostic attribution and ordering, and no writes/events/handlers for errors anywhere in closure.
+- [x] Run these files separately and observe missing-child-capture failures.
+- [x] Implement recursive prepare using a supplied single-source prepare function, avoiding capture↔pipeline namespace cycles. Track active physical stack, completed physical plans, logical aliases, and ordered diagnostics. Build references exactly `{:node-id :logical-reference :plan-id}`, sorted by node ID/reference/plan ID; first depth-first physical encounter is primary. Root remains `workflow://root`. Build sorted source/plan index via a reusable workflow bundle constructor; hash all aliases/references and exclude physical paths. Validate every reference target, primary alias relation, source/plan binding, and duplicate reference node before publication and on resume.
+- [x] Run capture, composition, recovery, lifecycle, parser, and validation files. Assert unchanged root-only fingerprints/golden vectors and existing source-only prepare arity.
+- [x] Commit `feat(capture): snapshot recursive prepared workflow closures`.
+
+Task 3 evidence: `15d6609` implements recursive capture; `61409c1` fixes the two review findings (CLI file-origin handoff and root self-primary enforcement). Recursive tests pass 14/85/0, CLI 6/57/0, lifecycle 8/161/0; root independently verified the final full suite at 438 tests / 2,839 assertions / 0 failures and built with local let-go AOT. Compiled real-file checks accept relative-child workflows through validate/lint and graph inspection and reject a source cycle with canonical diagnostics. Scope and quality review found no remaining blockers. These results prove preparation/capture, not child execution or selected-plan recovery.
 
 ## Chunk 2: Isolated child execution and recovery
 
