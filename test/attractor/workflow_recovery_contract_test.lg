@@ -353,6 +353,20 @@
       (is (= :workflow_already_published (:category error)))
       (is (= mutated-bytes (io/slurp manifest-path))))))
 
+(deftest identical-manifest-reuse-reverifies-every-referenced-content-file
+  (doseq [manifest-key [:sources :plans]]
+    (let [run-root (publication-root)
+          bundle (prepared-bundle)
+          manifest-path (workflow/publish! bundle run-root)
+          manifest-bytes (io/slurp manifest-path)
+          manifest (edn/read-string manifest-bytes)
+          content-path (str run-root "/" (get-in manifest [manifest-key 0 :path]))
+          _ (io/spit content-path "corrupted after publication")
+          error (workflow-error #(workflow/publish! bundle run-root))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (= content-path (:path error)))
+      (is (= manifest-bytes (io/slurp manifest-path))))))
+
 (deftest workflow-publication-refuses-an-uncommitted-lock
   (let [run-root (publication-root)
         workflow-dir (str run-root "/workflow")
