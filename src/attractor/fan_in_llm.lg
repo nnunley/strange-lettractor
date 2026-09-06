@@ -33,6 +33,10 @@
           client-provider (get (:client options) :default_provider)
           parsed (llm/parse-model-spec raw-model
                                        (or explicit-provider client-provider))]
+      (when (or (str/blank? (:model parsed))
+                (str/blank? (:provider parsed)))
+        (throw (configuration-error
+                 "Prompted fan-in requires non-empty LLM model and provider configuration")))
       (when (and (contains? #{"mock" "ollama"} (:provider parsed))
                  (not prefixed?)
                  (nil? explicit-provider)
