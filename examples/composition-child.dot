@@ -1,0 +1,6 @@
+digraph Child {
+    begin [shape=Mdiamond];
+    greet [type=tool, tool_command="printf hello-from-child"];
+    end [shape=Msquare];
+    begin -> greet -> end;
+}

@@ -1,0 +1,8 @@
+digraph Parent {
+    start [shape=Mdiamond];
+    child [type=subpipeline,
+           subpipeline.dotfile="composition-child.dot",
+           output_map="{\"tool.output\" \"child.result\"}"];
+    exit [shape=Msquare];
+    start -> child -> exit;
+}

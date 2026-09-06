@@ -1,6 +1,6 @@
 # Strange Lettractor Tutorial: Multi-Stage LLM Workflow Orchestration
 
-Strange Lettractor is an implementation of [StrongDM's Attractor](https://github.com/strongdm/attractor), built in **[let-go](https://github.com/nooga/let-go)** and managed with **[lgx](https://github.com/abogoyavlensky/lgx)**. It models autonomous coding agents and multi-stage LLM pipelines as **Graphviz DOT graphs**.
+Strange Lettractor is a unified agentic framework implementing [StrongDM's Attractor specifications](https://github.com/strongdm/attractor), built in [let-go](https://github.com/nooga/let-go) and managed with [lgx](https://github.com/abogoyavlensky/lgx). This tutorial focuses on its Graphviz DOT workflow layer; unified LLM access and the coding-agent runtime are complementary layers, not limited to DOT workflows. Full specification conformance is still in progress.
 
 ---
 
@@ -235,6 +235,52 @@ You can also pass this directly via CLI:
 
 ---
 
+### Tutorial 6: Captured Child Workflows
+
+Run the included provider-free example:
+
+```bash
+./bin/attractor run examples/composition-parent.dot --logs-root attractor_runs/composition-demo
+```
+
+The parent calls `composition-child.dot` through an explicit `type=subpipeline`
+node. The path is relative to the containing DOT file. The child runs a tool that
+prints `hello-from-child`; this output mapping copies its result back into the
+parent's `child.result` context key:
+
+```dot
+child [type=subpipeline,
+       subpipeline.dotfile="composition-child.dot",
+       output_map="{\"tool.output\" \"child.result\"}"];
+```
+
+Mappings are quoted EDN map strings inside DOT attributes. `input_map` maps parent
+keys to child keys; `output_map` maps child keys to parent keys. For example,
+`input_map="{\"request\" \"task\"}"` supplies the parent's existing `request`
+value as the child's `task`. Absent maps mean no values are mapped. Inputs are
+deep-copied, unmapped parent values are not inherited, and a present `nil` value
+is distinct from a missing key. All output keys must exist before any output is
+applied. Failed or cancelled children contribute no mapped outputs.
+
+The temporary mapping reader supports ordinary string-to-string maps, comments,
+commas, and string escapes. Metadata and reader discards are not yet supported;
+see the [Clojure reader compatibility findings](let-go-reader-compatibility.md).
+Engine-owned destination keys such as `run.id`, `current_node`, and `graph.*`
+cannot be mapped over.
+
+Preparation validates and captures the full recursive workflow before execution.
+Each child attempt has its own context and checkpoint beneath
+`<parent-run>/<node>/children/<uuid>/` (unusual node IDs use a hashed directory
+component). Each run retains the full captured workflow and identifies its own
+selected plan. A child checkpoint can therefore be resumed independently.
+
+If the parent is interrupted during a child call, parent resume starts a fresh
+child attempt from the capture and preserves the previous attempt's files. It
+does not continue the interrupted handler in place: external effects may run
+again. Completed child calls are skipped, retaining their mapped outputs.
+
+---
+
 ## 4. Checkpoints & Resuming
 
 Attractor writes state to `{logs_root}/checkpoint.edn` after every stage:
@@ -244,7 +290,7 @@ Attractor writes state to `{logs_root}/checkpoint.edn` after every stage:
  :current_node "implement"
  :completed_nodes ["start" "plan" "implement"]
  :node_retries {}
- :node_outcomes {"plan" :success "implement" :success}
+ :node_outcomes {"plan" {:status :success} "implement" {:status :success}}
  :context_values {"graph.goal" "..." "last_stage" "implement"}
  :logs []}
 ```
@@ -252,8 +298,15 @@ Attractor writes state to `{logs_root}/checkpoint.edn` after every stage:
 To resume execution from a saved checkpoint:
 
 ```bash
-./bin/attractor resume examples/hello.dot --checkpoint attractor_runs/run_123/checkpoint.edn
+./bin/attractor resume --checkpoint attractor_runs/run_123/checkpoint.edn
 ```
+
+Public runs also save an immutable workflow capture. Their checkpoints include
+`workflow_fingerprint`, `workflow_manifest`, and `workflow_plan_id` identity
+fields. Resume executes the captured plan even if current DOT files change or
+disappear, reporting source drift as a warning. Missing or corrupt captured data
+stops recovery. The optional DOT argument is a current-source comparison override,
+not a replacement execution plan.
 
 ---
 
