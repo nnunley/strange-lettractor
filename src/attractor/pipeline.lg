@@ -354,4 +354,4 @@
              (on-published prepared manifest-path))]
      (execute-prepared
        (assoc prepared :diagnostics diagnostics)
-       (assoc options :logs-root logs-root)))))
+       (assoc (dissoc options :attractor.pipeline/plan-id) :logs-root logs-root)))))

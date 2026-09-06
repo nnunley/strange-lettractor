@@ -4,6 +4,7 @@
             [os :as os]
             [attractor.context :as context]
             [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
             [attractor.pipeline :as pipeline]
             [attractor.workflow :as workflow]))
 
@@ -18,6 +19,32 @@
   (assoc prepared :graph (get-in prepared [:workflow :plans child-id :graph])))
 (defn temp-root [] (str (os/temp-dir) "/selected-plan-" (random-uuid)))
 (defn error-data [f] (try (f) nil (catch Exception e (ex-data e))))
+
+(deftest public-run-always-executes-the-original-root
+  (doseq [id [child-id "workflow://unknown" nil 42]]
+    (let [root (temp-root) observed (atom nil) result (atom nil)
+          run-engine engine/run-pipeline
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler! registry "subpipeline" (fn [& _] {:status :success}))
+          error (with-redefs [engine/run-pipeline
+                              (fn [graph options]
+                                (reset! observed {:graph graph :options options})
+                                (run-engine graph options))]
+                  (error-data #(reset! result
+                    (pipeline/run
+                      "digraph Root { start [shape=Mdiamond]; sub [type=subpipeline, subpipeline.dotfile=\"child.dot\"]; exit [shape=Msquare]; start -> sub -> exit; }"
+                      {:logs-root root :registry registry :attractor.pipeline/plan-id id
+                       :source-loader (fn [& _]
+                                        {:logical-id child-id :physical-id "child"
+                                         :source "digraph Child { child_start [shape=Mdiamond]; child_exit [shape=Msquare]; child_start -> child_exit; }"})}))))]
+      (is (nil? error))
+      (when (nil? error)
+        (is (= :success (:status @result)))
+        (is (= "Root" (get-in @observed [:graph :id])))
+        (is (= workflow/root-plan-id (get-in @observed [:options :attractor.engine/plan-id])))
+        (is (not (contains? (:options @observed) :attractor.pipeline/plan-id)))
+        (is (= workflow/root-plan-id (:workflow_plan_id
+                                       (context/load-checkpoint (str root "/checkpoint.edn")))))))))
 
 (deftest selected-child-publishes-full-capture-and-resumes-its-own-history
   (let [prepared (captured) root (temp-root)
