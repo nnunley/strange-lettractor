@@ -1,7 +1,25 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** independent local coding-loop journey verified; next uncovered runtime requirement is LLM tool pre/post hooks
+**Task:** exact-whitespace file editing repaired; LLM tool pre/post hook design remains awaiting approval
+
+**Exact-edit repair:** the local environment rejected a single space in
+`alpha beta` as an empty `old_string`, contrary to the §3.3 exact-match contract.
+The occurrence counter now rejects only empty targets, allowing meaningful
+whitespace while preserving missing/ambiguous-target checks. Real Anthropic and
+Gemini profile executors are covered by `tool_edit_contract_test.lg`: space
+replacement, newline deletion, all-tab replacement, mixed whitespace, and unchanged
+file bytes after rejected edits. RED: 20 failed assertions; GREEN: 2 tests / 32
+assertions / zero failures. Scoped review approves. Root full suite passes **557
+tests / 4458 assertions / zero failures**, exit 0; AOT builds successfully. The
+separate reader suite still fails its five assertions. This is an Attractor bug
+fix, not a let-go change or completion of the broader tools requirement.
+
+**Hook gap reproduced:** a public workflow with a codergen node carrying
+`tool_hooks.pre="exit 23"` still executes its registered tool once and returns
+success. The proposed existing-environment hook runner, node-over-graph precedence,
+JSON stdin metadata, EDN stage logs, and per-turn refresh for reused sessions await
+design approval. This dependency does not prevent independent tool-contract fixes.
 
 **Local agent-loop checkpoint:** `agent_loop_contract_test.lg` adds three session
 integration tests through a deterministic adapter registered with the real unified

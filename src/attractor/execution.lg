@@ -41,7 +41,8 @@
                      (subvec lines start end))))))
 
 (defn- occurrence-count [content needle]
-  (when (str/blank? needle)
+  ;; Whitespace is valid exact-match text; only an empty needle cannot advance.
+  (when (empty? needle)
     (throw (ex-info "old_string must not be empty"
                     {:category :invalid-edit})))
   (loop [start 0 total 0]

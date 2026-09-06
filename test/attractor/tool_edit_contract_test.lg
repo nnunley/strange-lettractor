@@ -1,0 +1,53 @@
+(ns attractor.tool-edit-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [os :as os]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; Coding Agent Loop §3.3: whitespace is exact text, not an empty old_string.
+;; Exercise the actual Anthropic/Gemini tool executors and local file environment.
+(defn- edit-result [executor environment old-text new-text replace-all]
+  (try
+    {:replacements
+     (executor {"file_path" "sample.txt" "old_string" old-text
+                "new_string" new-text "replace_all" replace-all} environment)}
+    (catch Object error {:category (:category (ex-data error))})))
+
+(deftest profile-edits-accept-exact-whitespace-targets
+  (doseq [make-profile [profiles/create-anthropic-profile profiles/create-gemini-profile]]
+    (let [profile (make-profile "contract")
+          executor (:executor (profiles/registry-get (:tool_registry profile) "edit_file"))
+          environment (execution/make-local-environment
+                        {:working_dir (str (os/temp-dir) "/attractor-edit-contract-"
+                                           (System/nanoTime))})]
+      (try
+        (doseq [[before old-text new-text after replacements replace-all]
+                [["alpha beta" " " "-" "alpha-beta" 1 false]
+                 ["alpha\nbeta" "\n" "" "alphabeta" 1 false]
+                 ["\talpha\tbeta" "\t" "  " "  alpha  beta" 2 true]
+                 ["alpha \n\tbeta" " \n\t" " / " "alpha / beta" 1 false]]]
+          ((:write_file environment) "sample.txt" before)
+          (is (= {:replacements replacements}
+                 (edit-result executor environment old-text new-text replace-all)))
+          (is (= after ((:read_text environment) "sample.txt"))))
+        (finally ((:cleanup environment)))))))
+
+(deftest whitespace-edits-preserve-ambiguity-missing-and-empty-guards
+  (doseq [make-profile [profiles/create-anthropic-profile profiles/create-gemini-profile]]
+    (let [profile (make-profile "contract")
+          executor (:executor (profiles/registry-get (:tool_registry profile) "edit_file"))
+          environment (execution/make-local-environment
+                        {:working_dir (str (os/temp-dir) "/attractor-edit-guard-"
+                                           (System/nanoTime))})
+          original "alpha beta gamma"]
+      (try
+        ((:write_file environment) "sample.txt" original)
+        (doseq [[old-text replace-all category]
+                [[" " false :edit-not-unique]
+                 ["\t" false :edit-not-found]
+                 ["" false :invalid-edit]
+                 ["" true :invalid-edit]]]
+          (is (= {:category category}
+                 (edit-result executor environment old-text "-" replace-all)))
+          (is (= original ((:read_text environment) "sample.txt"))))
+        (finally ((:cleanup environment)))))))
