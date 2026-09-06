@@ -29,6 +29,39 @@
 (def cli-dot
   "digraph CLI { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
 
+(deftest file-inspection-captures-relative-children-and-source-cycles
+  (let [dir (str (os/temp-dir) "/attractor-cli-recursive-" (random-uuid))
+        _ (io/mkdir dir)
+        root-path (str dir "/root.dot")
+        cycle-path (str dir "/cycle.dot")
+        child-path (str dir "/child.dot")
+        source (fn [reference] (str "digraph Recursive { start [shape=Mdiamond]; child [type=subpipeline, subpipeline.dotfile=\""
+                                    reference "\"]; exit [shape=Msquare]; start -> child -> exit; }"))
+        _ (io/spit root-path (source "child.dot"))
+        _ (io/spit cycle-path (source "cycle.dot"))
+        _ (io/spit child-path cli-dot)]
+    (doseq [command ["validate" "lint"]]
+      (let [exits (atom [])
+            output (with-redefs [os/exit #(swap! exits conj %)]
+                     (with-out-str (cli/-main command root-path)))]
+        (is (str/includes? output "is valid (0 errors, 0 warnings)"))
+        (is (not (some #{1} @exits))))
+      (let [exits (atom [])
+            output (with-redefs [os/exit #(swap! exits conj %)]
+                     (with-out-str (cli/-main command cycle-path)))]
+        (is (= [1] @exits))
+        (is (str/includes? output "[subpipeline_cycle]"))
+        (is (str/includes? output "workflow://root -> workflow://root/cycle.dot"))))
+    (let [prepare pipeline/prepare results (atom [])
+          output (with-redefs [pipeline/prepare
+                               (fn [s & options]
+                                 (let [p (prepare s (or (first options) {}))]
+                                   (swap! results conj p) p))]
+                   (with-out-str (cli/cmd-graph [root-path])))]
+      (is (str/includes? output "Pipeline Graph: Recursive"))
+      (is (empty? (:diagnostics (first @results))))
+      (is (= 2 (count (get-in (first @results) [:workflow :plans])))))))
+
 (deftest run-delegates-the-source-path-to-the-public-lifecycle
   (let [dot-path (str (os/temp-dir) "/attractor-cli-source-" (random-uuid) ".dot")
         logs-root (str (os/temp-dir) "/attractor-cli-logs-" (random-uuid))

@@ -190,6 +190,27 @@
     (let [b (workflow/root-bundle leaf g {})]
       (is (= :workflow_snapshot_corrupt (:category (failure #(workflow/verify-bundle! b g))))))))
 
+(deftest root-plan-cannot-be-an-alias-of-another-primary
+  (let [p (pipeline/prepare leaf)
+        root (:workflow p)
+        plan (get-in root [:plans "workflow://root"])
+        source (first (:source-records root))
+        b (workflow/captured-bundle
+            [source (assoc source :logical-id "workflow://other")]
+            {"workflow://root" plan "workflow://other" plan} [])
+        mutated (-> b
+                    (change-plan "workflow://root" #(assoc % :primary-plan-id "workflow://other"))
+                    (change-plan "workflow://other" #(assoc % :primary-plan-id "workflow://other")))
+        logs (str (os/temp-dir) "/recursive-root-alias-" (random-uuid))]
+    (is (= :workflow_snapshot_corrupt
+           (:category (failure #(workflow/verify-bundle! mutated (:graph p))))))
+    (workflow/publish! b logs)
+    (let [manifest (:workflow (workflow/verify-published! logs (:fingerprint b)))]
+      (io/spit (str logs "/" workflow/manifest-relative-path)
+               (pr-str (assoc manifest :index (:index mutated) :fingerprint (:fingerprint mutated))))
+      (is (= :workflow_snapshot_corrupt
+             (:category (failure #(workflow/verify-published! logs (:fingerprint mutated)))))))))
+
 (deftest child-serialization-failure-is-a-parent-diagnostic
   (let [result (try
                  (pipeline/prepare (branch "Root" [["a" "a.dot"]])

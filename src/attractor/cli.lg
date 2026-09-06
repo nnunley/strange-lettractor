@@ -84,7 +84,7 @@
           (os/exit 1))
         (try
           (let [dot-content (io/slurp dot-file)
-                prepared (pipeline/prepare dot-content)
+                prepared (pipeline/prepare dot-content {:source-path dot-file})
                 graph (:graph prepared)
                 diags (:diagnostics prepared)]
             (if (empty? diags)
@@ -110,7 +110,7 @@
       (do
         (println "Error: Valid DOT file required.")
         (os/exit 1))
-      (let [prepared (pipeline/prepare (io/slurp dot-file))
+      (let [prepared (pipeline/prepare (io/slurp dot-file) {:source-path dot-file})
             graph (:graph prepared)
             start-node (parser/find-start-node graph)
             exit-node (parser/find-exit-node graph)]

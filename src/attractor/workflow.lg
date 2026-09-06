@@ -307,6 +307,9 @@
     (when-not (and (= root-plan-id root-id) (contains? plans root-id))
       (snapshot-error! "Workflow index root plan is missing"
                        {:root-plan-id root-id}))
+    (when-not (= root-id (:primary-plan-id (get plans root-id)))
+      (snapshot-error! "Workflow root plan must be its own primary"
+                       {:root-plan-id root-id}))
     (when-not (= (set (keys sources)) (set (keys plans)))
       (snapshot-error! "Workflow source and plan identities differ" {}))
     (doseq [field [:sources :plans]]

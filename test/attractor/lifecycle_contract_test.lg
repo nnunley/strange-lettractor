@@ -692,9 +692,10 @@
           inspect-output
           (with-redefs
             [pipeline/prepare
-             (fn [source]
+             (fn [source options]
                (swap! prepare-calls conj source)
-               (real-prepare source {}))
+               (is (= {:source-path dot-path} options))
+               (real-prepare source options))
              os/exit (fn [_] nil)]
             (str (with-out-str (cli/cmd-validate [dot-path]))
                  (with-out-str (cli/cmd-graph [dot-path]))))
