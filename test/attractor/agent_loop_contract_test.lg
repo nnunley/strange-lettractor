@@ -1,0 +1,136 @@
+(ns attractor.agent-loop-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.agent :as agent]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]))
+
+;; SCN-CAL-LOOP: local session integration through the unified client. No live I/O.
+;; SCN-CAL-LOOP LOCAL COMPLETE
+(defn- response [id text calls]
+  {:id id :model "contract-model" :provider "contract"
+   :message {:role :assistant :content text} :tool_calls calls
+   :reasoning (str "reason-" id) :usage {:input_tokens 2 :output_tokens 3}
+   :finish_reason (if (seq calls) :tool_calls :stop)})
+
+(defn- fixture [complete executor options]
+  (let [registry (profiles/make-tool-registry)
+        _ (profiles/register-tool!
+            registry {:definition {:name "step" :description "Session step"
+                                   :parameters {:type "object" :properties {}}}
+                      :executor executor})
+        profile (profiles/make-profile
+                  {:id "contract" :model "contract-model" :tool_registry registry
+                   :supports_streaming false :supports_parallel_tool_calls false})
+        adapter (llm/make-adapter "contract" complete nil)
+        client (llm/make-client {:providers {"contract" adapter}
+                                 :default_provider "contract"})]
+    (agent/make-session
+      (merge {:provider_profile profile :llm_client client :project_docs []
+              :max_subagent_depth 0} options))))
+
+(deftest sequential-inputs-and-followups-retain-tool-history-and-steering
+  (let [requests (atom []) events (atom []) holder (atom nil) executions (atom [])
+        session
+        (fixture
+          (fn [request]
+            (swap! requests conj request)
+            (let [n (count @requests)]
+              (response (str n) (str "answer-" n)
+                        (if (= n 1) [{:id "step-1" :name "step" :arguments {}}] []))))
+          (fn [arguments _]
+            (swap! executions conj arguments)
+            (agent/steer-session! @holder "during tool")
+            (agent/set-reasoning-effort! @holder "high")
+            (agent/follow-up-session! @holder "followup")
+            "tool witness")
+          {:reasoning_effort "low" :on_event #(swap! events conj %)})]
+    (reset! holder session)
+    (try
+      (agent/steer-session! session "before model")
+      (is (= "answer-3" (agent/process-input! session "first")))
+      (is (= :idle (:state @session)))
+      (is (= "answer-4" (agent/process-input! session "second")))
+      (is (= [{}] @executions))
+      (is (= ["low" "high" "high" "high"] (mapv :reasoning_effort @requests)))
+      (is (= [:user :steering :assistant :tool_results :steering :assistant
+              :user :assistant :user :assistant]
+             (mapv :type (:history @session))))
+      (is (= ["first" "followup" "second"]
+             (mapv :content (filter #(= :user (:type %)) (:history @session)))))
+      (is (= ["1" "2" "3" "4"]
+             (mapv :response_id (filter #(= :assistant (:type %)) (:history @session)))))
+      (is (= ["reason-1" "reason-2" "reason-3" "reason-4"]
+             (mapv :reasoning (filter #(= :assistant (:type %)) (:history @session)))))
+      (is (= [:system :user :user :assistant :tool :user]
+             (mapv :role (:messages (second @requests)))))
+      (is (= "before model" (get-in @requests [0 :messages 2 :content])))
+      (is (= "during tool" (get-in @requests [1 :messages 5 :content])))
+      (is (= "step-1" (get-in @requests [1 :messages 4 :content 0 :tool_call_id])))
+      (is (= "tool witness" (get-in @requests [1 :messages 4 :content 0 :content])))
+      (is (= "answer-3" (get-in @requests [3 :messages 8 :content])))
+      (is (= "second" (get-in @requests [3 :messages 9 :content])))
+      (is (= [:session_start :user_input :steering_injected
+              :assistant_text_start :assistant_text_end :tool_call_start :tool_call_end
+              :steering_injected :assistant_text_start :assistant_text_end
+              :user_input :assistant_text_start :assistant_text_end :processing_end
+              :user_input :assistant_text_start :assistant_text_end :processing_end]
+             (mapv :type @events)))
+      (is (every? #(= (:id @session) (:session_id %)) @events))
+      (is (empty? (:followup-queue @session)))
+      (is (empty? (:steering-queue @session)))
+      (finally (agent/close-session! session)))))
+
+(deftest per-input-round-budget-resets-but-session-turn-budget-does-not
+  (let [calls (atom 0) executed (atom 0) events (atom [])
+        session (fixture
+                  (fn [_]
+                    (let [n (swap! calls inc)]
+                      (response (str n) "working"
+                                [{:id (str "c" n) :name "step" :arguments {}}])))
+                  (fn [_ _] (swap! executed inc) "ok")
+                  {:max_tool_rounds_per_input 1 :max_turns 2
+                   :enable_loop_detection false :on_event #(swap! events conj %)})]
+    (try
+      (doseq [prompt ["first" "second" "third"]]
+        (agent/process-input! session prompt)
+        (is (= :idle (:state @session))))
+      (is (= 2 @calls))
+      (is (= 2 @executed))
+      (is (= [:user :assistant :tool_results :user :assistant :tool_results :user]
+             (mapv :type (:history @session))))
+      (is (= [[1 1] [1 2] [0 2]]
+             (mapv (fn [event] [(:round event) (:total_turns event)])
+                   (filter #(= :turn_limit (:type %)) @events))))
+      (is (= 3 (count (filter #(= :processing_end (:type %)) @events))))
+      (finally (agent/close-session! session)))))
+
+(deftest repeated-tool-warning-reaches-next-model-request-without-stopping-loop
+  (doseq [enabled [true false]]
+    (let [requests (atom []) executions (atom 0) events (atom [])
+          session (fixture
+                    (fn [request]
+                      (swap! requests conj request)
+                      (let [n (count @requests)]
+                        (response (str n) (if (= n 3) "finished" "")
+                                  (if (< n 3)
+                                    [{:id (str "c" n) :name "step" :arguments {}}] []))))
+                    (fn [_ _] (swap! executions inc) "same result")
+                    {:enable_loop_detection enabled :loop_detection_window 2
+                     :on_event #(swap! events conj %)})]
+      (try
+        (is (= "finished" (agent/process-input! session "work")))
+        (is (= 3 (count @requests)))
+        (is (= 2 @executions))
+        (let [warnings (filter #(= :loop_detection (:type %)) @events)
+              steering (filter #(= :steering (:type %)) (:history @session))]
+          (is (= (if enabled 1 0) (count warnings)))
+          (is (= (if enabled 1 0) (count steering)))
+          (when enabled
+            (is (= (:message (first warnings)) (:content (first steering)))))
+          (is (= enabled
+                 (boolean (some #(and (= :user (:role %))
+                                      (str/includes? (str (:content %)) "Loop detected"))
+                                (:messages (last @requests)))))))
+        (is (= :idle (:state @session)))
+        (finally (agent/close-session! session))))))

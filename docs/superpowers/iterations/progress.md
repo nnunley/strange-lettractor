@@ -1,7 +1,22 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** graph-merging component verified; native timed-input and artifact-index proposals remain pending, not blockers for independent agent-loop work
+**Task:** independent local coding-loop journey verified; next uncovered runtime requirement is LLM tool pre/post hooks
+
+**Local agent-loop checkpoint:** `agent_loop_contract_test.lg` adds three session
+integration tests through a deterministic adapter registered with the real unified
+client. All 43 assertions pass: sequential input and queued follow-up preserve
+history; real tool results enter the next request; pre-model and during-tool
+steering arrive at the safe boundary; reasoning changes reach subsequent requests;
+normal events stay ordered; per-input tool-round limits reset while session turn
+limits accumulate; loop warnings reach the model without stopping progress.
+Replacing `detect-loop` with a false-returning function produces three expected
+assertion failures, demonstrating warning-path sensitivity without changing source.
+Scoped review approved with no material findings. Root full suite passes **555
+tests / 4426 assertions / zero failures**, exit 0; AOT build exits 0. No production
+change was necessary for this local journey. SCN-CAL-LOOP's local evidence is
+complete, but CAL-LOOP-01 remains partial pending broader streaming/shutdown and
+native/live contracts. Reader acceptance retains its five known failures.
 
 **Graph-merging component:** `993652f` adds the missing §9.4 public composition
 proof without production changes. Three tests / 63 assertions independently pass:

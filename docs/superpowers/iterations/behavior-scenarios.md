@@ -198,7 +198,7 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Given auth, rate-limit, transport, protocol, cancellation, and tool failures
 - When a session handles each failure
 - Then auth is never retried, only retryable failures back off, graceful shutdown flushes terminal events in order, and resources close once
-- Seam: coding-loop integration
+- Seam: coding-loop integration. Local deterministic-client journey is verified in `agent_loop_contract_test.lg` (3 tests / 43 assertions): sequential and queued follow-up inputs, actual tool-result continuation, steering/reasoning boundaries, exact normal event order, per-input versus session limits, and enabled/disabled loop warnings. This does not establish streaming, failure/shutdown event completeness, or native-provider parity.
 
 ### SCN-TOOL-HOOKS — Tool pre/post hooks
 
