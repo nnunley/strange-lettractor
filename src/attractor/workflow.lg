@@ -401,10 +401,11 @@
 
 (defn- verify-existing-publication! [bundle run-root manifest-path]
   (let [expected (manifest-for bundle)
-        actual (read-manifest! manifest-path)]
-    (when-not (= expected actual)
+        expected-bytes (pr-str expected)
+        actual-bytes (io/slurp manifest-path)]
+    (when-not (= expected-bytes actual-bytes)
       (already-published! manifest-path))
-    (verify-manifest-files! run-root actual)
+    (verify-manifest-files! run-root (read-manifest! manifest-path))
     manifest-path))
 
 (defn publish!

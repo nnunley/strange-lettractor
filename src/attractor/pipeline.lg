@@ -23,6 +23,7 @@
    :custom-rules
    :on-prepared
    :on-published
+   :source-loader
    :source-path
    :base-dir
    :workflow-roots])

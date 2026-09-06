@@ -621,6 +621,7 @@
              :on-published :wrapper
              :custom-transforms [:wrapper]
              :custom-rules [:wrapper]
+             :source-loader :wrapper
              :source-path "root.dot"
              :base-dir "."
              :workflow-roots []}))]

@@ -329,6 +329,30 @@
       (is (= :workflow_snapshot_corrupt (:category error)))
       (is (= target (:path error))))))
 
+(deftest existing-manifest-reuse-requires-byte-identical-edn
+  (doseq [mutation
+          [(fn [manifest bytes]
+             (let [original-prefix
+                   (str "{:format-version " (pr-str (:format-version manifest))
+                        ", :fingerprint " (pr-str (:fingerprint manifest)) ",")
+                   reordered-prefix
+                   (str "{:fingerprint " (pr-str (:fingerprint manifest))
+                        ", :format-version " (pr-str (:format-version manifest)) ",")]
+               (str reordered-prefix (subs bytes (count original-prefix)))))
+           (fn [_ bytes] (str bytes "\n"))
+           (fn [_ _] "{:not-valid")]]
+    (let [run-root (publication-root)
+          bundle (prepared-bundle)
+          manifest-path (workflow/publish! bundle run-root)
+          original-bytes (io/slurp manifest-path)
+          manifest (edn/read-string original-bytes)
+          mutated-bytes (mutation manifest original-bytes)
+          _ (io/spit manifest-path mutated-bytes)
+          error (workflow-error #(workflow/publish! bundle run-root))]
+      (is (not= original-bytes mutated-bytes))
+      (is (= :workflow_already_published (:category error)))
+      (is (= mutated-bytes (io/slurp manifest-path))))))
+
 (deftest workflow-publication-refuses-an-uncommitted-lock
   (let [run-root (publication-root)
         workflow-dir (str run-root "/workflow")
