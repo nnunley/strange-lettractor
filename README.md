@@ -22,6 +22,13 @@ without execution. Use `attractor.pipeline/run` for the same preparation plus
 validation-gated execution. `attractor.engine/run-pipeline` is the low-level API
 for callers that already hold a parsed, transformed, and validated graph.
 
+Public runs save an immutable workflow capture alongside `checkpoint.edn`.
+`attractor.pipeline/execute-prepared` publishes and runs an existing preparation;
+`attractor.pipeline/resume` takes a checkpoint path and resumes the captured plan,
+even if the original DOT file has changed or disappeared. Source changes produce
+drift warnings; missing or corrupt captures stop recovery before execution.
+Loop restarts retain independently resumable captures in their fresh run directories.
+
 ## License
 
 [Apache License 2.0](LICENSE)
