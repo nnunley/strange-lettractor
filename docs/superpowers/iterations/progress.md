@@ -2,6 +2,13 @@
 
 **Phase:** implementing ITER-0006
 **Task:** fan-in component reviewed and verified; interviewer matrix/nonblocking console timeout next
+
+Fan-in publication is remotely verified at `1fe6bd68c9bd9df0cf1b406a6e9183b099b164c7`
+on `iter-0006-interactive-concurrency`. [Console input investigation](../../console-input-findings.md)
+reproduces an immediate zero-argument `io/flush` error, then (with that call
+isolated in a probe) a question exceeding its 50ms timeout until input arrives.
+Native timed input needs an explicit ownership/cancellation contract; no local
+let-go files have been changed. This is not a blocker for the whole roadmap.
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; ATTR-PAR-02 component complete, iteration incomplete
