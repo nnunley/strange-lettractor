@@ -69,11 +69,13 @@ Isolation evidence matrix: parent, child, grandchild, and sibling runs must have
 
 Files: modify `src/attractor/workflow.lg`, `src/attractor/pipeline.lg`, `src/attractor/context.lg`, `src/attractor/engine.lg`; extend recovery/context/composition tests.
 
-- [ ] Write tests selecting a captured child via internal `:attractor.pipeline/plan-id`. Assert selected graph equals its stored plan, closure fingerprint stays unchanged, each child root has a verified local capture, and checkpoint `:workflow_plan_id` selects the child on resume. Missing optional field means original root for old checkpoints; unknown/non-string selection fails before engine entry.
-- [ ] Run focused tests and verify failure.
-- [ ] Generalize prepared verification to verify the whole closure against its original root, then compare the selected graph separately. Publish/reuse the full capture under each child root. Thread optional plan identity through stage/final checkpoints and restart options. Public resume selects that verified graph and validates checkpoint history against it, never a caller graph. Strip wrapper selection before engine call and inject a validated engine plan-ID option. Preserve root-only compatibility and previous restart capture guarantees.
-- [ ] Run recovery, context, engine, lifecycle, and loop-restart files separately.
-- [ ] Commit `feat(recovery): retain selected captured child plans`.
+- [x] Write tests selecting a captured child via internal `:attractor.pipeline/plan-id`. Assert selected graph equals its stored plan, closure fingerprint stays unchanged, each child root has a verified local capture, and checkpoint `:workflow_plan_id` selects the child on resume. Missing optional field means original root for old checkpoints; unknown/non-string selection fails before engine entry.
+- [x] Run focused tests and verify failure.
+- [x] Generalize prepared verification to verify the whole closure against its original root, then compare the selected graph separately. Publish/reuse the full capture under each child root. Thread optional plan identity through stage/final checkpoints and restart options. Public resume selects that verified graph and validates checkpoint history against it, never a caller graph. Strip wrapper selection before engine call and inject a validated engine plan-ID option. Preserve root-only compatibility and previous restart capture guarantees.
+- [x] Run recovery, context, engine, lifecycle, and loop-restart files separately.
+- [x] Commit `feat(recovery): retain selected captured child plans`.
+
+Task 4 evidence: `37873d8` implements selection and protected descendant callbacks; `23c3758` fixes the quality-review finding that public `pipeline/run` must ignore the internal selector and always execute its root. Initial RED: 4 tests / 24 assertions / 20 failures; public-root regression RED: 4 failed assertions. Final selected-plan tests pass 9/87/0; impacted recovery 52/481/0, context 10/42/0, engine 45/203/0, lifecycle 8/162/0, and loop-restart 10/198/0. Root independently verified the final full suite at 447 tests / 2,927 assertions / 0 failures, rebuilt with local let-go AOT, and resumed a genuinely interrupted child checkpoint through the compiled CLI. The final checkpoint contains only child nodes and its exact child ID, while the verified local capture retains both plans and the original root ID. Both review gates approved. Actual mapped subpipeline dispatch remains Task 5.
 
 ### Task 5: Mapping execution and scoped handler
 
