@@ -1,6 +1,12 @@
 # Strange Lettractor
 
-Strange Lettractor is an implementation of [StrongDM's Attractor](https://github.com/strongdm/attractor), a specification for orchestrating multi-stage LLM workflows as Graphviz DOT pipelines.
+Strange Lettractor is a unified agentic framework implementing [StrongDM's Attractor specifications](https://github.com/strongdm/attractor). Its scope spans three complementary layers:
+
+- [Unified LLM client](docs/upstream/strongdm-attractor/unified-llm-spec.md): a common interface across model providers for generation, streaming, structured output, and tool calling, while retaining provider-specific capabilities.
+- [Coding agent runtime](docs/upstream/strongdm-attractor/coding-agent-loop-spec.md): stateful agent sessions that combine model calls, tools, and execution environments.
+- [Workflow orchestration](docs/upstream/strongdm-attractor/attractor-spec.md): composable Graphviz DOT pipelines with branching, parallel execution, human interaction, and checkpoint recovery.
+
+The LLM and agent layers are foundations for applications in their own right; DOT workflows are one way to compose them. Implementation is in progress; full specification conformance is not yet claimed.
 
 It is written in [let-go](https://github.com/nooga/let-go) and built with [lgx](https://github.com/abogoyavlensky/lgx). It requires let-go 1.12.2 or newer.
 
@@ -15,7 +21,7 @@ lgx run-pipeline examples/hello.dot
 
 See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and CLI usage.
 
-## Programmatic lifecycle
+## Workflow lifecycle
 
 Use `attractor.pipeline/prepare` to parse, transform, and validate DOT source
 without execution. Use `attractor.pipeline/run` for the same preparation plus
