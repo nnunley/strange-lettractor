@@ -1,10 +1,12 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** completion-driven parallel joins, Task 1 regression and coordinator
+**Task:** parallel Task 1 reviewed; Task 2 public pipeline proof next
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; no story completion claimed yet
+
+**Latest component checkpoint:** `4851b51` implements completion-driven native-supervised parallel joins. Quality review reproduced an AssertionError escaping catch Exception and becoming a false success; `84dffe9` fixes both new throwable boundaries, with original identity/held cleanup/no queued launch evidence. Both review gates now approve Task 1. Root verified full default suite 488/3533/0, local AOT exit 0, and compiled parallel workflow success with ordered branch outputs and checkpoint `[start fork join exit]`. The separate reader suite still has five failing assertions. Public pipeline cancellation/cleanup proof remains Task 2; no SCN-FIRST-SUCCESS completion marker or ITER-0006 completion is claimed. [Upstream restoration checklist](../../let-go-followups.md) tracks #801, #805, #806, and #807 and points to affected code and regression checks.
 
 **ITER-0006 start:** User approved the design direction. Work is isolated in `.worktrees/iter-0006-interactive-concurrency`; fresh default-suite baseline at `38e9c9e` passes 473/3370/0. Two independent scope/spec reviews approved the parallel-join component and the implementation plan passed review. Design/plan and the independently reproduced [future exception compatibility finding](../../let-go-future-compatibility.md) are pushed at `f249180`. Task 1 follows test-first implementation. Interviewers, fan-in ranking, artifact recovery/discovery, and handler-matrix evidence remain required after this component. The five reader acceptance failures remain unmet and separate from the passing default suite.
 
