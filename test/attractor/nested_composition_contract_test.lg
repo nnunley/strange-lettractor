@@ -1,0 +1,375 @@
+(ns attractor.nested-composition-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [attractor.context :as context]
+            [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [attractor.transforms :as transforms]
+            [attractor.validation :as validation]
+            [attractor.workflow :as workflow]
+            [io :as io]
+            [os :as os]))
+
+(defn temp-root [] (str (os/temp-dir) "/nested-composition-" (random-uuid)))
+(defn subnode [id file extra]
+  (str id " [type=subpipeline, subpipeline.dotfile=" (pr-str file)
+       ", input_map=" (pr-str (pr-str {"payload" "payload"}))
+       ", output_map=" (pr-str (pr-str {"answer" "answer"}))
+       (when (seq extra) (str ", " extra)) "];"))
+(defn nested-sources [root-extra child-extra]
+  {:root (str "digraph Root { start [shape=Mdiamond]; "
+              (subnode "child" "child.dot" root-extra)
+              " exit [shape=Msquare]; start -> child -> exit; }")
+   :child (str "digraph Child { begin [shape=Mdiamond]; "
+               (subnode "grand" "grand.dot" child-extra)
+               " end [shape=Msquare]; begin -> grand -> end; }")
+   :grand "digraph Grand { enter [shape=Mdiamond]; work [type=probe]; leave [shape=Msquare]; enter -> work -> leave; }"})
+(defn fixture [sources]
+  (let [dir (temp-root)]
+    (io/mkdir dir)
+    (doseq [[key filename] [[:root "root.dot"] [:child "child.dot"] [:grand "grand.dot"]]]
+      (io/spit (str dir "/" filename) (get sources key)))
+    {:dir dir :prepared (pipeline/prepare (:root sources) {:source-path (str dir "/root.dot")})}))
+(defn registry-with [probe]
+  (let [registry (handlers/make-handler-registry)]
+    (handlers/register-handler! registry "probe" probe)
+    registry))
+(defn checkpoint [root] (context/load-checkpoint (str root "/checkpoint.edn")))
+(defn child-events [events]
+  (mapv :event (filter #(= :subpipeline.child_event (:type %)) events)))
+(defn child-root [events]
+  (:child_logs_root (first (filter #(= :subpipeline.child_event (:type %)) events))))
+(defn index-of [events predicate]
+  (first (keep-indexed (fn [index event] (when (predicate event) index)) events)))
+(defn forbidden [& _] (throw (ex-info "Execution consulted source preparation" {})))
+(defn artifact-bytes [root]
+  (let [listing (os/sh "find" root "-type" "f")]
+    (is (= 0 (:exit listing)))
+    (into {} (for [path (remove str/blank? (str/split (:out listing) #"\n"))] [path (io/slurp path)]))))
+
+(deftest captured-nesting-and-exact-event-envelopes
+  (let [{:keys [dir prepared]} (fixture (nested-sources "" ""))
+        root (temp-root) events (atom []) seen (atom [])
+        payload [{:nested [1 2]}]
+        ctx (context/make-context {"payload" payload "secret" "root-only"})
+        registry (registry-with (fn [_ child _ _]
+                                  (swap! seen conj (context/ctx-get child "payload"))
+                                  (is (nil? (context/ctx-get child "secret")))
+                                  {:status :success :context_updates {"answer" (context/ctx-get child "payload")}}))
+        _ (io/spit (str dir "/child.dot") "invalid changed source")
+        _ (io/delete-file (str dir "/grand.dot"))
+        result (with-redefs [parser/parse-dot forbidden transforms/apply-transforms forbidden
+                            validation/validate forbidden]
+                 (pipeline/execute-prepared prepared {:logs-root root :context ctx :registry registry
+                                                      :source-loader forbidden :on-event #(swap! events conj %)}))
+        ce (child-events @events) ge (child-events ce)
+        cr (child-root @events) gr (child-root ce)
+        child-id "workflow://root/child.dot" grand-id "workflow://root/grand.dot"]
+    (is (= :success (:status result)))
+    (is (= payload (context/ctx-get ctx "answer")))
+    (is (not (identical? payload (first @seen))))
+    (is (not (identical? (first payload) (first (first @seen)))))
+    (is (not (identical? (first @seen) (context/ctx-get ctx "answer"))))
+    (doseq [[parent-events id run-root plan-id] [[@events "child" cr child-id] [ce "grand" gr grand-id]]]
+      (let [wrapped (filterv #(= :subpipeline.child_event (:type %)) parent-events)
+            digest (get-in prepared [:workflow :plans plan-id :plan-sha256])]
+        (is (seq wrapped))
+        (is (not= digest (get-in prepared [:workflow :fingerprint])))
+        (is (re-find #"/children/[0-9a-f-]{36}$" run-root))
+        (doseq [envelope wrapped]
+          (is (= {:type :subpipeline.child_event :parent_node_id id :child_logs_root run-root
+                  :child_plan_fingerprint digest :event (:event envelope)} envelope)))
+        (is (= :pipeline.started (get-in (first wrapped) [:event :type])))
+        (is (= :pipeline.completed (get-in (last wrapped) [:event :type])))
+        (is (< (index-of parent-events #(= :pipeline.completed (get-in % [:event :type])))
+               (index-of parent-events #(and (= :stage.completed (:type %)) (= id (:node_id %))))))))
+    (is (= [:pipeline.started :stage.started :stage.completed :checkpoint.saved
+            :stage.started :stage.completed :checkpoint.saved :pipeline.completed]
+           (mapv :type ge)))
+    (doseq [[run-root plan-id completed] [[root workflow/root-plan-id ["start" "child" "exit"]]
+                                        [cr child-id ["begin" "grand" "end"]]
+                                        [gr grand-id ["enter" "work" "leave"]]]]
+      (let [cp (checkpoint run-root)]
+        (is (= plan-id (:workflow_plan_id cp)))
+        (is (= completed (:completed_nodes cp)))
+        (is (= (:workflow prepared)
+               (:captured-bundle (workflow/verify-published! run-root (get-in prepared [:workflow :fingerprint])))))
+        (is (= :success (:status (pipeline/resume (str run-root "/checkpoint.edn") {:registry registry}))))))))
+
+(deftest active-grandchild-cancellation-joins-and-parent-retries-fresh-capture
+  (let [{:keys [dir prepared]} (fixture (nested-sources "" ""))
+        root (temp-root) events (atom []) cancelled (atom false) cleanup (atom false) calls (atom 0)
+        ctx (context/make-context {"payload" ["captured"] "answer" "old"})
+        registry (registry-with
+                   (fn [node child _ _]
+                     (swap! calls inc)
+                     (try
+                       (when (= 1 @calls) (reset! cancelled true))
+                       (is (= @cancelled ((:cancelled? node))))
+                       {:status :success :context_updates {"answer" (context/ctx-get child "payload")}}
+                       (finally (reset! cleanup true)))))
+        result (pipeline/execute-prepared prepared
+                 {:logs-root root :context ctx :registry registry :cancelled? #(deref cancelled)
+                  :on-event (fn [event]
+                              (when (= :pipeline.cancelled (:type event)) (is @cleanup))
+                              (swap! events conj event))})
+        cr (child-root @events) gr (child-root (child-events @events))
+        old-child (artifact-bytes cr)
+        old-grand (artifact-bytes gr)]
+    (is (= :cancelled (:status result)))
+    (is (= ["start"] (:completed_nodes result)))
+    (is (= "old" (context/ctx-get ctx "answer")))
+    (is @cleanup)
+    (is (= :pipeline.cancelled (:type (last @events))))
+    (is (not-any? #(and (= :stage.completed (:type %)) (= "child" (:node_id %))) @events))
+    (is (= ["begin"] (:completed_nodes (checkpoint cr))))
+    (is (= ["enter"] (:completed_nodes (checkpoint gr))))
+    (io/spit (str dir "/child.dot") "changed")
+    (io/delete-file (str dir "/grand.dot"))
+    (reset! cancelled false)
+    (reset! events [])
+    (let [resumed (with-redefs [parser/parse-dot forbidden transforms/apply-transforms forbidden
+                               validation/validate forbidden]
+                    (pipeline/resume (str root "/checkpoint.edn")
+                      {:registry registry :source-loader forbidden :on-event #(swap! events conj %)}))
+          fresh-child (child-root @events) fresh-grand (child-root (child-events @events))]
+      (is (= :success (:status resumed)))
+      (is (= 2 @calls))
+      (is (= ["captured"] (get-in (checkpoint root) [:context_values "answer"])))
+      (is (not= cr fresh-child))
+      (is (not= gr fresh-grand))
+      (is (= old-child (artifact-bytes cr)))
+      (is (= old-grand (artifact-bytes gr)))
+      (reset! events [])
+      (is (= :success (:status (pipeline/resume (str root "/checkpoint.edn")
+                                 {:registry registry :on-event #(swap! events conj %)}))))
+      (is (= 2 @calls))
+      (is (= [] (child-events @events)))
+      (is (= ["captured"] (get-in (checkpoint root) [:context_values "answer"]))))))
+
+(deftest cancellation-waits-for-grandchild-cleanup-before-terminal-events
+  (let [{:keys [prepared]} (fixture (nested-sources "" ""))
+        entered (promise) cancellation-requested (promise) observed (promise) release (promise)
+        cancelled (atom false) cleanup (atom false) events (atom [])
+        ctx (context/make-context {"payload" [1] "answer" "old"})
+        registry (registry-with
+                   (fn [node child _ _]
+                     (deliver entered :entered)
+                     (try
+                       (deref cancellation-requested 3000 :timeout)
+                       (deliver observed ((:cancelled? node)))
+                       (deref release 3000 :timeout)
+                       {:status :success :context_updates {"answer" "late"}}
+                       (finally (reset! cleanup true)))))
+        task (core/future
+               (pipeline/execute-prepared prepared
+                 {:logs-root (temp-root) :context ctx :registry registry :cancelled? #(deref cancelled)
+                  :on-event #(swap! events conj %)}))]
+    (try
+      (is (= :entered (deref entered 3000 :timeout)))
+      (reset! cancelled true)
+      (deliver cancellation-requested :cancel)
+      (is (= true (deref observed 3000 :timeout)))
+      (is (= :pending (deref task 20 :pending)))
+      (is (false? @cleanup))
+      (is (= "old" (context/ctx-get ctx "answer")))
+      (is (not-any? #(#{:pipeline.completed :pipeline.cancelled :pipeline.failed} (:type %)) @events))
+      (finally (deliver release :release)))
+    (let [result (deref task 3000 :timeout)
+          terminal-events (filterv
+                            (fn [event]
+                              (= :pipeline.cancelled
+                                 (:type (loop [e event]
+                                          (if (= :subpipeline.child_event (:type e))
+                                            (recur (:event e)) e))))) @events)
+          settled @events]
+      (is (= :cancelled (:status result)))
+      (is @cleanup)
+      (is (= 3 (count terminal-events)))
+      (is (= :pipeline.cancelled (get-in (first terminal-events) [:event :event :type])))
+      (is (= :pipeline.cancelled (get-in (second terminal-events) [:event :type])))
+      (is (= :pipeline.cancelled (:type (last terminal-events))))
+      (is (= "old" (context/ctx-get ctx "answer")))
+      (is (= result (deref task 0 :pending)))
+      (is (= settled @events)))))
+
+(deftest nested-budgets-select-independently-and-parent-charges-one-call
+  (doseq [[root-extra root-default child-extra child-default expected-budgets expected-status expected-calls]
+          [["subpipeline.max_steps=2" 1 "subpipeline.max_steps=2" 1 [2 2 2] :success 1]
+           ["" 2 "" 2 [2 2 2] :success 1]
+           ["" nil "" nil [2 10000 10000] :success 1]
+           ["subpipeline.max_steps=1" 9 "" 9 [2 1] :fail 0]
+           ["subpipeline.max_steps=2" 9 "subpipeline.max_steps=1" 9 [2 2 1] :fail 0]]]
+    (let [sources (nested-sources root-extra child-extra)
+          sources (cond-> sources
+                    root-default (update :root str/replace "digraph Root {"
+                                   (str "digraph Root { graph [subpipeline.default_max_steps=" root-default "];"))
+                    child-default (update :child str/replace "digraph Child {"
+                                    (str "digraph Child { graph [subpipeline.default_max_steps=" child-default "];")))
+          {:keys [prepared]} (fixture sources)
+          calls (atom 0) observed (atom []) execute engine/run-pipeline
+          registry (registry-with (fn [& _] (swap! calls inc) {:status :success :context_updates {"answer" 1}}))
+          result (with-redefs [engine/run-pipeline
+                              (fn [graph options]
+                                (swap! observed conj (:max-steps options))
+                                (execute graph options))]
+                   (pipeline/execute-prepared prepared
+                     {:logs-root (temp-root) :max-steps 2 :registry registry
+                      :context (context/make-context {"payload" []})}))]
+      (is (= expected-budgets @observed))
+      (is (= expected-status (:status result)))
+      (is (= expected-calls @calls)))))
+
+(deftest nested-restart-budgets-remain-global-with-fresh-captured-segments
+  (doseq [budget [2 3]]
+    (let [sources (nested-sources (str "subpipeline.max_steps=" budget) "subpipeline.max_steps=2")
+          sources (-> sources
+                      (update :root str/replace "start -> child -> exit;"
+                              "start -> child [loop_restart=true]; child -> exit;")
+                      (update :child str/replace "end [shape=Msquare]; begin -> grand -> end;"
+                              "after [type=probe]; end [shape=Msquare]; begin -> grand [loop_restart=true]; grand -> after -> end;"))
+          {:keys [prepared]} (fixture sources)
+          events (atom []) roots (atom []) execute engine/run-pipeline
+          registry (registry-with (fn [& _] {:status :success :context_updates {"answer" 7}}))
+          result (with-redefs [engine/run-pipeline
+                              (fn [graph options]
+                                (swap! roots conj [(:id graph) (:logs-root options)])
+                                (execute graph options))]
+                   (pipeline/execute-prepared prepared
+                     {:logs-root (temp-root) :context (context/make-context {"payload" [1]})
+                      :registry registry :max-steps 2 :on-event #(swap! events conj %)}))
+          root-starts (filterv #(= :pipeline.started (:type %)) @events)
+          ce (child-events @events)
+          child-starts (filterv #(= :pipeline.started (:type %)) ce)]
+      (is (= (if (= budget 2) :fail :success) (:status result)))
+      (when (= budget 2)
+        (is (= "Pipeline step limit exceeded (2 steps)" (:failure_reason result))))
+      (is (= 2 (count root-starts)))
+      (is (= 2 (count child-starts)))
+      (is (= ["Root" "Child" "Grand"] (mapv first @roots)))
+      (doseq [[starts plan-id] [[root-starts workflow/root-plan-id]
+                              [child-starts "workflow://root/child.dot"]]]
+        (is (not= (:logs_root (first starts)) (:logs_root (second starts))))
+        (doseq [event starts]
+          (let [run-root (:logs_root event)]
+            (is (= plan-id (:workflow_plan_id (checkpoint run-root))))
+            (is (= (:workflow prepared)
+                   (:captured-bundle (workflow/verify-published! run-root (get-in prepared [:workflow :fingerprint])))))))))))
+
+(deftest incomplete-selected-child-and-grandchild-resume-their-own-captured-graphs
+  (let [{:keys [dir prepared]} (fixture (nested-sources "" ""))
+        root (temp-root) events (atom []) cancelled (atom false)
+        registry (registry-with (fn [& _] (reset! cancelled true) {:status :success}))
+        _ (pipeline/execute-prepared prepared
+            {:logs-root root :context (context/make-context {"payload" ["pinned"]})
+             :registry registry :cancelled? #(deref cancelled) :on-event #(swap! events conj %)})
+        cr (child-root @events) gr (child-root (child-events @events))
+        parent-bytes (io/slurp (str root "/checkpoint.edn"))
+        calls (atom [])
+        resumed-registry (registry-with
+                           (fn [_ ctx graph _]
+                             (swap! calls conj (:id graph))
+                             {:status :success :context_updates {"answer" (context/ctx-get ctx "payload")}}))]
+    (io/delete-file (str dir "/root.dot"))
+    (io/delete-file (str dir "/child.dot"))
+    (io/delete-file (str dir "/grand.dot"))
+    (doseq [[run-root plan-id completed] [[gr "workflow://root/grand.dot" ["enter" "work" "leave"]]
+                                        [cr "workflow://root/child.dot" ["begin" "grand" "end"]]]]
+      (let [result (with-redefs [parser/parse-dot forbidden transforms/apply-transforms forbidden
+                                validation/validate forbidden]
+                     (pipeline/resume (str run-root "/checkpoint.edn") {:registry resumed-registry :source-loader forbidden}))]
+        (is (= :success (:status result)))
+        (is (= completed (:completed_nodes result)))
+        (is (= plan-id (:workflow_plan_id (checkpoint run-root))))
+        (is (= ["pinned"] (get-in (checkpoint run-root) [:context_values "answer"])))
+        (is (= parent-bytes (io/slurp (str root "/checkpoint.edn"))))))
+    (is (= ["Grand" "Grand"] @calls))))
+
+(deftest explicit-custom-subpipeline-handler-survives-selected-descendants-and-restarts
+  (let [sources (-> (nested-sources "" "")
+                    (update :root str/replace "start -> child -> exit;"
+                            "start -> child [loop_restart=true]; child -> exit;")
+                    (update :child str/replace "begin -> grand -> end;"
+                            "begin -> grand [loop_restart=true]; grand -> end;"))
+        {:keys [prepared]} (fixture sources)
+        registry (handlers/make-handler-registry) calls (atom [])
+        _ (handlers/register-handler! registry "subpipeline"
+            (fn [node _ graph logs-root]
+              (swap! calls conj [(:id graph) (:id node) logs-root])
+              {:status :success :context_updates {"answer" "custom"}}))
+        original @registry
+        child-id "workflow://root/child.dot"]
+    (doseq [[p options] [[prepared {}]
+                        [(assoc prepared :graph (get-in prepared [:workflow :plans child-id :graph]))
+                         {:attractor.pipeline/plan-id child-id}]]]
+      (is (= :success (:status (pipeline/execute-prepared p
+                                 (merge {:logs-root (temp-root) :registry registry} options))))))
+    (is (= [["Root" "child"] ["Child" "grand"]] (mapv #(vec (take 2 %)) @calls)))
+    (is (every? #(str/includes? (nth % 2) "_restart_") @calls))
+    (is (= original @registry))))
+
+(deftest nested-and-sibling-runtime-state-is-consumed-without-leaking
+  (let [sources (update (nested-sources "" "") :root str/replace
+                       "exit [shape=Msquare]; start -> child -> exit;"
+                       (str (subnode "sibling" "child.dot" "")
+                            "exit [shape=Msquare]; start -> child -> sibling -> exit;"))
+        {:keys [prepared]} (fixture sources)
+        records (atom []) closures (atom []) events (atom []) execute engine/run-pipeline
+        registry (registry-with (fn [node ctx _ _]
+                                  (is (= ["enter"] (get-in @(:fidelity_threads node) ["shared" :history])))
+                                  {:status :success :context_updates {"answer" (context/ctx-get ctx "payload")}}))
+        _ (handlers/register-handler! registry "start"
+            (fn [node _ _ _]
+              (swap! (:fidelity_threads node) assoc-in ["shared" :history] [(:id node)])
+              {:status :success}))
+        original @registry
+        template-parallel @(get @registry handlers/parallel-executor-key)
+        template-manager @(get @registry handlers/manager-runtime-key)
+        result (with-redefs [engine/run-pipeline
+                            (fn [graph options]
+                              (let [identity (:logs-root options)]
+                                (execute graph
+                                  (assoc options :attractor.engine/on-segment-initialized
+                                    (fn [state]
+                                      (is (= {} @(:retry-counts state)))
+                                      (is (= {} @(:fidelity-threads state)))
+                                      (doseq [previous @records]
+                                        (is (= (:identity previous) ((deref (:parallel-executor previous)))))
+                                        (is (= (:identity previous) (:owner @(:manager-runtime previous)))))
+                                      (reset! (:parallel-executor state) (fn [] identity))
+                                      (swap! (:manager-runtime state) assoc :owner identity)
+                                      (swap! (:retry-counts state) assoc (get {"Root" "start" "Child" "begin" "Grand" "enter"} (:id graph)) 7)
+                                      (swap! (:fidelity-threads state) assoc "shared"
+                                             {:owner identity :history [] :close #(swap! closures conj identity)})
+                                      (swap! records conj (assoc state :identity identity :graph (:id graph))))))))]
+                 (pipeline/execute-prepared prepared
+                   {:logs-root (temp-root) :context (context/make-context {"payload" [{:a [1]}]})
+                    :registry registry :max-steps 3 :on-event #(swap! events conj %)}))]
+    (is (= :success (:status result)))
+    (is (= ["Root" "Child" "Grand" "Child" "Grand"] (mapv :graph @records)))
+    (is (= 5 (count (set (map :identity @records)))))
+    (doseq [key [:parallel-executor :manager-runtime :retry-counts :fidelity-threads]]
+      (doseq [a (range 5) b (range 5) :when (not= a b)]
+        (is (not (identical? (get (nth @records a) key) (get (nth @records b) key))))))
+    (doseq [record @records]
+      (let [cp (checkpoint (:identity record))
+            expected (get {"Root" ["start" "child" "sibling" "exit"]
+                           "Child" ["begin" "grand" "end"] "Grand" ["enter" "work" "leave"]} (:graph record))]
+        (is (= expected (:completed_nodes cp)))
+        (is (= (zipmap (butlast expected) (repeat 0)) (:node_retries cp)))
+        (is (= (set (butlast expected)) (set (keys (:node_outcomes cp)))))
+        (is (= {} @(:fidelity-threads record)))))
+    (is (= (mapv :identity (map #(nth @records %) [2 1 4 3 0])) @closures))
+    (let [unwrapped (map (fn [event]
+                          (loop [e event]
+                            (if (= :subpipeline.child_event (:type e)) (recur (:event e)) e))) @events)
+          start-attempts (filter #(and (= :stage.started (:type %))
+                                      (#{"start" "begin" "enter"} (:node_id %))) unwrapped)]
+      (is (= 5 (count start-attempts)))
+      (is (= [8 8 8 8 8] (mapv :attempt start-attempts))))
+    (is (= original @registry))
+    (is (= template-parallel @(get @registry handlers/parallel-executor-key)))
+    (is (= template-manager @(get @registry handlers/manager-runtime-key)))))
