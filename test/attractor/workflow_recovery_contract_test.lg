@@ -9,6 +9,8 @@
             [attractor.pipeline :as pipeline]
             [attractor.workflow :as workflow]))
 
+;; SCN-PINNED-RECOVERY COMPLETE
+
 (def root-dot
   "digraph Root { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
 

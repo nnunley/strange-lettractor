@@ -1,7 +1,7 @@
 # ITER-0004 audit evidence
 
-Status: Auditor A clean after remediation; Auditor B review remains running.
-Code checkpoint: `8b3842a`.
+Status: CLEAN after both independent auditors rechecked their findings.
+Code checkpoint: `dc448a9`.
 
 ## Direct integration audit
 
@@ -15,10 +15,12 @@ Impacted checkpoint, lifecycle, validation, transform ordering, loop restart, co
 
 ## Verification
 
+Auditor B found three Important gaps, all repaired and rechecked: publication reuse reread the manifest after byte comparison; malformed checkpoint context reached engine initialization; and opaque prepared source/root metadata could produce unreadable EDN. Reuse now validates the once-read bytes, public resume rejects non-map contexts before engine entry, and bundle/manifest metadata follows an exact serializable schema. Mutation tests demonstrate rejection at the intended boundaries. Auditor B returned CLEAN at `dc448a9`. Its minor server-timeout scenario documentation gap is also resolved.
+
 With `LGX_LG=/Users/ndn/development/let-go/lg`:
 
-- `lgx test`: 402 tests, 2,499 assertions, zero failures.
+- `lgx test`: 405 tests, 2,531 assertions, zero failures.
 - `lgx build`: successful AOT build of `bin/attractor`.
 - Pre-iteration sentinel baseline: 334 tests, 1,918 assertions, zero failures.
 
-The iteration completion marker and ledger status remain pending until the second independent audit is adjudicated.
+ITER-0004 is confirmed complete. Recursive child capture and context-mapped composition remain ITER-0005 work; this audit does not claim completion of the whole Attractor implementation.
