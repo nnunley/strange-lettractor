@@ -606,6 +606,7 @@
   (let [prepared (pipeline/prepare
                    "digraph G { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
         observed (atom nil)
+        execution-root (str (os/temp-dir) "/lettractor-prepared-options-" (random-uuid))
         fake-outcome {:status :success :completed_nodes ["start" "exit"]}
         result
         (with-redefs [attractor.engine/run-pipeline
@@ -614,7 +615,7 @@
                         fake-outcome)]
           (pipeline/execute-prepared
             prepared
-            {:logs-root "/tmp/exact-run-root"
+            {:logs-root execution-root
              :registry :registry
              :on-event :on-event
              :on-prepared :wrapper
@@ -626,7 +627,7 @@
              :base-dir "."
              :workflow-roots []}))]
     (is (identical? (:graph prepared) (:graph @observed)))
-    (is (= {:logs-root "/tmp/exact-run-root"
+    (is (= {:logs-root execution-root
             :registry :registry
             :on-event :on-event
             :workflow-fingerprint (get-in prepared [:workflow :fingerprint])
@@ -666,7 +667,11 @@
         "digraph Two { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"))
     (is (= 2 (count (set @roots))))
     (is (every? #(re-find #"^attractor_runs/run_[0-9]+-[0-9a-f-]+$" %) @roots))
-    (is (= 2 (count @prepared-sources)))))
+    ;; Run publishes before its callback; execute-prepared reverifies by reuse.
+    (is (= 4 (count @prepared-sources)))
+    (is (= 2 (count (set @prepared-sources))))
+    (is (= (first @roots) (second @roots)))
+    (is (= (nth @roots 2) (nth @roots 3)))))
 
 (defn- await-server-pipeline [pipeline-id]
   (loop [remaining 200]

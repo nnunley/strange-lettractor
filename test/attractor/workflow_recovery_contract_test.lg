@@ -55,6 +55,18 @@
     (catch ExceptionInfo error
       (ex-data error))))
 
+(deftest direct-prepared-execution-publishes-before-start-and-can-resume
+  (let [root (str (os/temp-dir) "/lettractor-direct-prepared-" (random-uuid))
+        prepared (pipeline/prepare root-dot)
+        result (pipeline/execute-prepared
+                 prepared
+                 {:logs-root root
+                  :on-event (fn [event]
+                              (when (= :pipeline.started (:type event))
+                                (is (some? (os/stat (str root "/workflow/manifest.edn"))))))})]
+    (is (= :success (:status result)))
+    (is (= :success (:status (pipeline/resume (str root "/checkpoint.edn") {}))))))
+
 (deftest canonical-tree-uses-the-version-one-scalar-grammar
   (is (= ["nil"] (workflow/canonical-tree nil)))
   (is (= ["bool" true] (workflow/canonical-tree true)))

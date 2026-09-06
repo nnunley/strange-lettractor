@@ -32,15 +32,20 @@
    :base-dir
    :workflow-roots])
 
+(declare fresh-logs-root)
+
 (defn execute-prepared
-  "Validate and execute a prepared root workflow without reparsing its source."
+  "Validate, publish, and execute a prepared root workflow without reparsing its source."
   ([prepared] (execute-prepared prepared {}))
   ([prepared options]
    (let [diagnostics (validation/raise-on-errors (:diagnostics prepared))
          graph (:graph prepared)
          bundle (workflow/verify-bundle! (:workflow prepared) graph)
+         logs-root (or (:logs-root options) (fresh-logs-root))
+         _ (workflow/publish! bundle logs-root)
          engine-options
          (assoc (apply dissoc options wrapper-option-keys)
+                :logs-root logs-root
                 :workflow-fingerprint (:fingerprint bundle)
                 :attractor.engine/publish-restart
                 (fn [root] (workflow/publish! bundle root))
