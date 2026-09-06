@@ -288,7 +288,7 @@
                 :on-event caller-on-event
                 :workflow-fingerprint expected-fingerprint
                 :attractor.engine/publish-restart
-                (fn [root] (workflow/publish! (:workflow verified) root))
+                (fn [root] (workflow/publish! (:captured-bundle verified) root))
                 :workflow-manifest workflow/manifest-relative-path)
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected

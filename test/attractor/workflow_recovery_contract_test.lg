@@ -55,6 +55,21 @@
     (catch ExceptionInfo error
       (ex-data error))))
 
+(deftest resumed-execution-can-publish-a-later-restart
+  (let [root (str (os/temp-dir) "/lettractor-resume-later-restart-" (random-uuid))
+        initial (pipeline/run
+                  "digraph Later { start [shape=Mdiamond] work [shape=box] exit [shape=Msquare] start -> work work -> exit [loop_restart=true] }"
+                  {:logs-root root :max-steps 1})
+        events (atom [])
+        resumed (pipeline/resume (str root "/checkpoint.edn")
+                                 {:on-event (fn [event] (swap! events conj event))})
+        restarts (filterv (fn [event] (= :pipeline.restarting (:type event))) @events)]
+    (is (= :fail (:status initial)))
+    (is (= :success (:status resumed)))
+    (is (= 1 (count restarts)))
+    (is (= :success (:status (pipeline/resume
+                              (str (:new_logs_root (first restarts)) "/checkpoint.edn") {}))))))
+
 (deftest direct-prepared-execution-publishes-before-start-and-can-resume
   (let [root (str (os/temp-dir) "/lettractor-direct-prepared-" (random-uuid))
         prepared (pipeline/prepare root-dot)

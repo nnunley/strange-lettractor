@@ -422,7 +422,8 @@
   path)
 
 (defn- verify-manifest-files! [run-root manifest]
-  (let [{:keys [sources plans]} (validate-manifest! manifest)]
+  (let [{:keys [sources plans]} (validate-manifest! manifest)
+        source-records (atom [])]
   (doseq [source (:sources manifest)]
     (let [path (str run-root "/" (:path source))]
       (when-not (io/file-exists? path)
@@ -438,8 +439,11 @@
       (when-not (= (:source-sha256 source) (sha256-text bytes))
         (snapshot-error! "Workflow source digest does not match"
                          {:kind :source :path path
-                          :logical-id (:logical-id source)})))))
-  (reduce
+                          :logical-id (:logical-id source)}))
+      (swap! source-records conj {:logical-id (:logical-id source)
+                                  :physical-id (:physical-id source)
+                                  :source bytes}))))
+  (let [verified-plans (reduce
     (fn [verified-plans plan]
       (let [path (str run-root "/" (:path plan))]
         (when-not (io/file-exists? path)
@@ -458,7 +462,8 @@
                               :logical-id (:logical-id plan)}))
           (assoc verified-plans (:logical-id plan) graph))))
     {}
-    (:plans manifest))))
+    (:plans manifest))]
+    {:plans verified-plans :source-records @source-records})))
 
 (defn verify-bundle! [bundle graph]
   (when-not (and (map? bundle)
@@ -528,9 +533,23 @@
                        {:path manifest-path
                         :expected expected-fingerprint
                         :actual (:fingerprint manifest)}))
-    (let [verified-plans (verify-manifest-files! run-root manifest)]
+    (let [contents (verify-manifest-files! run-root manifest)
+          verified-plans (:plans contents)
+          bundle {:format-version (:format-version manifest)
+                  :fingerprint (:fingerprint manifest)
+                  :root-plan-id root-id
+                  :index (:index manifest)
+                  :workflow-roots (:workflow-roots manifest)
+                  :source-records (:source-records contents)
+                  :plans (reduce
+                           (fn [plans entry]
+                             (assoc plans (:logical-id entry)
+                                    (assoc (dissoc entry :logical-id)
+                                           :graph (get verified-plans (:logical-id entry)))))
+                           {} (get-in manifest [:index :plans]))}]
       {:graph (get verified-plans root-id)
        :diagnostics []
+       :captured-bundle bundle
        :workflow manifest})))
 
 (defn- unreadable-drift [record path]
