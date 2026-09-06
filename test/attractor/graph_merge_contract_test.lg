@@ -1,0 +1,162 @@
+(ns attractor.graph-merge-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [io :as io]
+            [os :as os]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [attractor.workflow :as workflow]))
+
+;; ATTR-COMPOSE-02 / SCN-GRAPH-MERGE: application-owned composition seam.
+(def base-dot
+  "digraph Base { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+(def donor-dot
+  "digraph Donor { first [type=tool, prompt=alpha] second [type=tool, prompt=beta] first -> second [label=\"donor-edge\"] }")
+(def merged-ids #{"start" "first" "second" "exit"})
+(def merged-pairs [["start" "first"] ["first" "second"] ["second" "exit"]])
+(def route ["start" "first" "second" "exit"])
+
+(defn- edge-pairs [graph]
+  (mapv (fn [edge] [(:from edge) (:to edge)]) (:edges graph)))
+
+(defn- graft [base donor]
+  (let [bridge (first (:edges base))]
+    (assoc base
+           :nodes (merge (:nodes base) (:nodes donor))
+           :edges (vec (concat [(assoc bridge :to "first")]
+                               (:edges donor)
+                               [(assoc bridge :from "second")])))))
+
+(defn- assert-merged [graph]
+  (is (= merged-ids (set (keys (:nodes graph)))))
+  (is (= merged-pairs (edge-pairs graph)))
+  (is (= ["alpha" "beta"]
+         (mapv #(get-in graph [:nodes % :prompt]) ["first" "second"])))
+  (is (= "donor-edge" (:label (second (:edges graph))))))
+
+(defn- registry-for [calls]
+  (let [registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "tool"
+      (fn [node ctx _graph _logs]
+        (swap! calls conj [(:id node) (:prompt node)])
+        {:status :success
+         :context_updates
+         {"merged.output" (str (get (context/ctx-snapshot ctx) "merged.output" "")
+                               (:prompt node))}}))
+    registry))
+
+(defn- temp-root []
+  (str (os/temp-dir) "/attractor-graph-merge-" (random-uuid)))
+
+(defn- assert-finished [result logs calls]
+  (let [checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= [["first" "alpha"] ["second" "beta"]] @calls))
+    (is (= route (:completed_nodes result)))
+    (is (= "alphabeta" (get (:context result) "merged.output")))
+    (is (= (:completed_nodes result) (:completed_nodes checkpoint)))
+    (is (= (:context result) (:context_values checkpoint)))
+    (is (= "exit" (:current_node checkpoint)))))
+
+(deftest prepare-validates-and-captures-a-merge-without-executing
+  (let [base (parser/parse-dot base-dot)
+        donor (parser/parse-dot donor-dot)
+        ;; Serialized snapshots are taken before the callback runs: no alias comparison.
+        base-before (workflow/canonical-edn base)
+        donor-before (workflow/canonical-edn donor)
+        observed-base (atom nil) observed-before (atom nil)
+        calls (atom []) events (atom []) publications (atom []) validations (atom 0)
+        logs (temp-root)
+        prepared (pipeline/prepare
+                   base-dot
+                   {:logs-root logs :registry (registry-for calls)
+                    :on-event #(swap! events conj %)
+                    :on-published #(swap! publications conj %)
+                    :custom-transforms [(fn [graph]
+                                          (reset! observed-base graph)
+                                          (reset! observed-before (workflow/canonical-edn graph))
+                                          (graft graph donor))]
+                    :custom-rules [(fn [graph]
+                                     (swap! validations inc)
+                                     (assert-merged graph)
+                                     [])]})]
+    (is (= [] (:diagnostics prepared)))
+    (is (= 1 @validations))
+    (assert-merged (:graph prepared))
+    (assert-merged (workflow/selected-graph! (:workflow prepared) workflow/root-plan-id))
+    (is (= base-before (workflow/canonical-edn base)))
+    (is (= @observed-before (workflow/canonical-edn @observed-base)))
+    (is (= donor-before (workflow/canonical-edn donor)))
+    (is (= [] @calls))
+    (is (= [] @events))
+    (is (= [] @publications))
+    (is (nil? (os/stat logs)))))
+
+(deftest public-run-traverses-grafted-edges-and-consumes-donor-attributes
+  (let [donor (parser/parse-dot donor-dot)
+        before (workflow/canonical-edn donor)
+        calls (atom []) captured (atom nil) logs (temp-root)
+        result (pipeline/run base-dot
+                 {:logs-root logs :registry (registry-for calls)
+                  :custom-transforms [#(graft % donor)]
+                  :on-prepared #(reset! captured %)})]
+    (assert-finished result logs calls)
+    (assert-merged (workflow/selected-graph! (:workflow @captured) workflow/root-plan-id))
+    (is (= before (workflow/canonical-edn donor)))
+    ;; Negative control: omitting the merger leaves a different topology and route.
+    (let [control-calls (atom [])
+          control (pipeline/run base-dot {:logs-root (temp-root)
+                                           :registry (registry-for control-calls)})
+          graph (:graph (pipeline/prepare base-dot))]
+      (is (= #{"start" "exit"} (set (keys (:nodes graph)))))
+      (is (= [["start" "exit"]] (edge-pairs graph)))
+      (is (= :success (:status control)))
+      (is (= ["start" "exit"] (:completed_nodes control)))
+      (is (= [] @control-calls))
+      (is (nil? (get (:context control) "merged.output"))))))
+
+(deftest copied-run-resumes-the-captured-merge-with-runtime-registry-only
+  (let [root (temp-root) logs (str root "/original") copied (str root "/copied")
+        _ (io/mkdir root)
+        source (str root "/root.dot") donor-source (str root "/donor.dot")
+        _ (io/spit source base-dot) _ (io/spit donor-source donor-dot)
+        donor (parser/parse-dot (io/slurp donor-source))
+        transform-calls (atom 0) transform-enabled (atom true) calls (atom [])
+        transform (fn [graph]
+                    (swap! transform-calls inc)
+                    (if @transform-enabled (graft graph donor)
+                        (throw (ex-info "Current transform must not run" {}))))
+        initial (pipeline/run (io/slurp source)
+                  {:logs-root logs :source-path source :max-steps 1
+                   :registry (registry-for calls) :custom-transforms [transform]})
+        checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))
+        manifest (workflow/read-manifest! (str logs "/workflow/manifest.edn"))
+        paths (concat ["checkpoint.edn" "workflow/manifest.edn"]
+                      (map :path (:sources manifest)) (map :path (:plans manifest)))
+        bytes (into {} (map (fn [path] [path (io/slurp (str logs "/" path))]) paths))]
+    (is (= :fail (:status initial)))
+    (is (= ["start"] (:completed_nodes checkpoint)))
+    (is (= [] @calls))
+    (is (= 1 @transform-calls))
+    ;; Copy the complete recovery artifact set, including the checkpoint.
+    (io/mkdir (str copied "/workflow/sources"))
+    (io/mkdir (str copied "/workflow/plans"))
+    (doseq [[path content] bytes] (io/spit (str copied "/" path) content))
+    (io/spit source "invalid current root")
+    (io/spit donor-source "invalid current donor")
+    (reset! transform-enabled false)
+    (let [result (pipeline/resume (str copied "/checkpoint.edn")
+                                 {:registry (registry-for calls)})
+          verified (workflow/verify-published! copied (:workflow_fingerprint checkpoint))]
+      (assert-finished result copied calls)
+      (assert-merged (workflow/selected-graph! (:captured-bundle verified) workflow/root-plan-id))
+      (is (= 1 @transform-calls))
+      ;; The persisted plan survives EDN verification: callback closures were not serialized.
+      (is (= (get bytes (:path (first (:plans manifest))))
+             (io/slurp (str copied "/" (:path (first (:plans manifest))))))))
+    (doseq [[path content] bytes]
+      (is (= content (io/slurp (str logs "/" path)))))
+    (doseq [path (rest paths)]
+      (is (= (get bytes path) (io/slurp (str copied "/" path)))))))
