@@ -1,10 +1,12 @@
 # Progress
 
-**Phase:** ITER-0005 integrated and pushed; ITER-0006 next
-**Task:** plan interactive concurrency against the upstream requirements
+**Phase:** implementing ITER-0006
+**Task:** completion-driven parallel joins, Task 1 regression and coordinator
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
-**Current iteration:** ITER-0005 — scoped delivery verified on main; full-reader exception remains explicit
+**Current iteration:** ITER-0006 — interactive concurrency; no story completion claimed yet
+
+**ITER-0006 start:** User approved the design direction. Work is isolated in `.worktrees/iter-0006-interactive-concurrency`; fresh default-suite baseline at `38e9c9e` passes 473/3370/0. Two independent scope/spec reviews approved the parallel-join component and the implementation plan passed review. Design/plan and the independently reproduced [future exception compatibility finding](../../let-go-future-compatibility.md) are pushed at `f249180`. Task 1 follows test-first implementation. Interviewers, fan-in ranking, artifact recovery/discovery, and handler-matrix evidence remain required after this component. The five reader acceptance failures remain unmet and separate from the passing default suite.
 
 **Integration checkpoint:** Main was fast-forwarded to `ac7b241` after both independent three-tier audits returned scoped CLEAN. The post-merge full suite passes 473/3370/0 and local let-go AOT builds successfully. A fresh compiled `examples/composition-parent.dot` run succeeds and its saved checkpoint contains `child.result = "hello-from-child"`. Public main was pushed and remotely verified at `7d097b4`; the iteration branch was remotely verified at `ac7b241`. All worktrees and untracked private notes are preserved. ATTR-READ-01 and ATTR-COMPOSE-02 remain unresolved full-goal requirements; see [iteration audit](iter-0005-audit.md). Historical task checkpoints below describe their state at the time, not current integration status.
 
