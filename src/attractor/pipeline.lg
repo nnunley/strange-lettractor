@@ -42,6 +42,8 @@
          engine-options
          (assoc (apply dissoc options wrapper-option-keys)
                 :workflow-fingerprint (:fingerprint bundle)
+                :attractor.engine/publish-restart
+                (fn [root] (workflow/publish! bundle root))
                 :workflow-manifest workflow/manifest-relative-path)
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
@@ -280,6 +282,8 @@
                 :logs-root run-root
                 :on-event caller-on-event
                 :workflow-fingerprint expected-fingerprint
+                :attractor.engine/publish-restart
+                (fn [root] (workflow/publish! (:workflow verified) root))
                 :workflow-manifest workflow/manifest-relative-path)
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected

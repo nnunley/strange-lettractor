@@ -1148,6 +1148,8 @@
                  (close-fidelity-threads! threads)
                  (let [new-root
                        (allocate-restart-root root-base allocated-roots)]
+                   (when-let [publish (:attractor.engine/publish-restart base-options)]
+                     (publish new-root))
                    (on-event {:type :pipeline.restarting
                               :old_logs_root (:old_logs_root result)
                               :new_logs_root new-root

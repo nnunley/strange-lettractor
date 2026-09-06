@@ -631,7 +631,13 @@
             :on-event :on-event
             :workflow-fingerprint (get-in prepared [:workflow :fingerprint])
             :workflow-manifest "workflow/manifest.edn"}
-           (:options @observed)))
+           (dissoc (:options @observed) :attractor.engine/publish-restart)))
+    (let [root (str (os/temp-dir) "/lettractor-restart-handoff-" (random-uuid))
+          publish (get-in @observed [:options :attractor.engine/publish-restart])]
+      (publish root)
+      (is (= (:graph prepared)
+             (:graph (workflow/verify-published!
+                       root (get-in prepared [:workflow :fingerprint]))))))
     (is (= (:diagnostics prepared) (:diagnostics result)))
     (doseq [broken [(assoc-in prepared [:workflow :format-version] 2)
                     (assoc-in prepared [:workflow :fingerprint] "wrong")
