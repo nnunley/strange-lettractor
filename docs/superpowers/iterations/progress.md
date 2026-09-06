@@ -1,7 +1,30 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** fan-in component reviewed and verified; interviewer matrix/nonblocking console timeout next
+**Task:** handler dispatch matrix reviewed and verified; native console API proposal awaits user approval, artifact recovery remains pending
+
+**Dispatch matrix checkpoint:** `5ea986f` adds evidence only: 5 tests / 324
+assertions, independently approved by spec and quality reviewers. Root full suite
+passes 535 tests / 4198 assertions / zero failures, exit 0. SCN-HANDLER-MATRIX and
+ATTR-HND-01 are complete as a component; no runtime behavior changed. Coverage
+isolates registry-to-engine dispatch and does not substitute for native handler
+semantics. The remaining console/interviewer and artifact stories still prevent
+ITER-0006 completion. The separately failing reader acceptance is unchanged.
+
+**Independent work while native console API approval is pending:** Registry-to-engine
+dispatch matrix proof is underway without production changes. Terminal `Msquare`
+nodes must be verified as an explicit engine short-circuit, not incorrectly
+required to invoke the exit handler: upstream §3.2 recognizes terminal nodes
+before handler dispatch.
+
+Artifact discovery has a concrete recovery gap: root stored a 102401-byte string
+under `/tmp/lettractor-artifact-discovery.GBYKPv`; `large.edn` exists and the
+original store lists one artifact. A new store with the same base directory lists
+zero artifacts and `retrieve-artifact` returns `:artifact-not-found`. The current
+constructor always creates an empty registration map; small values exist only in
+that map. Persisted registration and pipeline recovery integration are still
+required by SCN-ARTIFACT-DISCOVERY. This probe does not imply the upstream basic
+in-memory store constructor itself promises automatic reopening.
 
 Fan-in publication is remotely verified at `1fe6bd68c9bd9df0cf1b406a6e9183b099b164c7`
 on `iter-0006-interactive-concurrency`. [Console input investigation](../../console-input-findings.md)

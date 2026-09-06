@@ -83,7 +83,7 @@ advancement after provider entry, with bounded waits and unconditional releases.
 - [x] Hold ranker cleanup with bounded promises in two separate public cases: external cancellation and node-attempt timeout. Prove no parent terminal event/return before release and no winner updates after either cancellation source. Use native scoped primitives and finally cleanup; do not rely on detached async/map ownership.
 - [x] Run full `env LGX_LG=/Users/ndn/development/let-go/lg lgx test` and `lgx build` sequentially. Run `/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg` separately, retaining failures as unmet reader acceptance. Run a fresh compiled heuristic workflow and inspect its persisted winner; offline prompted adapter evidence is not live-provider parity.
 - [x] Independent spec then quality review of public proof and the complete component. Only after approval add exact `;; SCN-FANIN-RANKING COMPLETE` marker, marker-gated focused corpus command, and scoped ATTR-FANIN-01 evidence. Keep interviewer/artifact/handler-matrix work pending; do not mark ITER-0006 done.
-- [ ] Commit/push explicit scoped files under standing approval; verify remote SHA. Preserve all worktrees and private `docs/notes.md`. Record upstream workaround references without claiming the let-go bugs fixed.
+- [x] Commit/push explicit scoped files under standing approval; verify remote SHA. Preserve all worktrees and private `docs/notes.md`. Record upstream workaround references without claiming the let-go bugs fixed.
 
 ## Execution constraints
 

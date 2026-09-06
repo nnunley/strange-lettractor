@@ -210,7 +210,13 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Given each built-in handler shape/type and a registered custom handler
 - When each node executes through the engine registry
 - Then the correct handler receives the node/context and its outcome controls routing
-- Seam: engine integration
+- Fixed expectations cover eight executable shapes, eleven explicit types (including custom/subpipeline), and three unknown-type/shape fallbacks
+- Explicit registered types override conflicting shapes; missing registrations fall through shape then codergen
+- Suggested routing overrides the higher-weight default branch; handler witness, branch-observed context, invocation counts and checkpoint agree
+- Caller registry and its mutable parallel/manager runtime values remain unchanged
+- Msquare resolves to exit but the engine recognizes terminal completion before dispatch, as required by the upstream core loop; explicit exit type on a nonterminal node separately exercises the registry entry
+- A bounded wrong-registration control loses the expected witness and takes the default route
+- Seam: real low-level engine with registry spies; native handler behavior is covered separately, and this matrix does not claim public validation accepts every synthetic graph
 
 ### SCN-INTERVIEWERS — Interviewer contract matrix
 

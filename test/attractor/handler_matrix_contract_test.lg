@@ -1,3 +1,4 @@
+;; SCN-HANDLER-MATRIX COMPLETE
 (ns attractor.handler-matrix-contract-test
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.context :as context]
