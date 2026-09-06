@@ -42,7 +42,11 @@ Files: extend `test/attractor/parallel_join_contract_test.lg`; modify `src/attra
 - [x] Run focused public evidence RED before any needed runtime fix; implement only the demonstrated gap. If existing behavior already passes, record this as evidence-only work, not a fabricated bugfix.
 - [x] Run `env LGX_LG=/Users/ndn/development/let-go/lg lgx test` and `env LGX_LG=/Users/ndn/development/let-go/lg lgx build` sequentially. Expected full default suite: at least baseline 473 tests, zero failures; AOT exit 0. Run `/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg` separately and retain its failure count as unmet reader acceptance.
 - [x] Obtain independent spec then quality review. Once proof is adequate, add exact `;; SCN-FIRST-SUCCESS COMPLETE` marker to the focused test file; update corpus command to require this marker and run that file. Correct ATTR-PAR-02 wording to success observation -> cancellation/join -> return; record component evidence without marking all ITER-0006 done. Other iteration stories remain required.
-- [ ] Commit the public proof and scoped documentation. Push the iteration branch under standing user authorization and verify remote SHA. Preserve worktrees/private notes. Full ITER-0006 audit/integration waits for interviewer, fan-in, artifact, and handler-matrix components.
+- [x] Commit the public proof and scoped documentation. Push the iteration branch under standing user authorization and verify remote SHA. Preserve worktrees/private notes. Full ITER-0006 audit/integration waits for interviewer, fan-in, artifact, and handler-matrix components.
+
+Publication verified: public iteration branch `1e1950d7353f93aca1919230b6cfedcfeed050e4`.
+Final marked corpus command passes 18 tests / 215 assertions / zero failures.
+Main is unchanged; all worktrees and private notes remain intact.
 
 ## Execution constraints
 
