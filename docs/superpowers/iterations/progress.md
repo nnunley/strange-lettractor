@@ -1,7 +1,28 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** interviewer contract fixes reviewed; fixing reproduced tool-launch timeout race; native timed-input and artifact-index proposals await approval
+**Task:** interviewer fixes and tool-launch timeout repair reviewed and verified; native timed-input and artifact-index proposals await approval
+
+**Tool startup race repaired:** `7f3d628` establishes the owned command group
+through Bash job control at spawn instead of an asynchronously initializing
+`setsid`/Perl launcher. A privileged child guard honors existing stop markers
+before startup files or user commands execute. Both independent reviews approve.
+The genuine delayed-session reproducer below now reports timeout without a late
+marker; permanent bounded fixtures additionally cover cancellation and hostile
+`BASH_ENV`. Native execution contracts: 29 tests / 111 assertions / zero failures.
+Root full suite: **549 tests / 4320 assertions / zero failures**, exit 0; AOT
+build exits 0. A fresh compiled real-tool workflow with a 50ms timeout returns
+the expected failure, persists partial output and `:timeout_error`, and creates
+no forbidden marker after the command's one-second delay has elapsed. Evidence:
+`/tmp/lettractor-launch-race.bjIJBu/compiled-run`. Timeout duration and existing
+TERM/KILL escalation grace remain unchanged. This closes the reproduced execution
+defect, not all remaining lifecycle requirements or the full goal.
+
+Bash's [job-control contract](https://www.gnu.org/software/bash/manual/html_node/Job-Control-Basics.html)
+supports process-group signaling; independent local probes observed child PID
+equal to PGID immediately after parent-side spawn. Platform scope remains the
+existing Bash/Unix execution environment. The separate five reader acceptance
+failures remain unmet.
 
 **Interviewer checkpoint:** `82a7461` adds adapter/public-routing evidence and
 `1ca62bb` fixes zero-argument console flushing and the auto-approve empty-choice
