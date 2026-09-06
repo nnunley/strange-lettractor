@@ -7,6 +7,7 @@
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
+            [attractor.workflow :as workflow-lib]
             [http :as http]))
 
 ;; In-memory pipeline registry: id -> pipeline state map
@@ -97,33 +98,64 @@
             on-event (fn [ev]
                        (swap! events-atom conj ev))
             on-prepared
-            (fn [{:keys [graph diagnostics]}]
-              (if (compare-and-set! preparation-phase :waiting :registering)
-                (try
-                  ;; Publish prepared state before allowing the HTTP response.
-                  (swap! active-pipelines assoc pipeline-id
-                         {:id pipeline-id
-                          :graph graph
-                          :dot dot-source
-                          :status :running
-                          :diagnostics diagnostics
-                          :events events-atom
-                          :questions questions-atom
-                          :pending-answers pending-answers
-                          :cancelled cancelled
-                          :context ctx
-                          :logs_root logs-dir})
-                  (reset! preparation-phase :registered)
-                  (deliver prepared-signal {:graph graph})
-                  (catch Object e
-                    (swap! active-pipelines dissoc pipeline-id)
-                    (reset! preparation-phase :failed)
-                    (deliver prepared-signal {:error e})
-                    (throw e)))
-                (do
-                  (reset! cancelled true)
-                  (throw (ex-info "Pipeline preparation was abandoned"
-                                  {:category :preparation_abandoned})))))]
+            (fn [_]
+              ;; Preparation is a validation gate, not a durable publication.
+              (when-not (= :waiting @preparation-phase)
+                (reset! cancelled true)
+                (throw (ex-info "Pipeline preparation was abandoned"
+                                {:category :preparation_abandoned}))))
+            on-published
+            (fn [{:keys [graph diagnostics workflow]} manifest-path]
+              ;; The callback is the HTTP visibility boundary. Verify the exact
+              ;; publication before racing the request timeout for ownership.
+              (let [expected-path (str logs-dir "/" workflow-lib/manifest-relative-path)
+                    fingerprint (:fingerprint workflow)
+                    manifest (workflow-lib/read-manifest! manifest-path)
+                    verified (workflow-lib/verify-published! logs-dir fingerprint)]
+                (when-not (and (= expected-path manifest-path)
+                               (= fingerprint (:fingerprint manifest))
+                               (= fingerprint (get-in verified [:workflow :fingerprint])))
+                  (throw (ex-info "Published workflow manifest does not match prepared workflow"
+                                  {:category :workflow_snapshot_corrupt
+                                   :path manifest-path})))
+                (cond
+                  (= :registered @preparation-phase)
+                  (let [registered (get @active-pipelines pipeline-id)]
+                    (when-not (and (= fingerprint (:workflow_fingerprint registered))
+                                   (= manifest-path (:workflow_manifest registered)))
+                      (throw (ex-info "Published workflow registration does not match"
+                                      {:category :workflow_snapshot_corrupt
+                                       :path manifest-path}))))
+
+                  (compare-and-set! preparation-phase :waiting :registering)
+                  (try
+                    (swap! active-pipelines assoc pipeline-id
+                           {:id pipeline-id
+                            :graph graph
+                            :dot dot-source
+                            :status :running
+                            :diagnostics diagnostics
+                            :events events-atom
+                            :questions questions-atom
+                            :pending-answers pending-answers
+                            :cancelled cancelled
+                            :context ctx
+                            :logs_root logs-dir
+                            :workflow_fingerprint fingerprint
+                            :workflow_manifest manifest-path})
+                    (reset! preparation-phase :registered)
+                    (deliver prepared-signal {:graph graph})
+                    (catch Object e
+                      (swap! active-pipelines dissoc pipeline-id)
+                      (reset! preparation-phase :failed)
+                      (deliver prepared-signal {:error e})
+                      (throw e)))
+
+                  :else
+                  (do
+                    (reset! cancelled true)
+                    (throw (ex-info "Pipeline publication was abandoned"
+                                    {:category :preparation_abandoned}))))))]
 
         ;; Run in background future
         (core/future
@@ -134,6 +166,7 @@
                                          :registry registry
                                          :cancelled? (fn [] @cancelled)
                                          :on-prepared on-prepared
+                                         :on-published on-published
                                          :on-event on-event})]
               (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
             (catch Object e

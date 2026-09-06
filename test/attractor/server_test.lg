@@ -1,10 +1,13 @@
 (ns attractor.server-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [io :as io]
             [json :as json]
             [os :as os]
             [attractor.context :as context]
-            [attractor.server :as server]))
+            [attractor.pipeline :as pipeline]
+            [attractor.server :as server]
+            [attractor.workflow :as workflow]))
 
 (deftest test-checkpoint-endpoint-reads-edn-and-returns-json
   (let [logs-root (str "/tmp/strange-lettractor-server-" (System/currentTimeMillis))
@@ -70,3 +73,66 @@
     (is (= 200 (:status response)))
     (is (= "image/svg+xml" (get-in response [:headers "Content-Type"])))
     (is (str/includes? (:body response) "<svg"))))
+
+(def server-dot
+  "digraph Server { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+
+(deftest start-registers-only-after-a-verified-publication
+  (reset! server/active-pipelines {})
+  (let [before-publication (atom nil)
+        first-registration (atom nil)
+        second-registration (atom nil)
+        callback-count (atom 0)
+        response
+        (with-redefs
+          [pipeline/run
+           (fn [source options]
+             (let [prepared (pipeline/prepare source)]
+               ((:on-prepared options) prepared)
+               (reset! before-publication @server/active-pipelines)
+               (let [manifest-path
+                     (workflow/publish! (:workflow prepared) (:logs-root options))]
+                 ((:on-published options) prepared manifest-path)
+                 (swap! callback-count inc)
+                 (reset! first-registration
+                         (first (vals @server/active-pipelines)))
+                 ((:on-published options) prepared manifest-path)
+                 (swap! callback-count inc)
+                 (reset! second-registration
+                         (first (vals @server/active-pipelines)))
+                 {:status :success})))]
+          (server/handle-start-pipeline {:body server-dot}))
+        body (json/read-json (:body response))
+        pipeline-id (get body "id")
+        registered (get @server/active-pipelines pipeline-id)
+        manifest-path (:workflow_manifest registered)
+        verified (workflow/verify-published!
+                   (:logs_root registered)
+                   (:workflow_fingerprint registered))]
+    (is (= 201 (:status response)))
+    (is (= {} @before-publication))
+    (is (= 2 @callback-count))
+    (is (identical? @first-registration @second-registration))
+    (is (= (:workflow_fingerprint registered)
+           (get-in verified [:workflow :fingerprint])))
+    (is (= (str (:logs_root registered) "/workflow/manifest.edn")
+           manifest-path))
+    (is (some? (io/slurp manifest-path)))
+    (is (= 1 (count @server/active-pipelines)))))
+
+(deftest publication-or-publication-callback-failure-does-not-register
+  (doseq [run-fn
+          [(fn [source options]
+             ((:on-prepared options) (pipeline/prepare source))
+             (throw (ex-info "publication failed" {:phase :publication})))
+           (fn [source options]
+             (let [prepared (pipeline/prepare source)]
+               ((:on-prepared options) prepared)
+               ((:on-published options)
+                prepared
+                (str (:logs-root options) "/workflow/manifest.edn"))))]]
+    (reset! server/active-pipelines {})
+    (let [response (with-redefs [pipeline/run run-fn]
+                     (server/handle-start-pipeline {:body server-dot}))]
+      (is (= 400 (:status response)))
+      (is (= {} @server/active-pipelines)))))

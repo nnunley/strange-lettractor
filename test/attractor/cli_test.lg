@@ -1,6 +1,14 @@
 (ns attractor.cli-test
   (:require [clojure.test :refer [deftest is testing]]
-            [attractor.cli :as cli]))
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.cli :as cli]
+            [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [attractor.transforms :as transforms]))
 
 (deftest canonical-validation-diagnostics-retain-cli-targets
   (testing "node diagnostics render the canonical node target"
@@ -17,3 +25,134 @@
               :severity :warning
               :message "Invalid condition"
               :edge ["from" "to"]})))))
+
+(def cli-dot
+  "digraph CLI { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+
+(deftest run-delegates-the-source-path-to-the-public-lifecycle
+  (let [dot-path (str (os/temp-dir) "/attractor-cli-source-" (random-uuid) ".dot")
+        logs-root (str (os/temp-dir) "/attractor-cli-logs-" (random-uuid))
+        calls (atom [])
+        exits (atom [])]
+    (io/spit dot-path cli-dot)
+    (with-redefs [pipeline/run
+                  (fn [source options]
+                    (swap! calls conj [source options])
+                    {:status :success})
+                  os/exit #(swap! exits conj %)]
+      (with-out-str
+        (cli/cmd-run
+          [dot-path "--mock" "--auto-approve" "--logs-root" logs-root])))
+    (is (= 1 (count @calls)))
+    (is (= cli-dot (get-in @calls [0 0])))
+    (is (= dot-path (get-in @calls [0 1 :source-path])))
+    (is (= logs-root (get-in @calls [0 1 :logs-root])))
+    (is (= [0] @exits))))
+
+(deftest resume-delegates-only-to-pinned-public-recovery
+  (let [checkpoint (str (os/temp-dir) "/attractor-cli-checkpoint-" (random-uuid) ".edn")
+        removed-source (str (os/temp-dir) "/attractor-cli-removed-" (random-uuid) ".dot")
+        calls (atom [])
+        exits (atom [])]
+    (io/spit checkpoint "{}")
+    (with-redefs [pipeline/resume
+                  (fn [checkpoint-path options]
+                    (swap! calls conj [checkpoint-path options])
+                    {:status :success})
+                  parser/parse-dot
+                  (fn [_] (throw (ex-info "CLI parsed current source" {})))
+                  transforms/apply-transforms
+                  (fn [_] (throw (ex-info "CLI transformed current source" {})))
+                  engine/resume-pipeline
+                  (fn [& _] (throw (ex-info "CLI used low-level resume" {})))
+                  os/exit #(swap! exits conj %)]
+      (with-out-str
+        (cli/cmd-resume
+          [removed-source "--checkpoint" checkpoint "--mock"])))
+    (is (= 1 (count @calls)))
+    (is (= checkpoint (get-in @calls [0 0])))
+    (is (= removed-source (get-in @calls [0 1 :current-source-path])))
+    (is (= #{:registry :current-source-path}
+           (set (keys (get-in @calls [0 1])))))
+    (is (= [0] @exits))))
+
+(deftest resume-needs-only-a-checkpoint-and-help-shows-optional-dotfile
+  (let [checkpoint (str (os/temp-dir) "/attractor-cli-checkpoint-only-" (random-uuid) ".edn")
+        calls (atom [])
+        exits (atom [])
+        usage (with-out-str (cli/print-usage))]
+    (io/spit checkpoint "{}")
+    (with-redefs [pipeline/resume
+                  (fn [checkpoint-path options]
+                    (swap! calls conj [checkpoint-path options])
+                    {:status :success})
+                  os/exit #(swap! exits conj %)]
+      (with-out-str
+        (cli/cmd-resume ["--checkpoint" checkpoint "--mock"])))
+    (is (str/includes? usage "resume [dotfile] --checkpoint <path>"))
+    (is (= 1 (count @calls)))
+    (is (= checkpoint (get-in @calls [0 0])))
+    (is (= #{:registry} (set (keys (get-in @calls [0 1])))))
+    (is (= [0] @exits))))
+
+(def pinned-cli-dot
+  "digraph PinnedCLI {
+     start [shape=Mdiamond]
+     work [type=pinned.cli]
+     exit [shape=Msquare]
+     start -> work -> exit
+   }")
+
+(deftest cli-resume-reports-source-mutations-and-executes-the-captured-plan
+  (doseq [[mutation expected-state]
+          [[(fn [path] (io/spit path "this is no longer valid DOT")) :changed]
+           [(fn [path] (io/delete-file path)) :missing]]]
+    (let [dot-path (str (os/temp-dir) "/attractor-cli-pinned-" (random-uuid) ".dot")
+          logs-root (str (os/temp-dir) "/attractor-cli-pinned-run-" (random-uuid))
+          checkpoint-path (str logs-root "/checkpoint.edn")
+          registry (handlers/make-handler-registry)
+          handler-calls (atom 0)
+          run-calls (atom [])
+          resume-calls (atom [])
+          resume-result (atom nil)
+          exits (atom [])
+          real-run pipeline/run
+          real-resume pipeline/resume]
+      (handlers/register-handler!
+        registry "pinned.cli"
+        (fn [_ _ _ _]
+          (swap! handler-calls inc)
+          {:status :success}))
+      (io/spit dot-path pinned-cli-dot)
+      (with-redefs [handlers/make-handler-registry (fn [& _] registry)
+                    pipeline/run
+                    (fn [source options]
+                      (swap! run-calls conj [source options])
+                      (real-run source (assoc options :max-steps 1)))
+                    os/exit #(swap! exits conj %)]
+        (with-out-str
+          (cli/cmd-run
+            [dot-path "--mock" "--auto-approve" "--logs-root" logs-root])))
+      (mutation dot-path)
+      (with-redefs [handlers/make-handler-registry (fn [& _] registry)
+                    pipeline/resume
+                    (fn [path options]
+                      (swap! resume-calls conj [path options])
+                      (let [result (real-resume path options)]
+                        (reset! resume-result result)
+                        result))
+                    os/exit #(swap! exits conj %)]
+        (with-out-str
+          (cli/cmd-resume [dot-path "--checkpoint" checkpoint-path "--mock"])))
+      (is (= 1 (count @run-calls)))
+      (is (= dot-path (get-in @run-calls [0 1 :source-path])))
+      (is (= 1 (count @resume-calls)))
+      (is (= checkpoint-path (get-in @resume-calls [0 0])))
+      (is (= dot-path (get-in @resume-calls [0 1 :current-source-path])))
+      (is (= #{:registry :current-source-path}
+             (set (keys (get-in @resume-calls [0 1])))))
+      (is (str/includes? (get-in @resume-result [:diagnostics 0 :message])
+                         (str ":state " expected-state)))
+      (is (= :success (:status @resume-result)))
+      (is (= 1 @handler-calls))
+      (is (= [1 0] @exits)))))

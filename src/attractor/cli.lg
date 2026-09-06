@@ -3,8 +3,6 @@
             [os :as os]
             [io :as io]
             [attractor.parser :as parser]
-            [attractor.transforms :as transforms]
-            [attractor.engine :as engine]
             [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
@@ -53,7 +51,7 @@
   (println "  run <dotfile> [--logs-root <dir>] [--auto-approve]   Execute a DOT pipeline")
   (println "  validate <dotfile>                                  Validate pipeline structure & syntax")
   (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
-  (println "  resume <dotfile> --checkpoint <path>                Resume pipeline from checkpoint")
+  (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
@@ -173,6 +171,7 @@
                          nil))
             outcome (pipeline/run (io/slurp dot-file)
                                   {:logs-root logs-root
+                                   :source-path dot-file
                                    :registry registry
                                    :on-event on-event})]
         (println (str "\nExecution finished with status: " (:status outcome)))
@@ -182,19 +181,22 @@
           (os/exit 1))))))
 
 (defn cmd-resume [args]
-  (let [dot-file (first args)
+  (let [first-arg (first args)
+        dot-file (when (and (string? first-arg)
+                            (not (str/starts-with? first-arg "--")))
+                   first-arg)
         cp-path (find-arg-val args "--checkpoint")]
-    (if (or (str/blank? dot-file) (str/blank? cp-path) (not (os/stat cp-path)))
+    (if (or (str/blank? cp-path) (not (os/stat cp-path)))
       (do
-        (println "Error: Both valid DOT file and --checkpoint path required.")
+        (println "Error: Valid --checkpoint path required.")
         (os/exit 1))
-      (let [graph (-> (io/slurp dot-file)
-                      parser/parse-dot
-                      transforms/apply-transforms)
-            interviewer (interviewer/make-console-interviewer)
+      (let [interviewer (interviewer/make-console-interviewer)
             codergen-backend (make-codergen-backend-from-args args)
             registry (handlers/make-handler-registry interviewer codergen-backend)
-            outcome (engine/resume-pipeline cp-path graph {:registry registry})]
+            resume-options (cond-> {:registry registry}
+                             (not (str/blank? dot-file))
+                             (assoc :current-source-path dot-file))
+            outcome (pipeline/resume cp-path resume-options)]
         (println (str "Resumed execution finished with status: " (:status outcome)))
         (if (= (:status outcome) :success)
           (os/exit 0)
