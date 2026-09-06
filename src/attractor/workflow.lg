@@ -316,7 +316,21 @@
 (defn- same-logical-ids? [left right]
   (= (set (keys left)) (set (keys right))))
 
+(defn- validate-captured-roots! [roots]
+  (when-not (and (vector? roots)
+                 (every? (fn [root]
+                           (and (map? root)
+                                (exact-keys? root #{:id :path})
+                                (string? (:id root))
+                                (not (str/blank? (:id root)))
+                                (string? (:path root))
+                                (not (str/blank? (:path root))))) roots)
+                 (= (count roots) (count (set (map :id roots)))))
+    (snapshot-error! "Captured workflow roots have an invalid shape"
+                     {:field :workflow-roots})))
+
 (defn- validate-manifest! [manifest]
+  (validate-captured-roots! (:workflow-roots manifest))
   (when-not (map? manifest)
     (snapshot-error! "Workflow manifest must contain an EDN map" {}))
   (when-not (exact-keys? manifest #{:format-version :fingerprint :root-plan-id
@@ -471,6 +485,7 @@
     {:plans verified-plans :source-records @source-records})))
 
 (defn verify-bundle! [bundle graph]
+  (validate-captured-roots! (:workflow-roots bundle))
   (when-not (and (map? bundle)
                  (exact-keys? bundle #{:format-version :fingerprint :root-plan-id
                                        :plans :index :source-records
@@ -496,6 +511,7 @@
     (doseq [[logical-id indexed] sources]
       (let [runtime (get runtime-sources logical-id)]
         (when-not (and (exact-keys? runtime #{:logical-id :physical-id :source})
+                       (or (nil? (:physical-id runtime)) (string? (:physical-id runtime)))
                        (string? (:source runtime))
                        (= (:source-sha256 indexed)
                           (sha256-text (:source runtime))))

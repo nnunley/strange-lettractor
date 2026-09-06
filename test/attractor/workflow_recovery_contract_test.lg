@@ -86,6 +86,24 @@
     (is (= :success (:status result)))
     (is (= :success (:status (pipeline/resume (str root "/checkpoint.edn") {}))))))
 
+(deftest prepared-metadata-is-validated-before-publication
+  (doseq [mutate [(fn [p] (assoc-in p [:workflow :source-records 0 :physical-id] (fn [] nil)))
+                 (fn [p] (assoc-in p [:workflow :source-records 0 :physical-id] 42))
+                 (fn [p] (assoc-in p [:workflow :workflow-roots] (fn [] nil)))
+                 (fn [p] (assoc-in p [:workflow :workflow-roots] [{:id "root" :path (fn [] nil)}]))
+                 (fn [p] (assoc-in p [:workflow :workflow-roots] [{:id "root" :path "/tmp" :extra true}]))
+                 (fn [p] (assoc-in p [:workflow :workflow-roots] [{:id "root" :path "/tmp"}
+                                                                             {:id "root" :path "/tmp"}]))]]
+    (let [root (str (os/temp-dir) "/lettractor-invalid-metadata-" (random-uuid))
+          prepared (mutate (pipeline/prepare root-dot))
+          events (atom [])
+          error (workflow-error #(pipeline/execute-prepared prepared
+                                                            {:logs-root root
+                                                             :on-event (fn [e] (swap! events conj e))}))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (nil? (os/stat root)))
+      (is (= [] @events)))))
+
 (deftest canonical-tree-uses-the-version-one-scalar-grammar
   (is (= ["nil"] (workflow/canonical-tree nil)))
   (is (= ["bool" true] (workflow/canonical-tree true)))
