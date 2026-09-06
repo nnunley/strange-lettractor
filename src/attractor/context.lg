@@ -428,28 +428,54 @@
 
 ;; Save a checkpoint (Section 5.3)
 (defn save-checkpoint [checkpoint path]
-  (let [checkpoint-data {:timestamp (:timestamp checkpoint)
-                         :current_node (:current_node checkpoint)
-                         :completed_nodes (or (:completed_nodes checkpoint) [])
-                         :node_retries (or (:node_retries checkpoint) {})
-                         :node_outcomes (or (:node_outcomes checkpoint) {})
-                         :context_values (or (:context_values checkpoint) {})
-                         :logs (or (:logs checkpoint) [])}]
+  (let [checkpoint-data
+        (cond->
+          {:timestamp (:timestamp checkpoint)
+           :current_node (:current_node checkpoint)
+           :completed_nodes (or (:completed_nodes checkpoint) [])
+           :node_retries (or (:node_retries checkpoint) {})
+           :node_outcomes (or (:node_outcomes checkpoint) {})
+           :context_values (or (:context_values checkpoint) {})
+           :logs (or (:logs checkpoint) [])}
+          (some? (:current_fidelity checkpoint))
+          (assoc :current_fidelity (:current_fidelity checkpoint))
+
+          (some? (:workflow_fingerprint checkpoint))
+          (assoc :workflow_fingerprint (:workflow_fingerprint checkpoint))
+
+          (some? (:workflow_manifest checkpoint))
+          (assoc :workflow_manifest (:workflow_manifest checkpoint)))]
     (io/spit path (pr-str checkpoint-data))
     checkpoint))
+
+(defn- checkpoint-field [data field]
+  (if (contains? data field)
+    (get data field)
+    (get data (name field))))
 
 ;; Load a checkpoint (Section 5.3)
 (defn load-checkpoint [path]
   (let [raw (io/slurp path)
         data (try
                (edn/read-string raw)
-               (catch Object _ (json/read-json raw)))]
-    {:timestamp (or (:timestamp data) (get data "timestamp"))
-     :current_node (or (:current_node data) (get data "current_node"))
-     :completed_nodes (or (:completed_nodes data) (get data "completed_nodes") [])
-     :node_retries (or (:node_retries data) (get data "node_retries") {})
-     :node_outcomes (or (:node_outcomes data) (get data "node_outcomes") {})
-     :context_values (or (:context_values data)
-                         (get data "context_values")
-                         (get data "context") {})
-     :logs (or (:logs data) (get data "logs") [])}))
+               (catch Object _ (json/read-json raw)))
+        context-values (or (checkpoint-field data :context_values)
+                           (checkpoint-field data :context)
+                           {})]
+    (cond->
+      {:timestamp (checkpoint-field data :timestamp)
+       :current_node (checkpoint-field data :current_node)
+       :completed_nodes (or (checkpoint-field data :completed_nodes) [])
+       :node_retries (or (checkpoint-field data :node_retries) {})
+       :node_outcomes (or (checkpoint-field data :node_outcomes) {})
+       :context_values context-values
+       :logs (or (checkpoint-field data :logs) [])}
+      (some? (checkpoint-field data :current_fidelity))
+      (assoc :current_fidelity (checkpoint-field data :current_fidelity))
+
+      (some? (checkpoint-field data :workflow_fingerprint))
+      (assoc :workflow_fingerprint
+             (checkpoint-field data :workflow_fingerprint))
+
+      (some? (checkpoint-field data :workflow_manifest))
+      (assoc :workflow_manifest (checkpoint-field data :workflow_manifest)))))

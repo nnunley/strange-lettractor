@@ -777,6 +777,17 @@
     (on-event {:type :pipeline.failed :error reason})
     result))
 
+(defn- with-checkpoint-identity [checkpoint options current-fidelity]
+  (cond-> checkpoint
+    (some? current-fidelity)
+    (assoc :current_fidelity current-fidelity)
+
+    (some? (:workflow-fingerprint options))
+    (assoc :workflow_fingerprint (:workflow-fingerprint options))
+
+    (some? (:workflow-manifest options))
+    (assoc :workflow_manifest (:workflow-manifest options))))
+
 ;; Main execution loop (Section 3.2)
 (defn- run-pipeline*
   ([graph] (run-pipeline* graph {}))
@@ -794,6 +805,7 @@
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
          fidelity-threads (or (:fidelity-threads options) (atom {}))
+         checkpoint-fidelity (atom nil)
          step-counter (or (:step-counter options) (atom 0))
          max-steps (or (:max-steps options) default-max-steps)
          retry-options (assoc options :retry-counts retry-counts)
@@ -897,13 +909,17 @@
                                     :completed_nodes (conj completed-nodes node-id)
                                     :context (context/ctx-snapshot ctx)}]
                    ;; Write final checkpoint
-                   (let [cp {:timestamp (str (System/currentTimeMillis))
-                             :current_node node-id
-                             :completed_nodes (conj completed-nodes node-id)
-                             :node_retries @retry-counts
-                             :node_outcomes node-outcomes
-                             :context_values (context/ctx-snapshot ctx)
-                             :logs (:logs @ctx)}]
+                   (let [cp
+                         (with-checkpoint-identity
+                           {:timestamp (str (System/currentTimeMillis))
+                            :current_node node-id
+                            :completed_nodes (conj completed-nodes node-id)
+                            :node_retries @retry-counts
+                            :node_outcomes node-outcomes
+                            :context_values (context/ctx-snapshot ctx)
+                            :logs (:logs @ctx)}
+                           options
+                           @checkpoint-fidelity)]
                      (context/save-checkpoint cp (str logs-root "/checkpoint.edn")))
                    (on-event {:type :pipeline.completed :duration_steps step-count :completed_nodes (:completed_nodes success-res)})
                    success-res)))
@@ -951,14 +967,19 @@
                    (context/ctx-set! ctx "preferred_label" (:preferred_label outcome)))
 
                  ;; Step 5: Save checkpoint
-                 (let [cp {:timestamp (str (System/currentTimeMillis))
-                           :current_node node-id
-                           :completed_nodes new-completed
-                           :node_retries @retry-counts
-                           :node_outcomes new-outcomes
-                           :current_fidelity (:resolved_fidelity prepared-node)
-                           :context_values (context/ctx-snapshot ctx)
-                           :logs (:logs @ctx)}]
+                 (let [current-fidelity (:resolved_fidelity prepared-node)
+                       _ (reset! checkpoint-fidelity current-fidelity)
+                       cp
+                       (with-checkpoint-identity
+                         {:timestamp (str (System/currentTimeMillis))
+                          :current_node node-id
+                          :completed_nodes new-completed
+                          :node_retries @retry-counts
+                          :node_outcomes new-outcomes
+                          :context_values (context/ctx-snapshot ctx)
+                          :logs (:logs @ctx)}
+                         options
+                         current-fidelity)]
                    (context/save-checkpoint cp (str logs-root "/checkpoint.edn"))
                    (on-event {:type :checkpoint.saved :node_id node-id}))
 

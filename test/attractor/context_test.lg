@@ -1,9 +1,80 @@
 (ns attractor.context-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [clojure.edn :as edn]
             [attractor.context :as context]
+            [json :as json]
             [io :as io]
             [os :as os]))
+
+(defn- checkpoint-path [label extension]
+  (str (os/temp-dir) "/lettractor-checkpoint-" label "-"
+       (random-uuid) extension))
+
+(deftest test-checkpoint-roundtrip-preserves-pinned-workflow-fields
+  (let [path (checkpoint-path "pinned-roundtrip" ".edn")
+        checkpoint {:timestamp "now"
+                    :current_node "work"
+                    :completed_nodes ["start" "work"]
+                    :node_retries {"work" 1}
+                    :node_outcomes {"work" {:status :success}}
+                    :current_fidelity "compact"
+                    :context_values {"answer" 42}
+                    :logs ["saved"]
+                    :workflow_fingerprint "abc123"
+                    :workflow_manifest "workflow/manifest.edn"}
+        _ (context/save-checkpoint checkpoint path)
+        serialized (edn/read-string (io/slurp path))
+        loaded (context/load-checkpoint path)]
+    (is (= checkpoint serialized))
+    (is (= checkpoint loaded))))
+
+(deftest test-checkpoint-omits-optional-pinned-workflow-fields
+  (let [path (checkpoint-path "optional-fields" ".edn")
+        _ (context/save-checkpoint
+            {:timestamp "now"
+             :current_node "start"}
+            path)
+        serialized (edn/read-string (io/slurp path))
+        loaded (context/load-checkpoint path)]
+    (is (not (contains? serialized :current_fidelity)))
+    (is (not (contains? serialized :workflow_fingerprint)))
+    (is (not (contains? serialized :workflow_manifest)))
+    (is (not (contains? loaded :current_fidelity)))
+    (is (not (contains? loaded :workflow_fingerprint)))
+    (is (not (contains? loaded :workflow_manifest)))))
+
+(deftest test-load-checkpoint-supports-legacy-edn-and-json-keys
+  (let [edn-path (checkpoint-path "legacy-edn" ".edn")
+        json-path (checkpoint-path "legacy-json" ".json")
+        legacy {:timestamp "then"
+                :current_node "start"
+                :completed_nodes ["start"]
+                :node_retries {}
+                :node_outcomes {}
+                :context {"legacy" true}
+                :logs []}
+        json-checkpoint {:timestamp "now"
+                         :current_node "work"
+                         :completed_nodes ["start" "work"]
+                         :node_retries {}
+                         :node_outcomes {}
+                         :current_fidelity "full"
+                         :context_values {:modern true}
+                         :logs []
+                         :workflow_fingerprint "def456"
+                         :workflow_manifest "workflow/manifest.edn"}
+        _ (io/spit edn-path (pr-str legacy))
+        _ (io/spit json-path (json/write-json json-checkpoint))
+        loaded-edn (context/load-checkpoint edn-path)
+        loaded-json (context/load-checkpoint json-path)]
+    (is (= {"legacy" true} (:context_values loaded-edn)))
+    (is (not (contains? loaded-edn :current_fidelity)))
+    (is (not (contains? loaded-edn :workflow_fingerprint)))
+    (is (= "full" (:current_fidelity loaded-json)))
+    (is (= "def456" (:workflow_fingerprint loaded-json)))
+    (is (= "workflow/manifest.edn" (:workflow_manifest loaded-json)))
+    (is (= {"modern" true} (:context_values loaded-json)))))
 
 (deftest test-truncate-preamble-carries-goal-and-run-id
   (let [ctx (context/make-context {"run.id" "run-42"})

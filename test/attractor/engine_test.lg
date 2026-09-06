@@ -35,6 +35,22 @@ digraph Linear {
                 "outcome")))
     ))
 
+(deftest test-low-level-checkpoint-retains-fidelity-without-workflow-identity
+  (let [graph (p/parse-dot
+                "digraph LowLevel {
+                   graph [default_fidelity=compact]
+                   start [shape=Mdiamond]
+                   exit [shape=Msquare]
+                   start -> exit
+                 }")
+        logs (test-logs "low-level-checkpoint-shape")
+        result (e/run-pipeline graph {:logs-root logs})
+        checkpoint (c/load-checkpoint (str logs "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= "compact" (:current_fidelity checkpoint)))
+    (is (not (contains? checkpoint :workflow_fingerprint)))
+    (is (not (contains? checkpoint :workflow_manifest)))))
+
 (deftest test-human-gate-selection
   (let [dot "
 digraph Review {

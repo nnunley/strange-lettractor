@@ -4,6 +4,8 @@
             [clojure.edn :as edn]
             [io :as io]
             [os :as os]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
             [attractor.pipeline :as pipeline]
             [attractor.workflow :as workflow]))
 
@@ -514,3 +516,39 @@
     (is (= :workflow_snapshot_missing (:category error)))
     (is (= :source (:kind error)))
     (is (= source-path (:path error)))))
+
+(deftest public-runs-persist-pinned-workflow-identity-in-checkpoints
+  (testing "successful runs retain identity in the final checkpoint"
+    (let [logs (publication-root)
+          prepared (pipeline/prepare root-dot)
+          expected (get-in prepared [:workflow :fingerprint])
+          result (pipeline/run root-dot {:logs-root logs})
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+      (is (= :success (:status result)))
+      (is (= expected (:workflow_fingerprint checkpoint)))
+      (is (= "workflow/manifest.edn" (:workflow_manifest checkpoint)))
+      (is (string? (:current_fidelity checkpoint)))))
+  (testing "failed runs retain identity in their last stage checkpoint"
+    (let [source
+          "digraph Failed {
+             graph [default_fidelity=compact]
+             start [shape=Mdiamond]
+             broken [type=checkpoint.fail]
+             exit [shape=Msquare]
+             start -> broken
+             broken -> exit [condition=\"outcome=success\"]
+           }"
+          logs (publication-root)
+          prepared (pipeline/prepare source)
+          expected (get-in prepared [:workflow :fingerprint])
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler!
+              registry "checkpoint.fail"
+              (fn [_ _ _ _]
+                {:status :fail :failure_reason "expected failure"}))
+          result (pipeline/run source {:logs-root logs :registry registry})
+          checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+      (is (= :fail (:status result)))
+      (is (= expected (:workflow_fingerprint checkpoint)))
+      (is (= "workflow/manifest.edn" (:workflow_manifest checkpoint)))
+      (is (= "compact" (:current_fidelity checkpoint))))))
