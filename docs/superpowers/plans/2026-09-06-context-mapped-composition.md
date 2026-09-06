@@ -36,10 +36,12 @@ Files: create `src/attractor/composition.lg` and `test/attractor/composition_con
 
 Files: create `src/attractor/capture.lg` and `test/attractor/capture_contract_test.lg`; use `src/attractor/workflow.lg` root configuration helpers through a small documented utility surface if needed.
 
-- [ ] Add filesystem tests for relative children, in-memory roots with base-dir, absolute/parent references inside roots, outside-root refusal, symlink escapes, nested/overlapping roots, equal-root lexicographic tie-breaking, non-DOT extensions, unreadable files, and invalid UTF-8. Assert authorization happens before file read with a read spy.
-- [ ] Run capture test and verify failure before implementation.
-- [ ] Implement `(capture/resolve-source containing reference options)` returning `{:logical-id string :physical-id string :source string}`. Resolve physical paths before authorization, choose longest containing canonical root then smallest root ID, assign `workflow://<root-id>/<relative-path>`, and require `.dot`. Injected source-loader receives containing source record and literal reference; validate its output. Inspect local let-go filesystem/string APIs for strict UTF-8 validation; do not silently replace invalid bytes. Errors become canonical `subpipeline_source` diagnostics at the parent node boundary.
-- [ ] Run focused tests, including loader call counts, before committing `feat(capture): resolve authorized workflow sources`.
+- [x] Add filesystem tests for relative children, in-memory roots with base-dir, absolute/parent references inside roots, outside-root refusal, symlink escapes, nested/overlapping roots, equal-root lexicographic tie-breaking, non-DOT extensions, unreadable files, and invalid UTF-8. Assert authorization happens before file read with a read spy.
+- [x] Run capture test and verify failure before implementation.
+- [x] Implement `(capture/resolve-source containing reference options)` returning `{:logical-id string :physical-id string :source string}`. Resolve physical paths before authorization, choose longest containing canonical root then smallest root ID, assign `workflow://<root-id>/<relative-path>`, and require `.dot`. Injected source-loader receives containing source record and literal reference; validate its output. Inspect local let-go filesystem/string APIs for strict UTF-8 validation; do not silently replace invalid bytes. Errors become canonical `subpipeline_source` diagnostics at the parent node boundary.
+- [x] Run focused tests, including loader call counts, before committing `feat(capture): resolve authorized workflow sources`.
+
+Task 2 evidence: `2c06f76`, scope and quality reviews approved. Capture 11 tests / 45 assertions; impacted recovery 52/481 and lifecycle 8/159; root's independent default suite 423/2739, all zero failures. Initial stub produced 39 failed assertions; the disguised-target-extension regression produced two failures before its fix. Filesystem confinement is a pre-read canonical-path check, not descriptor-anchored protection against hostile concurrent filesystem mutation. Parent-node diagnostic wrapping is part of Task 3. Run lgx tests sequentially: concurrent invocations in one worktree can overwrite their shared generated runner.
 
 ### Task 3: Recursive prepare and closure bundle
 
