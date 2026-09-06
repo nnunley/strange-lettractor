@@ -1,0 +1,184 @@
+(ns attractor.interviewer-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interview]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [os :as os]))
+
+;; Evidence for §§4.6 and 6, excluding console input and actual elapsed timers.
+(def first-option {:key "A" :label "Approve" :metadata {:scope "review"}})
+(def second-option {:key "R" :label "Revise"})
+(def default-answer {:value "R" :text "Revise" :selected_option second-option})
+(def complete-question
+  {:text "Review proposal" :type :multiple_choice
+   :options [first-option second-option] :default default-answer
+   :timeout_seconds 2.5 :stage "review" :metadata {:ticket "T-42" :attempt 2}})
+(def questions
+  [complete-question
+   (assoc complete-question :type :freeform :text "Explain" :stage "explain")])
+(def answers
+  [default-answer {:value "because" :text "because" :metadata {:source "operator"}}])
+
+(deftest auto-approve-preserves-first-option-and-covers-question-types
+  (let [interviewer (interview/make-auto-approve-interviewer)]
+    (doseq [kind [:yes_no :confirmation]]
+      (is (= {:value :yes :text "yes"}
+             (interview/ask interviewer (assoc complete-question :type kind)))))
+    (is (= {:value "A" :text "Approve" :selected_option first-option}
+           (interview/ask interviewer complete-question)))
+    (is (= [{:value "A" :text "Approve" :selected_option first-option}
+            {:value "auto-approved" :text "auto-approved"}]
+           (interview/ask-multiple interviewer questions)))
+    (is (nil? (interview/inform interviewer "ready" "review")))))
+
+(deftest queue-consumes-supplied-answer-maps-in-order-before-default
+  (let [queue (interview/make-queue-interviewer answers)]
+    (is (= answers (interview/ask-multiple queue questions)))
+    (is (= {:value :skipped :text "queue exhausted"}
+           (interview/ask queue (dissoc complete-question :default))))
+    ;; Local extension: exhausted queues use Question.default. Upstream §6.4
+    ;; queue pseudocode always returns SKIPPED on exhaustion.
+    (is (= default-answer (interview/ask queue complete-question)))
+    (is (= :skipped (:value (interview/ask queue {:type :freeform}))))
+    (is (nil? (interview/inform queue "done" "review")))))
+
+(deftest callback-receives-complete-questions-and-returns-answers-unchanged
+  (let [received (atom [])
+        callback (interview/make-callback-interviewer
+                   (fn [question]
+                     (swap! received conj question)
+                     (nth answers (dec (count @received)))))]
+    (is (= answers (interview/ask-multiple callback questions)))
+    (is (= questions @received))))
+
+(deftest callback-and-recording-preserve-exceptions-and-only-record-answers
+  (let [failure (ex-info "operator disconnected" {:stage "explain" :retry false})
+        received (atom [])
+        callback (interview/make-callback-interviewer
+                   (fn [question]
+                     (swap! received conj question)
+                     (if (= "explain" (:stage question))
+                       (throw failure)
+                       default-answer)))
+        recording (interview/make-recording-interviewer callback)
+        wrapped (:interviewer recording)]
+    (is (identical? failure
+                   (try (interview/ask callback (second questions))
+                        (catch Object e e))))
+    (reset! received [])
+    (is (identical? failure
+                   (try (interview/ask-multiple wrapped questions)
+                        (catch Object e e))))
+    (is (= questions @received))
+    (is (= [{:question complete-question :answer default-answer}]
+           @(:recordings recording)))))
+
+(deftype InformWitness [messages]
+  interview/IInterviewer
+  (ask [_ _] default-answer)
+  (ask-multiple [_ _] [])
+  (inform [_ message stage] (swap! messages conj [message stage]) nil))
+
+(deftest recording-preserves-complete-ordered-pairs-and-delegates-inform
+  (let [queue (interview/make-queue-interviewer answers)
+        recording (interview/make-recording-interviewer queue)]
+    (is (= answers (interview/ask-multiple (:interviewer recording) questions)))
+    (is (= [{:question (first questions) :answer (first answers)}
+            {:question (second questions) :answer (second answers)}]
+           @(:recordings recording)))
+    (is (= :skipped (:value (interview/ask queue {})))))
+  (let [messages (atom [])
+        recording (interview/make-recording-interviewer (->InformWitness messages))]
+    (is (nil? (interview/inform (:interviewer recording) "review ready" "review")))
+    (is (= [["review ready" "review"]] @messages))
+    (is (= [] @(:recordings recording)))))
+
+(deftest accelerator-grammar-table
+  (doseq [[label expected]
+          [["[K] Keep" "K"] ["k) Keep" "K"] ["k - Keep" "K"]
+           ["keep" "K"] ["  [r] Revise  " "R"] ["  r) Revise " "R"]
+           ["  r - Revise " "R"] ["  revise " "R"] ["[7] Seven" "7"]
+           ["" ""] [" \t\n " ""] [nil ""]]]
+    (testing (str "accelerator for " (pr-str label))
+      (is (= expected (interview/parse-accelerator-key label))))))
+
+(defn- human-source [default-target]
+    (str "digraph Review {
+      start [shape=Mdiamond]
+      review [shape=hexagon, label=\"Review proposal\""
+      (when default-target (str ", human.default_choice=\"" default-target "\"")) "]
+      approve [shape=diamond]
+      revise [shape=diamond]
+      done [shape=Msquare]
+      start -> review
+      review -> approve [label=\"[A] Approve\", weight=100]
+      review -> revise [label=\"[R] Revise\", weight=1]
+      approve -> done
+      revise -> done
+    }"))
+
+(def gate-question
+  {:text "Review proposal" :type :multiple_choice :stage "review"
+   :options [{:key "A" :label "[A] Approve"}
+             {:key "R" :label "[R] Revise"}]})
+
+(defn- assert-gate-recording [recordings answer]
+  ;; Compare the sequence at its own level: native nested map equality treats
+  ;; the handler's lazy options differently from the expected vector.
+  (is (= 1 (count recordings)))
+  (is (= answer (:answer (first recordings))))
+  (is (= (dissoc gate-question :options)
+         (dissoc (:question (first recordings)) :options)))
+  (is (= (:options gate-question) (:options (:question (first recordings))))))
+
+(defn- run-human-route [answer default-target]
+  (let [queue (interview/make-queue-interviewer [answer {:value "sentinel"}])
+        recording (interview/make-recording-interviewer queue)
+        logs (str (os/temp-dir) "/attractor-interviewer-contract-" (random-uuid))
+        result (pipeline/run
+                 (human-source default-target)
+                 {:registry (handlers/make-handler-registry (:interviewer recording) nil)
+                  :logs-root logs})]
+    {:result result
+     :checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))
+     :recordings @(:recordings recording)
+     :remaining [(interview/ask queue {}) (interview/ask queue {})]}))
+
+(deftest real-human-gate-routes-second-choice-and-persists-selection
+  ;; TIMEOUT is injected: this proves handler policy, not input deadlines.
+  (doseq [[answer default-target]
+          [[{:value "r"} nil]
+           [{:value "[r] revise"} nil]
+           [{:value "unmatched" :text "[R] Revise"} nil]
+           [{:value :timeout} "revise"]]]
+    (testing (pr-str answer)
+      (let [evidence (run-human-route answer default-target)
+            checkpoint (:checkpoint evidence)]
+        (is (= :success (get-in evidence [:result :status])))
+        (is (= ["start" "review" "revise" "done"]
+               (get-in evidence [:result :completed_nodes])))
+        (is (= ["start" "review" "revise" "done"] (:completed_nodes checkpoint)))
+        (is (= "R" (get-in checkpoint [:context_values "human.gate.selected"])))
+        (is (= "[R] Revise" (get-in checkpoint [:context_values "human.gate.label"])))
+        (is (= ["revise"] (get-in checkpoint [:node_outcomes "review" :suggested_next_ids])))
+        (is (= "[R] Revise" (get-in checkpoint [:node_outcomes "review" :preferred_label])))
+        (assert-gate-recording (:recordings evidence) answer)
+        (is (= [{:value "sentinel"} {:value :skipped :text "queue exhausted"}]
+               (:remaining evidence)))))))
+
+(deftest skipped-and-timeout-without-default-return-distinct-handler-outcomes
+  ;; Direct handler calls avoid engine retry backoff; no elapsed-time claim.
+  (doseq [[answer expected]
+          [[{:value :skipped} {:status :fail :failure_reason "human skipped interaction"}]
+           [{:value :timeout} {:status :retry :failure_reason "human gate timeout, no default"}]]]
+    (let [queue (interview/make-queue-interviewer [answer])
+          recording (interview/make-recording-interviewer queue)
+          graph (parser/parse-dot (human-source nil))
+          handler (handlers/make-wait-human-handler (:interviewer recording))
+          ctx (context/make-context)]
+      (is (= expected (handler (parser/find-node graph "review") ctx graph "")))
+      (assert-gate-recording @(:recordings recording) answer)
+      (is (= :skipped (:value (interview/ask queue {}))))
+      (is (nil? (context/ctx-get ctx "human.gate.selected"))))))
