@@ -1,9 +1,12 @@
 (ns attractor.pipeline
   (:require [attractor.engine :as engine]
+            [attractor.context :as context]
             [attractor.parser :as parser]
             [attractor.transforms :as transforms]
             [attractor.validation :as validation]
-            [attractor.workflow :as workflow]))
+            [attractor.workflow :as workflow]
+            [clojure.string :as str]
+            [io :as io]))
 
 (defn prepare
   "Parse, transform, and validate DOT source without starting execution."
@@ -41,6 +44,121 @@
                 :workflow-manifest workflow/manifest-relative-path)
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
+
+(def ^:private resume-wrapper-option-keys
+  [:check-current?
+   :current-source-path
+   :custom-transforms
+   :custom-rules
+   :on-prepared
+   :on-published
+   :source-loader
+   :base-dir
+   :workflow-roots
+   :source-path
+   :dot-source
+   :graph
+   :workflow
+   :logs-root
+   :workflow-fingerprint
+   :workflow-manifest])
+
+(defn- checkpoint-parent [checkpoint-path]
+  (let [index (str/last-index-of checkpoint-path "/")]
+    (cond
+      (nil? index) "."
+      (zero? index) "/"
+      :else (subs checkpoint-path 0 index))))
+
+(defn- snapshot-missing! [message data]
+  (throw (ex-info message (merge {:category :workflow_snapshot_missing} data))))
+
+(defn- snapshot-corrupt! [message data]
+  (throw (ex-info message (merge {:category :workflow_snapshot_corrupt} data))))
+
+(defn- load-pinned-checkpoint! [checkpoint-path]
+  (when-not (and (string? checkpoint-path)
+                 (not (str/blank? checkpoint-path))
+                 (io/file-exists? checkpoint-path))
+    (snapshot-missing! "Workflow checkpoint is missing"
+                       {:kind :checkpoint :path checkpoint-path}))
+  (try
+    (context/load-checkpoint checkpoint-path)
+    (catch Object cause
+      (snapshot-corrupt! "Workflow checkpoint cannot be read"
+                         {:kind :checkpoint
+                          :path checkpoint-path
+                          :cause (str cause)}))))
+
+(defn- require-checkpoint-identity! [checkpoint]
+  (let [manifest-path (:workflow_manifest checkpoint)
+        fingerprint (:workflow_fingerprint checkpoint)]
+    (when (nil? manifest-path)
+      (snapshot-missing! "Workflow checkpoint has no snapshot manifest"
+                         {:kind :manifest
+                          :workflow-manifest manifest-path}))
+    (when-not (= workflow/manifest-relative-path manifest-path)
+      (snapshot-corrupt! "Workflow checkpoint manifest path is not canonical"
+                         {:kind :checkpoint
+                          :workflow-manifest manifest-path}))
+    (when (nil? fingerprint)
+      (snapshot-missing! "Workflow checkpoint has no snapshot fingerprint"
+                         {:kind :fingerprint}))
+    fingerprint))
+
+(defn- validate-checkpoint-graph! [checkpoint graph]
+  (let [current-node (:current_node checkpoint)
+        completed (:completed_nodes checkpoint)]
+    (when-not (and (string? current-node)
+                   (parser/find-node graph current-node))
+      (snapshot-corrupt! "Workflow checkpoint node is not in the captured plan"
+                         {:kind :checkpoint
+                          :current-node current-node}))
+    (when-not (and (vector? completed)
+                   (= current-node (last completed))
+                   (every? #(and (string? %)
+                                 (parser/find-node graph %))
+                           completed))
+      (snapshot-corrupt! "Workflow checkpoint history does not match the captured plan"
+                         {:kind :checkpoint
+                          :current-node current-node
+                          :completed-nodes completed}))
+    checkpoint))
+
+(defn- drift-diagnostic [changes]
+  {:rule "workflow_drift"
+   :severity :warning
+   :message (str "Pinned workflow differs from current sources: "
+                 (pr-str changes))})
+
+(defn resume
+  "Resume from an immutable, fingerprint-verified workflow snapshot.
+
+   Current source files are inspected only for drift diagnostics. Execution is
+   always delegated with the exact decoded root graph from the published run."
+  ([checkpoint-path] (resume checkpoint-path {}))
+  ([checkpoint-path options]
+   (let [checkpoint (load-pinned-checkpoint! checkpoint-path)
+         expected-fingerprint (require-checkpoint-identity! checkpoint)
+         run-root (checkpoint-parent checkpoint-path)
+         verified (workflow/verify-published! run-root expected-fingerprint)
+         _ (validate-checkpoint-graph! checkpoint (:graph verified))
+         changes (workflow/current-drift (:workflow verified) options)
+         caller-on-event (or (:on-event options) (fn [_] nil))
+         engine-options
+         (assoc (apply dissoc options resume-wrapper-option-keys)
+                :logs-root run-root
+                :on-event caller-on-event
+                :workflow-fingerprint expected-fingerprint
+                :workflow-manifest workflow/manifest-relative-path)
+         _ (when (seq changes)
+             (caller-on-event {:type :workflow.drift_detected
+                               :changes changes}))
+         outcome (engine/resume-pipeline checkpoint-path
+                                         (:graph verified)
+                                         engine-options)]
+     (assoc outcome :diagnostics
+            (if (seq changes) [(drift-diagnostic changes)] [])))))
 
 (defn- fresh-logs-root []
   (let [printed (str (random-uuid))

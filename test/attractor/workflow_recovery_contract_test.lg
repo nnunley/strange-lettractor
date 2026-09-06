@@ -560,3 +560,321 @@
       (is (= expected (:workflow_fingerprint checkpoint)))
       (is (= "workflow/manifest.edn" (:workflow_manifest checkpoint)))
       (is (= "compact" (:current_fidelity checkpoint))))))
+
+(def pinned-resume-dot
+  "digraph PinnedResume {
+     start [shape=Mdiamond]
+     work [type=pinned.original]
+     exit [shape=Msquare]
+     start -> work -> exit
+   }")
+
+(defn- interrupted-pinned-run []
+  (let [run-root (publication-root)
+        checkout (str (os/temp-dir) "/lettractor-current-" (random-uuid))
+        source-path (str checkout "/root.dot")
+        _ (io/mkdir checkout)
+        _ (io/spit source-path pinned-resume-dot)
+        result (pipeline/run pinned-resume-dot
+                             {:source-path source-path
+                              :logs-root run-root
+                              :max-steps 1})]
+    (is (= :fail (:status result)))
+    {:run-root run-root
+     :source-path source-path
+     :checkpoint-path (str run-root "/checkpoint.edn")}))
+
+(defn- update-edn-file! [path update-fn]
+  (io/spit path (pr-str (update-fn (edn/read-string (io/slurp path))))))
+
+(deftest current-drift-is-exact-sorted-and-root-override-only
+  (let [root-dir (str (os/temp-dir) "/lettractor-drift-" (random-uuid))
+        changed-path (str root-dir "/changed.dot")
+        unreadable-path (str root-dir "/unreadable.dot")
+        relocated-original (str root-dir "/old-root.dot")
+        relocated-path (str root-dir "/new-root.dot")
+        root-symlink (str root-dir "/root-link.dot")
+        missing-path (str root-dir "/missing.dot")
+        _ (io/mkdir root-dir)
+        _ (io/spit changed-path "changed")
+        _ (io/spit unreadable-path "unreadable")
+        _ (io/spit relocated-original "captured")
+        _ (io/spit relocated-path "captured")
+        _ (os/sh "ln" "-s" relocated-original root-symlink)
+        manifest
+        {:root-plan-id workflow/root-plan-id
+         :sources
+         [{:logical-id "workflow://root/z-unreadable"
+           :source-sha256 (workflow/sha256-text "expected")
+           :physical-id unreadable-path}
+          {:logical-id workflow/root-plan-id
+           :source-sha256 (workflow/sha256-text "captured")
+           :physical-id relocated-original}
+          {:logical-id "workflow://root/a-changed"
+           :source-sha256 (workflow/sha256-text "expected")
+           :physical-id changed-path}
+          {:logical-id "workflow://root/m-missing"
+           :source-sha256 (workflow/sha256-text "expected")
+           :physical-id missing-path}]}
+        real-slurp io/slurp
+        changes
+        (with-redefs [io/slurp
+                      (fn [path]
+                        (if (= (os/canonical-path unreadable-path)
+                               (os/canonical-path path))
+                          (throw (ex-info "denied" {}))
+                          (real-slurp path)))]
+          (workflow/current-drift
+            manifest {:current-source-path relocated-path}))]
+    (is (= [{:logical-id "workflow://root"
+             :state :relocated
+             :expected-sha256 (workflow/sha256-text "captured")
+             :actual-sha256 (workflow/sha256-text "captured")
+             :path (os/canonical-path relocated-path)}
+            {:logical-id "workflow://root/a-changed"
+             :state :changed
+             :expected-sha256 (workflow/sha256-text "expected")
+             :actual-sha256 (workflow/sha256-text "changed")
+             :path (os/canonical-path changed-path)}
+            {:logical-id "workflow://root/m-missing"
+             :state :missing
+             :expected-sha256 (workflow/sha256-text "expected")
+             :path missing-path}
+            {:logical-id "workflow://root/z-unreadable"
+             :state :unreadable
+             :expected-sha256 (workflow/sha256-text "expected")
+             :path (os/canonical-path unreadable-path)}]
+           changes))
+    (is (= []
+           (workflow/current-drift
+             {:root-plan-id workflow/root-plan-id
+              :sources [{:logical-id workflow/root-plan-id
+                         :source-sha256 (workflow/sha256-text "captured")
+                         :physical-id relocated-original}]}
+             {})))
+    (is (= []
+           (workflow/current-drift
+             {:root-plan-id workflow/root-plan-id
+              :sources [{:logical-id workflow/root-plan-id
+                         :source-sha256 (workflow/sha256-text "captured")
+                         :physical-id relocated-original}]}
+             {:current-source-path root-symlink})))
+    (is (= [] (workflow/current-drift manifest {:check-current? false})))))
+
+(deftest public-resume-executes-captured-bytes-and-reports-canonical-drift
+  (let [{:keys [run-root source-path checkpoint-path]}
+        (interrupted-pinned-run)
+        _ (io/spit source-path "this is no longer valid DOT")
+        events (atom [])
+        original-calls (atom 0)
+        changed-calls (atom 0)
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "pinned.original"
+            (fn [_ _ _ _]
+              (swap! original-calls inc)
+              {:status :success
+               :artifacts [{:name "captured" :value "yes"}]}))
+        _ (handlers/register-handler!
+            registry "pinned.changed"
+            (fn [_ _ _ _]
+              (swap! changed-calls inc)
+              {:status :success}))
+        decoy-root (str (os/temp-dir) "/run_latest-" (random-uuid))
+        expected-change
+        {:logical-id workflow/root-plan-id
+         :state :changed
+         :expected-sha256 (workflow/sha256-text pinned-resume-dot)
+         :actual-sha256 (workflow/sha256-text "this is no longer valid DOT")
+         :path (os/canonical-path source-path)}
+        result (pipeline/resume
+                 checkpoint-path
+                 {:registry registry
+                  :logs-root decoy-root
+                  :on-event #(swap! events conj %)})
+        final-checkpoint (context/load-checkpoint checkpoint-path)
+        warning {:rule "workflow_drift"
+                 :severity :warning
+                 :message
+                 (str "Pinned workflow differs from current sources: "
+                      (pr-str [expected-change]))}]
+    (is (= :success (:status result)))
+    (is (= 1 @original-calls))
+    (is (= 0 @changed-calls))
+    (is (= [warning] (:diagnostics result)))
+    (is (= {:type :workflow.drift_detected :changes [expected-change]}
+           (first @events)))
+    (is (= :pipeline.started (:type (second @events))))
+    (is (= run-root (:logs_root (second @events))))
+    (is (= "exit" (:current_node final-checkpoint)))
+    (is (= "workflow/manifest.edn" (:workflow_manifest final-checkpoint)))
+    (is (io/file-exists? (str run-root "/work/status.json")))
+    (is (not (io/file-exists? (str decoy-root "/work/status.json"))))))
+
+(deftest public-resume-can-suppress-current-source-comparison
+  (let [{:keys [source-path checkpoint-path]} (interrupted-pinned-run)
+        _ (io/spit source-path "invalid current source")
+        events (atom [])
+        result (pipeline/resume checkpoint-path
+                                {:check-current? false
+                                 :on-event #(swap! events conj %)})]
+    (is (= :success (:status result)))
+    (is (= [] (:diagnostics result)))
+    (is (empty? (filter #(= :workflow.drift_detected (:type %)) @events)))
+    (is (= :pipeline.started (:type (first @events))))))
+
+(deftest public-resume-survives-a-deleted-current-source
+  (let [{:keys [source-path checkpoint-path]} (interrupted-pinned-run)
+        recorded-source-path (os/canonical-path source-path)
+        _ (io/delete-file source-path)
+        calls (atom 0)
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "pinned.original"
+            (fn [_ _ _ _]
+              (swap! calls inc)
+              {:status :success}))
+        result (pipeline/resume checkpoint-path
+                                {:registry registry
+                                 :on-event #(swap! events conj %)})
+        change {:logical-id workflow/root-plan-id
+                :state :missing
+                :expected-sha256 (workflow/sha256-text pinned-resume-dot)
+                :path recorded-source-path}]
+    (is (= :success (:status result)))
+    (is (= 1 @calls))
+    (is (= {:type :workflow.drift_detected :changes [change]}
+           (first @events)))
+    (is (= [{:rule "workflow_drift"
+             :severity :warning
+             :message
+             (str "Pinned workflow differs from current sources: "
+                  (pr-str [change]))}]
+           (:diagnostics result)))))
+
+(deftest public-resume-rejects-untrusted-manifest-paths-before-the-engine
+  (doseq [manifest-value ["/workflow/manifest.edn"
+                          "../workflow/manifest.edn"
+                          "workflow/../workflow/manifest.edn"
+                          "workflow/other.edn"
+                          :workflow/manifest]]
+    (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+          checkpoint (context/load-checkpoint checkpoint-path)
+          _ (context/save-checkpoint
+              (assoc checkpoint :workflow_manifest manifest-value)
+              checkpoint-path)
+          events (atom [])
+          calls (atom 0)
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler!
+              registry "pinned.original"
+              (fn [_ _ _ _]
+                (swap! calls inc)
+                {:status :success}))
+          error (workflow-error
+                  #(pipeline/resume checkpoint-path
+                                    {:registry registry
+                                     :on-event #(swap! events conj %)}))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (= manifest-value (:workflow-manifest error)))
+      (is (= [] @events))
+      (is (= 0 @calls)))))
+
+(deftest public-resume-fails-closed-for-missing-or-corrupt-captures
+  (doseq [[label attack expected-category]
+          [[:manifest-missing
+            (fn [run-root _checkpoint-path]
+              (io/delete-file (str run-root "/workflow/manifest.edn")))
+            :workflow_snapshot_missing]
+           [:source-missing
+            (fn [run-root _checkpoint-path]
+              (let [manifest (workflow/read-manifest!
+                               (str run-root "/workflow/manifest.edn"))]
+                (io/delete-file (str run-root "/" (get-in manifest [:sources 0 :path])))))
+            :workflow_snapshot_missing]
+           [:plan-missing
+            (fn [run-root _checkpoint-path]
+              (let [manifest (workflow/read-manifest!
+                               (str run-root "/workflow/manifest.edn"))]
+                (io/delete-file (str run-root "/" (get-in manifest [:plans 0 :path])))))
+            :workflow_snapshot_missing]
+           [:source-corrupt
+            (fn [run-root _checkpoint-path]
+              (let [manifest (workflow/read-manifest!
+                               (str run-root "/workflow/manifest.edn"))]
+                (io/spit (str run-root "/" (get-in manifest [:sources 0 :path]))
+                         "corrupt")))
+            :workflow_snapshot_corrupt]
+           [:plan-corrupt
+            (fn [run-root _checkpoint-path]
+              (let [manifest (workflow/read-manifest!
+                               (str run-root "/workflow/manifest.edn"))]
+                (io/spit (str run-root "/" (get-in manifest [:plans 0 :path]))
+                         "corrupt")))
+            :workflow_snapshot_corrupt]
+           [:manifest-fingerprint
+            (fn [run-root _checkpoint-path]
+              (update-edn-file!
+                (str run-root "/workflow/manifest.edn")
+                #(assoc % :fingerprint (apply str (repeat 64 "0")))))
+            :workflow_snapshot_corrupt]
+           [:manifest-format
+            (fn [run-root _checkpoint-path]
+              (update-edn-file!
+                (str run-root "/workflow/manifest.edn")
+                #(assoc % :format-version 2)))
+            :workflow_snapshot_corrupt]
+           [:manifest-root
+            (fn [run-root _checkpoint-path]
+              (update-edn-file!
+                (str run-root "/workflow/manifest.edn")
+                #(assoc % :root-plan-id "workflow://missing")))
+            :workflow_snapshot_corrupt]
+           [:checkpoint-fingerprint
+            (fn [_run-root checkpoint-path]
+              (update-edn-file!
+                checkpoint-path
+                #(assoc % :workflow_fingerprint
+                        (apply str (repeat 64 "f")))))
+            :workflow_snapshot_corrupt]
+           [:checkpoint-node
+            (fn [_run-root checkpoint-path]
+              (update-edn-file!
+                checkpoint-path
+                #(assoc % :current_node "not-in-captured-plan")))
+            :workflow_snapshot_corrupt]]]
+    (testing (name label)
+      (let [{:keys [run-root checkpoint-path]} (interrupted-pinned-run)
+            _ (attack run-root checkpoint-path)
+            events (atom [])
+            calls (atom 0)
+            registry (handlers/make-handler-registry)
+            _ (handlers/register-handler!
+                registry "pinned.original"
+                (fn [_ _ _ _]
+                  (swap! calls inc)
+                  {:status :success}))
+            error (workflow-error
+                    #(pipeline/resume checkpoint-path
+                                      {:registry registry
+                                       :on-event #(swap! events conj %)}))]
+        (is (= expected-category (:category error)))
+        (is (or (:path error) (:kind error) (:format-version error)
+                (:root-plan-id error) (:expected error) (:current-node error)))
+        (is (= [] @events))
+        (is (= 0 @calls))))))
+
+(deftest public-resume-requires-both-checkpoint-identity-fields
+  (doseq [[missing-key expected-kind]
+          [[:workflow_manifest :manifest]
+           [:workflow_fingerprint :fingerprint]]]
+    (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+          _ (update-edn-file! checkpoint-path #(dissoc % missing-key))
+          events (atom [])
+          error (workflow-error
+                  #(pipeline/resume checkpoint-path
+                                    {:on-event #(swap! events conj %)}))]
+      (is (= :workflow_snapshot_missing (:category error)))
+      (is (= expected-kind (:kind error)))
+      (is (= [] @events)))))

@@ -591,6 +591,8 @@ digraph Gate {
     (is (= 2 @attempts))
     (is (= [2] @delays) (str "restored retry delays: " @delays))
     (is (= 2 (get (:node_retries final-checkpoint) "work")))
+    (is (not (contains? final-checkpoint :workflow_fingerprint)))
+    (is (not (contains? final-checkpoint :workflow_manifest)))
     ))
 
 (deftest test-resume-does-not-repeat-a-completed-failed-node

@@ -533,6 +533,79 @@
        :diagnostics []
        :workflow manifest})))
 
+(defn- unreadable-drift [record path]
+  {:logical-id (:logical-id record)
+   :state :unreadable
+   :expected-sha256 (:source-sha256 record)
+   :path path})
+
+(defn- current-source-change [record root-plan-id options]
+  (let [logical-id (:logical-id record)
+        recorded-path (:physical-id record)
+        override? (and (= logical-id root-plan-id)
+                       (contains? options :current-source-path))
+        selected-path (if override?
+                        (:current-source-path options)
+                        recorded-path)
+        expected (:source-sha256 record)]
+    ;; An in-memory workflow has no current file to compare. Its captured bytes
+    ;; remain fully verified by verify-published! and it is not drift by itself.
+    (when (and (string? selected-path) (not (str/blank? selected-path)))
+      (if-not (io/file-exists? selected-path)
+        {:logical-id logical-id
+         :state :missing
+         :expected-sha256 expected
+         :path selected-path}
+        (let [resolved
+              (try
+                (os/canonical-path selected-path)
+                (catch Object _ nil))]
+          (if (nil? resolved)
+            (unreadable-drift record selected-path)
+            (let [bytes
+                  (try
+                    {:value (io/slurp resolved)}
+                    (catch Object _ {:unreadable true}))]
+              (if (:unreadable bytes)
+                (unreadable-drift record resolved)
+                (let [actual (sha256-text (:value bytes))]
+                  (if (not= expected actual)
+                    {:logical-id logical-id
+                     :state :changed
+                     :expected-sha256 expected
+                     :actual-sha256 actual
+                     :path resolved}
+                    (when override?
+                      (let [recorded-resolved
+                            (try
+                              (when (and (string? recorded-path)
+                                         (not (str/blank? recorded-path))
+                                         (io/file-exists? recorded-path))
+                                (os/canonical-path recorded-path))
+                              (catch Object _ nil))]
+                        (when (not= recorded-resolved resolved)
+                          {:logical-id logical-id
+                           :state :relocated
+                           :expected-sha256 expected
+                           :actual-sha256 actual
+                           :path resolved})))))))))))))
+
+(defn current-drift
+  "Compare a published manifest's physical source records with current files.
+
+   The returned records are diagnostic evidence only; captured source and plan
+   bytes remain the sole execution inputs. :current-source-path applies only to
+   the root plan, and :check-current? false disables all filesystem reads."
+  ([manifest] (current-drift manifest {}))
+  ([manifest options]
+   (if (= false (:check-current? options))
+     []
+     (->> (:sources manifest)
+          (map #(current-source-change % (:root-plan-id manifest) options))
+          (remove nil?)
+          (sort-by :logical-id)
+          vec))))
+
 (defn- publish-content! [target bytes kind]
   (if (io/file-exists? target)
     (verify-file-bytes! target bytes kind)
