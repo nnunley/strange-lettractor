@@ -18,7 +18,7 @@
      :diagnostics diagnostics
      :workflow (workflow/root-bundle dot-source prepared-graph options)})))
 
-(def wrapper-option-keys
+(def ^:private wrapper-option-keys
   [:custom-transforms
    :custom-rules
    :on-prepared

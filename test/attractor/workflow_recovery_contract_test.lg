@@ -261,6 +261,23 @@
     (is (not= (workflow/closure-fingerprint base)
               (workflow/closure-fingerprint referenced)))))
 
+(deftest runtime-bundle-materialization-is-bound-to-the-fingerprinted-index
+  (let [prepared (pipeline/prepare root-dot)
+        graph (:graph prepared)
+        changed-graph (assoc graph :goal "unfingerprinted mutation")
+        changed-sha (workflow/plan-fingerprint changed-graph)
+        attacked
+        (-> prepared
+            (assoc :graph changed-graph)
+            (assoc-in [:workflow :plans workflow/root-plan-id :graph] changed-graph)
+            (assoc-in [:workflow :plans workflow/root-plan-id :plan-sha256]
+                      changed-sha))]
+    (is (= :workflow_snapshot_corrupt
+           (:category
+             (workflow-error
+               #(workflow/verify-bundle! (:workflow attacked)
+                                         (:graph attacked))))))))
+
 (defn- publication-root []
   (str (os/temp-dir) "/lettractor-publication-" (random-uuid)))
 
@@ -374,14 +391,17 @@
         _ (io/mkdir (str workflow-dir "/.publish.lock"))
         error (workflow-error #(workflow/publish! (prepared-bundle) run-root))]
     (is (= :workflow_publication_incomplete (:category error)))
+    (is (= workflow/publish-lock-wait-ms (:wait-ms error)))
     (is (nil? (os/stat (str workflow-dir "/manifest.edn"))))))
 
 (deftest concurrent-publishers-never-corrupt-the-committed-bundle
   (let [run-root (publication-root)
         bundle (prepared-bundle)
         started (promise)
+        contender-observed (promise)
         release (promise)
         real-spit io/spit
+        real-sh os/sh
         first (core/future
                 (with-redefs [io/spit
                               (fn [path content]
@@ -389,20 +409,26 @@
                                            (re-find #"[.]tmp-" path))
                                   (deliver started true)
                                   (deref release 1000 :timeout))
-                                (real-spit path content))]
+                                (real-spit path content))
+                              os/sh
+                              (fn [command path]
+                                (let [result (real-sh command path)]
+                                  (when (and (= command "mkdir")
+                                             (not (zero? (:exit result))))
+                                    (deliver contender-observed true))
+                                  result))]
                   (workflow/publish! bundle run-root)))
         _ (deref started 1000 :not-started)
         second (core/future
                  (try
                    {:path (workflow/publish! bundle run-root)}
-                   (catch ExceptionInfo error
+                 (catch ExceptionInfo error
                      {:error (ex-data error)})))
-        second-result (deref second 1000 :timeout)
+        _ (deref contender-observed 1000 :not-observed)
         _ (deliver release true)
-        first-path (deref first 1000 :timeout)]
-    (is (or (= :workflow_publication_incomplete
-               (get-in second-result [:error :category]))
-            (= first-path (:path second-result))))
+        first-path (deref first 1000 :timeout)
+        second-result (deref second 1000 :timeout)]
+    (is (= first-path (:path second-result)))
     (is (= (:fingerprint bundle)
            (:fingerprint (workflow/read-manifest! first-path))))))
 
@@ -418,3 +444,73 @@
            (:category
              (workflow-error
                #(workflow/verify-published! run-root "not-the-fingerprint")))))))
+
+(deftest published-manifest-materialization-is-bound-and-confined
+  (doseq [mutate
+          [(fn [manifest]
+             (assoc-in manifest [:plans 0 :plan-sha256]
+                       (apply str (repeat 64 "0"))))
+           (fn [manifest]
+             (assoc-in manifest [:plans 0 :path] "../outside.edn"))
+           (fn [manifest]
+             (update manifest :plans conj (first (:plans manifest))))
+           (fn [manifest]
+             (assoc manifest :sources []))
+           (fn [manifest]
+             (assoc-in manifest [:plans 0 :unexpected] true))
+           (fn [manifest]
+             (assoc-in manifest [:index :plans] {}))]]
+    (let [run-root (publication-root)
+          bundle (prepared-bundle)
+          manifest-path (workflow/publish! bundle run-root)
+          manifest (workflow/read-manifest! manifest-path)
+          attacked (mutate manifest)
+          outside-path (str run-root "/../outside.edn")
+          _ (io/spit manifest-path (pr-str attacked))
+          real-slurp io/slurp
+          reads (atom [])
+          error
+          (with-redefs [io/slurp (fn [path]
+                                  (swap! reads conj path)
+                                  (real-slurp path))]
+            (workflow-error
+              #(workflow/verify-published! run-root (:fingerprint bundle))))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (not (some #(= outside-path %) @reads))))))
+
+(deftest verify-published-reads-each-plan-once-and-returns-that-verified-value
+  (let [run-root (publication-root)
+        bundle (prepared-bundle)
+        manifest-path (workflow/publish! bundle run-root)
+        manifest (workflow/read-manifest! manifest-path)
+        plan-path (str run-root "/" (get-in manifest [:plans 0 :path]))
+        real-slurp io/slurp
+        plan-reads (atom 0)
+        verified
+        (with-redefs [io/slurp
+                      (fn [path]
+                        (if (= path plan-path)
+                          (do
+                            (swap! plan-reads inc)
+                            (if (= 1 @plan-reads)
+                              (real-slurp path)
+                              "corrupted on a second read"))
+                          (real-slurp path)))]
+          (workflow/verify-published! run-root (:fingerprint bundle)))]
+    (is (= 1 @plan-reads))
+    (is (= (get-in bundle [:plans workflow/root-plan-id :graph])
+           (:graph verified)))))
+
+(deftest verify-published-normalizes-a-missing-source
+  (let [run-root (publication-root)
+        bundle (prepared-bundle)
+        manifest-path (workflow/publish! bundle run-root)
+        manifest (workflow/read-manifest! manifest-path)
+        source-path (str run-root "/" (get-in manifest [:sources 0 :path]))
+        _ (io/delete-file source-path)
+        error
+        (workflow-error
+          #(workflow/verify-published! run-root (:fingerprint bundle)))]
+    (is (= :workflow_snapshot_missing (:category error)))
+    (is (= :source (:kind error)))
+    (is (= source-path (:path error)))))

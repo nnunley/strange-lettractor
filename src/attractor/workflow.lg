@@ -1,5 +1,6 @@
 (ns attractor.workflow
-  (:require [clojure.edn :as edn]
+  (:require [clojure.core :as core]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
             [io :as io]
@@ -237,6 +238,8 @@
      :workflow-roots roots}))
 
 (def manifest-relative-path "workflow/manifest.edn")
+(def publish-lock-wait-ms 500)
+(def publish-lock-poll-ms 5)
 
 (defn- uuid-text []
   (let [printed (str (random-uuid))]
@@ -251,6 +254,113 @@
   (throw (ex-info "A different workflow is already published for this run"
                   {:category :workflow_already_published
                    :path path})))
+
+(defn- digest? [value]
+  (and (string? value) (some? (re-matches #"[0-9a-f]{64}" value))))
+
+(defn- exact-keys? [value expected]
+  (= (set (keys value)) expected))
+
+(defn- records-by-logical-id! [records kind]
+  (when-not (vector? records)
+    (snapshot-error! "Workflow records must be a vector" {:kind kind}))
+  (reduce
+    (fn [by-id record]
+      (when-not (map? record)
+        (snapshot-error! "Workflow record must be a map" {:kind kind}))
+      (let [logical-id (:logical-id record)]
+        (when-not (and (string? logical-id) (not (str/blank? logical-id)))
+          (snapshot-error! "Workflow record has an invalid logical ID"
+                           {:kind kind :logical-id logical-id}))
+        (when (contains? by-id logical-id)
+          (snapshot-error! "Workflow records contain a duplicate logical ID"
+                           {:kind kind :logical-id logical-id}))
+        (assoc by-id logical-id record)))
+    {}
+    records))
+
+(defn- validate-index! [index]
+  (when-not (map? index)
+    (snapshot-error! "Workflow index must be a map" {}))
+  (when-not (exact-keys? index #{:format-version :root-plan-id :sources :plans})
+    (snapshot-error! "Workflow index has an invalid shape" {}))
+  (when-not (= 1 (:format-version index))
+    (snapshot-error! "Unsupported workflow index version"
+                     {:format-version (:format-version index)}))
+  (let [root-id (:root-plan-id index)
+        sources (records-by-logical-id! (:sources index) :source-index)
+        plans (records-by-logical-id! (:plans index) :plan-index)]
+    (when-not (and (string? root-id) (contains? plans root-id))
+      (snapshot-error! "Workflow index root plan is missing"
+                       {:root-plan-id root-id}))
+    (doseq [[logical-id source] sources]
+      (when-not (and (exact-keys? source #{:logical-id :source-sha256})
+                     (digest? (:source-sha256 source)))
+        (snapshot-error! "Workflow source index has an invalid digest"
+                         {:logical-id logical-id})))
+    (doseq [[logical-id plan] plans]
+      (when-not (and (exact-keys? plan #{:logical-id :primary-plan-id
+                                         :plan-sha256 :source-sha256 :references})
+                     (digest? (:plan-sha256 plan))
+                     (digest? (:source-sha256 plan))
+                     (string? (:primary-plan-id plan))
+                     (vector? (:references plan)))
+        (snapshot-error! "Workflow plan index has an invalid shape"
+                         {:logical-id logical-id}))
+      (when-not (= (:source-sha256 plan)
+                   (:source-sha256 (get sources logical-id)))
+        (snapshot-error! "Workflow plan source is not bound to its source index"
+                         {:logical-id logical-id})))
+    {:root-id root-id :sources sources :plans plans}))
+
+(defn- same-logical-ids? [left right]
+  (= (set (keys left)) (set (keys right))))
+
+(defn- validate-manifest! [manifest]
+  (when-not (map? manifest)
+    (snapshot-error! "Workflow manifest must contain an EDN map" {}))
+  (when-not (exact-keys? manifest #{:format-version :fingerprint :root-plan-id
+                                    :index :sources :plans :workflow-roots})
+    (snapshot-error! "Workflow manifest has an invalid shape" {}))
+  (when-not (= 1 (:format-version manifest))
+    (snapshot-error! "Unsupported workflow manifest version"
+                     {:format-version (:format-version manifest)}))
+  (let [{:keys [root-id sources plans]} (validate-index! (:index manifest))
+        materialized-sources
+        (records-by-logical-id! (:sources manifest) :source)
+        materialized-plans
+        (records-by-logical-id! (:plans manifest) :plan)]
+    (when-not (= root-id (:root-plan-id manifest))
+      (snapshot-error! "Workflow manifest root differs from its index"
+                       {:root-plan-id (:root-plan-id manifest)}))
+    (when-not (and (same-logical-ids? sources materialized-sources)
+                   (same-logical-ids? plans materialized-plans))
+      (snapshot-error! "Workflow manifest records are incomplete" {}))
+    (doseq [[logical-id indexed] sources]
+      (let [materialized (get materialized-sources logical-id)
+            digest (:source-sha256 indexed)
+            expected-path (str "workflow/sources/" digest ".dot")]
+        (when-not (and (exact-keys? materialized
+                                   #{:logical-id :source-sha256 :path :physical-id})
+                       (= digest (:source-sha256 materialized))
+                       (= expected-path (:path materialized))
+                       (or (nil? (:physical-id materialized))
+                           (string? (:physical-id materialized))))
+          (snapshot-error! "Workflow source materialization does not match its index"
+                           {:logical-id logical-id :path (:path materialized)}))))
+    (doseq [[logical-id indexed] plans]
+      (let [materialized (get materialized-plans logical-id)
+            digest (:plan-sha256 indexed)
+            expected-path (str "workflow/plans/" digest ".edn")]
+        (when-not (and (exact-keys? materialized
+                                   #{:logical-id :plan-sha256 :path})
+                       (= digest (:plan-sha256 materialized))
+                       (= expected-path (:path materialized)))
+          (snapshot-error! "Workflow plan materialization does not match its index"
+                           {:logical-id logical-id :path (:path materialized)}))))
+    {:root-id root-id
+     :sources materialized-sources
+     :plans materialized-plans}))
 
 (defn- manifest-for [bundle]
   (let [records-by-id
@@ -312,41 +422,89 @@
   path)
 
 (defn- verify-manifest-files! [run-root manifest]
+  (let [{:keys [sources plans]} (validate-manifest! manifest)]
   (doseq [source (:sources manifest)]
-    (let [path (str run-root "/" (:path source))
-          bytes (io/slurp path)]
+    (let [path (str run-root "/" (:path source))]
+      (when-not (io/file-exists? path)
+        (throw (ex-info "Workflow source is missing"
+                        {:category :workflow_snapshot_missing
+                         :kind :source :path path})))
+      (let [bytes
+            (try
+              (io/slurp path)
+              (catch Object cause
+                (snapshot-error! "Workflow source cannot be read"
+                                 {:kind :source :path path :cause (str cause)})))]
       (when-not (= (:source-sha256 source) (sha256-text bytes))
         (snapshot-error! "Workflow source digest does not match"
                          {:kind :source :path path
-                          :logical-id (:logical-id source)}))))
-  (doseq [plan (:plans manifest)]
-    (let [path (str run-root "/" (:path plan))]
-      (when-not (io/file-exists? path)
-        (throw (ex-info "Workflow plan is missing"
-                        {:category :workflow_snapshot_missing
-                         :kind :plan :path path})))
-      (let [graph
-            (try
-              (decode-canonical-tree (edn/read-string (io/slurp path)))
-              (catch Object cause
-                (snapshot-error! "Workflow plan is not valid EDN"
-                                 {:kind :plan :path path :cause (str cause)})))]
-        (when-not (= (:plan-sha256 plan) (plan-fingerprint graph))
-          (snapshot-error! "Workflow plan digest does not match"
-                           {:kind :plan :path path
-                            :logical-id (:logical-id plan)})))))
-  manifest)
+                          :logical-id (:logical-id source)})))))
+  (reduce
+    (fn [verified-plans plan]
+      (let [path (str run-root "/" (:path plan))]
+        (when-not (io/file-exists? path)
+          (throw (ex-info "Workflow plan is missing"
+                          {:category :workflow_snapshot_missing
+                           :kind :plan :path path})))
+        (let [graph
+              (try
+                (decode-canonical-tree (edn/read-string (io/slurp path)))
+                (catch Object cause
+                  (snapshot-error! "Workflow plan is not valid EDN"
+                                   {:kind :plan :path path :cause (str cause)})))]
+          (when-not (= (:plan-sha256 plan) (plan-fingerprint graph))
+            (snapshot-error! "Workflow plan digest does not match"
+                             {:kind :plan :path path
+                              :logical-id (:logical-id plan)}))
+          (assoc verified-plans (:logical-id plan) graph))))
+    {}
+    (:plans manifest))))
 
 (defn verify-bundle! [bundle graph]
+  (when-not (and (map? bundle)
+                 (exact-keys? bundle #{:format-version :fingerprint :root-plan-id
+                                       :plans :index :source-records
+                                       :workflow-roots}))
+    (snapshot-error! "Runtime workflow bundle has an invalid shape" {}))
   (when-not (= 1 (:format-version bundle))
     (snapshot-error! "Unsupported workflow format version"
                      {:format-version (:format-version bundle)}))
-  (when-not (= (:fingerprint bundle)
-               (closure-fingerprint (:index bundle)))
+  (let [{:keys [root-id sources plans]} (validate-index! (:index bundle))]
+  (when-not (= (:fingerprint bundle) (closure-fingerprint (:index bundle)))
     (snapshot-error! "Workflow fingerprint does not match its index"
                      {:expected (:fingerprint bundle)}))
-  (let [root-id (:root-plan-id bundle)
-        plan (get-in bundle [:plans root-id])]
+  (when-not (= root-id (:root-plan-id bundle))
+    (snapshot-error! "Workflow root plan differs from its index"
+                     {:root-plan-id (:root-plan-id bundle)}))
+  (let [runtime-plans (:plans bundle)
+        runtime-sources
+        (records-by-logical-id! (:source-records bundle) :runtime-source)]
+    (when-not (and (map? runtime-plans)
+                   (same-logical-ids? plans runtime-plans)
+                   (same-logical-ids? sources runtime-sources))
+      (snapshot-error! "Runtime workflow records are incomplete" {}))
+    (doseq [[logical-id indexed] sources]
+      (let [runtime (get runtime-sources logical-id)]
+        (when-not (and (exact-keys? runtime #{:logical-id :physical-id :source})
+                       (string? (:source runtime))
+                       (= (:source-sha256 indexed)
+                          (sha256-text (:source runtime))))
+          (snapshot-error! "Runtime workflow source differs from its index"
+                           {:logical-id logical-id}))))
+    (doseq [[logical-id indexed] plans]
+      (let [runtime (get runtime-plans logical-id)]
+        (when-not (and (map? runtime)
+                       (exact-keys? runtime #{:graph :plan-sha256 :source-sha256
+                                              :primary-plan-id :references})
+                       (= (:plan-sha256 indexed) (:plan-sha256 runtime))
+                       (= (:source-sha256 indexed) (:source-sha256 runtime))
+                       (= (:primary-plan-id indexed) (:primary-plan-id runtime))
+                       (= (:references indexed) (:references runtime))
+                       (= (:plan-sha256 indexed)
+                          (plan-fingerprint (:graph runtime))))
+          (snapshot-error! "Runtime workflow plan differs from its index"
+                           {:logical-id logical-id}))))
+  (let [plan (get runtime-plans root-id)]
     (when-not plan
       (snapshot-error! "Workflow root plan is missing" {:root-plan-id root-id}))
     (when-not (= graph (:graph plan))
@@ -355,15 +513,12 @@
     (when-not (= (:plan-sha256 plan) (plan-fingerprint (:graph plan)))
       (snapshot-error! "Workflow root plan digest does not match"
                        {:root-plan-id root-id})))
-  bundle)
+  bundle)))
 
 (defn verify-published! [run-root expected-fingerprint]
   (let [manifest-path (str run-root "/" manifest-relative-path)
-        manifest (read-manifest! manifest-path)]
-    (when-not (= 1 (:format-version manifest))
-      (snapshot-error! "Unsupported workflow manifest version"
-                       {:path manifest-path
-                        :format-version (:format-version manifest)}))
+        manifest (read-manifest! manifest-path)
+        {:keys [root-id]} (validate-manifest! manifest)]
     (when-not (= (:fingerprint manifest)
                  (closure-fingerprint (:index manifest)))
       (snapshot-error! "Workflow manifest fingerprint does not match its index"
@@ -373,16 +528,8 @@
                        {:path manifest-path
                         :expected expected-fingerprint
                         :actual (:fingerprint manifest)}))
-    (verify-manifest-files! run-root manifest)
-    (let [root-id (:root-plan-id manifest)
-          plan-record (first (filter #(= root-id (:logical-id %))
-                                     (:plans manifest)))]
-      (when-not plan-record
-        (snapshot-error! "Workflow root plan is absent from the manifest"
-                         {:path manifest-path :root-plan-id root-id}))
-      {:graph (decode-canonical-tree
-                (edn/read-string
-                  (io/slurp (str run-root "/" (:path plan-record)))))
+    (let [verified-plans (verify-manifest-files! run-root manifest)]
+      {:graph (get verified-plans root-id)
        :diagnostics []
        :workflow manifest})))
 
@@ -408,6 +555,25 @@
     (verify-manifest-files! run-root (read-manifest! manifest-path))
     manifest-path))
 
+(defn- acquire-publication-lock! [lock-dir manifest-path]
+  (let [deadline (+ (System/currentTimeMillis) publish-lock-wait-ms)]
+    (loop []
+      (if (io/file-exists? manifest-path)
+        :published
+        (let [lock-result (os/sh "mkdir" lock-dir)]
+          (cond
+            (zero? (:exit lock-result)) :acquired
+            (io/file-exists? manifest-path) :published
+            (>= (System/currentTimeMillis) deadline)
+            (throw (ex-info "Workflow publication lock remained incomplete"
+                            {:category :workflow_publication_incomplete
+                             :path lock-dir
+                             :wait-ms publish-lock-wait-ms}))
+            :else
+            (do
+              (core/sleep publish-lock-poll-ms)
+              (recur))))))))
+
 (defn publish!
   "Publish an immutable workflow bundle below run-root and return its manifest.
 
@@ -426,13 +592,9 @@
       (verify-existing-publication! bundle run-root manifest-path)
       (do
         (io/mkdir workflow-dir)
-        (let [lock-result (os/sh "mkdir" lock-dir)]
-          (if-not (zero? (:exit lock-result))
-            (if (io/file-exists? manifest-path)
-              (verify-existing-publication! bundle run-root manifest-path)
-              (throw (ex-info "Workflow publication lock exists without a manifest"
-                              {:category :workflow_publication_incomplete
-                               :path lock-dir}))))
+        (let [lock-state (acquire-publication-lock! lock-dir manifest-path)]
+          (if (= :published lock-state)
+            (verify-existing-publication! bundle run-root manifest-path)
             (try
               (if (io/file-exists? manifest-path)
                 (verify-existing-publication! bundle run-root manifest-path)
@@ -460,4 +622,4 @@
                   manifest-path)))
               (finally
                 (when (io/file-exists? lock-dir)
-                  (io/delete-file lock-dir)))))))))
+                  (io/delete-file lock-dir))))))))))
