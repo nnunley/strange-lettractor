@@ -32,21 +32,39 @@
    :source-loader
    :source-path
    :base-dir
-   :workflow-roots])
+   :workflow-roots
+   :attractor.pipeline/plan-id])
 
-(declare fresh-logs-root)
+(declare fresh-logs-root execute-prepared)
+
+(defn- captured-handoff [bundle plan-id]
+  {:workflow bundle
+   :attractor.engine/plan-id plan-id
+   :execute-subpipeline
+   (fn [request]
+     (let [child-id (:plan-id request)
+           graph (workflow/selected-graph! bundle child-id)]
+       (execute-prepared
+         {:graph graph :diagnostics [] :workflow bundle}
+         (assoc (select-keys request [:context :logs-root :registry :cancelled?
+                                      :on-event :max-steps])
+                :attractor.pipeline/plan-id child-id))))})
 
 (defn execute-prepared
-  "Validate, publish, and execute a prepared root workflow without reparsing its source."
+  "Validate, publish, and execute a selected captured plan without reparsing source."
   ([prepared] (execute-prepared prepared {}))
   ([prepared options]
    (let [diagnostics (validation/raise-on-errors (:diagnostics prepared))
          graph (:graph prepared)
-         bundle (workflow/verify-bundle! (:workflow prepared) graph)
+         plan-id (if (contains? options :attractor.pipeline/plan-id)
+                   (:attractor.pipeline/plan-id options)
+                   (:root-plan-id (:workflow prepared)))
+         bundle (workflow/verify-bundle! (:workflow prepared) graph plan-id)
          logs-root (or (:logs-root options) (fresh-logs-root))
          _ (workflow/publish! bundle logs-root)
          engine-options
-         (assoc (apply dissoc options wrapper-option-keys)
+         (assoc (merge (apply dissoc options wrapper-option-keys)
+                       (captured-handoff bundle plan-id))
                 :logs-root logs-root
                 :workflow-fingerprint (:fingerprint bundle)
                 :attractor.engine/publish-restart
@@ -276,7 +294,7 @@
   "Resume from an immutable, fingerprint-verified workflow snapshot.
 
    Current source files are inspected only for drift diagnostics. Execution is
-   always delegated with the exact decoded root graph from the published run."
+   always delegated with the exact selected graph from the published run."
   ([checkpoint-path] (resume checkpoint-path {}))
   ([checkpoint-path options]
    (let [resolved-checkpoint-path (resolve-checkpoint-path! checkpoint-path)
@@ -284,11 +302,17 @@
          expected-fingerprint (require-checkpoint-identity! checkpoint)
          run-root (checkpoint-parent resolved-checkpoint-path)
          verified (workflow/verify-published! run-root expected-fingerprint)
-         _ (validate-checkpoint-graph! checkpoint (:graph verified))
+         bundle (:captured-bundle verified)
+         plan-id (if (contains? checkpoint :workflow_plan_id)
+                   (:workflow_plan_id checkpoint)
+                   (:root-plan-id bundle))
+         graph (workflow/selected-graph! bundle plan-id)
+         _ (validate-checkpoint-graph! checkpoint graph)
          changes (workflow/current-drift (:workflow verified) options)
          caller-on-event (or (:on-event options) (fn [_] nil))
          engine-options
-         (assoc (select-keys options resume-runtime-option-keys)
+         (assoc (merge (select-keys options resume-runtime-option-keys)
+                       (captured-handoff bundle plan-id))
                 :logs-root run-root
                 :on-event caller-on-event
                 :workflow-fingerprint expected-fingerprint
@@ -299,7 +323,7 @@
              (caller-on-event {:type :workflow.drift_detected
                                :changes changes}))
          outcome (engine/resume-pipeline-from-checkpoint
-                   checkpoint (:graph verified) engine-options)]
+                   checkpoint graph engine-options)]
      (assoc outcome :diagnostics
             (if (seq changes) [(drift-diagnostic changes)] [])))))
 

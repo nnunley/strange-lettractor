@@ -797,7 +797,10 @@
     (assoc :workflow_fingerprint (:workflow-fingerprint options))
 
     (some? (:workflow-manifest options))
-    (assoc :workflow_manifest (:workflow-manifest options))))
+    (assoc :workflow_manifest (:workflow-manifest options))
+
+    (contains? options :attractor.engine/plan-id)
+    (assoc :workflow_plan_id (:attractor.engine/plan-id options))))
 
 ;; Main execution loop (Section 3.2)
 (defn- run-pipeline*

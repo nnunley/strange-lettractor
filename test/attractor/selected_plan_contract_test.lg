@@ -1,0 +1,169 @@
+(ns attractor.selected-plan-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [io :as io]
+            [os :as os]
+            [attractor.context :as context]
+            [attractor.engine :as engine]
+            [attractor.pipeline :as pipeline]
+            [attractor.workflow :as workflow]))
+
+(def child-id "workflow://child")
+(defn captured []
+  (pipeline/prepare
+    "digraph Root { start [shape=Mdiamond]; sub [type=subpipeline, subpipeline.dotfile=\"child.dot\"]; exit [shape=Msquare]; start -> sub -> exit; }"
+    {:source-loader (fn [_ reference]
+                      {:logical-id child-id :physical-id "captured-child"
+                       :source "digraph Child { child_start [shape=Mdiamond]; child_work [shape=box]; child_exit [shape=Msquare]; child_start -> child_work -> child_exit; }"})}))
+(defn selected [prepared]
+  (assoc prepared :graph (get-in prepared [:workflow :plans child-id :graph])))
+(defn temp-root [] (str (os/temp-dir) "/selected-plan-" (random-uuid)))
+(defn error-data [f] (try (f) nil (catch Exception e (ex-data e))))
+
+(deftest selected-child-publishes-full-capture-and-resumes-its-own-history
+  (let [prepared (captured) root (temp-root)
+        result (atom nil)
+        error (error-data #(reset! result (pipeline/execute-prepared
+                                           (selected prepared)
+                                           {:logs-root root :max-steps 1
+                                            :attractor.pipeline/plan-id child-id})))]
+    (is (nil? error))
+    (when (nil? error)
+      (is (= ["child_start"] (:completed_nodes @result)))
+      (let [checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))
+            verified (workflow/verify-published! root (get-in prepared [:workflow :fingerprint]))]
+        (is (= child-id (:workflow_plan_id checkpoint)))
+        (is (= (:workflow prepared) (:captured-bundle verified)))
+        (is (= :success (:status (pipeline/resume (str root "/checkpoint.edn") {}))))
+        (is (= ["child_start" "child_work" "child_exit"]
+               (:completed_nodes (context/load-checkpoint (str root "/checkpoint.edn")))))))))
+
+(deftest selection-is-validated-before-publication-and-engine-entry
+  (doseq [id [nil 42 "workflow://unknown"]]
+    (let [root (temp-root) events (atom [])
+          error (error-data #(pipeline/execute-prepared
+                               (captured)
+                               {:logs-root root :attractor.pipeline/plan-id id
+                                :on-event (fn [e] (swap! events conj e))}))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (not (io/file-exists? root)))
+      (is (= [] @events)))))
+
+(deftest checkpoint-selection-preserves-presence-and-key-precedence
+  (let [path (str (temp-root) ".edn")]
+    (doseq [value [nil 42 child-id]]
+      (context/save-checkpoint {:workflow_plan_id value} path)
+      (let [loaded (context/load-checkpoint path)]
+        (is (contains? loaded :workflow_plan_id))
+        (is (= value (:workflow_plan_id loaded)))))
+    (doseq [data [{"workflow_plan_id" child-id}
+                 {:workflow_plan_id nil "workflow_plan_id" child-id}]]
+      (io/spit path (pr-str data))
+      (let [loaded (context/load-checkpoint path)]
+        (is (contains? loaded :workflow_plan_id))
+        (is (= (if (contains? data :workflow_plan_id) nil child-id)
+               (:workflow_plan_id loaded)))))
+    (io/spit path "{}")
+    (is (not (contains? (context/load-checkpoint path) :workflow_plan_id)))))
+
+(deftest public-lifecycle-supplies-captured-descendant-executor
+  (let [prepared (captured) observed (atom nil)
+        spoof (fn [_] (throw (ex-info "spoof" {})))
+        root (temp-root)]
+    (with-redefs [engine/run-pipeline (fn [graph options]
+                                        (reset! observed {:graph graph :options options})
+                                        {:status :success})]
+      (pipeline/execute-prepared prepared
+        {:logs-root root :workflow :spoof :execute-subpipeline spoof
+         :attractor.engine/plan-id "spoof"}))
+    (let [options (:options @observed) execute (:execute-subpipeline options)]
+      (is (= (:workflow prepared) (:workflow options)))
+      (is (= workflow/root-plan-id (:attractor.engine/plan-id options)))
+      (is (fn? execute))
+      (when (and (fn? execute) (not= spoof execute))
+        (let [child-root (temp-root)
+              result (execute {:plan-id child-id :context (context/make-context)
+                               :logs-root child-root :max-steps 1
+                               :workflow :spoof :graph :spoof
+                               :execute-subpipeline spoof
+                               :attractor.engine/plan-id "spoof"})]
+          (is (= ["child_start"] (:completed_nodes result)))
+          (is (= child-id (:workflow_plan_id
+                           (context/load-checkpoint (str child-root "/checkpoint.edn"))))))))))
+
+(deftest selected-execution-verifies-unselected-plans-and-graph-identity
+  (let [prepared (captured)]
+    (doseq [broken [(assoc-in (selected prepared) [:workflow :plans workflow/root-plan-id :graph :id] "tampered")
+                    prepared]]
+      (let [root (temp-root) entered (atom false)
+            error (with-redefs [workflow/publish! (fn [& _] (reset! entered true))
+                                engine/run-pipeline (fn [& _] (reset! entered true))]
+                    (error-data #(pipeline/execute-prepared broken
+                                  {:logs-root root :attractor.pipeline/plan-id child-id})))]
+        (is (= :workflow_snapshot_corrupt (:category error)))
+        (is (false? @entered))))))
+
+(deftest persisted-selection-is-validated-before-resume-side-effects
+  (let [prepared (captured) root (temp-root) path (str root "/checkpoint.edn")]
+    (pipeline/execute-prepared (selected prepared)
+      {:logs-root root :max-steps 1 :attractor.pipeline/plan-id child-id})
+    (let [checkpoint (context/load-checkpoint path)]
+      (doseq [id [nil 42 "workflow://missing" workflow/root-plan-id]]
+        (context/save-checkpoint (assoc checkpoint :workflow_plan_id id) path)
+        (let [entered (atom false) events (atom [])
+              error (with-redefs [engine/resume-pipeline-from-checkpoint
+                                  (fn [& _] (reset! entered true))]
+                      (error-data #(pipeline/resume path {:on-event (fn [e] (swap! events conj e))})))]
+          (is (= :workflow_snapshot_corrupt (:category error)))
+          (is (false? @entered))
+          (is (= [] @events)))))))
+
+(deftest resumed-handoff-retains-the-full-capture-and-protects-descendant-options
+  (let [prepared (captured) root (temp-root) path (str root "/checkpoint.edn")
+        _ (pipeline/execute-prepared (selected prepared)
+            {:logs-root root :max-steps 1 :attractor.pipeline/plan-id child-id})
+        observed (atom nil)]
+    (with-redefs [engine/resume-pipeline-from-checkpoint
+                  (fn [checkpoint graph options]
+                    (reset! observed {:graph graph :options options}) {:status :success})]
+      (pipeline/resume path {:workflow :spoof :execute-subpipeline :spoof
+                             :attractor.engine/plan-id "spoof"
+                             :attractor.pipeline/plan-id workflow/root-plan-id}))
+    (let [options (:options @observed) child-root (temp-root)]
+      (is (= (:graph (selected prepared)) (:graph @observed)))
+      (is (= (:workflow prepared) (:workflow options)))
+      (is (= child-id (:attractor.engine/plan-id options)))
+      (is (not (contains? options :attractor.pipeline/plan-id)))
+      (is (= :success (:status ((:execute-subpipeline options)
+                                {:plan-id child-id :logs-root child-root
+                                 :context (context/make-context)
+                                 :workflow :spoof :graph :spoof :execute-subpipeline :spoof}))))
+      (is (= (:workflow prepared)
+             (:captured-bundle (workflow/verify-published! child-root
+                                (get-in prepared [:workflow :fingerprint]))))))))
+
+(deftest selected-alias-survives-restart-and-legacy-root-still-resumes
+  (let [prepared (pipeline/prepare
+                   "digraph Root { start [shape=Mdiamond]; a [type=subpipeline, subpipeline.dotfile=\"a.dot\"]; b [type=subpipeline, subpipeline.dotfile=\"b.dot\"]; exit [shape=Msquare]; start -> a -> b -> exit; }"
+                   {:source-loader
+                    (fn [_ reference]
+                      {:logical-id (str "workflow://" reference) :physical-id "same-child"
+                       :source "digraph Child { child_start [shape=Mdiamond]; child_work [shape=box]; child_exit [shape=Msquare]; child_start -> child_work [loop_restart=true]; child_work -> child_exit; }"})})
+        id "workflow://b.dot" root (temp-root) events (atom [])
+        result (pipeline/execute-prepared
+                 (assoc prepared :graph (get-in prepared [:workflow :plans id :graph]))
+                 {:logs-root root :attractor.pipeline/plan-id id
+                  :on-event (fn [e] (swap! events conj e))})
+        started (filterv #(= :pipeline.started (:type %)) @events)
+        restart-root (:logs_root (second started))]
+    (is (= :success (:status result)))
+    (is (= 2 (count started)))
+    (doseq [run-root [root restart-root]]
+      (is (= id (:workflow_plan_id (context/load-checkpoint (str run-root "/checkpoint.edn")))))
+      (is (= (:workflow prepared) (:captured-bundle
+                                   (workflow/verify-published! run-root (get-in prepared [:workflow :fingerprint])))))
+      (is (= :success (:status (pipeline/resume (str run-root "/checkpoint.edn") {}))))))
+  (let [root (temp-root) path (str root "/checkpoint.edn")]
+    (pipeline/run "digraph Root { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }" {:logs-root root})
+    (context/save-checkpoint (dissoc (context/load-checkpoint path) :workflow_plan_id) path)
+    (is (not (contains? (context/load-checkpoint path) :workflow_plan_id)))
+    (is (= :success (:status (pipeline/resume path {}))))))

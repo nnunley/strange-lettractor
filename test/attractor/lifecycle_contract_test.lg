@@ -630,9 +630,12 @@
     (is (= {:logs-root execution-root
             :registry :registry
             :on-event :on-event
+            :workflow (:workflow prepared)
+            :attractor.engine/plan-id workflow/root-plan-id
             :workflow-fingerprint (get-in prepared [:workflow :fingerprint])
             :workflow-manifest "workflow/manifest.edn"}
-           (dissoc (:options @observed) :attractor.engine/publish-restart)))
+           (dissoc (:options @observed) :attractor.engine/publish-restart :execute-subpipeline)))
+    (is (fn? (get-in @observed [:options :execute-subpipeline])))
     (let [root (str (os/temp-dir) "/lettractor-restart-handoff-" (random-uuid))
           publish (get-in @observed [:options :attractor.engine/publish-restart])]
       (publish root)

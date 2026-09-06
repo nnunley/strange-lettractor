@@ -544,7 +544,22 @@
                                   (get verified-plans (:logical-id plan)) (:references plan)))
     {:plans verified-plans :source-records @source-records})))
 
-(defn verify-bundle! [bundle graph]
+(defn selected-graph!
+  "Select a logical plan from a verified closure without changing its root identity."
+  [bundle plan-id]
+  (when-not (and (string? plan-id) (contains? (:plans bundle) plan-id))
+    (snapshot-error! "Selected workflow plan is invalid or missing" {:plan-id plan-id}))
+  (get-in bundle [:plans plan-id :graph]))
+
+(defn verify-bundle!
+  ([bundle graph plan-id]
+   ;; The complete closure remains authenticated against its original root.
+   (verify-bundle! bundle (get-in bundle [:plans (:root-plan-id bundle) :graph]))
+   (when-not (= graph (selected-graph! bundle plan-id))
+     (snapshot-error! "Prepared graph does not match the selected workflow plan"
+                      {:plan-id plan-id}))
+   bundle)
+  ([bundle graph]
   (validate-captured-roots! (:workflow-roots bundle))
   (when-not (and (map? bundle)
                  (exact-keys? bundle #{:format-version :fingerprint :root-plan-id
@@ -600,7 +615,7 @@
     (when-not (= (:plan-sha256 plan) (plan-fingerprint (:graph plan)))
       (snapshot-error! "Workflow root plan digest does not match"
                        {:root-plan-id root-id})))
-  bundle)))
+  bundle))))
 
 (defn verify-published! [run-root expected-fingerprint]
   (let [manifest-path (str run-root "/" manifest-relative-path)
