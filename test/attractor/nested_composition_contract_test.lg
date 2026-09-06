@@ -3,6 +3,7 @@
             [clojure.core :as core]
             [clojure.string :as str]
             [attractor.context :as context]
+            [attractor.composition :as composition]
             [attractor.engine :as engine]
             [attractor.handlers :as handlers]
             [attractor.parser :as parser]
@@ -42,6 +43,11 @@
   (mapv :event (filter #(= :subpipeline.child_event (:type %)) events)))
 (defn child-root [events]
   (:child_logs_root (first (filter #(= :subpipeline.child_event (:type %)) events))))
+(defn unwrap-event [event]
+  (loop [e event]
+    (if (= :subpipeline.child_event (:type e)) (recur (:event e)) e)))
+(defn terminal-event? [event]
+  (#{:pipeline.completed :pipeline.cancelled :pipeline.failed} (:type (unwrap-event event))))
 (defn index-of [events predicate]
   (first (keep-indexed (fn [index event] (when (predicate event) index)) events)))
 (defn forbidden [& _] (throw (ex-info "Execution consulted source preparation" {})))
@@ -167,7 +173,9 @@
         task (core/future
                (pipeline/execute-prepared prepared
                  {:logs-root (temp-root) :context ctx :registry registry :cancelled? #(deref cancelled)
-                  :on-event #(swap! events conj %)}))]
+                  :on-event (fn [event]
+                              (when (terminal-event? event) (is @cleanup))
+                              (swap! events conj event))}))]
     (try
       (is (= :entered (deref entered 3000 :timeout)))
       (reset! cancelled true)
@@ -176,7 +184,7 @@
       (is (= :pending (deref task 20 :pending)))
       (is (false? @cleanup))
       (is (= "old" (context/ctx-get ctx "answer")))
-      (is (not-any? #(#{:pipeline.completed :pipeline.cancelled :pipeline.failed} (:type %)) @events))
+      (is (not-any? terminal-event? @events))
       (finally (deliver release :release)))
     (let [result (deref task 3000 :timeout)
           terminal-events (filterv
@@ -193,6 +201,61 @@
       (is (= :pipeline.cancelled (get-in (second terminal-events) [:event :type])))
       (is (= :pipeline.cancelled (:type (last terminal-events))))
       (is (= "old" (context/ctx-get ctx "answer")))
+      (is (= result (deref task 0 :pending)))
+      (is (= settled @events)))))
+
+(deftest public-subpipeline-timeout-propagates-through-grandchild-and-joins-cleanup
+  (let [{:keys [prepared]} (fixture (nested-sources "timeout=20" ""))
+        clock (atom 0) entered (promise) observed (promise) release (promise)
+        cleanup (atom false) events (atom [])
+        ctx (context/make-context {"payload" [1] "answer" "old"})
+        registry (registry-with
+                   (fn [node _ _ _]
+                     (deliver entered :entered)
+                     (try
+                       (loop []
+                         (cond
+                           ((:cancelled? node))
+                           (do
+                             (deliver observed :deadline-propagated)
+                             (deref release 3000 :timeout)
+                             {:status :success :context_updates {"answer" "late"}})
+
+                           ;; Even a failed observation must not strand a worker.
+                           (not= :pending (deref release 1 :pending))
+                           {:status :success :context_updates {"answer" "late"}}
+
+                           :else (recur)))
+                       (finally (reset! cleanup true)))))
+        task (core/future
+               (pipeline/execute-prepared prepared
+                 {:logs-root (temp-root) :context ctx :registry registry
+                  :now-ms #(deref clock) :cancelled? (fn [] false)
+                  :on-event (fn [event]
+                              (when (terminal-event? event) (is @cleanup))
+                              (swap! events conj event))}))]
+    (try
+      (is (= :entered (deref entered 3000 :timeout)))
+      (reset! clock 20)
+      (is (= :deadline-propagated (deref observed 3000 :timeout)))
+      (is (= :pending (deref task 20 :pending)))
+      (is (false? @cleanup))
+      (is (not-any? terminal-event? @events))
+      (is (= "old" (context/ctx-get ctx "answer")))
+      (finally (deliver release :release)))
+    (let [result (deref task 3000 :timeout)
+          terminal-events (filterv terminal-event? @events)
+          settled @events]
+      (is @cleanup)
+      (is (= :fail (:status result)))
+      (is (= :timeout_error (:category result)))
+      (is (str/includes? (:failure_reason result) "Node 'child' timed out"))
+      (is (not (contains? result :context_updates)))
+      (is (= "old" (context/ctx-get ctx "answer")))
+      (is (= 3 (count terminal-events)))
+      (is (= :pipeline.cancelled (get-in (first terminal-events) [:event :event :type])))
+      (is (= :pipeline.cancelled (get-in (second terminal-events) [:event :type])))
+      (is (= :pipeline.failed (:type (last terminal-events))))
       (is (= result (deref task 0 :pending)))
       (is (= settled @events)))))
 
@@ -310,6 +373,42 @@
     (is (= [["Root" "child"] ["Child" "grand"]] (mapv #(vec (take 2 %)) @calls)))
     (is (every? #(str/includes? (nth % 2) "_restart_") @calls))
     (is (= original @registry))))
+
+(deftest custom-subpipeline-delegation-inherits-through-the-real-captured-callback
+  (let [sources (-> (nested-sources "" "")
+                    (update :root str/replace "start -> child -> exit;"
+                            "start -> child [loop_restart=true]; child -> exit;")
+                    (update :child str/replace "begin -> grand -> end;"
+                            "begin -> grand [loop_restart=true]; grand -> end;"))
+        {:keys [prepared]} (fixture sources)
+        registry (registry-with (fn [& _] {:status :success :context_updates {"answer" "delegated"}}))
+        options-by-graph (atom {}) calls (atom []) inherited (atom []) execute engine/run-pipeline
+        _ (handlers/register-handler! registry "subpipeline"
+            (fn [node ctx graph logs-root]
+              (swap! calls conj [(:id graph) (:id node) logs-root])
+              (let [options (get @options-by-graph (:id graph))
+                    delegate (composition/make-handler options (:registry options)
+                                                       (:on-event options) (fn [] false))]
+                (delegate node ctx graph logs-root))))
+        custom (get @registry "subpipeline") original @registry
+        template-parallel @(get @registry handlers/parallel-executor-key)
+        template-manager @(get @registry handlers/manager-runtime-key)
+        ctx (context/make-context {"payload" [1]})
+        result (with-redefs [engine/run-pipeline
+                            (fn [graph options]
+                              (swap! options-by-graph assoc (:id graph) options)
+                              (swap! inherited conj (identical? custom (get @(:registry options) "subpipeline")))
+                              (execute graph options))]
+                 (pipeline/execute-prepared prepared
+                   {:logs-root (temp-root) :registry registry :context ctx :on-event (fn [_] nil)}))]
+    (is (= :success (:status result)))
+    (is (= [["Root" "child"] ["Child" "grand"]] (mapv #(vec (take 2 %)) @calls)))
+    (is (= [true true true] @inherited))
+    (is (every? #(str/includes? (nth % 2) "_restart_") @calls))
+    (is (= "delegated" (context/ctx-get ctx "answer")))
+    (is (= original @registry))
+    (is (= template-parallel @(get @registry handlers/parallel-executor-key)))
+    (is (= template-manager @(get @registry handlers/manager-runtime-key)))))
 
 (deftest nested-and-sibling-runtime-state-is-consumed-without-leaking
   (let [sources (update (nested-sources "" "") :root str/replace
