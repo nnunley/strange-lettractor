@@ -1,0 +1,62 @@
+(ns attractor.tool-write-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+(deftest profile-writes-confirm-utf8-byte-count-after-persisting-content
+  (doseq [make-profile [profiles/create-openai-profile
+                       profiles/create-anthropic-profile profiles/create-gemini-profile]]
+    (let [profile (make-profile "contract")
+          execute (:executor (profiles/registry-get (:tool_registry profile) "write_file"))
+          root (str (os/temp-dir) "/attractor-write-contract-" (System/nanoTime))
+          environment (execution/make-local-environment {:working_dir root})
+          path (str root "/nested/sample.txt")]
+      (try
+        (doseq [[content expected-bytes] [["abc" 3] ["é😀" 6] ["" 0]]]
+          (is (= (str "File written: " expected-bytes " bytes")
+                 (execute {"file_path" path "content" content} environment)))
+          (is (= content ((:read_text environment) path)))
+          (is (= expected-bytes (:size (os/stat path)))))
+        (finally ((:cleanup environment)))))))
+
+(deftest session-delivers-write-failure-as-error-without-success-confirmation
+  (doseq [make-profile [profiles/create-openai-profile
+                       profiles/create-anthropic-profile profiles/create-gemini-profile]]
+    (let [root (str (os/temp-dir) "/attractor-write-failure-" (System/nanoTime))
+          environment (execution/make-local-environment {:working_dir root})
+          _ ((:write_file environment) "blocked" "preserve this file")
+          requests (atom []) events (atom [])
+          profile (assoc (make-profile "contract") :supports_streaming false)
+          session (agent/make-session
+                    {:provider_profile profile :execution_env environment
+                     :project_docs [] :max_subagent_depth 0
+                     :on_event #(swap! events conj %)
+                     :complete_fn
+                     (fn [request]
+                       (swap! requests conj request)
+                       (if (= 1 (count @requests))
+                         {:id "write-response" :message {:role :assistant :content ""}
+                          :tool_calls [{:id "failed-write" :name "write_file"
+                                        :arguments {"file_path" (str root "/blocked/child.txt")
+                                                    "content" "must not be written"}}]}
+                         {:id "recovery-response"
+                          :message {:role :assistant :content "choose a different path"}
+                          :tool_calls []}))})]
+      (try
+        (is (= "choose a different path" (agent/process-input! session "write")))
+        (is (= 2 (count @requests)))
+        (let [result (get-in @requests [1 :messages 3 :content 0])
+              event (first (filter #(= :tool_call_end (:type %)) @events))]
+          (is (= "failed-write" (:tool_call_id result)))
+          (is (true? (:is_error result)))
+          (is (str/includes? (:content result) "Tool error"))
+          (is (not (str/includes? (:content result) "File written")))
+          (is (= "failed-write" (:call_id event)))
+          (is (= (:content result) (:error event)))
+          (is (nil? (:output event))))
+        (is (= "preserve this file" ((:read_text environment) "blocked")))
+        (is (= ["blocked"] (vec (os/ls root))))
+        (finally (agent/close-session! session))))))

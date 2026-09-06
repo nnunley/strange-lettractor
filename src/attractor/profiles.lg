@@ -166,8 +166,10 @@
                     (arg args "offset") (arg args "limit"))))
          (registered write-def
                  (fn [args env]
-                   ((:write_file env) (arg args "file_path") (arg args "content"))
-                   "File written"))
+                   (let [content (arg args "content")
+                         byte-count (count (.getBytes content "UTF-8"))]
+                     ((:write_file env) (arg args "file_path") content)
+                     (str "File written: " byte-count " bytes"))))
          (registered edit-def
                  (if (= edit-kind "apply_patch")
                    (fn [args env]

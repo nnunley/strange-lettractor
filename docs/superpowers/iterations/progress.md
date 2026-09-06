@@ -1,7 +1,22 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** exact-whitespace file editing repaired; LLM tool pre/post hook design remains awaiting approval
+**Task:** file-write byte confirmations repaired and filesystem failures verified through sessions; hook design remains awaiting approval
+
+**Write-tool repair:** §3.3 requires confirmation with bytes written; all provider
+profiles previously returned only `File written`. The shared executor now counts
+explicit UTF-8 bytes and returns confirmation only after the environment write
+succeeds. `tool_write_contract_test.lg` exercises all three profile executors,
+real nested-file creation, non-ASCII data, empty overwrite, and stat-size/content
+agreement. Actual sessions verify a blocked-parent write becomes an error result
+in the next model request, matches its tool error event, and preserves the original
+file without a success message. RED: 9 assertion failures / zero errors; GREEN:
+2 tests / 60 assertions. Scoped review approves. Root full suite passes **559
+tests / 4518 assertions / zero failures**, exit 0; AOT builds. This remains a
+scoped tools fix, not full CAL-TOOLS-01 completion. The separate reader failures
+remain unresolved. An independently verified supplementary-Unicode string-count
+difference is filed as let-go #812; explicit UTF-8 encoding avoids depending on
+either runtime's string-count semantics. No local let-go files were changed.
 
 **Exact-edit repair:** the local environment rejected a single space in
 `alpha beta` as an empty `old_string`, contrary to the §3.3 exact-match contract.

@@ -14,6 +14,7 @@ the actual configured compiler and rerun the relevant behavior checks.
 | [#808: unary negation overflow](https://github.com/nooga/let-go/issues/808) | `src/attractor/fan_in.lg` descending score comparison | Verify ordinary `(- Long/MIN_VALUE)` and first-class/apply calls throw overflow. Retain direct comparison: Clojure also cannot safely negate this score. |
 | [#809: UUID string coercion](https://github.com/nooga/let-go/issues/809) | Unique manager-test fixture names in `test/attractor/engine_test.lg` | Verify `str` returns canonical UUID text while `pr-str` and direct UUID printing remain tagged. Reassess fixture-name sanitization separately from general path escaping. |
 | [#810: asymmetric nested sequence equality](https://github.com/nooga/let-go/issues/810) | Complete human-question comparisons in `test/attractor/interviewer_contract_test.lg` | Verify vector/lazy-sequence values compare equally inside maps in both operand orders, then restore whole-question equality instead of comparing options separately. |
+| [#812: supplementary Unicode string count](https://github.com/nooga/let-go/issues/812) | `src/attractor/profiles.lg` write confirmation uses explicit UTF-8 bytes | Existing binary returns `(count "😀") = 1`, JVM Clojure returns 2. Clarify intentional divergence or restore compatible counting/indexing semantics. Retain explicit `.getBytes "UTF-8"`: neither convention is a UTF-8 byte count. |
 
 ## Restoration checks
 
