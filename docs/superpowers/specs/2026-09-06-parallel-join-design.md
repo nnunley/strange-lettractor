@@ -22,9 +22,18 @@ completion-driven coordinator. Preserve the public factory arities and engine's
 existing branch-executor callback. Use let-go futures for active branches and
 explicit completion records rather than waiting for futures in launch order.
 Own all workers in one native let-go scope opened in the coordinator's execution
-context before any worker launch. Scope inheritance owns descendant async work,
-not just each callback's future. Keep changes local to the parallel handler unless a public integration regression
-demonstrates an engine gap. No general scheduler service or external dependency.
+context before any worker launch. Scope inheritance owns registered descendant
+async work, not just each callback's future. Keep changes local to the parallel
+handler unless a public integration regression demonstrates an engine gap.
+No general scheduler service or external dependency.
+
+Upstream limitation: local `async/map` registers its worker in the process root
+and escapes child-scope ownership, as independently reproduced in
+[supervision compatibility](../../let-go-supervision-compatibility.md).
+The scheduler uses scoped `future`/`go` primitives. The no-late-work contract is
+proved for owned workers and registered descendants, not detached/root-owned
+work launched by arbitrary custom callbacks. The upstream helper ownership gap
+remains explicit; this component does not fix or claim it away.
 
 Alternatives considered: retaining batches cannot meet early join; an unbounded
 future per edge violates max_parallel. A fixed bounded active set is sufficient.
