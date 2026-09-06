@@ -106,8 +106,7 @@
     fingerprint))
 
 (defn- failed-checkpoint-outcome? [outcome]
-  (let [status (:status outcome)]
-    (or (= :fail status) (= "fail" status))))
+  (= :fail (:status (status/normalize-contract outcome :status))))
 
 (defn- node-retry-target [node]
   (or (when-not (str/blank? (:retry_target node)) (:retry_target node))

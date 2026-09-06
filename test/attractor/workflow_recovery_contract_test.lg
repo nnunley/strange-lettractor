@@ -1120,6 +1120,100 @@
            (:completed_nodes checkpoint)))
     (is (= :success (:status result)))))
 
+(deftest public-resume-allows-legacy-failed-node-retry-history
+  (let [source
+        "digraph LegacyRetryHistory {
+           start [shape=Mdiamond]
+           flaky [type=legacy.flaky, retry_target=repair]
+           repair [type=legacy.repair]
+           exit [shape=Msquare]
+           start -> flaky
+           start -> repair [condition=\"outcome=fail\"]
+           flaky -> exit [condition=\"outcome=success\"]
+           repair -> flaky
+         }"
+        run-root (publication-root)
+        initial-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            initial-registry "legacy.flaky"
+            (fn [_ _ _ _] {:status :fail :failure_reason "repair me"}))
+        _ (handlers/register-handler!
+            initial-registry "legacy.repair"
+            (fn [_ _ _ _] {:status :success}))
+        _ (pipeline/run source {:logs-root run-root
+                                :registry initial-registry
+                                :max-steps 3})
+        checkpoint-path (str run-root "/checkpoint.edn")
+        _ (update-edn-file!
+            checkpoint-path
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success"}
+                     "flaky" {"status" "fail"
+                              "failure_reason" "repair me"}
+                     "repair" {"status" "success"}}))
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "legacy.flaky"
+            (fn [_ _ _ _] {:status :success}))
+        result (pipeline/resume checkpoint-path
+                                {:registry registry
+                                 :on-event #(swap! events conj %)})]
+    (is (= :success (:status result)))
+    (is (= :pipeline.started (:type (first @events))))
+    (is (= "flaky"
+           (:node_id (first (filter #(= :stage.started (:type %)) @events)))))))
+
+(deftest public-resume-allows-legacy-failed-goal-gate-reroute-history
+  (let [source
+        "digraph LegacyGoalGateHistory {
+           start [shape=Mdiamond]
+           gate [type=legacy.gate, goal_gate=true, retry_target=repair]
+           after [type=legacy.after]
+           repair [type=legacy.repair]
+           exit [shape=Msquare]
+           start -> gate
+           start -> repair [condition=\"outcome=fail\"]
+           gate -> after [condition=\"outcome=fail\"]
+           after -> exit
+           repair -> gate
+         }"
+        run-root (publication-root)
+        initial-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            initial-registry "legacy.gate"
+            (fn [_ _ _ _] {:status :fail :failure_reason "gate failed"}))
+        _ (handlers/register-handler!
+            initial-registry "legacy.after"
+            (fn [_ _ _ _] {:status :success}))
+        _ (handlers/register-handler!
+            initial-registry "legacy.repair"
+            (fn [_ _ _ _] {:status :success}))
+        _ (pipeline/run source {:logs-root run-root
+                                :registry initial-registry
+                                :max-steps 5})
+        checkpoint-path (str run-root "/checkpoint.edn")
+        _ (update-edn-file!
+            checkpoint-path
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success"}
+                     "gate" {"status" "fail"
+                             "failure_reason" "gate failed"}
+                     "after" {"status" "success"}
+                     "repair" {"status" "success"}}))
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "legacy.gate"
+            (fn [_ _ _ _] {:status :success}))
+        result (pipeline/resume checkpoint-path
+                                {:registry registry
+                                 :on-event #(swap! events conj %)})]
+    (is (= :success (:status result)))
+    (is (= :pipeline.started (:type (first @events))))
+    (is (= "gate"
+           (:node_id (first (filter #(= :stage.started (:type %)) @events)))))))
+
 (deftest public-resume-allows-only-explicit-runtime-options
   (let [source
         "digraph SafeResumeOptions {
