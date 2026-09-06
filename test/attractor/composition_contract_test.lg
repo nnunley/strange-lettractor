@@ -1,0 +1,94 @@
+(ns attractor.composition-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [attractor.composition :as composition]
+            [attractor.pipeline :as pipeline]
+            [attractor.validation :as validation]))
+
+(defn config [attrs graph]
+  (composition/node-config {:id "child" :type "subpipeline"
+                            :attrs (merge {:subpipeline.dotfile "child.dot"} attrs)} graph))
+
+(deftest mapping-defaults-and-edn
+  (is (= {:config {:dotfile "child.dot" :input-map {} :output-map {} :max-steps 10000}
+          :diagnostics []} (config {} {})))
+  (doseq [v [nil "" "  \n"]]
+    (is (= {} (get-in (config {:input_map v :output_map v} {}) [:config :input-map]))))
+  (is (= {"a" "b" "c" "d"}
+         (get-in (config {:input_map "; hi\n{\"a\", \"b\" ; pair\n \"c\" \"d\"} ; end"} {}) [:config :input-map])))
+  (is (= {"quote\"" "line\n"}
+         (get-in (config {:input_map "{\"quote\\\"\" \"line\\n\"}"} {}) [:config :input-map])))
+  (is (= {"a" "b"}
+         (get-in (config {:input_map "{\"\\u0061\" \"\\u0062\"}"} {}) [:config :input-map]))))
+
+(deftest malformed-mappings-rejected
+  (doseq [attribute [:input_map :output_map]
+          v ["{} {}" "{} nil" "{}]" "[]" "{:a \"b\"}" "{\"a\" nil}"
+             "{\"a\" 2}" "{\"a\"}" "{\"a\" \"b\"" "{\"a\" \"z\" \"b\" \"z\"}"
+             "{\"a\" \"x\" \"a\" \"y\"}" "{\"a\" \"\\q\"}" "{\"a\" \"\\u00ZZ\"}" {} 3]]
+    (let [result (config {attribute v} {})]
+      (is (nil? (:config result)))
+      (is (= "subpipeline_config" (:rule (first (:diagnostics result))))))))
+
+(deftest destination-ownership-boundaries
+  (doseq [attribute [:input_map :output_map]
+          destination ["run.id" "current_node" "outcome" "preferred_label" "graph." "graph.goal"
+                       "internal.retry_count." "internal.retry_count.child"]]
+    (is (seq (:diagnostics (config {attribute (pr-str {"source" destination})} {})))))
+  (doseq [destination ["run.id.more" "my.run.id" "graph" "graphs.goal" "internal.retry_count"
+                       "internal.retry_countish.x" "ns/outcome" ""]]
+    (is (empty? (:diagnostics (config {:input_map (pr-str {"outcome" destination})} {})))))
+  (doseq [source ["run.id" "current_node" "outcome" "preferred_label" "graph.goal" "internal.retry_count.x"]]
+    (is (= {source "value"} (get-in (config {:output_map (pr-str {source "value"})} {}) [:config :output-map])))))
+
+(deftest budgets-and-dotfile
+  (is (= 7 (get-in (config {} {:attrs {:subpipeline.default_max_steps 7}}) [:config :max-steps])))
+  (is (= 3 (get-in (config {:subpipeline.max_steps 3} {:subpipeline.default_max_steps 7}) [:config :max-steps])))
+  (doseq [value [nil "" "  " 9]]
+    (is (seq (:diagnostics (config {:subpipeline.dotfile value} {})))))
+  (doseq [value [nil 0 -1 1.5 "" "2.5" "x" false]]
+    (is (seq (:diagnostics (config {:subpipeline.max_steps value} {}))))
+    (is (seq (:diagnostics (config {} {:attrs {:subpipeline.default_max_steps value}}))))))
+
+(deftest parser-attributes-and-validation-order
+  (let [graph (parser/parse-dot "digraph G { graph [subpipeline.default_max_steps=9]; start [shape=Mdiamond]; child [type=subpipeline, subpipeline.dotfile=\"child.dot\", subpipeline.max_steps=4, input_map=\"{\\\"missing-at-runtime\\\" \\\"request\\\"}\"]; exit [shape=Msquare]; start -> child -> exit; }")
+        node (get-in graph [:nodes "child"])
+        before (pr-str graph)
+        result (composition/node-config node graph)]
+    (is (= {:dotfile "child.dot" :max-steps 4 :input-map {"missing-at-runtime" "request"} :output-map {}}
+           (:config result)))
+    (is (empty? (validation/validate graph)))
+    (is (= before (pr-str graph)))
+    (is (= 2 (get-in (composition/node-config {:id "direct" :subpipeline.dotfile "direct.dot"
+                                             :subpipeline.max_steps 2 :output_map "{}"} {}) [:config :max-steps]))))
+  (let [graph (parser/parse-dot "digraph G { start [shape=Mdiamond]; child [type=subpipeline, fidelity=unknown]; exit [shape=Msquare]; start -> child -> exit; }")
+        diagnostics (validation/validate graph [(fn [_] [{:rule "custom"}])])]
+    (is (= ["fidelity_valid" "subpipeline_config" "custom"] (mapv :rule diagnostics)))))
+
+(deftest stable-diagnostics-and-public-validation
+  (let [result (config {:subpipeline.dotfile "" :input_map "[]" :output_map "[]" :subpipeline.max_steps 0} {})]
+    (is (= 4 (count (:diagnostics result))))
+    (doseq [[d attribute] (map vector (:diagnostics result) ["subpipeline.dotfile" "input_map" "output_map" "subpipeline.max_steps"])]
+      (is (= :error (:severity d)))
+      (is (= "child" (:node_id d)))
+      (is (str/starts-with? (:message d) (str "Subpipeline node 'child' has invalid " attribute ": ")))))
+  (let [calls (atom 0)
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler! registry "subpipeline" (fn [& _] (swap! calls inc)))
+        logs (str (os/temp-dir) "/composition-invalid-" (random-uuid))
+        source "digraph G { start [shape=Mdiamond]; child [type=subpipeline]; exit [shape=Msquare]; start -> child -> exit; }"
+        result (pipeline/prepare source)
+        error (try (pipeline/run source {:registry registry :logs-root logs :on-event #(swap! events conj %)})
+                   nil (catch Exception e (ex-data e)))]
+    (is (some (fn [d] (= "subpipeline_config" (:rule d))) (:diagnostics result)))
+    (is (not (some (fn [d] (= "type_known" (:rule d))) (:diagnostics result))))
+    (is (= :validation_error (:category error)))
+    (is (= (:diagnostics result) (:diagnostics error)))
+    (is (= 0 @calls))
+    (is (empty? @events))
+    (is (not (io/file-exists? logs)))))

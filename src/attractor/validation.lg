@@ -2,11 +2,12 @@
   (:require [clojure.string :as str]
             [clojure.set :as set]
             [attractor.conditions :as conditions]
-            [attractor.stylesheet :as stylesheet]))
+            [attractor.stylesheet :as stylesheet]
+            [attractor.composition :as composition]))
 
 ;; Known standard handler types
 (def standard-types
-  #{"start" "exit" "codergen" "wait.human" "conditional" "parallel" "parallel.fan_in" "tool" "stack.manager_loop"})
+  #{"start" "exit" "codergen" "wait.human" "conditional" "parallel" "parallel.fan_in" "tool" "stack.manager_loop" "subpipeline"})
 
 ;; Known valid fidelity modes
 (def valid-fidelity-modes
@@ -211,6 +212,12 @@
           []
           (:nodes graph)))
 
+(defn rule-subpipeline-config [graph]
+  (vec (mapcat (fn [[_ node]]
+                 (if (= "subpipeline" (:type node))
+                   (:diagnostics (composition/node-config node graph)) []))
+               (sort-by first (:nodes graph)))))
+
 ;; Full validation runner
 (defn validate
   ([graph] (validate graph []))
@@ -227,7 +234,8 @@
                          rule-fidelity-valid
                          rule-retry-target-exists
                          rule-goal-gate-has-retry
-                         rule-prompt-on-llm-nodes]
+                         rule-prompt-on-llm-nodes
+                         rule-subpipeline-config]
          all-rules (concat built-in-rules custom-rules)]
      (vec (mapcat (fn [r] (r graph)) all-rules)))))
 

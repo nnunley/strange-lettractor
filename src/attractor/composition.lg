@@ -1,0 +1,100 @@
+(ns attractor.composition
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]))
+
+(defn- attribute [entity k]
+  (if (contains? (:attrs entity) k) (get (:attrs entity) k) (get entity k)))
+
+(defn- explicit? [entity k]
+  (or (contains? (:attrs entity) k) (contains? entity k)))
+
+(defn- invalid [reason]
+  (throw (ex-info reason {:reason reason})))
+
+(defn- character-at [s i]
+  (when (< i (count s)) (subs s i (inc i))))
+
+(defn- skip-space [s start]
+  (loop [i start comment? false]
+    (let [c (character-at s i)]
+      (cond
+        (nil? c) i
+        comment? (recur (inc i) (not (or (= c "\n") (= c "\r"))))
+        (= c ";") (recur (inc i) true)
+        (or (= c ",") (re-matches #"\s" c)) (recur (inc i) false)
+        :else i))))
+
+(defn- read-string-token [s start]
+  (when (not= "\"" (character-at s start))
+    (invalid "mapping keys and values must be strings"))
+  (loop [i (inc start) escaped? false]
+    (let [c (character-at s i)]
+      (cond
+        (nil? c) (invalid "unterminated EDN string")
+        escaped? (recur (inc i) false)
+        (= c "\\") (recur (inc i) true)
+        (= c "\"") [(edn/read-string (subs s start (inc i))) (inc i)]
+        :else (recur (inc i) false)))))
+
+(defn- reserved-destination? [s]
+  (or (contains? #{"run.id" "current_node" "outcome" "preferred_label"} s)
+      (str/starts-with? s "graph.")
+      (str/starts-with? s "internal.retry_count.")))
+
+(defn- read-mapping [s]
+  ;; The runtime reader reads only the first form. Scan the restricted string-map
+  ;; grammar ourselves so closing delimiters and trailing forms cannot be hidden.
+  ;; Delegate individual quoted tokens to EDN for standard string escape decoding.
+  (if (or (nil? s) (and (string? s) (str/blank? s)))
+    {}
+    (do
+      (when (not (string? s)) (invalid "must be an EDN map string"))
+      (let [start (skip-space s 0)]
+        (when (not= "{" (character-at s start)) (invalid "must be an EDN map"))
+        (loop [i (skip-space s (inc start)) result {} destinations #{}]
+          (if (= "}" (character-at s i))
+            (do
+              (when (not= (count s) (skip-space s (inc i)))
+                (invalid "must contain exactly one EDN map"))
+              result)
+            (let [[source after-source] (read-string-token s i)
+                  [destination after-destination] (read-string-token s (skip-space s after-source))]
+              (when (contains? result source) (invalid "duplicate source key"))
+              (when (contains? destinations destination) (invalid "duplicate destination"))
+              (when (reserved-destination? destination) (invalid "engine-owned destination"))
+              (recur (skip-space s after-destination)
+                     (assoc result source destination) (conj destinations destination)))))))))
+
+(defn- checked [node attr f]
+  (try
+    {:value (f)}
+    (catch Exception e
+      {:diagnostic {:rule "subpipeline_config" :severity :error :node_id (:id node)
+                    :message (str "Subpipeline node '" (:id node) "' has invalid " (name attr) ": "
+                                  (or (:reason (ex-data e)) "malformed EDN"))}})))
+
+(defn node-config
+  "Return {:config validated-config :diagnostics []}, or nil config and ordered diagnostics.
+   Mapping keys are sources, values are destinations; context values (including nil)
+   are resolved only at execution time. This function never modifies the graph."
+  [node graph]
+  (let [budget-attr (if (explicit? node :subpipeline.max_steps)
+                      :subpipeline.max_steps :subpipeline.default_max_steps)
+        budget (if (explicit? node :subpipeline.max_steps)
+                 (attribute node :subpipeline.max_steps)
+                 (if (explicit? graph :subpipeline.default_max_steps)
+                   (attribute graph :subpipeline.default_max_steps) 10000))
+        dotfile (checked node :subpipeline.dotfile
+                  (fn [] (let [s (attribute node :subpipeline.dotfile)]
+                           (when (or (not (string? s)) (str/blank? s))
+                             (invalid "must be a nonblank path string")) s)))
+        inputs (checked node :input_map (fn [] (read-mapping (attribute node :input_map))))
+        outputs (checked node :output_map (fn [] (read-mapping (attribute node :output_map))))
+        steps (checked node budget-attr
+                (fn [] (when (or (not (integer? budget)) (<= budget 0))
+                         (invalid "must be a positive integer")) budget))
+        diagnostics (vec (keep :diagnostic [dotfile inputs outputs steps]))]
+    {:config (when (empty? diagnostics)
+               {:dotfile (:value dotfile) :input-map (:value inputs)
+                :output-map (:value outputs) :max-steps (:value steps)})
+     :diagnostics diagnostics}))
