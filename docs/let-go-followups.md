@@ -11,6 +11,7 @@ the actual configured compiler and rerun the relevant behavior checks.
 | [#805: future exceptions](https://github.com/nooga/let-go/issues/805) | `src/attractor/handlers.lg` parallel worker error records and coordinator collection | Reassess explicit exception transport; preserve cleanup-before-propagation and ordered results. |
 | [#806: async helper scope ownership](https://github.com/nooga/let-go/issues/806) | Parallel invocation scope; `test/attractor/parallel_join_contract_test.lg` | Add real async-helper descendant cancellation/join evidence and remove the documented ownership exception only when proved. |
 | [#807: unfinished trailing forms](https://github.com/nooga/let-go/issues/807) | Test discovery checks and independent JVM reader checks | Verify malformed sources fail visibly across evaluation, namespace loading, and AOT; then reassess the extra manual syntax cross-check. |
+| [#808: unary negation overflow](https://github.com/nooga/let-go/issues/808) | `src/attractor/fan_in.lg` descending score comparison | Verify ordinary `(- Long/MIN_VALUE)` and first-class/apply calls throw overflow. Retain direct comparison: Clojure also cannot safely negate this score. |
 
 ## Restoration checks
 
@@ -40,6 +41,15 @@ the actual configured compiler and rerun the relevant behavior checks.
 6. Run the full default suite and AOT with the configured binary. Report reader
    compatibility separately until it is actually restored; skips are not passes.
    Update requirement/scenario status and these notes only from verified evidence.
+
+For #808, direct and apply unary minus on `Long/MIN_VALUE` both returned the same
+negative integer at source revision `bdd8268c9cb3acf369f0854bada47af79d1d673d`;
+the independent JVM Clojure control threw `ArithmeticException`. `vm.NumNeg` uses
+unchecked host negation for Int. Revisit checked-error compatibility after the
+upstream fix, preserving normal/unchecked/promoting arithmetic distinctions.
+Keep the fan-in minimum-score regression and direct descending comparison; this
+is a boundary-safe algorithm, not a workaround to remove when overflow starts
+throwing correctly.
 
 Detailed reproducers and current limitations:
 [reader](let-go-reader-compatibility.md),

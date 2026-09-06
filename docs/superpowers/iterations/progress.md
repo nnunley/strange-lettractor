@@ -1,10 +1,21 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** approved fan-in ranking plan; Task 1 selector implementation underway
+**Task:** fan-in Task 1 selector reviewed; Task 2 unified LLM adapter and entrypoint wiring next
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; ATTR-PAR-02 component complete, iteration incomplete
+
+**Fan-in checkpoint:** `cf03766` implements score-aware deterministic and injected
+selection; `901dfa4` strengthens parent-context, status-order and tie evidence.
+Both Task 1 review gates approved. Root verified 508 tests / 3649 assertions /
+zero failures, AOT success, and compiled heuristic fan-in/checkpoint success.
+Focused evidence is 17/64/0; separate reader acceptance still fails 5 assertions.
+Real LLM adapter, CLI run/resume configuration and public recovery/cancellation
+proof remain Tasks 2–3; ATTR-FANIN-01 is not yet complete. Additional let-go unary
+negation bug [#808](https://github.com/nooga/let-go/issues/808) is reproduced against
+JVM Clojure and linked in the restoration checklist; the selector compares scores
+directly to remain safe even after upstream checked overflow is restored.
 
 **Latest component checkpoint:** Task 1 (`4851b51`, `84dffe9`) and public Task 2 (`7a150be`) passed independent spec and quality reviews. Task 2 public cancellation barriers passed without runtime changes; its primary-error/cleanup regression failed 2 assertions before the scoped engine fix. Final focused evidence is 18/215/0; root independently verified full default suite 491/3585/0, local AOT exit 0, and compiled parallel workflow/checkpoint success. Separate reader acceptance remains 1 test / 5 failed assertions / exit 1. SCN-FIRST-SUCCESS and ATTR-PAR-02 are complete only as this component; interviewer, fan-in ranking, artifact lifecycle, and registry matrix work remain required before iteration audit/integration. [Upstream restoration checklist](../../let-go-followups.md) tracks #801, #805, #806, and #807, affected code, and removal/regression checks.
 

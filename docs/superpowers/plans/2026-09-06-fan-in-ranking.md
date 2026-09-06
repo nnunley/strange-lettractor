@@ -22,13 +22,20 @@ in the design; Task 1 is executing in the existing isolated iteration worktree.
 
 Files: create `src/attractor/fan_in.lg`, `test/attractor/fan_in_contract_test.lg`; replace only the old `handle-fan-in` body in `src/attractor/handlers.lg` with delegation and add its require. No LLM/CLI wiring yet.
 
-- [ ] Add a native-readable regression against existing `handlers/handle-fan-in`: SUCCESS records a/score1 and z/score9 must choose z. A lone RETRY must be selectable. Run `env LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/fan_in_contract_test.lg` and record actual failing assertions, not a namespace error.
-- [ ] Create `(make-handler ranker)` returning `[node ctx graph logs-root]`. Handler reads `parallel.results`, checks cancellation, enumerates original indices, filters to SUCCESS/PARTIAL_SUCCESS/RETRY, chooses heuristic for blank prompts or calls ranker once with `{:node node :prompt prompt :candidates [{:index i :candidate original-record} ...] :cancelled? predicate}`. The ranker returns an original integer index. Missing ranker on a prompt throws non-retryable configuration error until Task 2 supplies the default adapter. Preserve FAIL reasons for empty/all-ineligible inputs, existing best_id/best_outcome string values, notes, and id/node_id fallback.
-- [ ] Heuristic key is `[status-rank (- score) string-id original-index]`; missing score is zero, present nonnumeric score throws non-retryable configuration error. Validate only eligible scores and only on heuristic path. Reject NaN/infinite scores if the runtime represents them: no nondeterministic ordering. Ranker-selected index must belong to eligible indices, and cancellation after invocation returns CANCELLED without winner updates. Never mutate the context or candidate records. Let thrown ranker errors propagate unchanged for existing retry classification.
-- [ ] Extend tests: all status ranks, descending score, ID and original-occurrence ties, duplicate target IDs, absent scores, invalid score, empty/all-ineligible, blank/nonblank prompts, complete request data and one invocation, invalid index type/range/ineligible membership, exact error identity, pre/post cancellation, and unchanged parent context. Use bounded fixtures and finally release any barriers.
-- [ ] Run focused tests and `lgx test test/attractor/handlers_test.lg` sequentially with local LGX_LG. Run `git diff --check`; commit scoped source/tests. Obtain independent spec review then quality review; fix/re-review before Task 2. Do not add completion markers yet.
+- [x] Add a native-readable regression against existing `handlers/handle-fan-in`: SUCCESS records a/score1 and z/score9 must choose z. A lone RETRY must be selectable. Run `env LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/fan_in_contract_test.lg` and record actual failing assertions, not a namespace error.
+- [x] Create `(make-handler ranker)` returning `[node ctx graph logs-root]`. Handler reads `parallel.results`, checks cancellation, enumerates original indices, filters to SUCCESS/PARTIAL_SUCCESS/RETRY, chooses heuristic for blank prompts or calls ranker once with `{:node node :prompt prompt :candidates [{:index i :candidate original-record} ...] :cancelled? predicate}`. The ranker returns an original integer index. Missing ranker on a prompt throws non-retryable configuration error until Task 2 supplies the default adapter. Preserve FAIL reasons for empty/all-ineligible inputs, existing best_id/best_outcome string values, notes, and id/node_id fallback.
+- [x] Heuristic key is `[status-rank (- score) string-id original-index]`; missing score is zero, present nonnumeric score throws non-retryable configuration error. Validate only eligible scores and only on heuristic path. Reject NaN/infinite scores if the runtime represents them: no nondeterministic ordering. Ranker-selected index must belong to eligible indices, and cancellation after invocation returns CANCELLED without winner updates. Never mutate the context or candidate records. Let thrown ranker errors propagate unchanged for existing retry classification.
+- [x] Extend tests: all status ranks, descending score, ID and original-occurrence ties, duplicate target IDs, absent scores, invalid score, empty/all-ineligible, blank/nonblank prompts, complete request data and one invocation, invalid index type/range/ineligible membership, exact error identity, pre/post cancellation, and unchanged parent context. Use bounded fixtures and finally release any barriers.
+- [x] Run focused tests and `lgx test test/attractor/handlers_test.lg` sequentially with local LGX_LG. Run `git diff --check`; commit scoped source/tests. Obtain independent spec review then quality review; fix/re-review before Task 2. Do not add completion markers yet.
 
 ## Chunk 2: Unified LLM and entrypoint wiring
+
+Task 1 evidence: selector `cf03766`, proof corrections `901dfa4`; independent
+spec and quality reviews approved. Initial RED 2/3/3, boundary RED 14/54/1;
+final focused 17/64/0 and handlers 20/60/0. Root full suite 508/3649/0,
+AOT exit 0, compiled heuristic fan-in/checkpoint exit 0. Separate reader check
+remains 1 test / 5 failed assertions / exit 1. The pure `heuristic-index` seam
+is public for direct selection evidence. Task 2 and public proof remain required.
 
 ### Task 2: Adapter and runtime configuration
 
@@ -61,6 +68,11 @@ not `:cancelled?`. `generate-object` accepts `(model prompt schema options)`;
 for separated messages pass nil prompt and `:messages` in options. Model parsing
 gives a provider-qualified model prefix precedence over the explicit provider,
 matching the existing CLI helper; do not silently alter that shared convention.
+Set `:tools []` and `:max_tool_rounds 0` explicitly: generation otherwise permits
+one tool round even with no advertised tools. Test a provider returning tool calls
+cannot cause a continuation request or execution. Root independently exercised
+generate-object with an in-memory provider and confirmed string-keyed index output,
+explicit provider/model routing, and the strict object schema request.
 
 One lgx process per worktree: it writes a shared generated runner. Use apply_patch,
 explicit staging (new docs require git add -f), and local compiler. Never stage
