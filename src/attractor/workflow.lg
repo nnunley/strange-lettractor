@@ -197,6 +197,16 @@
     base-dir [{:id "root" :path base-dir}]
     :else []))
 
+(defn configured-roots
+  "Canonical allowed roots for root capture and child source resolution.
+   Recursive callers pass the root bundle's captured :workflow-roots to retain
+   the original authority instead of deriving new roots from child paths."
+  [options]
+  (normalize-roots
+    (if (contains? options :workflow-roots)
+      (:workflow-roots options)
+      (default-roots (:source-path options) (:base-dir options)))))
+
 (defn root-bundle
   "Capture a prepared root graph and exact DOT source as a portable workflow.
 
@@ -204,11 +214,7 @@
    checks, but deliberately remain outside the fingerprinted index."
   [source graph options]
   (let [source-path (:source-path options)
-        base-dir (:base-dir options)
-        roots (normalize-roots
-                (if (contains? options :workflow-roots)
-                  (:workflow-roots options)
-                  (default-roots source-path base-dir)))
+        roots (configured-roots options)
         physical-id (when source-path (os/canonical-path source-path))
         source-sha (sha256-text source)
         plan-sha (plan-fingerprint graph)

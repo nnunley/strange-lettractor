@@ -1,0 +1,145 @@
+(ns attractor.capture-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [io :as io]
+            [os :as os]
+            [attractor.capture :as capture]))
+
+(def exact-dot "digraph Child {\r\n  // café\r\n}\n")
+
+(defn- fixture []
+  (let [base (str (os/temp-dir) "/lettractor-resolver-" (random-uuid))
+        root (str base "/allowed")
+        nested (str root "/nested")
+        outside (str base "/allowed-lookalike")]
+    (doseq [path [base root nested outside]] (io/mkdir path))
+    (doseq [path [(str root "/root.dot") (str root "/child.dot")
+                 (str nested "/child.dot") (str outside "/escape.dot")
+                 (str root "/wrong.txt")]]
+      (io/spit path exact-dot))
+    {:root (os/canonical-path root) :nested (os/canonical-path nested)
+     :outside (os/canonical-path outside)
+     :containing {:logical-id "workflow://root"
+                  :physical-id (os/canonical-path (str root "/root.dot"))
+                  :source exact-dot}}))
+
+(defn- failure [f]
+  (try (f) nil (catch ExceptionInfo e (ex-data e))))
+
+(deftest relative-absolute-and-parent-references-preserve-source
+  (let [{:keys [root nested containing]} (fixture)
+        options {:source-path (:physical-id containing)}]
+    (doseq [reference ["child.dot" (str root "/child.dot") "nested/../child.dot"]]
+      (is (= {:logical-id "workflow://root/child.dot"
+              :physical-id (str root "/child.dot") :source exact-dot}
+             (capture/resolve-source containing reference options))))
+    (is (= "workflow://root/child.dot"
+           (:logical-id (capture/resolve-source
+                          (assoc containing :physical-id (str nested "/child.dot"))
+                          "../child.dot" options))))))
+
+(deftest in-memory-root-requires-base-dir
+  (let [{:keys [root]} (fixture)
+        containing {:logical-id "workflow://root" :physical-id nil :source exact-dot}]
+    (is (= exact-dot (:source (capture/resolve-source containing "child.dot" {:base-dir root}))))
+    (is (= :missing-base-dir (:reason (failure #(capture/resolve-source containing "child.dot" {})))))))
+
+(deftest authorization-precedes-content-read
+  (let [{:keys [root outside containing]} (fixture)
+        reads (atom [])
+        slurp io/slurp
+        options {:source-path (:physical-id containing)}]
+    (os/sh "ln" "-s" (str outside "/escape.dot") (str root "/escape.dot"))
+    (with-redefs [io/slurp (fn [path] (swap! reads conj path) (slurp path))]
+      (doseq [reference [(str outside "/escape.dot") "../allowed-lookalike/escape.dot" "escape.dot"]]
+        (let [error (failure #(capture/resolve-source containing reference options))]
+          (is (= :subpipeline_source (:category error)))
+          (is (= :outside-roots (:reason error)))))
+      (is (= [] @reads))
+      (is (= exact-dot (:source (capture/resolve-source containing "child.dot" options))))
+      (is (= [(str root "/child.dot")] @reads)))))
+
+(deftest invalid-extension-and-empty-roots-never-read-content
+  (let [{:keys [containing]} (fixture)
+        reads (atom [])]
+    (with-redefs [io/slurp (fn [path] (swap! reads conj path) exact-dot)]
+      (is (= :invalid-extension
+             (:reason (failure #(capture/resolve-source containing "wrong.txt"
+                                                        {:source-path (:physical-id containing)})))))
+      (is (= :outside-roots
+             (:reason (failure #(capture/resolve-source containing "child.dot" {:workflow-roots []})))))
+      (is (= [] @reads)))))
+
+(deftest canonical-symlink-parent-semantics
+  (let [{:keys [root outside containing]} (fixture)
+        target (str outside "/deeper")]
+    (io/mkdir target)
+    (os/sh "ln" "-s" target (str root "/link"))
+    (is (= :outside-roots
+           (:reason (failure #(capture/resolve-source containing "link/../escape.dot"
+                                                       {:source-path (:physical-id containing)})))))))
+
+(deftest symlink-cannot-disguise-non-dot-source
+  (let [{:keys [root containing]} (fixture)
+        reads (atom [])]
+    (os/sh "ln" "-s" (str root "/wrong.txt") (str root "/disguised.dot"))
+    (with-redefs [io/slurp (fn [path] (swap! reads conj path) exact-dot)]
+      (is (= :invalid-extension
+             (:reason (failure #(capture/resolve-source containing "disguised.dot"
+                                                        {:source-path (:physical-id containing)})))))
+      (is (= [] @reads)))))
+
+(deftest longest-root-and-lexicographic-tie-determine-logical-id
+  (let [{:keys [root nested containing]} (fixture)
+        roots [{:id "z" :path nested} {:id "outer" :path root} {:id "a" :path nested}]]
+    (doseq [ordered [roots (vec (reverse roots))]]
+      (is (= "workflow://a/child.dot"
+             (:logical-id (capture/resolve-source containing "nested/child.dot" {:workflow-roots ordered})))))))
+
+(deftest bad-files-have-usable-errors
+  (let [{:keys [root containing]} (fixture)
+        options {:source-path (:physical-id containing)}]
+    (io/mkdir (str root "/directory.dot"))
+    (doseq [[reference reason] [["wrong.txt" :invalid-extension]
+                               ["missing.dot" :unavailable-source]
+                               ["directory.dot" :unavailable-source]]]
+      (is (= reason (:reason (failure #(capture/resolve-source containing reference options)))))))
+  (let [{:keys [containing]} (fixture)]
+    (with-redefs [io/slurp (fn [_] (throw (ex-info "permission denied" {})))]
+      (is (= :unavailable-source
+             (:reason (failure #(capture/resolve-source containing "child.dot"
+                                                        {:source-path (:physical-id containing)}))))))))
+
+(deftest invalid-utf8-is-rejected-without-normalization
+  (let [{:keys [root containing]} (fixture)]
+    (doseq [hex ["e282" "eda080" "c080" "ff"]]
+      (io/spit (str root "/invalid.dot") (io/decode :hex hex))
+      (is (= :invalid-utf8
+             (:reason (failure #(capture/resolve-source containing "invalid.dot"
+                                                        {:source-path (:physical-id containing)}))))))
+    (io/spit (str root "/valid.dot") (io/decode :hex "efbfbd"))
+    (is (= (io/decode :hex "efbfbd")
+           (:source (capture/resolve-source containing "valid.dot" {:source-path (:physical-id containing)}))))))
+
+(deftest trusted-loader-receives-literal-input-once-per-call
+  (let [containing {:logical-id "workflow://root" :physical-id nil :source exact-dot}
+        calls (atom [])
+        record {:logical-id "virtual://child" :physical-id "store:123" :source exact-dot}
+        options {:source-loader (fn [parent reference] (swap! calls conj [parent reference])
+                                  (assoc record :ignored true))}]
+    (dotimes [_ 2]
+      (is (= record (capture/resolve-source containing "literal://child" options))))
+    (is (= [[containing "literal://child"] [containing "literal://child"]] @calls))))
+
+(deftest injected-loader-output-is-validated
+  (let [good {:logical-id "virtual://child" :physical-id "store:123" :source exact-dot}]
+    (doseq [record [nil [] (dissoc good :source) (assoc good :source 1)
+                   (assoc good :logical-id "  ") (assoc good :physical-id "")
+                   (assoc good :logical-id 1) (assoc good :physical-id nil)]]
+      (is (= :invalid-loader-result
+             (:reason (failure #(capture/resolve-source {} "child" {:source-loader (fn [_ _] record)}))))))
+    (is (= :invalid-utf8
+           (:reason (failure #(capture/resolve-source {} "child"
+                                  {:source-loader (fn [_ _] (assoc good :source (io/decode :hex "ff")))})))))
+    (is (= :loader-failed
+           (:reason (failure #(capture/resolve-source {} "child"
+                                  {:source-loader (fn [_ _] (throw (ex-info "offline" {})))})))))))

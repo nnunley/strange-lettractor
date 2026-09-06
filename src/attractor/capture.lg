@@ -1,0 +1,87 @@
+(ns attractor.capture
+  (:require [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.workflow :as workflow]))
+
+(defn- source-error! [reason reference]
+  (throw (ex-info "Cannot resolve subpipeline source"
+                  {:category :subpipeline_source :reason reason :reference reference})))
+
+(defn- nonblank-string? [value]
+  (and (string? value) (not (str/blank? value))))
+
+(defn- valid-source [source reference]
+  ;; seq decodes UTF-8, replacing malformed byte sequences. Re-encoding must
+  ;; reproduce the exact input bytes, including valid literal replacement chars.
+  (when-not (= source (apply str (seq source)))
+    (source-error! :invalid-utf8 reference))
+  source)
+
+(defn- load-injected [loader containing reference]
+  (let [record (try (loader containing reference)
+                   (catch Exception _ (source-error! :loader-failed reference)))]
+    (when-not (and (map? record)
+                   (nonblank-string? (:logical-id record))
+                   (nonblank-string? (:physical-id record))
+                   (string? (:source record)))
+      (source-error! :invalid-loader-result reference))
+    {:logical-id (:logical-id record)
+     :physical-id (:physical-id record)
+     :source (valid-source (:source record) reference)}))
+
+(defn- parent-path [path]
+  (let [index (str/last-index-of path "/")]
+    (cond (nil? index) "." (zero? index) "/" :else (subs path 0 index))))
+
+(defn- root-prefix [root]
+  (if (= "/" (:path root)) "/" (str (:path root) "/")))
+
+(defn- authorized-root [roots physical-id]
+  (first
+    (sort (fn [left right]
+            (let [length-order (compare (count (:path right)) (count (:path left)))]
+              (if (zero? length-order)
+                (compare (:id left) (:id right))
+                length-order)))
+          (filter (fn [root] (str/starts-with? physical-id (root-prefix root))) roots))))
+
+(defn- load-filesystem [containing reference options]
+  (when-not (nonblank-string? reference)
+    (source-error! :invalid-reference reference))
+  (when-not (str/ends-with? reference ".dot")
+    (source-error! :invalid-extension reference))
+  (let [base (if (:physical-id containing)
+               (parent-path (:physical-id containing))
+               (:base-dir options))]
+    (when-not (nonblank-string? base)
+      (source-error! :missing-base-dir reference))
+    (let [roots (workflow/configured-roots options)
+          ;; Do not lexical-clean before canonicalization: link/.. must follow
+          ;; the link's actual parent, not its lexical parent.
+          candidate (if (str/starts-with? reference "/") reference (str base "/" reference))
+          physical-id (try (os/canonical-path candidate)
+                           (catch Exception _ (source-error! :unavailable-source reference)))
+          root (authorized-root roots physical-id)]
+      (when-not root (source-error! :outside-roots reference))
+      (when-not (str/ends-with? physical-id ".dot")
+        (source-error! :invalid-extension reference))
+      (let [source (try (io/slurp physical-id)
+                       (catch Exception _ (source-error! :unavailable-source reference)))]
+        {:logical-id (str "workflow://" (:id root) "/"
+                          (subs physical-id (count (root-prefix root))))
+         :physical-id physical-id
+         :source (valid-source source reference)}))))
+
+(defn resolve-source
+  "Resolve one child source, without parsing or caching.
+   Default filesystem loading canonicalizes symlinks and authorizes the path
+   against :workflow-roots before reading bytes. Preserve the root bundle's
+   :workflow-roots in recursive callers. In-memory parents require :base-dir.
+   :source-loader is a trusted caller function of containing record and literal
+   reference; it owns virtual-source authorization and stable physical identity.
+   Injected results are validated but are not subject to filesystem confinement."
+  [containing reference options]
+  (if (contains? options :source-loader)
+    (load-injected (:source-loader options) containing reference)
+    (load-filesystem containing reference options)))
