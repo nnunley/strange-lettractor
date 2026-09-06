@@ -1,6 +1,6 @@
 # Prompted and heuristic fan-in
 
-Proposed detailed contract within the approved ITER-0006 direction. This component
+User-approved detailed contract (2026-09-06) within ITER-0006. This component
 implements StrongDM Attractor §4.9 and ATTR-FANIN-01; it does not complete the
 iteration or the unified framework.
 

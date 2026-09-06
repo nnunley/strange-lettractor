@@ -1,7 +1,7 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** parallel join component reviewed and verified; remaining interactive-concurrency components next
+**Task:** approved fan-in ranking plan; Task 1 selector implementation underway
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; ATTR-PAR-02 component complete, iteration incomplete
