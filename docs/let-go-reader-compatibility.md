@@ -35,3 +35,35 @@ Five desired acceptance cases are preserved outside default discovery in `compat
 Current result: 1 test, 5 failed assertions, exit 1. These are deferred failing requirements, not skipped or passing tests. Default composition tests instead verify the temporary rejection behavior and supported Unicode decoding.
 
 Restore full support by fixing/verifying #801, replacing the scanner with native reader integration that safely consumes the whole input, and making the deferred command pass. Then move those acceptance cases back into default discovery, replace the temporary rejection assertions, and remove the exception from the design/plan. An upstream fix alone does not change the application scanner. `read-string` reading only the first form is normal Clojure behavior; the application must separately enforce exactly one resulting map without evaluating forms.
+
+## Unfinished trailing source forms
+
+Separately confirmed on 2026-09-06 with the local let-go checkout at
+`bdd8268c9cb3acf369f0854bada47af79d1d673d`:
+
+```sh
+/Users/ndn/development/let-go/lg -e '(println "before") (println "unfinished"'
+clojure -M -e '(println "before") (println "unfinished"'
+```
+
+The let-go command prints `before` and `nil`, then exits 0. JVM Clojure prints
+`before`, reports `EOF while reading`, and exits 1. The valid control with the
+missing closing parenthesis restored prints both strings in let-go.
+
+The same difference occurs when evaluating:
+
+```clojure
+(load-string "(println :before) (println :unfinished")
+```
+
+In the inspected source, `pkg/compiler/compiler.go`'s `CompileMultiple` loop
+stops on `isErrorEOF` without distinguishing end-of-input between forms from
+end-of-input inside an unfinished form. This is different from `read-string`
+legitimately returning only the first form. It is also separate from the
+metadata/discard defects tracked in #801; no new upstream issue has been filed
+for this finding yet.
+
+An unfinished trailing test definition can therefore disappear from discovery
+without making the test command fail. Check discovered test counts as well as
+failure counts, and verify newly added tests actually run. No local let-go files
+were changed for this investigation.
