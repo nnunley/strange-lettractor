@@ -9,6 +9,7 @@
             [attractor.workflow :as workflow]))
 
 ;; ATTR-COMPOSE-02 / SCN-GRAPH-MERGE: application-owned composition seam.
+;; SCN-GRAPH-MERGE COMPLETE
 (def base-dot
   "digraph Base { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
 (def donor-dot

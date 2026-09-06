@@ -111,7 +111,8 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Given two independently parsed graphs and a caller custom transform that merges nodes and edges into one valid graph
 - When public preparation validates and captures the transformed graph, then execution runs it
 - Then the merged nodes and edges are present in validation and the captured plan, execution traverses the intended merged route, and the original parsed inputs remain unchanged
-- Seam: public transform/validation/pipeline/checkpoint integration; pending reusable proof, not a requirement for a new built-in merger API
+- And a copied checkpoint/workflow bundle resumes that captured route after current root/donor sources change, without rerunning transforms or changing the original recovery artifacts
+- Seam: public transform/validation/pipeline/checkpoint integration; complete component evidence in `graph_merge_contract_test.lg` (3 tests / 63 assertions), not a new built-in merger API. Recovery evidence covers checkpoint and workflow-bundle bytes, not ancillary execution logs.
 
 ### SCN-CLOJURE-READER — Safe Clojure data-reading syntax
 

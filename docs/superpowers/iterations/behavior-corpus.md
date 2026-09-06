@@ -48,7 +48,7 @@ Commands are run from the repository root with the configured local compiler at 
 
 Additional full-goal residual gates from the ITER-0005 audit:
 
-- `SCN-GRAPH-MERGE`: `rg -q '^;; SCN-GRAPH-MERGE COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg` — pending valid nodes-and-edges merge execution proof.
+- `SCN-GRAPH-MERGE`: `rg -q '^;; SCN-GRAPH-MERGE COMPLETE$' test/attractor/graph_merge_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/graph_merge_contract_test.lg` — complete component: merged nodes/edges, validation/capture, execution, input preservation, omitted-transform control, and copied pinned recovery (3 tests / 63 assertions).
 - `SCN-CLOJURE-READER`: `/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg` — currently 1 test / 5 failed assertions / exit 1. This is failing acceptance evidence, not a skip or pass; broader artifact-reader checks must accompany restoration.
 
 Build/AOT release check: `LGX_LG=/Users/ndn/development/let-go/lg lgx build`.

@@ -1,7 +1,21 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** interviewer fixes and tool-launch timeout repair reviewed and verified; native timed-input and artifact-index proposals await approval
+**Task:** graph-merging component verified; native timed-input and artifact-index proposals remain pending, not blockers for independent agent-loop work
+
+**Graph-merging component:** `993652f` adds the missing §9.4 public composition
+proof without production changes. Three tests / 63 assertions independently pass:
+donor nodes and edges reach validation, capture, and execution; input snapshots
+are preserved; the omitted-transform control keeps the original route; and a
+copied checkpoint/workflow bundle resumes the captured merge after source drift
+without invoking transforms. Original checkpoint/bundle bytes remain unchanged
+(ancillary execution logs are outside this recovery assertion). Scoped spec and
+quality review found no material findings. Root full suite passes **552 tests /
+4383 assertions / zero failures**, exit 0; local AOT build exits 0. The separate
+reader acceptance still fails all five assertions, exit 1. ATTR-COMPOSE-02 and
+SCN-GRAPH-MERGE are complete components, not completion of ITER-0013 or the goal.
+Next independent implementation scope is ITER-0007's local tool-loop contracts;
+neither pending ITER-0006 proposal should stop that work.
 
 **Tool startup race repaired:** `7f3d628` establishes the owned command group
 through Bash job control at spawn instead of an asynchronously initializing
