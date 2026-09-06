@@ -18,6 +18,8 @@ Runtime findings: let-go `io/slurp` preserves raw string bytes and string `seq` 
 
 Configuration handoff: capture calls `composition/node-config` for diagnostics; the scoped runtime handler calls the same pure function on the verified captured node and graph attributes. Those original strings/numbers already participate in the plan fingerprint. Do not retain an unpinned side cache or add schema fields for parsed mappings.
 
+Reader clarification (user, 2026-09-06): use Clojure reader syntax, the superset of EDN, rather than strict EDN or a hand-scanned string-map subset. Accept reader discards and metadata where valid, consume exactly one resulting value, and validate its map/string schema without evaluating forms. Keep `.edn` filenames. Check the local reader's capabilities and report any demonstrated Clojure compatibility bug to the user rather than silently narrowing the contract. The explicit `node-config` return envelope is `{:config validated-config :diagnostics []}` on success, or `{:config nil :diagnostics [canonical-errors...]}` on failure; the config fields listed below are nested under `:config`.
+
 ### Task 1: Mapping grammar and node configuration
 
 Files: create `src/attractor/composition.lg` and `test/attractor/composition_contract_test.lg`; modify `src/attractor/validation.lg`.

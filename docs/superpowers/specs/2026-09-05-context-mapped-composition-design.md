@@ -23,7 +23,7 @@ compose [
 ]
 ```
 
-`input_map` maps parent string keys to child string keys. `output_map` maps child string keys to parent string keys. Blank/absent maps mean `{}`. Present values must be quoted EDN maps with string entries.
+`input_map` maps parent string keys to child string keys. `output_map` maps child string keys to parent string keys. Blank/absent maps mean `{}`. Present values must be quoted strings containing exactly one map with string entries, read using Clojure's reader syntax (the superset of EDN), not a restricted EDN grammar. Reader discards and metadata are accepted where valid; validation applies to the resulting value. Reading must not evaluate code. Files retain the `.edn` extension. This reflects the user's 2026-09-06 clarification and applies to the project's data-reading convention, while each artifact retains its own value/schema constraints.
 
 Lookup uses `contains?`, distinguishing present nil from missing. Two sources cannot target one destination. Output destinations may overwrite existing nonreserved parent values, but every output is collected before returning one transactional `:context_updates` map.
 
