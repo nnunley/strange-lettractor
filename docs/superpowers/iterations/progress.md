@@ -1,10 +1,45 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** fan-in Task 2 adapter/wiring reviewed; Task 3 public lifecycle, recovery and cancellation proof next
+**Task:** fan-in component reviewed and verified; interviewer matrix/nonblocking console timeout next
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; ATTR-PAR-02 component complete, iteration incomplete
+
+**Fan-in completion checkpoint:** Public proof `b51a386`, spec corrections
+`bbb1471`, and failure-path fixture teardown `b87269c` passed independent spec
+then quality review. Root full suite at `bbb1471`: 530 tests / 3874 assertions /
+zero failures; AOT exit 0. After the test-only teardown correction, root focused
+public proof passes 4/110/0. A fresh compiled heuristic run selects and persists
+`a`; the offline HTTP prompted run below selects `b`. ATTR-FANIN-01 and
+SCN-FANIN-RANKING are complete as this component only. Interviewers, console
+timeouts, artifact lifecycle/recovery, and the registry-to-engine matrix remain
+required before ITER-0006 audit/integration. Source inspection confirms the next
+gap: console questions still use unconditional `read-line` and ignore
+`timeout_seconds`, contrary to upstream §§6.4–6.5.
+
+**Public fan-in verification at `b51a386`:** Root independently ran the default
+suite: 530 tests / 3840 assertions / zero failures, exit 0; local AOT build exits
+0. Separate reader acceptance remains 1 test / 5 failures, exit 1. A compiled
+workflow using actual tool branches and a one-request localhost OpenAI Responses
+fixture succeeds. Captured HTTP payload has the configured model, strict integer
+candidate-index schema, no tools, and both complete ordered branch records. The
+saved checkpoint selects `b` against heuristic ID order and completes
+`[start fork join exit]`. Fixture evidence is retained under
+`/tmp/lettractor-fanin-wire.VlJNob/`; this is offline HTTP evidence, not live-provider
+parity. Initial sandbox-denied connection is retained separately from the
+successful authorized run.
+
+An implementer full-suite run (session 64423) reported 530/3840/**1 failure**.
+Its exact assertion was lost to output truncation; the missing region was within
+the LLM test listing, while all four new public fan-in tests were visibly green.
+Do not classify that failure as fixed. Root's full rerun passed, and a subsequent
+ten-run LLM-only check retained every repetition summary: each 83 tests / 494
+assertions / zero failures. The historical failure remains unreproduced, with no
+justification for a speculative runtime change. Future failures require complete
+captured diagnostics. Task 3 spec review requested stronger final-checkpoint,
+complete candidate-envelope and deep registry-state assertions; no component
+completion marker is authorized until those corrections pass both reviews.
 
 **Latest fan-in adapter checkpoint:** `3f8e9f5` adds the real unified-client ranker
 and CLI run/resume wiring; `4c704cb` rejects empty parsed model/provider before any

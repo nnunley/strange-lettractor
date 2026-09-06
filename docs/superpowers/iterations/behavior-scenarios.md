@@ -162,9 +162,14 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 ### SCN-FANIN-RANKING — Prompted and heuristic fan-in
 
-- Given multiple branch outcomes
-- When a non-empty prompt and injected ranker are present, its selection wins; with an empty prompt, deterministic heuristic selection wins
-- Seam: handler/LLM integration
+- Given real wait-all branches with ordered, scored outcomes and a configured unified client
+- A prompted fan-in selects against the heuristic through a real in-memory provider; complete EDN candidate envelopes retain original indices, statuses and branch evidence
+- A blank prompt chooses the higher score without invoking the provider
+- Saved checkpoints agree with returned winners, winner statuses, ordered results and completed nodes
+- Independent and captured-child runs preserve caller registry maps and mutable runtime state
+- Copied pinned recovery uses the captured prompt despite source drift, does not rerun completed branches, and leaves all original artifacts unchanged
+- External cancellation and injected-clock node timeout cannot return or emit terminal events until held provider cleanup joins; no winner is published afterward
+- Seam: public pipeline/engine/native scope/unified client/checkpoint integration; CLI and offline compiled HTTP checks supplement this, not live-provider parity
 
 ### SCN-HUMAN-TIMEOUT — Non-blocking console question
 

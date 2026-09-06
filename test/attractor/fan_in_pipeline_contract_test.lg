@@ -1,3 +1,4 @@
+;; SCN-FANIN-RANKING COMPLETE
 (ns attractor.fan-in-pipeline-contract-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.core :as core]
