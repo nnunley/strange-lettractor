@@ -37,5 +37,8 @@ Attractor's parallel scheduler uses verified scoped futures and drains their
 registered subtree. This cannot supervise work a custom callback launches through
 a root-owned helper or another detached host mechanism. Arbitrary helper-spawned
 descendant cleanup remains unproved until the upstream ownership gap is addressed.
-The user was notified; no let-go source changes or upstream issue submission were
-made during this investigation.
+Tracked upstream as [let-go #806](https://github.com/nooga/let-go/issues/806).
+The user authorized filing bugs and evolving let-go as needed. Fixing native
+ownership and rerunning these probes is the intended resolution, not retaining
+this limitation permanently. No let-go source changes were made during this
+investigation.

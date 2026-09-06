@@ -50,6 +50,8 @@ joining its workers. It does not expose the configurable scheduling bound and
 early-stop policy this handler needs. The narrower future error finding remains
 valid; it does not imply that all let-go concurrency APIs discard errors.
 
-The user has been notified. No let-go source changes or upstream issue submission
+Tracked upstream as [let-go #805](https://github.com/nooga/let-go/issues/805).
+The user authorized filing bugs and evolving let-go as needed; this is a removable
+workaround, not a permanent architectural constraint. No let-go source changes
 were made as part of this investigation. This workaround does not change the
 separate failing Clojure-reader acceptance requirements.

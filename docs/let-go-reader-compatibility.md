@@ -60,8 +60,8 @@ In the inspected source, `pkg/compiler/compiler.go`'s `CompileMultiple` loop
 stops on `isErrorEOF` without distinguishing end-of-input between forms from
 end-of-input inside an unfinished form. This is different from `read-string`
 legitimately returning only the first form. It is also separate from the
-metadata/discard defects tracked in #801; no new upstream issue has been filed
-for this finding yet.
+metadata/discard defects tracked in #801. The unfinished-form finding is now
+tracked separately as [let-go #807](https://github.com/nooga/let-go/issues/807).
 
 An unfinished trailing test definition can therefore disappear from discovery
 without making the test command fail. Check discovered test counts as well as
