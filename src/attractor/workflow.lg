@@ -1,5 +1,6 @@
 (ns attractor.workflow
-  (:require [clojure.edn :as edn]))
+  (:require [clojure.edn :as edn]
+            [hash :as hash]))
 
 (defn- not-serializable! [path]
   (throw
