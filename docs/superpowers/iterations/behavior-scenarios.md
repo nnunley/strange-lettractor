@@ -144,10 +144,14 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 ### SCN-FIRST-SUCCESS — Early parallel completion
 
-- Given one immediately successful branch and one blocked branch
-- When policy is `first_success`
-- Then the handler returns before the blocked branch's normal completion and cancels/joins the loser
-- Seam: handler concurrency integration
+- Given a bounded parallel fork with a successful branch and a native-blocked loser
+- When policy is `first_success` and SUCCESS is observed
+- Then queued launches stop, the loser observes cancellation, and all launched workers and registered descendants are joined before return; held cleanup prevents fork/pipeline terminal events and fan-in entry
+- External cancellation during cleanup wins; successful routing enters fan-in exactly once after cleanup
+- Branch contexts remain isolated and checkpoint results retain original edge order and boundary routing
+- Thrown primary execution errors survive fidelity cleanup failures; ordinary returned FAIL and retryable handler exceptions retain their existing retry semantics
+- Direct evidence also covers replenishment, duplicate targets, exact SUCCESS, wait_all, clone/launch/worker errors, and sibling scope isolation
+- Seam: real public pipeline/engine/checkpoint integration plus direct native concurrency contracts; async helper ownership limitation remains tracked in let-go #806
 
 ### SCN-ARTIFACT-DISCOVERY — Handler artifact lifecycle
 

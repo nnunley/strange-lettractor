@@ -22,6 +22,7 @@
    (context/make-context) (graph-for ids) "run"))
 (defn results [outcome] (get-in outcome [:context_updates "parallel.results"]))
 
+;; SCN-FIRST-SUCCESS COMPLETE
 (def public-dot
   "digraph Join { start [shape=Mdiamond]; fork [shape=component, join_policy=first_success, max_parallel=2]; slow [type=probe, timeout=10s]; winner [type=probe, timeout=10s]; join [shape=tripleoctagon]; exit [shape=Msquare]; start -> fork; fork -> slow; fork -> winner; slow -> join; winner -> join; join -> exit; }")
 (defn public-root [] (str (os/temp-dir) "/public-parallel-" (random-uuid)))
