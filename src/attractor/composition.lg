@@ -42,6 +42,9 @@
       (str/starts-with? s "internal.retry_count.")))
 
 (defn- read-mapping [s]
+  ;; TEMPORARY user-approved subset pending nooga/let-go#801. Native Clojure
+  ;; reader syntax remains the desired contract; see compat/ and
+  ;; docs/let-go-reader-compatibility.md. Never evaluate reader output.
   ;; The runtime reader reads only the first form. Scan the restricted string-map
   ;; grammar ourselves so closing delimiters and trailing forms cannot be hidden.
   ;; Delegate individual quoted tokens to EDN for standard string escape decoding.

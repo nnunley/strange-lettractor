@@ -22,6 +22,8 @@ Reader clarification (user, 2026-09-06): use Clojure reader syntax, the superset
 
 ### Task 1: Mapping grammar and node configuration
 
+Temporary user-approved exception: continue with ordinary string/string maps, whitespace, commas, comments, and string/Unicode escapes while [let-go #801](https://github.com/nooga/let-go/issues/801) is unresolved. The application currently rejects all metadata and discards, including leading/trailing discards supported by the runtime. Full reader support above remains **unmet**. Preserve runnable failing acceptance cases in `compat/`; see `docs/let-go-reader-compatibility.md` for the command and restoration criteria. Upstream fixes must be followed by replacing the scanner with safe whole-input native reading and restoring acceptance cases to default discovery.
+
 Files: create `src/attractor/composition.lg` and `test/attractor/composition_contract_test.lg`; modify `src/attractor/validation.lg`.
 
 - [ ] Write tests for `(composition/node-config node graph)` returning `{:input-map map :output-map map :max-steps positive-integer :dotfile string}` or canonical configuration diagnostics. Blank/absent mapping strings mean `{}`; other forms must contain exactly one EDN map of string/string entries. Reject trailing forms, duplicate destinations, engine-owned destination names/prefixes, malformed EDN, missing/blank dotfile, and invalid budgets. Source names may be reserved. Nil input values are tested later at runtime, not forbidden by configuration.

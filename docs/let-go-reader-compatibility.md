@@ -20,10 +20,18 @@ Clojure returns `{"a" "b"}`. The local let-go reader throws `map literal must co
 
 The [Clojure reader reference](https://clojure.org/reference/reader) specifies that metadata attaches to the following form and that `#_` completely skips its following form. Both expected results were also verified by executing the expressions in JVM Clojure, not inferred solely from documentation.
 
-## Implementation status
+## Temporary implementation and remaining requirement
 
-- Do not use `eval` to compensate for the metadata result or narrow accepted syntax to conceal either difference.
-- Fixes in the separate local let-go repository await user authorization. No runtime files were changed for these findings.
-- Mapping configuration still needs native-reader parsing and safe whole-input consumption. Its current scanner does not meet the clarified contract.
-- `read-string` reading only the first form is normal Clojure behavior, not a compatibility bug; the application must separately enforce exactly one resulting value.
-- The mapping regression tests are intentionally red pending the runtime/parser work. This is not completion of ITER-0005.
+The upstream defects are tracked in [let-go issue #801](https://github.com/nooga/let-go/issues/801). The user authorized a temporary mapping subset so Attractor development can continue. No local let-go files were changed.
+
+The current application scanner accepts ordinary string-to-string maps, whitespace, commas, comments, and native string escapes including Unicode. It rejects **all** reader discards and metadata, even leading/trailing discards that the runtime can already read. This is an explicit interim application limitation, separate from the two runtime defects above. Unsupported forms produce `subpipeline_config` errors; reading never evaluates code. Full Clojure reader support remains unmet.
+
+Five desired acceptance cases are preserved outside default discovery in `compat/clojure_reader_mapping_test.lg`. From the project root, run:
+
+```sh
+/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg
+```
+
+Current result: 1 test, 5 failed assertions, exit 1. These are deferred failing requirements, not skipped or passing tests. Default composition tests instead verify the temporary rejection behavior and supported Unicode decoding.
+
+Restore full support by fixing/verifying #801, replacing the scanner with native reader integration that safely consumes the whole input, and making the deferred command pass. Then move those acceptance cases back into default discovery, replace the temporary rejection assertions, and remove the exception from the design/plan. An upstream fix alone does not change the application scanner. `read-string` reading only the first form is normal Clojure behavior; the application must separately enforce exactly one resulting map without evaluating forms.

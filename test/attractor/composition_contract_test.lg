@@ -23,7 +23,9 @@
   (is (= {"quote\"" "line\n"}
          (get-in (config {:input_map "{\"quote\\\"\" \"line\\n\"}"} {}) [:config :input-map])))
   (is (= {"a" "b"}
-         (get-in (config {:input_map "{\"\\u0061\" \"\\u0062\"}"} {}) [:config :input-map]))))
+         (get-in (config {:input_map "{\"\\u0061\" \"\\u0062\"}"} {}) [:config :input-map])))
+  (is (= {"héllo" "世界"}
+         (get-in (config {:input_map "{\"héllo\" \"世界\"}"} {}) [:config :input-map]))))
 
 (deftest malformed-mappings-rejected
   (doseq [attribute [:input_map :output_map]
@@ -33,6 +35,21 @@
     (let [result (config {attribute v} {})]
       (is (nil? (:config result)))
       (is (= "subpipeline_config" (:rule (first (:diagnostics result))))))))
+
+(deftest temporary-reader-limitations-reject-cleanly
+  ;; User-approved temporary limitation pending nooga/let-go#801. Acceptance
+  ;; remains a separate failing compatibility suite, not a skipped assertion.
+  (doseq [s ["#_ :ignored {\"a\" \"b\"}"
+             "{#_ [:ignored] \"a\" #_ :ignored \"b\" #_ {:discard \"value\"}}"
+             "{\"a\" \"b\"} #_ [:discarded]"
+             "^{:purpose :mapping} {\"a\" \"b\"}"
+             "^:mapping {\"\\u0061\" \"\\u0062\"}"]]
+    (let [result (config {:input_map s} {})]
+      (is (nil? (:config result)))
+      (is (= "subpipeline_config" (:rule (first (:diagnostics result)))))))
+  (doseq [s ["{}] {}" "{}] #_ [" "{}] ; hidden trailing input" "{} #_" "{} #_ 1 {}"
+             "{} #=(throw (ex-info \"must not execute\" {}))" "^:tag []" "^{:tag true} {} nil"]]
+    (is (seq (:diagnostics (config {:input_map s} {}))))))
 
 (deftest destination-ownership-boundaries
   (doseq [attribute [:input_map :output_map]

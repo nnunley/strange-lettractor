@@ -31,6 +31,8 @@ Engine-owned destinations are rejected: `run.id`, `current_node`, `outcome`, `pr
 
 ## Preparation and Validation
 
+Temporary user-approved reader exception: mappings currently accept ordinary string/string maps with whitespace, commas, comments, and string/Unicode escapes. All metadata and reader discards are rejected, including leading/trailing discards the runtime supports. Full Clojure reader support remains required but unmet pending [let-go #801](https://github.com/nooga/let-go/issues/801) and replacement of the application scanner with safe whole-input native reading. Deferred runnable acceptance evidence and restoration criteria are recorded in `docs/let-go-reader-compatibility.md`; this exception does not redefine the final contract.
+
 After transforms, the workflow preparer finds explicit `subpipeline` nodes in lexical node-ID order, parses mappings, resolves `subpipeline.dotfile`, and recursively prepares each new physical child once. Transform-added references are included. Completed sources are reused; active-stack references produce a cycle error with the logical chain.
 
 Canonical error rules are `subpipeline_config` for dotfile/mapping/destination defects, `subpipeline_source` for unauthorized/non-DOT/unreadable/invalid-UTF-8 sources, and `subpipeline_cycle` for recursion. Child diagnostics are attributed to the parent reference boundary as defined by the pinned design. Any error prevents publication and every root/child handler.
