@@ -881,9 +881,11 @@ digraph Gate {
     (io/delete-file child-dotfile)))
 
 (deftest test-manager-real-child-observes-attempt-cancellation
-  (let [stamp (System/currentTimeMillis)
-        child-dotfile (str (os/temp-dir) "/lettractor-manager-cancel-" stamp ".dot")
-        logs (str (os/temp-dir) "/lettractor-manager-logs-" stamp)
+  (let [fixture-id (str/replace (str (random-uuid)) #"[^A-Za-z0-9-]" "")
+        child-dotfile (str (os/temp-dir) "/lettractor-manager-cancel-" fixture-id ".dot")
+        logs (str (os/temp-dir) "/lettractor-manager-logs-" fixture-id)
+        clock (atom 0)
+        external-cancel (atom false)
         started (promise)
         observed-cancel (promise)
         _ (io/spit child-dotfile
@@ -913,12 +915,21 @@ digraph Gate {
                              (do (core/sleep 1) (recur)))))
                        {:status :success})))
         task (core/future
-               (e/run-pipeline parent {:registry registry :logs-root logs}))]
+               (e/run-pipeline parent {:registry registry :logs-root logs
+                                       :now-ms (fn [] @clock)
+                                       :cancelled? (fn [] @external-cancel)}))]
     (try
       (is (= true (deref started 1000 false)))
+      ;; Keep the attempt's logical clock frozen until the child work handler
+      ;; is live, then cross the existing 100 ms deadline deterministically.
+      (reset! clock 100)
       (is (= true (deref observed-cancel 3000 false)))
-      (is (= :fail (:status (deref task 3000 {:status :timeout}))))
+      (let [result (deref task 3000 {:status :timeout})]
+        (is (= :fail (:status result)))
+        (is (= :timeout_error (:category result))))
       (finally
+        (reset! external-cancel true)
+        (deref task 3000 :cleanup-timeout)
         (io/delete-file child-dotfile)))))
 
 (deftest test-execute-subgraph-combines-branch-cancellation-at-boundary
