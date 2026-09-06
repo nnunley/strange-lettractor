@@ -12,6 +12,8 @@
 
 All test commands below use `env LGX_LG=/Users/ndn/development/let-go/lg lgx test <one-file>`; lgx accepts only one test path. Run the full suite with the same prefix and no path. Use `apply_patch` for edits and preserve all existing worktrees.
 
+Runtime findings: let-go `io/slurp` preserves raw string bytes and string `seq` converts through Go runes. The read-only probe `(= source (apply str (seq source)))` accepted UTF-8 `héllo 世界` and a genuine U+FFFD character, and rejected byte sequences `ff` and `c080` generated with `io/decode :hex`. Task 2 can use this strict UTF-8 check before parsing; extend tests with truncated multibyte sequences, surrogate encodings, and overlong encodings. `clojure.edn/read-string` reads only one form; Task 1 needs explicit whole-input consumption and cannot rely on that call alone.
+
 ## Chunk 1: Configuration and recursive capture
 
 ### Task 1: Mapping grammar and node configuration
