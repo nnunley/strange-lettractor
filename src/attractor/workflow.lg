@@ -657,7 +657,7 @@
         actual-bytes (io/slurp manifest-path)]
     (when-not (= expected-bytes actual-bytes)
       (already-published! manifest-path))
-    (verify-manifest-files! run-root (read-manifest! manifest-path))
+    (verify-manifest-files! run-root (edn/read-string actual-bytes))
     manifest-path))
 
 (defn- acquire-publication-lock! [lock-dir manifest-path]

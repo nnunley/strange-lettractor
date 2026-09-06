@@ -226,6 +226,9 @@
     (validate-checkpoint-outcome! graph node-id outcome)))
 
 (defn- validate-checkpoint-graph! [checkpoint graph]
+  (when-not (map? (:context_values checkpoint))
+    (snapshot-corrupt! "Workflow checkpoint context must be a map"
+                       {:kind :checkpoint :field :context_values}))
   (let [current-node (:current_node checkpoint)
         completed (:completed_nodes checkpoint)
         completed-set (if (vector? completed) (into #{} completed) #{})]

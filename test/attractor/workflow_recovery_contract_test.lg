@@ -455,6 +455,24 @@
     (is (= workflow/publish-lock-wait-ms (:wait-ms error)))
     (is (nil? (os/stat (str workflow-dir "/manifest.edn"))))))
 
+(deftest publication-reuse-verifies-the-once-compared-manifest
+  (let [root (publication-root)
+        bundle (prepared-bundle)
+        manifest-path (workflow/publish! bundle root)
+        reads (atom 0)
+        real-slurp io/slurp
+        result (with-redefs [io/slurp
+                             (fn [path]
+                               (if (= manifest-path path)
+                                 (if (= 1 (swap! reads inc))
+                                   (real-slurp path)
+                                   "{:changed true}")
+                                 (real-slurp path)))]
+                 (try (workflow/publish! bundle root)
+                      (catch Object error :reread-failed)))]
+    (is (= manifest-path result))
+    (is (= 1 @reads))))
+
 (deftest concurrent-publishers-never-corrupt-the-committed-bundle
   (let [run-root (publication-root)
         bundle (prepared-bundle)
@@ -839,6 +857,19 @@
       (is (= manifest-value (:workflow-manifest error)))
       (is (= [] @events))
       (is (= 0 @calls)))))
+
+(deftest public-resume-rejects-non-map-checkpoint-context-before-engine-entry
+  (doseq [values [[] "bad" 42]]
+    (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+          checkpoint (context/load-checkpoint checkpoint-path)
+          _ (context/save-checkpoint (assoc checkpoint :context_values values) checkpoint-path)
+          entered (atom false)
+          error (with-redefs [attractor.engine/resume-pipeline-from-checkpoint
+                              (fn [_ _ _] (reset! entered true) {:status :success})]
+                  (workflow-error #(pipeline/resume checkpoint-path {})))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (= :context_values (:field error)))
+      (is (false? @entered)))))
 
 (deftest plan-byte-mutations-fail-publication-reuse-and-public-resume
   (doseq [suffix ["\n" " []"]]
