@@ -275,35 +275,49 @@
     (is (identical? original (deref task 1000 nil)))
     (is (= true (deref cleaned 0 false)))))
 
-(deftest ranker-scope-does-not-capture-an-existing-caller-sibling
-  (let [caller (core/scope-open)
-        sibling-channel (async/chan) probe-channel (async/chan)
-        sibling-entered (promise) probe-entered (promise)
-        sibling (core/future
-                  (deliver sibling-entered true)
-                  (core/<! sibling-channel)
-                  :sibling-done)
-        {:keys [rank]} (memory-ranker "{\"candidate_index\":0}"
-                                      {:model "memory/model"})]
-    (is (= true (deref sibling-entered 1000 false)))
-    (try
-      (is (= 0 (rank request)))
-      (let [probe (core/future
-                    (deliver probe-entered true)
-                    (core/<! probe-channel)
-                    :probe-done)]
-        (is (= true (deref probe-entered 1000 false)))
-        (is (= :pending (deref sibling 30 :pending)))
-        (is (= :pending (deref probe 30 :pending)))
-        (is (= 2 (core/scope-live caller)))
-        (async/close! probe-channel)
-        (is (= :probe-done (deref probe 1000 nil))))
-      (finally
-        (async/close! sibling-channel)
-        (async/close! probe-channel)
-        (core/scope-close! caller 0)))
-    (is (= :sibling-done (deref sibling 1000 nil)))
-    (is (= 0 (core/scope-live caller)))))
+(deftest ranker-restores-caller-scope-after-success-and-provider-error
+  (doseq [throws? [false true]]
+    (let [caller (core/scope-open)
+          sibling-channel (async/chan) probe-channel (async/chan)
+          sibling-entered (promise) probe-entered (promise)
+          sibling (core/future
+                    (deliver sibling-entered true)
+                    (core/<! sibling-channel)
+                    :sibling-done)
+          original (ex-info "scope restoration provider failure"
+                            {:category :authentication :retryable false})
+          adapter (llm/make-adapter
+                    "memory"
+                    (fn [_]
+                      (if throws?
+                        (throw original)
+                        (response "{\"candidate_index\":0}")))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"memory" adapter}})
+          rank (ranker/make-ranker {:client client :model "memory/model"})]
+      (is (= true (deref sibling-entered 1000 false)))
+      (try
+        (let [result (try {:selection (rank request)}
+                          (catch Object error {:error error}))]
+          (if throws?
+            (is (identical? original (:error result)))
+            (is (= 0 (:selection result)))))
+        (let [probe (core/future
+                      (deliver probe-entered true)
+                      (core/<! probe-channel)
+                      :probe-done)]
+          (is (= true (deref probe-entered 1000 false)))
+          (is (= :pending (deref sibling 30 :pending)))
+          (is (= :pending (deref probe 30 :pending)))
+          (is (= 2 (core/scope-live caller)))
+          (async/close! probe-channel)
+          (is (= :probe-done (deref probe 1000 nil))))
+        (finally
+          (async/close! sibling-channel)
+          (async/close! probe-channel)
+          (core/scope-close! caller 0)))
+      (is (= :sibling-done (deref sibling 1000 nil)))
+      (is (= 0 (core/scope-live caller))))))
 
 (deftest registry-default-and-override-rankers-are-wired-to-fan-in
   (let [{:keys [requests client]}
