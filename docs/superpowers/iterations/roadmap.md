@@ -19,3 +19,20 @@ The repository already has a walking skeleton: DOT parse → transform/validate 
 | ITER-0012 Native loop and live release evidence | pending | After transport/adapter contracts: native coding-loop continuation/profile/steering evidence, credential-gated provider matrix, and real Attractor smoke; skips are recorded but never treated as passes | ATTR-SMOKE-01, CAL-LOOP-01, CAL-PROFILE-01, CAL-STEER-01, CAL-SUBAGENT-01, CAL-PARITY-01, ULLM-RELEASE-01 | SCN-CAL-LOOP, SCN-CAL-PROFILES, SCN-CAL-SUBAGENTS, SCN-ATTR-SMOKE-LIVE, SCN-PROVIDER-MATRIX |
 
 Every iteration closes with the impacted scenarios, the full sentinel suite, AOT compilation, parallel adversarial audit, and a public checkpoint commit.
+
+## Future design: executable packets and skill packages
+
+Requested by the user on 2026-09-06. Record this as future design work, not an implemented capability or a replacement for the Attractor conformance iterations above.
+
+The design session should settle:
+
+- What an executable packet contains: workflow, executable code, skill instructions, assets, dependencies, and entry point; distinguish executable artifacts from serialized data.
+- Skill package discovery, manifests, versions, dependency resolution, and compatibility requirements for let-go and lgx.
+- How package identity and dependency fingerprints participate in pinned launch and recovery, including behavior when installed packages change or disappear.
+- Trust and permissions: installation versus execution, explicit capabilities, secret handling, and validation before launching package code. Reading configuration must not implicitly execute it.
+- Distribution choices: source bundles, compiled/AOT artifacts, or both; portability and reproducible builds. Keep `.edn` data files and the intended Clojure reader syntax contract.
+- Evidence: install/load/run a packaged skill, launch an executable packet, and recover from the same pinned package versions after local changes.
+
+These are design questions, not selected formats or APIs. Schedule a bounded design before implementation; do not add a package manager or expand the current reader workaround into one.
+
+PEG improvements belong to a separate owner/workstream and must **not** be implemented by this agent. Any packaging dependency on PEG should be identified and handed off with an interface and acceptance criteria; neither PEG redesign nor a replacement Clojure parser is part of this agent's current work.
