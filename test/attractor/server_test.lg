@@ -218,18 +218,26 @@
         release-verification (promise)
         background-complete (promise)
         engine-entered (atom false)
-        real-verify workflow/verify-published!
+        prepared-workflow (pipeline/prepare server-dot)
+        published-fingerprint (atom nil)
         response
         (with-redefs
-          [workflow/verify-published!
+          [workflow/publish!
+           (fn [bundle logs-root]
+             (reset! published-fingerprint (:fingerprint bundle))
+             (str logs-root "/" workflow/manifest-relative-path))
+           workflow/read-manifest!
+           (fn [_]
+             {:fingerprint @published-fingerprint})
+           workflow/verify-published!
            (fn [run-root fingerprint]
              (deliver verification-entered true)
              @release-verification
-             (real-verify run-root fingerprint))
+             {:workflow {:fingerprint fingerprint}})
            pipeline/run
            (fn [source options]
              (try
-               (let [prepared (pipeline/prepare source)
+               (let [prepared prepared-workflow
                      manifest-path
                      (workflow/publish! (:workflow prepared) (:logs-root options))]
                  ((:on-published options) prepared manifest-path)
@@ -255,12 +263,24 @@
         release-publication (promise)
         background-complete (promise)
         engine-entered (atom false)
+        prepared-workflow (pipeline/prepare server-dot)
+        published-fingerprint (atom nil)
         result
         (with-redefs
-          [pipeline/run
+          [workflow/publish!
+           (fn [bundle logs-root]
+             (reset! published-fingerprint (:fingerprint bundle))
+             (str logs-root "/" workflow/manifest-relative-path))
+           workflow/read-manifest!
+           (fn [_]
+             {:fingerprint @published-fingerprint})
+           workflow/verify-published!
+           (fn [_ fingerprint]
+             {:workflow {:fingerprint fingerprint}})
+           pipeline/run
            (fn [source options]
              (try
-               (let [prepared (pipeline/prepare source)]
+               (let [prepared prepared-workflow]
                  ((:on-prepared options) prepared)
                  (deliver prepublication-entered true)
                  @release-publication
@@ -294,6 +314,8 @@
         background-complete (promise)
         engine-entered (atom false)
         observed-cancelled (atom nil)
+        prepared-workflow (pipeline/prepare server-dot)
+        published-fingerprint (atom nil)
         watch-key (keyword (str "timeout-registration-" (random-uuid)))]
     (add-watch server/active-pipelines watch-key
                (fn [_ _ old-state new-state]
@@ -305,10 +327,20 @@
     (try
       (let [result
             (with-redefs
-              [pipeline/run
+              [workflow/publish!
+               (fn [bundle logs-root]
+                 (reset! published-fingerprint (:fingerprint bundle))
+                 (str logs-root "/" workflow/manifest-relative-path))
+               workflow/read-manifest!
+               (fn [_]
+                 {:fingerprint @published-fingerprint})
+               workflow/verify-published!
+               (fn [_ fingerprint]
+                 {:workflow {:fingerprint fingerprint}})
+               pipeline/run
                (fn [source options]
                  (try
-                   (let [prepared (pipeline/prepare source)
+                   (let [prepared prepared-workflow
                          manifest-path
                          (workflow/publish! (:workflow prepared) (:logs-root options))]
                      ((:on-published options) prepared manifest-path)
@@ -341,6 +373,8 @@
   (let [delivery-entered (promise)
         release-delivery (promise)
         background-complete (promise)
+        prepared-workflow (pipeline/prepare server-dot)
+        published-fingerprint (atom nil)
         real-deliver deliver
         result
         (with-redefs
@@ -352,10 +386,20 @@
                  @release-delivery
                  (real-deliver signal value))
                (real-deliver signal value)))
+           workflow/publish!
+           (fn [bundle logs-root]
+             (reset! published-fingerprint (:fingerprint bundle))
+             (str logs-root "/" workflow/manifest-relative-path))
+           workflow/read-manifest!
+           (fn [_]
+             {:fingerprint @published-fingerprint})
+           workflow/verify-published!
+           (fn [_ fingerprint]
+             {:workflow {:fingerprint fingerprint}})
            pipeline/run
            (fn [source options]
              (try
-               (let [prepared (pipeline/prepare source)
+               (let [prepared prepared-workflow
                      manifest-path
                      (workflow/publish! (:workflow prepared) (:logs-root options))]
                  ((:on-published options) prepared manifest-path)
