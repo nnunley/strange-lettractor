@@ -1,14 +1,14 @@
 # Strange Lettractor
 
-Strange Lettractor is a unified agentic framework implementing [StrongDM's Attractor specifications](https://github.com/strongdm/attractor). Its scope spans three complementary layers:
+Strange Lettractor is a unified agentic framework for building provider-independent LLM applications, tool-using agents, and composable workflows in [let-go](https://github.com/nooga/let-go). It implements [StrongDM's Attractor specifications](https://github.com/strongdm/attractor) across three complementary layers:
 
-- [Unified LLM client](docs/upstream/strongdm-attractor/unified-llm-spec.md): a common interface across model providers for generation, streaming, structured output, and tool calling, while retaining provider-specific capabilities.
+- [Unified LLM client](docs/upstream/strongdm-attractor/unified-llm-spec.md): a common interface across OpenAI, Anthropic, and Google Gemini for multimodal generation, first-class streaming, structured output, and tool calling, using native provider APIs and explicit access to provider-specific capabilities.
 - [Coding agent runtime](docs/upstream/strongdm-attractor/coding-agent-loop-spec.md): stateful agent sessions that combine model calls, tools, and execution environments.
 - [Workflow orchestration](docs/upstream/strongdm-attractor/attractor-spec.md): composable Graphviz DOT pipelines with branching, parallel execution, human interaction, and checkpoint recovery.
 
-The LLM and agent layers are foundations for applications in their own right; DOT workflows are one way to compose them. Implementation is in progress; full specification conformance is not yet claimed.
+Applications can use the LLM client and agent runtime directly, without a DOT workflow. Workflow orchestration builds on those foundations; it does not define the framework's entire scope. Implementation is in progress; full specification conformance is not yet claimed.
 
-It is written in [let-go](https://github.com/nooga/let-go) and built with [lgx](https://github.com/abogoyavlensky/lgx). It requires let-go 1.12.2 or newer.
+It is built with [lgx](https://github.com/abogoyavlensky/lgx) and requires let-go 1.12.2 or newer.
 
 ## Quick start
 

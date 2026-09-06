@@ -1,10 +1,12 @@
 # Progress
 
-**Phase:** implementing ITER-0005
-**Task:** audited iteration integration and main verification (Task 7)
-**Iterations:** 5 complete, 9 pending
-**Sentinel corpus:** 4 established; latest default suite at `bfdc5a3`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
-**Current iteration:** ITER-0005 — context-mapped composition
+**Phase:** integrating verified ITER-0005; ITER-0006 next
+**Task:** public checkpoint push (Task 7)
+**Iterations:** 6 complete, 8 pending
+**Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
+**Current iteration:** ITER-0005 — scoped delivery verified on main; full-reader exception remains explicit
+
+**Integration checkpoint:** Main was fast-forwarded to `ac7b241` after both independent three-tier audits returned scoped CLEAN. The post-merge full suite passes 473/3370/0 and local let-go AOT builds successfully. A fresh compiled `examples/composition-parent.dot` run succeeds and its saved checkpoint contains `child.result = "hello-from-child"`. Public push is next. All worktrees and untracked private notes are preserved. ATTR-READ-01 and ATTR-COMPOSE-02 remain unresolved full-goal requirements; see [iteration audit](iter-0005-audit.md). Historical task checkpoints below describe their state at the time, not current integration status.
 
 **Latest review:** The composition plan passed its chunk reviews. Task 1 configuration review found reader-syntax gaps. The user authorized a temporary ordinary-map path while native reader compatibility remains unresolved; do not count this as full Clojure-reader conformance. Pinned recovery was merged and pushed to public main at `f67cdc6` after both audits returned CLEAN; see [audit evidence](iter-0004-audit.md).
 
