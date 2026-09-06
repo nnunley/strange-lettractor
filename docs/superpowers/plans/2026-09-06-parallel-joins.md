@@ -4,7 +4,7 @@
 
 **Goal:** Make bounded parallel execution satisfy first_success promptly while joining every launched worker before return.
 
-**Architecture:** Replace the parallel handler's pmap batches with an invocation-local bounded active set. Workers publish tagged result/error completion records; the coordinator stops launch on success, cancellation, or error and joins all launched workers. Preserve existing factory arities, engine wiring, result order, and wait_all behavior.
+**Architecture:** Replace the parallel handler's pmap batches with an invocation-local bounded active set owned by a native let-go scope. Workers publish tagged result/error completion records; the coordinator stops launch on success, cancellation, or error, closes the scope with an indefinite drain, and collects all launched workers. Preserve existing factory arities, engine wiring, result order, and wait_all behavior.
 
 **Tech Stack:** let-go 1.12.2+ via `/Users/ndn/development/let-go/lg`, lgx, futures/promises/atoms, EDN, existing pipeline engine.
 
@@ -24,6 +24,7 @@ Files: modify `src/attractor/handlers.lg` only around the parallel handler; crea
 - [ ] Add bounded slot-replenishment evidence: while edge 0 is held, edge 1 finishes and edge 2 starts; an active counter proves max_parallel is never exceeded. Assert deterministic result order despite reverse completion.
 - [ ] Add direct cases for already-cancelled/no launch; cancellation winning success plus held cleanup; wait_all compatibility; all-fail and partial-success-only first_success exhaustion; max_parallel=1; target-ID versus exact-edge callback handoff; four-argument callbacks joined normally; no outgoing edges. Preserve existing numeric/unknown-policy behavior.
 - [ ] Add exception evidence: throwing worker stops queued launch and joins a held sibling; clone failure during replenishment cancels and joins existing work. Assert the original exception, no late writes, and finally-safe test release. Secondary cleanup exceptions must not replace the first coordinator-observed primary error.
+- [ ] Before changing the initial future-based patch, add native-supervision RED tests: loser blocked on native `<!` without predicate polling, descendant future cleanup on normal wait_all return, and independent sibling scope survival/caller restoration. Implement scope-open in the coordinator's own execution context before launch, a coordinator-owned close-once guard, and scope-close! with zero timeout on stop/error/normal exit. Set local cancellation before native scope cancellation. Do not close from a tracked child or use the default five-second escape. Native scopes handle lifetime and native blocking cancellation; explicit error records still handle propagation. Verify these tests using real native primitives, bounded external fixture escapes, and finally cleanup.
 - [ ] Run the new focused file and `env LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/handlers_test.lg` sequentially. Require nonzero test/assertion counts and zero failures for both. Inspect the diff and run `git diff --check`.
 - [ ] Commit only the scoped source/test files as `feat(parallel): coordinate early success and joined cancellation`. Require independent spec review, then code-quality review; fix and re-review findings before Task 2.
 

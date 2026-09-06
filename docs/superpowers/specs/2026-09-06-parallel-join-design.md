@@ -21,7 +21,9 @@ Replace batch scheduling inside `make-parallel-handler*` with a bounded,
 completion-driven coordinator. Preserve the public factory arities and engine's
 existing branch-executor callback. Use let-go futures for active branches and
 explicit completion records rather than waiting for futures in launch order.
-Keep changes local to the parallel handler unless a public integration regression
+Own all workers in one native let-go scope opened in the coordinator's execution
+context before any worker launch. Scope inheritance owns descendant async work,
+not just each callback's future. Keep changes local to the parallel handler unless a public integration regression
 demonstrates an engine gap. No general scheduler service or external dependency.
 
 Alternatives considered: retaining batches cannot meet early join; an unbounded
@@ -47,6 +49,16 @@ future per edge violates max_parallel. A fixed bounded active set is sufficient.
 - A branch cancellation predicate combines the invocation's cancellation source
   and local stop flag. A first-success local stop does not masquerade as parent
   cancellation when selecting the final handler status.
+- On success/error/external cancellation, set the local stop flag first, then
+  have the coordinator owner close its native scope exactly once with
+  `scope-close! scope 0`. This cancels native blocking channel/sleep operations
+  and drains the entire subtree indefinitely. Never close from a worker belonging
+  to that scope (self-join). The default five-second with-scope warning/return
+  behavior is insufficient for the no-late-work contract. Also close on normal
+  completion and exceptional coordinator exit, preserving the primary error.
+  Native scopes supervise lifetime, not exception transport: keep explicit
+  worker error records. Scope closure must restore the caller's prior scope;
+  independent sibling invocations must remain uncancelled.
 - Join all launched workers, including their cleanup, before returning an outcome,
   rethrowing an execution exception, or allowing parent terminal events. No late
   mutation from a returned invocation. Never force-kill arbitrary user callbacks.
@@ -91,6 +103,12 @@ Use self-unwinding bounded test barriers, not scheduler-speed assertions:
 6. Run impacted handlers/engine/timeout/composition suites, full default suite,
    and local-compiler AOT. Report the separate failing reader compatibility gate
    alongside default-suite results, not as a pass or skip.
+7. Native-supervision regressions: a losing callback blocked in `<!` (without
+   polling the supplied predicate) is released by scope cancellation; cleanup
+   remains joined. Callback-spawned descendants cannot outlive the invocation,
+   including normal wait_all return. Independent sibling work survives another
+   invocation's cancellation; caller scope is restored. The explicit zero drain
+   argument must be exercised without replacing native scope cancellation by mocks.
 
 Baseline main is 38e9c9e: default 473 tests / 3370 assertions / zero failures;
 reader compatibility remains one test / five failed assertions. A fresh worktree

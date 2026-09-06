@@ -27,7 +27,28 @@ Attractor's parallel coordinator must therefore catch worker exceptions inside
 the future and return explicit tagged result/error records. Coordinator cleanup
 and error propagation cannot depend on native future dereference rethrowing.
 An error record is not itself proof of worker termination: join the actual future
-before returning or reusing the slot.
+before reusing the slot, and use native scope supervision to drain its descendants
+before returning from the invocation.
+
+## Native supervision is available
+
+Let-go provides `with-scope`, `scope-open`, `scope-close!`, `scope-live`, and
+`scope?`, backed by `vm.Scope`. These supervise worker lifetimes and cancellation;
+they are not absent merely because Clojure-compatible futures lose exceptions.
+The user correctly directed this implementation toward those native primitives.
+
+A local runtime probe opened a scope, launched a future blocked on `<!`, and
+closed the scope with `scope-close! scope 0`. The worker's finally block ran and
+`scope-live` returned zero afterward. A launcher closure created before opening
+the scope still inherited it when invoked within the owner's execution context.
+Zero means indefinite drain; the default `with-scope` five-second warning-and-return
+behavior is not sufficient for Attractor's no-late-work guarantee. The coordinator
+must close its scope, never a worker tracked inside that same scope.
+
+Native `pmapv` also preserves Go worker errors and returns `vm.NIL, err` after
+joining its workers. It does not expose the configurable scheduling bound and
+early-stop policy this handler needs. The narrower future error finding remains
+valid; it does not imply that all let-go concurrency APIs discard errors.
 
 The user has been notified. No let-go source changes or upstream issue submission
 were made as part of this investigation. This workaround does not change the
