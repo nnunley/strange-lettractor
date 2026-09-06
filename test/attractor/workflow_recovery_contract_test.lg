@@ -1,5 +1,6 @@
 (ns attractor.workflow-recovery-contract-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
             [clojure.edn :as edn]
             [io :as io]
             [os :as os]
@@ -259,3 +260,123 @@
               (workflow/closure-fingerprint alias)))
     (is (not= (workflow/closure-fingerprint base)
               (workflow/closure-fingerprint referenced)))))
+
+(defn- publication-root []
+  (str (os/temp-dir) "/lettractor-publication-" (random-uuid)))
+
+(defn- prepared-bundle []
+  (:workflow (pipeline/prepare root-dot)))
+
+(deftest workflow-publication-commits-content-before-an-edn-manifest
+  (let [run-root (publication-root)
+        bundle (prepared-bundle)
+        writes (atom [])
+        renames (atom [])
+        real-spit io/spit
+        real-rename os/rename
+        manifest-path
+        (with-redefs [io/spit (fn [path content]
+                               (swap! writes conj path)
+                               (real-spit path content))
+                      os/rename (fn [source target]
+                                  (swap! renames conj [source target])
+                                  (real-rename source target))]
+          (workflow/publish! bundle run-root))
+        manifest (edn/read-string (io/slurp manifest-path))
+        source-path (get-in manifest [:sources 0 :path])
+        plan-path (get-in manifest [:plans 0 :path])]
+    (is (= (str run-root "/workflow/manifest.edn") manifest-path))
+    (is (= (:fingerprint bundle) (:fingerprint manifest)))
+    (is (= (:index bundle) (:index manifest)))
+    (is (= root-dot (io/slurp (str run-root "/" source-path))))
+    (is (= (get-in bundle [:plans workflow/root-plan-id :graph])
+           (workflow/decode-canonical-tree
+             (edn/read-string (io/slurp (str run-root "/" plan-path))))))
+    (is (= manifest-path (second (last @renames))))
+    (is (every? #(re-find #"[.]tmp-[0-9a-f-]+$" (first %)) @renames))
+    (is (nil? (os/stat (str run-root "/workflow/.publish.lock"))))
+    (is (map? (edn/read-string (io/slurp manifest-path))))))
+
+(deftest workflow-publication-reuses-verified-content-and-rejects-collisions
+  (testing "the same immutable bundle is reusable"
+    (let [run-root (publication-root)
+          bundle (prepared-bundle)
+          first-path (workflow/publish! bundle run-root)
+          first-bytes (io/slurp first-path)
+          second-path (workflow/publish! bundle run-root)]
+      (is (= first-path second-path))
+      (is (= first-bytes (io/slurp second-path)))
+      (is (= (:fingerprint bundle)
+             (:fingerprint (workflow/read-manifest! second-path))))))
+  (testing "different manifests never overwrite a committed run"
+    (let [run-root (publication-root)
+          first (prepared-bundle)
+          second (:workflow (pipeline/prepare changed-root-dot))
+          path (workflow/publish! first run-root)
+          before (io/slurp path)
+          error (workflow-error #(workflow/publish! second run-root))]
+      (is (= :workflow_already_published (:category error)))
+      (is (= before (io/slurp path)))))
+  (testing "an existing content address with wrong bytes is rejected"
+    (let [run-root (publication-root)
+          bundle (prepared-bundle)
+          source-sha (get-in bundle [:index :sources 0 :source-sha256])
+          source-dir (str run-root "/workflow/sources")
+          _ (io/mkdir source-dir)
+          target (str source-dir "/" source-sha ".dot")
+          _ (io/spit target "wrong bytes")
+          error (workflow-error #(workflow/publish! bundle run-root))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (= target (:path error))))))
+
+(deftest workflow-publication-refuses-an-uncommitted-lock
+  (let [run-root (publication-root)
+        workflow-dir (str run-root "/workflow")
+        _ (io/mkdir workflow-dir)
+        _ (io/mkdir (str workflow-dir "/.publish.lock"))
+        error (workflow-error #(workflow/publish! (prepared-bundle) run-root))]
+    (is (= :workflow_publication_incomplete (:category error)))
+    (is (nil? (os/stat (str workflow-dir "/manifest.edn"))))))
+
+(deftest concurrent-publishers-never-corrupt-the-committed-bundle
+  (let [run-root (publication-root)
+        bundle (prepared-bundle)
+        started (promise)
+        release (promise)
+        real-spit io/spit
+        first (core/future
+                (with-redefs [io/spit
+                              (fn [path content]
+                                (when (and (re-find #"/sources/" path)
+                                           (re-find #"[.]tmp-" path))
+                                  (deliver started true)
+                                  (deref release 1000 :timeout))
+                                (real-spit path content))]
+                  (workflow/publish! bundle run-root)))
+        _ (deref started 1000 :not-started)
+        second (core/future
+                 (try
+                   {:path (workflow/publish! bundle run-root)}
+                   (catch ExceptionInfo error
+                     {:error (ex-data error)})))
+        second-result (deref second 1000 :timeout)
+        _ (deliver release true)
+        first-path (deref first 1000 :timeout)]
+    (is (or (= :workflow_publication_incomplete
+               (get-in second-result [:error :category]))
+            (= first-path (:path second-result))))
+    (is (= (:fingerprint bundle)
+           (:fingerprint (workflow/read-manifest! first-path))))))
+
+(deftest verify-published-validates-the-expected-fingerprint
+  (let [run-root (publication-root)
+        bundle (prepared-bundle)
+        _ (workflow/publish! bundle run-root)
+        verified (workflow/verify-published! run-root (:fingerprint bundle))]
+    (is (= (:fingerprint bundle) (get-in verified [:workflow :fingerprint])))
+    (is (= (:graph (get-in bundle [:plans workflow/root-plan-id]))
+           (:graph verified)))
+    (is (= :workflow_snapshot_corrupt
+           (:category
+             (workflow-error
+               #(workflow/verify-published! run-root "not-the-fingerprint")))))))

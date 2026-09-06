@@ -13,7 +13,8 @@
             [attractor.server :as server]
             [attractor.stylesheet :as stylesheet]
             [attractor.transforms :as transforms]
-            [attractor.validation :as validation]))
+            [attractor.validation :as validation]
+            [attractor.workflow :as workflow]))
 
 (deftest subgraph-label-derivation-is-order-independent
   (let [graph
@@ -556,6 +557,109 @@
       (is (= [] @handoffs))
       (is (= before @ctx))
       (is (nil? (os/stat logs))))))
+
+(deftest publication-callbacks-bracket-engine-execution
+  (testing "a throwing pre-publication callback writes nothing"
+    (let [logs (str (os/temp-dir) "/attractor-pre-publish-failure-" (random-uuid))
+          events (atom [])
+          error (try
+                  (pipeline/run
+                    "digraph G { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
+                    {:logs-root logs
+                     :on-prepared (fn [_] (throw (ex-info "reject" {:gate :prepared})))
+                     :on-event #(swap! events conj %)})
+                  (catch ExceptionInfo caught caught))]
+      (is (= :prepared (:gate (ex-data error))))
+      (is (nil? (os/stat logs)))
+      (is (= [] @events))))
+  (testing "on-published observes a verified manifest; failure is reusable"
+    (let [logs (str (os/temp-dir) "/attractor-post-publish-failure-" (random-uuid))
+          dot "digraph G { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"
+          callback-count (atom 0)
+          events (atom [])
+          callback
+          (fn [prepared manifest-path]
+            (swap! callback-count inc)
+            (is (= (:fingerprint (:workflow prepared))
+                   (:fingerprint (workflow/read-manifest! manifest-path))))
+            (when (= 1 @callback-count)
+              (throw (ex-info "handoff failed" {:gate :published}))))
+          first-error
+          (try
+            (pipeline/run dot {:logs-root logs
+                               :on-published callback
+                               :on-event #(swap! events conj %)})
+            (catch ExceptionInfo caught caught))
+          committed (io/slurp (str logs "/workflow/manifest.edn"))
+          events-after-first @events
+          result (pipeline/run dot {:logs-root logs
+                                    :on-published callback
+                                    :on-event #(swap! events conj %)})]
+      (is (= :published (:gate (ex-data first-error))))
+      (is (= [] events-after-first))
+      (is (= committed (io/slurp (str logs "/workflow/manifest.edn"))))
+      (is (= 2 @callback-count))
+      (is (= :success (:status result)))
+      (is (= :pipeline.started (:type (first @events)))))))
+
+(deftest execute-prepared-validates-the-root-plan-and-forwards-only-engine-options
+  (let [prepared (pipeline/prepare
+                   "digraph G { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+        observed (atom nil)
+        fake-outcome {:status :success :completed_nodes ["start" "exit"]}
+        result
+        (with-redefs [attractor.engine/run-pipeline
+                      (fn [graph options]
+                        (reset! observed {:graph graph :options options})
+                        fake-outcome)]
+          (pipeline/execute-prepared
+            prepared
+            {:logs-root "/tmp/exact-run-root"
+             :registry :registry
+             :on-event :on-event
+             :on-prepared :wrapper
+             :on-published :wrapper
+             :custom-transforms [:wrapper]
+             :custom-rules [:wrapper]
+             :source-path "root.dot"
+             :base-dir "."
+             :workflow-roots []}))]
+    (is (identical? (:graph prepared) (:graph @observed)))
+    (is (= {:logs-root "/tmp/exact-run-root"
+            :registry :registry
+            :on-event :on-event
+            :workflow-fingerprint (get-in prepared [:workflow :fingerprint])
+            :workflow-manifest "workflow/manifest.edn"}
+           (:options @observed)))
+    (is (= (:diagnostics prepared) (:diagnostics result)))
+    (doseq [broken [(assoc-in prepared [:workflow :format-version] 2)
+                    (assoc-in prepared [:workflow :fingerprint] "wrong")
+                    (assoc prepared :graph (assoc (:graph prepared) :id "different"))]]
+      (is (= :workflow_snapshot_corrupt
+             (:category
+               (try
+                 (pipeline/execute-prepared broken {})
+                 nil
+                 (catch ExceptionInfo error (ex-data error)))))))))
+
+(deftest public-runs-without-options-allocate-distinct-roots
+  (let [roots (atom [])
+        prepared-sources (atom [])]
+    (with-redefs [attractor.workflow/publish!
+                  (fn [bundle logs-root]
+                    (swap! roots conj logs-root)
+                    (swap! prepared-sources conj
+                           (get-in bundle [:source-records 0 :source]))
+                    (str logs-root "/workflow/manifest.edn"))
+                  attractor.engine/run-pipeline
+                  (fn [_ _] {:status :success})]
+      (pipeline/run
+        "digraph One { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+      (pipeline/run
+        "digraph Two { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }"))
+    (is (= 2 (count (set @roots))))
+    (is (every? #(re-find #"^attractor_runs/run_[0-9]+-[0-9a-f-]+$" %) @roots))
+    (is (= 2 (count @prepared-sources)))))
 
 (defn- await-server-pipeline [pipeline-id]
   (loop [remaining 200]

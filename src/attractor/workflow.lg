@@ -2,6 +2,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
+            [io :as io]
             [os :as os]))
 
 (def root-plan-id "workflow://root")
@@ -109,6 +110,35 @@
 (defn canonical-edn [value]
   (pr-str (canonical-tree value)))
 
+(declare decode-canonical-tree snapshot-error!)
+
+(defn- qualified-name [constructor namespace-part local-name]
+  (if namespace-part
+    (constructor namespace-part local-name)
+    (constructor local-name)))
+
+(defn decode-canonical-tree [tree]
+  (let [tag (first tree)
+        payload (second tree)]
+    (case tag
+      "nil" nil
+      "bool" payload
+      "int" (edn/read-string payload)
+      "decimal" (edn/read-string payload)
+      "string" payload
+      "keyword" (qualified-name keyword payload (get tree 2))
+      "symbol" (qualified-name symbol payload (get tree 2))
+      "vector" (mapv decode-canonical-tree payload)
+      "list" (apply list (map decode-canonical-tree payload))
+      "map" (reduce (fn [result pair]
+                       (assoc result
+                              (decode-canonical-tree (first pair))
+                              (decode-canonical-tree (second pair))))
+                     {}
+                     payload)
+      "set" (into #{} (map decode-canonical-tree payload))
+      (snapshot-error! "Unknown canonical workflow value tag" {:tag tag}))))
+
 (defn sha256-text [text]
   (hash/sha256 text))
 
@@ -205,3 +235,228 @@
                        :physical-id physical-id
                        :source source}]
      :workflow-roots roots}))
+
+(def manifest-relative-path "workflow/manifest.edn")
+
+(defn- uuid-text []
+  (let [printed (str (random-uuid))]
+    (or (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+                         printed))
+        printed)))
+
+(defn- snapshot-error! [message data]
+  (throw (ex-info message (merge {:category :workflow_snapshot_corrupt} data))))
+
+(defn- already-published! [path]
+  (throw (ex-info "A different workflow is already published for this run"
+                  {:category :workflow_already_published
+                   :path path})))
+
+(defn- manifest-for [bundle]
+  (let [records-by-id
+        (reduce (fn [records record]
+                  (assoc records (:logical-id record) record))
+                {}
+                (:source-records bundle))]
+    {:format-version (:format-version bundle)
+     :fingerprint (:fingerprint bundle)
+     :root-plan-id (:root-plan-id bundle)
+     :index (:index bundle)
+     :sources
+     (mapv
+       (fn [entry]
+         (let [logical-id (:logical-id entry)
+               source-sha (:source-sha256 entry)
+               record (get records-by-id logical-id)]
+           {:logical-id logical-id
+            :source-sha256 source-sha
+            :path (str "workflow/sources/" source-sha ".dot")
+            :physical-id (:physical-id record)}))
+       (get-in bundle [:index :sources]))
+     :plans
+     (mapv
+       (fn [entry]
+         {:logical-id (:logical-id entry)
+          :plan-sha256 (:plan-sha256 entry)
+          :path (str "workflow/plans/" (:plan-sha256 entry) ".edn")})
+       (get-in bundle [:index :plans]))
+     :workflow-roots (:workflow-roots bundle)}))
+
+(defn read-manifest! [manifest-path]
+  (when-not (io/file-exists? manifest-path)
+    (throw (ex-info "Workflow manifest is missing"
+                    {:category :workflow_snapshot_missing
+                     :path manifest-path})))
+  (try
+    (let [manifest (edn/read-string (io/slurp manifest-path))]
+      (when-not (map? manifest)
+        (snapshot-error! "Workflow manifest must contain an EDN map"
+                         {:path manifest-path}))
+      manifest)
+    (catch ExceptionInfo error
+      (throw error))
+    (catch Object cause
+      (snapshot-error! "Workflow manifest is not valid EDN"
+                       {:path manifest-path :cause (str cause)}))))
+
+(defn- verify-file-bytes! [path expected-bytes kind]
+  (when-not (io/file-exists? path)
+    (throw (ex-info "Workflow snapshot content is missing"
+                    {:category :workflow_snapshot_missing
+                     :kind kind
+                     :path path})))
+  (let [actual (io/slurp path)]
+    (when-not (= expected-bytes actual)
+      (snapshot-error! "Workflow snapshot content does not match its address"
+                       {:kind kind :path path})))
+  path)
+
+(defn- verify-manifest-files! [run-root manifest]
+  (doseq [source (:sources manifest)]
+    (let [path (str run-root "/" (:path source))
+          bytes (io/slurp path)]
+      (when-not (= (:source-sha256 source) (sha256-text bytes))
+        (snapshot-error! "Workflow source digest does not match"
+                         {:kind :source :path path
+                          :logical-id (:logical-id source)}))))
+  (doseq [plan (:plans manifest)]
+    (let [path (str run-root "/" (:path plan))]
+      (when-not (io/file-exists? path)
+        (throw (ex-info "Workflow plan is missing"
+                        {:category :workflow_snapshot_missing
+                         :kind :plan :path path})))
+      (let [graph
+            (try
+              (decode-canonical-tree (edn/read-string (io/slurp path)))
+              (catch Object cause
+                (snapshot-error! "Workflow plan is not valid EDN"
+                                 {:kind :plan :path path :cause (str cause)})))]
+        (when-not (= (:plan-sha256 plan) (plan-fingerprint graph))
+          (snapshot-error! "Workflow plan digest does not match"
+                           {:kind :plan :path path
+                            :logical-id (:logical-id plan)})))))
+  manifest)
+
+(defn verify-bundle! [bundle graph]
+  (when-not (= 1 (:format-version bundle))
+    (snapshot-error! "Unsupported workflow format version"
+                     {:format-version (:format-version bundle)}))
+  (when-not (= (:fingerprint bundle)
+               (closure-fingerprint (:index bundle)))
+    (snapshot-error! "Workflow fingerprint does not match its index"
+                     {:expected (:fingerprint bundle)}))
+  (let [root-id (:root-plan-id bundle)
+        plan (get-in bundle [:plans root-id])]
+    (when-not plan
+      (snapshot-error! "Workflow root plan is missing" {:root-plan-id root-id}))
+    (when-not (= graph (:graph plan))
+      (snapshot-error! "Prepared graph does not match the workflow root plan"
+                       {:root-plan-id root-id}))
+    (when-not (= (:plan-sha256 plan) (plan-fingerprint (:graph plan)))
+      (snapshot-error! "Workflow root plan digest does not match"
+                       {:root-plan-id root-id})))
+  bundle)
+
+(defn verify-published! [run-root expected-fingerprint]
+  (let [manifest-path (str run-root "/" manifest-relative-path)
+        manifest (read-manifest! manifest-path)]
+    (when-not (= 1 (:format-version manifest))
+      (snapshot-error! "Unsupported workflow manifest version"
+                       {:path manifest-path
+                        :format-version (:format-version manifest)}))
+    (when-not (= (:fingerprint manifest)
+                 (closure-fingerprint (:index manifest)))
+      (snapshot-error! "Workflow manifest fingerprint does not match its index"
+                       {:path manifest-path}))
+    (when-not (= expected-fingerprint (:fingerprint manifest))
+      (snapshot-error! "Workflow fingerprint does not match the expected run"
+                       {:path manifest-path
+                        :expected expected-fingerprint
+                        :actual (:fingerprint manifest)}))
+    (verify-manifest-files! run-root manifest)
+    (let [root-id (:root-plan-id manifest)
+          plan-record (first (filter #(= root-id (:logical-id %))
+                                     (:plans manifest)))]
+      (when-not plan-record
+        (snapshot-error! "Workflow root plan is absent from the manifest"
+                         {:path manifest-path :root-plan-id root-id}))
+      {:graph (decode-canonical-tree
+                (edn/read-string
+                  (io/slurp (str run-root "/" (:path plan-record)))))
+       :diagnostics []
+       :workflow manifest})))
+
+(defn- publish-content! [target bytes kind]
+  (if (io/file-exists? target)
+    (verify-file-bytes! target bytes kind)
+    (let [temp-path (str target ".tmp-" (uuid-text))]
+      (try
+        (io/spit temp-path bytes)
+        (os/rename temp-path target)
+        target
+        (catch Object cause
+          (when (io/file-exists? temp-path)
+            (io/delete-file temp-path))
+          (throw cause))))))
+
+(defn- verify-existing-publication! [bundle run-root manifest-path]
+  (let [expected (manifest-for bundle)
+        actual (read-manifest! manifest-path)]
+    (when-not (= expected actual)
+      (already-published! manifest-path))
+    (verify-manifest-files! run-root actual)
+    manifest-path))
+
+(defn publish!
+  "Publish an immutable workflow bundle below run-root and return its manifest.
+
+   Content-addressed source and plan files are committed before manifest.edn.
+   The manifest is the only durable publication boundary."
+  [bundle run-root]
+  (verify-bundle! bundle
+                  (get-in bundle [:plans (:root-plan-id bundle) :graph]))
+  (let [workflow-dir (str run-root "/workflow")
+        source-dir (str workflow-dir "/sources")
+        plan-dir (str workflow-dir "/plans")
+        lock-dir (str workflow-dir "/.publish.lock")
+        manifest-path (str workflow-dir "/manifest.edn")
+        expected-manifest (manifest-for bundle)]
+    (if (io/file-exists? manifest-path)
+      (verify-existing-publication! bundle run-root manifest-path)
+      (do
+        (io/mkdir workflow-dir)
+        (let [lock-result (os/sh "mkdir" lock-dir)]
+          (if-not (zero? (:exit lock-result))
+            (if (io/file-exists? manifest-path)
+              (verify-existing-publication! bundle run-root manifest-path)
+              (throw (ex-info "Workflow publication lock exists without a manifest"
+                              {:category :workflow_publication_incomplete
+                               :path lock-dir}))))
+            (try
+              (if (io/file-exists? manifest-path)
+                (verify-existing-publication! bundle run-root manifest-path)
+                (do
+                  (io/mkdir source-dir)
+                  (io/mkdir plan-dir)
+                  (let [records-by-id
+                        (reduce (fn [records record]
+                                  (assoc records (:logical-id record) record))
+                                {}
+                                (:source-records bundle))]
+                    (doseq [entry (:sources expected-manifest)]
+                      (let [record (get records-by-id (:logical-id entry))]
+                        (publish-content!
+                          (str run-root "/" (:path entry))
+                          (:source record)
+                          :source)))
+                    (doseq [entry (:plans expected-manifest)]
+                      (publish-content!
+                        (str run-root "/" (:path entry))
+                        (canonical-edn
+                          (get-in bundle [:plans (:logical-id entry) :graph]))
+                        :plan))
+                  (publish-content! manifest-path (pr-str expected-manifest) :manifest)
+                  manifest-path)))
+              (finally
+                (when (io/file-exists? lock-dir)
+                  (io/delete-file lock-dir)))))))))

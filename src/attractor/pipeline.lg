@@ -15,8 +15,38 @@
          diagnostics (validation/validate
                        prepared-graph (or (:custom-rules options) []))]
      {:graph prepared-graph
-      :diagnostics diagnostics
-      :workflow (workflow/root-bundle dot-source prepared-graph options)})))
+     :diagnostics diagnostics
+     :workflow (workflow/root-bundle dot-source prepared-graph options)})))
+
+(def wrapper-option-keys
+  [:custom-transforms
+   :custom-rules
+   :on-prepared
+   :on-published
+   :source-path
+   :base-dir
+   :workflow-roots])
+
+(defn execute-prepared
+  "Validate and execute a prepared root workflow without reparsing its source."
+  ([prepared] (execute-prepared prepared {}))
+  ([prepared options]
+   (let [diagnostics (validation/raise-on-errors (:diagnostics prepared))
+         graph (:graph prepared)
+         bundle (workflow/verify-bundle! (:workflow prepared) graph)
+         engine-options
+         (assoc (apply dissoc options wrapper-option-keys)
+                :workflow-fingerprint (:fingerprint bundle)
+                :workflow-manifest workflow/manifest-relative-path)
+         outcome (engine/run-pipeline graph engine-options)]
+     (assoc outcome :diagnostics diagnostics))))
+
+(defn- fresh-logs-root []
+  (let [printed (str (random-uuid))
+        uuid (or (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+                                  printed))
+                 printed)]
+    (str "attractor_runs/run_" (System/currentTimeMillis) "-" uuid)))
 
 (defn run
   "Prepare DOT source, reject validation errors, then execute the prepared graph.
@@ -28,12 +58,14 @@
   ([dot-source] (run dot-source {}))
   ([dot-source options]
    (let [prepared (prepare dot-source options)
-         graph (:graph prepared)
          diagnostics (:diagnostics prepared)
          diagnostics (validation/raise-on-errors diagnostics)
          _ (when-let [on-prepared (:on-prepared options)]
              (on-prepared prepared))
-         engine-options (dissoc options
-                                :custom-transforms :custom-rules :on-prepared)
-         outcome (engine/run-pipeline graph engine-options)]
-     (assoc outcome :diagnostics diagnostics))))
+         logs-root (or (:logs-root options) (fresh-logs-root))
+         manifest-path (workflow/publish! (:workflow prepared) logs-root)
+         _ (when-let [on-published (:on-published options)]
+             (on-published prepared manifest-path))]
+     (execute-prepared
+       (assoc prepared :diagnostics diagnostics)
+       (assoc options :logs-root logs-root)))))
