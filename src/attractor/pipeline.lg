@@ -2,7 +2,8 @@
   (:require [attractor.engine :as engine]
             [attractor.parser :as parser]
             [attractor.transforms :as transforms]
-            [attractor.validation :as validation]))
+            [attractor.validation :as validation]
+            [attractor.workflow :as workflow]))
 
 (defn prepare
   "Parse, transform, and validate DOT source without starting execution."
@@ -14,7 +15,8 @@
          diagnostics (validation/validate
                        prepared-graph (or (:custom-rules options) []))]
      {:graph prepared-graph
-      :diagnostics diagnostics})))
+      :diagnostics diagnostics
+      :workflow (workflow/root-bundle dot-source prepared-graph options)})))
 
 (defn run
   "Prepare DOT source, reject validation errors, then execute the prepared graph.

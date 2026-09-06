@@ -324,6 +324,9 @@
                            :on-event #(swap! events conj %)}))]
       (is (= "second" (get-in result [:graph :nodes "work" :transform_marker])))
       (is (= diagnostics (:diagnostics result)))
+      (is (identical? (:graph result)
+                      (get-in result
+                              [:workflow :plans "workflow://root" :graph])))
       (is (= [[:transform-1 "Deliver Ship it" "prepared-model"]
               [:transform-2 "first"]
               [:rule "second"]]

@@ -1,6 +1,10 @@
 (ns attractor.workflow
   (:require [clojure.edn :as edn]
-            [hash :as hash]))
+            [clojure.string :as str]
+            [hash :as hash]
+            [os :as os]))
+
+(def root-plan-id "workflow://root")
 
 (defn- not-serializable! [path]
   (throw
@@ -113,3 +117,91 @@
 
 (defn closure-fingerprint [index]
   (sha256-text (canonical-edn index)))
+
+(defn- configuration-error! [reason data]
+  (throw
+    (ex-info "Invalid workflow configuration"
+             (merge {:category :workflow_configuration_error
+                     :option :workflow-roots
+                     :reason reason}
+                    data))))
+
+(defn- parent-path [path]
+  (let [index (str/last-index-of path "/")]
+    (cond
+      (nil? index) "."
+      (zero? index) "/"
+      :else (subs path 0 index))))
+
+(defn- root-record [record]
+  (when-not (map? record)
+    (configuration-error! :invalid-record {:record record}))
+  (let [id (:id record)
+        path (:path record)]
+    (when-not (and (string? id) (not (str/blank? id)))
+      (configuration-error! :invalid-id {:record record}))
+    (when-not (and (string? path) (not (str/blank? path)))
+      (configuration-error! :invalid-path {:id id :path path}))
+    {:id id :path (os/canonical-path path)}))
+
+(defn- normalize-roots [roots]
+  (when-not (vector? roots)
+    (configuration-error! :not-a-vector {:value roots}))
+  (:roots
+    (reduce
+      (fn [{:keys [roots paths-by-id] :as normalized} record]
+        (let [{:keys [id path] :as root} (root-record record)]
+          (if-let [known-path (get paths-by-id id)]
+            (if (= known-path path)
+              normalized
+              (configuration-error! :duplicate-id {:id id}))
+            {:roots (conj roots root)
+             :paths-by-id (assoc paths-by-id id path)})))
+      {:roots [] :paths-by-id {}}
+      roots)))
+
+(defn- default-roots [source-path base-dir]
+  (cond
+    source-path [{:id "root" :path (parent-path source-path)}]
+    base-dir [{:id "root" :path base-dir}]
+    :else []))
+
+(defn root-bundle
+  "Capture a prepared root graph and exact DOT source as a portable workflow.
+
+   Physical source and root paths are retained for diagnostics and future drift
+   checks, but deliberately remain outside the fingerprinted index."
+  [source graph options]
+  (let [source-path (:source-path options)
+        base-dir (:base-dir options)
+        roots (normalize-roots
+                (if (contains? options :workflow-roots)
+                  (:workflow-roots options)
+                  (default-roots source-path base-dir)))
+        physical-id (when source-path (os/canonical-path source-path))
+        source-sha (sha256-text source)
+        plan-sha (plan-fingerprint graph)
+        references []
+        plan {:graph graph
+              :plan-sha256 plan-sha
+              :source-sha256 source-sha
+              :primary-plan-id root-plan-id
+              :references references}
+        index {:format-version 1
+               :root-plan-id root-plan-id
+               :sources [{:logical-id root-plan-id
+                          :source-sha256 source-sha}]
+               :plans [{:logical-id root-plan-id
+                        :primary-plan-id root-plan-id
+                        :plan-sha256 plan-sha
+                        :source-sha256 source-sha
+                        :references references}]}]
+    {:format-version 1
+     :fingerprint (closure-fingerprint index)
+     :root-plan-id root-plan-id
+     :plans {root-plan-id plan}
+     :index index
+     :source-records [{:logical-id root-plan-id
+                       :physical-id physical-id
+                       :source source}]
+     :workflow-roots roots}))

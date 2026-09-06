@@ -1,7 +1,22 @@
 (ns attractor.workflow-recovery-contract-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.edn :as edn]
+            [io :as io]
+            [os :as os]
+            [attractor.pipeline :as pipeline]
             [attractor.workflow :as workflow]))
+
+(def root-dot
+  "digraph Root { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+
+(def changed-root-dot
+  "digraph Root { start [shape=Mdiamond] work [shape=box] exit [shape=Msquare] start -> work -> exit }")
+
+(defn- workflow-error [f]
+  (try
+    (do (f) nil)
+    (catch ExceptionInfo error
+      (ex-data error))))
 
 (defn- serialization-error [value]
   (try
@@ -93,3 +108,154 @@
            (workflow/plan-fingerprint graph)))
     (is (= "815856054ca24c5a33b05c9ea4391743a593e362c429e045e2e543881938483e"
            (workflow/closure-fingerprint index)))))
+
+(deftest prepare-captures-the-exact-root-source-and-prepared-graph
+  (let [root (str (os/temp-dir) "/lettractor-root-capture-" (random-uuid))
+        source-path (str root "/root.dot")
+        _ (io/mkdir root)
+        _ (io/spit source-path "current bytes are deliberately ignored")
+        prepared (pipeline/prepare root-dot {:source-path source-path})
+        graph (:graph prepared)
+        bundle (:workflow prepared)
+        source-sha (workflow/sha256-text root-dot)
+        plan-sha (workflow/plan-fingerprint graph)
+        expected-index
+        {:format-version 1
+         :root-plan-id "workflow://root"
+         :sources [{:logical-id "workflow://root"
+                    :source-sha256 source-sha}]
+         :plans [{:logical-id "workflow://root"
+                  :primary-plan-id "workflow://root"
+                  :plan-sha256 plan-sha
+                  :source-sha256 source-sha
+                  :references []}]}]
+    (is (= 1 (:format-version bundle)))
+    (is (= "workflow://root" (:root-plan-id bundle)))
+    (is (= expected-index (:index bundle)))
+    (is (= (workflow/closure-fingerprint expected-index)
+           (:fingerprint bundle)))
+    (is (= [{:logical-id "workflow://root"
+             :physical-id (os/canonical-path source-path)
+             :source root-dot}]
+           (:source-records bundle)))
+    (is (= [{:id "root" :path (os/canonical-path root)}]
+           (:workflow-roots bundle)))
+    (is (= {:graph graph
+            :plan-sha256 plan-sha
+            :source-sha256 source-sha
+            :primary-plan-id "workflow://root"
+            :references []}
+           (get-in bundle [:plans "workflow://root"])))
+    (is (identical? graph
+                    (get-in bundle [:plans "workflow://root" :graph])))))
+
+(deftest prepare-supports-source-only-and-an-in-memory-base-directory
+  (let [source-only (pipeline/prepare root-dot)
+        base (str (os/temp-dir) "/lettractor-root-base-" (random-uuid))
+        _ (io/mkdir base)
+        based (pipeline/prepare root-dot {:base-dir base})]
+    (is (map? (:workflow source-only)))
+    (is (= [] (get-in source-only [:workflow :workflow-roots])))
+    (is (= [{:logical-id "workflow://root"
+             :physical-id nil
+             :source root-dot}]
+           (get-in source-only [:workflow :source-records])))
+    (is (= [{:id "root" :path (os/canonical-path base)}]
+           (get-in based [:workflow :workflow-roots])))
+    (is (= nil
+           (get-in based [:workflow :source-records 0 :physical-id])))))
+
+(deftest workflow-roots-are-normalized-in-order-and-reject-conflicting-ids
+  (let [first-root (str (os/temp-dir) "/lettractor-allowed-a-" (random-uuid))
+        second-root (str (os/temp-dir) "/lettractor-allowed-b-" (random-uuid))
+        _ (io/mkdir first-root)
+        _ (io/mkdir second-root)
+        prepared
+        (pipeline/prepare
+          root-dot
+          {:base-dir first-root
+           :workflow-roots [{:id "z" :path first-root}
+                            {:id "a" :path second-root}
+                            {:id "z" :path first-root}]})]
+    (is (= [{:id "z" :path (os/canonical-path first-root)}
+            {:id "a" :path (os/canonical-path second-root)}]
+           (get-in prepared [:workflow :workflow-roots])))
+    (is (= {:category :workflow_configuration_error
+            :option :workflow-roots
+            :reason :duplicate-id
+            :id "same"}
+           (workflow-error
+             #(pipeline/prepare
+                root-dot
+                {:workflow-roots [{:id "same" :path first-root}
+                                  {:id "same" :path second-root}]}))))
+    (doseq [roots [{}
+                   [{:id "ok"}]
+                   [{:id 7 :path first-root}]
+                   [{:id "" :path first-root}]
+                   [{:id "ok" :path 7}]]]
+      (is (= :workflow_configuration_error
+             (:category
+               (workflow-error
+                 #(pipeline/prepare root-dot {:workflow-roots roots}))))))))
+
+(deftest root-fingerprints-separate-source-plan-and-physical-identity
+  (let [checkout-a (str (os/temp-dir) "/lettractor-checkout-a-" (random-uuid))
+        checkout-b (str (os/temp-dir) "/lettractor-checkout-b-" (random-uuid))
+        path-a (str checkout-a "/root.dot")
+        path-b (str checkout-b "/root.dot")
+        _ (io/mkdir checkout-a)
+        _ (io/mkdir checkout-b)
+        _ (io/spit path-a root-dot)
+        _ (io/spit path-b root-dot)
+        a (:workflow (pipeline/prepare root-dot {:source-path path-a}))
+        b (:workflow (pipeline/prepare root-dot {:source-path path-b}))
+        changed (:workflow (pipeline/prepare changed-root-dot))
+        whitespace-source (str root-dot "\n\n")
+        whitespace (:workflow (pipeline/prepare whitespace-source))]
+    (is (= (:fingerprint a) (:fingerprint b)))
+    (is (not= (get-in a [:source-records 0 :physical-id])
+              (get-in b [:source-records 0 :physical-id])))
+    (is (not= (get-in a [:plans "workflow://root" :source-sha256])
+              (get-in changed [:plans "workflow://root" :source-sha256])))
+    (is (not= (get-in a [:plans "workflow://root" :plan-sha256])
+              (get-in changed [:plans "workflow://root" :plan-sha256])))
+    (is (= (get-in a [:plans "workflow://root" :graph])
+           (get-in whitespace [:plans "workflow://root" :graph])))
+    (is (= (get-in a [:plans "workflow://root" :plan-sha256])
+           (get-in whitespace [:plans "workflow://root" :plan-sha256])))
+    (is (not= (get-in a [:plans "workflow://root" :source-sha256])
+              (get-in whitespace [:plans "workflow://root" :source-sha256])))
+    (is (not= (:fingerprint a) (:fingerprint whitespace)))))
+
+(deftest closure-fingerprint-includes-logical-aliases-and-references
+  (let [root-source (workflow/sha256-text root-dot)
+        root-plan (workflow/plan-fingerprint (:graph (pipeline/prepare root-dot)))
+        base {:format-version 1
+              :root-plan-id "workflow://root"
+              :sources [{:logical-id "workflow://root"
+                         :source-sha256 root-source}]
+              :plans [{:logical-id "workflow://root"
+                       :primary-plan-id "workflow://root"
+                       :plan-sha256 root-plan
+                       :source-sha256 root-source
+                       :references []}]}
+        alias (-> base
+                  (update :sources conj
+                          {:logical-id "workflow://root/alias.dot"
+                           :source-sha256 root-source})
+                  (update :plans conj
+                          {:logical-id "workflow://root/alias.dot"
+                           :primary-plan-id "workflow://root"
+                           :plan-sha256 root-plan
+                           :source-sha256 root-source
+                           :references []}))
+        referenced (assoc-in
+                     base [:plans 0 :references]
+                     [{:node-id "child"
+                       :logical-reference "child.dot"
+                       :plan-id "workflow://root/child.dot"}])]
+    (is (not= (workflow/closure-fingerprint base)
+              (workflow/closure-fingerprint alias)))
+    (is (not= (workflow/closure-fingerprint base)
+              (workflow/closure-fingerprint referenced)))))
