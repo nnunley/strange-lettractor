@@ -805,7 +805,6 @@
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
          fidelity-threads (or (:fidelity-threads options) (atom {}))
-         checkpoint-fidelity (atom nil)
          step-counter (or (:step-counter options) (atom 0))
          max-steps (or (:max-steps options) default-max-steps)
          retry-options (assoc options :retry-counts retry-counts)
@@ -919,7 +918,8 @@
                             :context_values (context/ctx-snapshot ctx)
                             :logs (:logs @ctx)}
                            options
-                           @checkpoint-fidelity)]
+                           (context/resolve-fidelity
+                             incoming-edge current-node graph))]
                      (context/save-checkpoint cp (str logs-root "/checkpoint.edn")))
                    (on-event {:type :pipeline.completed :duration_steps step-count :completed_nodes (:completed_nodes success-res)})
                    success-res)))
@@ -968,7 +968,6 @@
 
                  ;; Step 5: Save checkpoint
                  (let [current-fidelity (:resolved_fidelity prepared-node)
-                       _ (reset! checkpoint-fidelity current-fidelity)
                        cp
                        (with-checkpoint-identity
                          {:timestamp (str (System/currentTimeMillis))

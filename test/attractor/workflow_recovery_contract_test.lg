@@ -519,15 +519,23 @@
 
 (deftest public-runs-persist-pinned-workflow-identity-in-checkpoints
   (testing "successful runs retain identity in the final checkpoint"
-    (let [logs (publication-root)
-          prepared (pipeline/prepare root-dot)
+    (let [source
+          "digraph FinalFidelity {
+             graph [default_fidelity=compact]
+             start [shape=Mdiamond]
+             exit [shape=Msquare]
+             start -> exit [fidelity=full]
+           }"
+          logs (publication-root)
+          prepared (pipeline/prepare source)
           expected (get-in prepared [:workflow :fingerprint])
-          result (pipeline/run root-dot {:logs-root logs})
+          result (pipeline/run source {:logs-root logs})
           checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
       (is (= :success (:status result)))
       (is (= expected (:workflow_fingerprint checkpoint)))
       (is (= "workflow/manifest.edn" (:workflow_manifest checkpoint)))
-      (is (string? (:current_fidelity checkpoint)))))
+      (is (= "exit" (:current_node checkpoint)))
+      (is (= "full" (:current_fidelity checkpoint)))))
   (testing "failed runs retain identity in their last stage checkpoint"
     (let [source
           "digraph Failed {
