@@ -1,0 +1,338 @@
+(ns attractor.parallel-join-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [async :as async]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]))
+
+(defn await-predicate [pred]
+  (loop [remaining 1000]
+    (cond (pred) true
+          (zero? remaining) false
+          :else (do (core/sleep 2) (recur (dec remaining))))))
+(defn graph-for [ids]
+  {:edges (mapv (fn [id] {:from "fork" :to id}) ids)})
+(defn run-handler [callback attrs ids cancelled?]
+  ((handlers/make-parallel-handler callback false true)
+   {:id "fork" :attrs attrs :cancelled? cancelled?}
+   (context/make-context) (graph-for ids) "run"))
+(defn results [outcome] (get-in outcome [:context_updates "parallel.results"]))
+
+(deftest first-success-cancels-and-joins-before-return
+  (let [entered (promise) cleanup (promise) release (promise)
+        parent-cancel (atom false) calls (atom [])
+        task (core/future
+               (run-handler
+                 (fn [id _ _ _ cancelled?]
+                   (swap! calls conj id)
+                   (case id
+                     "slow" (do (deliver entered true)
+                                (when (await-predicate cancelled?) (deliver cleanup true))
+                                (deref release 5000 :timeout)
+                                {:status :cancelled})
+                     "winner" (do (deref entered 3000 :timeout) {:status :success})
+                     {:status :success}))
+                 {:join_policy "first_success" :max_parallel 2}
+                 ["slow" "winner" "queued"] #(deref parent-cancel)))]
+    (try
+      (is (= true (deref cleanup 3000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (is (= #{"slow" "winner"} (set @calls)))
+      (finally (deliver release true)))
+    (let [outcome (deref task 3000 :timeout)]
+      (is (= :success (:status outcome)))
+      (is (= ["slow" "winner"] (mapv :id (results outcome))))
+      (is (= [:cancelled :success] (mapv :status (results outcome)))))))
+
+(deftest external-cancellation-during-loser-cleanup-wins
+  (let [entered (promise) cleanup (promise) release (promise) cancelled (atom false)
+        task (core/future
+               (run-handler
+                 (fn [id _ _ _ stop?]
+                   (if (= id "slow")
+                     (do (deliver entered true)
+                         (when (await-predicate stop?) (deliver cleanup true))
+                         (deref release 5000 :timeout) {:status :cancelled})
+                     (do (deref entered 3000 :timeout) {:status :success})))
+                 {:join_policy "first_success" :max_parallel 2}
+                 ["slow" "winner"] #(deref cancelled)))]
+    (try
+      (is (= true (deref cleanup 3000 :timeout)))
+      (reset! cancelled true)
+      (is (= ::pending (deref task 20 ::pending)))
+      (finally (deliver release true)))
+    (is (= :cancelled (:status (deref task 3000 :timeout))))))
+
+(deftest completed-slot-is-replenished-without-waiting-for-earlier-edge
+  (let [release (promise) entered (promise) third (promise)
+        active (atom 0) peak (atom 0)
+        task (core/future
+               (run-handler
+                 (fn [id _ _ _ _]
+                   (let [n (swap! active inc)] (swap! peak max n))
+                   (try
+                     (case id
+                       "a" (do (deliver entered true) (deref release 5000 :timeout))
+                       "b" (deref entered 3000 :timeout)
+                       "c" (deliver third true))
+                     {:status :success :boundary_node_id "join"}
+                     (finally (swap! active dec))))
+                 {:max_parallel 2} ["a" "b" "c"] (fn [] false)))]
+    (try
+      (is (= true (deref third 1000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (finally (deliver release true)))
+    (let [outcome (deref task 3000 :timeout)]
+      (is (= :success (:status outcome)))
+      (is (= ["a" "b" "c"] (mapv :id (results outcome))))
+      (is (= "join" (:next_node_id outcome)))
+      (is (<= @peak 2))
+      (is (= 0 @active)))))
+
+(deftest first-success-status-and-sequential-compatibility
+  (doseq [[statuses policy expected launched]
+          [[[:fail :fail] "first_success" :fail 2]
+           [[:partial_success :partial_success] "first_success" :fail 2]
+           [[:fail :success :success] "first_success" :success 2]
+           [[:fail :success] "wait_all" :partial_success 2]
+           [[:success :success] "unknown" :success 2]]]
+    (let [calls (atom [])
+          outcome (run-handler (fn [id _ _ _ _]
+                                 (swap! calls conj id)
+                                 {:status (nth statuses id)})
+                               {:max_parallel 1 :join_policy policy}
+                               (range (count statuses)) (fn [] false))]
+      (is (= expected (:status outcome)))
+      (is (= launched (count @calls)))
+      (is (= (vec (take launched (range))) (mapv :id (results outcome)))))))
+
+(deftest pre-cancelled-and-empty-graph-never-launch
+  (let [calls (atom 0) callback (fn [& _] (swap! calls inc) {:status :success})]
+    (is (= :cancelled (:status (run-handler callback {} ["a"] (fn [] true)))))
+    (is (= {:status :fail :failure_reason "Parallel node has no outgoing branches"}
+           (run-handler callback {} [] (fn [] false))))
+    (is (= 0 @calls))))
+
+(deftest edge-occurrences-and-legacy-factory-arities
+  (let [edges [{:from "fork" :to "same" :attrs {:label "one"}}
+               {:from "fork" :to "same" :attrs {:label "two"}}]]
+    (doseq [arity [1 2 3]]
+      (let [seen (atom [])
+            callback (fn [start ctx graph logs]
+                       (swap! seen conj [start logs])
+                       (context/ctx-set! ctx "branch" start)
+                       {:status :success :boundary_node_id (str (count @seen))})
+            handler (case arity
+                      1 (handlers/make-parallel-handler callback)
+                      2 (handlers/make-parallel-handler callback true)
+                      3 (handlers/make-parallel-handler
+                          (fn [start ctx graph logs stop?]
+                            (is (false? (stop?))) (callback start ctx graph logs)) true true))
+            ctx (context/make-context)
+            outcome (handler {:id "fork" :attrs {:max_parallel 1}} ctx {:edges edges} "run")]
+        (is (= :success (:status outcome)))
+        (is (= (if (= arity 1) ["same" "same"] edges) (mapv first @seen)))
+        (is (= ["run/branches/same" "run/branches/same"] (mapv second @seen)))
+        (is (= ["same" "same"] (mapv :node_id (results outcome))))
+        (is (nil? (:next_node_id outcome)))
+        (is (nil? (context/ctx-get ctx "branch")))))))
+
+(deftest worker-error-cancels-and-joins-sibling-preserving-error
+  (let [entered (promise) cleanup (promise) release (promise)
+        calls (atom []) writes (atom []) original (ex-info "primary-worker-error" {:tag :original})
+        task (core/future
+               (try
+                 (run-handler
+                   (fn [id _ _ _ stop?]
+                     (swap! calls conj id)
+                     (if (= id "held")
+                       (do (deliver entered true)
+                           (when (await-predicate stop?) (deliver cleanup true))
+                           (deref release 5000 :timeout)
+                           (swap! writes conj :cleanup)
+                           (throw (ex-info "secondary-worker-error" {})))
+                       (do (deref entered 3000 :timeout) (throw original))))
+                   {:max_parallel 2} ["held" "throw" "queued"] (fn [] false))
+                 (catch Exception e {:caught e})))]
+    (try
+      (is (= true (deref cleanup 3000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (is (= #{"held" "throw"} (set @calls)))
+      (finally (deliver release true)))
+    (let [outcome (deref task 3000 :timeout)]
+      (is (identical? original (:caught outcome)))
+      (is (= [:cleanup] @writes))
+      (core/sleep 20)
+      (is (= [:cleanup] @writes))
+      (is (= #{"held" "throw"} (set @calls))))))
+
+(deftest clone-error-on-replenishment-joins-existing-worker
+  (let [entered (promise) cleanup (promise) release (promise)
+        clones (atom 0) original-clone context/ctx-clone
+        original (ex-info "primary-clone-error" {}) calls (atom []) writes (atom [])]
+    (with-redefs [context/ctx-clone (fn [ctx]
+                                   (if (= 3 (swap! clones inc)) (throw original)
+                                       (original-clone ctx)))]
+      (let [task (core/future
+                   (try
+                     (run-handler
+                       (fn [id _ _ _ stop?]
+                         (swap! calls conj id)
+                         (if (= id "held")
+                           (do (deliver entered true)
+                               (when (await-predicate stop?) (deliver cleanup true))
+                               (deref release 5000 :timeout)
+                               (swap! writes conj :cleanup)
+                               {:status :cancelled})
+                           (do (deref entered 3000 :timeout) {:status :success})))
+                       {:max_parallel 2} ["held" "done" "clone-fails" "queued"] (fn [] false))
+                     (catch Exception e {:caught e})))]
+        (try
+          (is (= true (deref cleanup 3000 :timeout)))
+          (is (= ::pending (deref task 20 ::pending)))
+          (is (= #{"held" "done"} (set @calls)))
+          (finally (deliver release true)))
+        (let [outcome (deref task 3000 :timeout)]
+          (is (identical? original (:caught outcome)))
+          (is (= [:cleanup] @writes))
+          (core/sleep 20)
+          (is (= [:cleanup] @writes))
+          (is (= #{"held" "done"} (set @calls))))))))
+
+(deftest default-and-numeric-parallelism-bound-is-preserved
+  (doseq [[limit expected] [[nil 4] [0 4] [-1 4] ["2" 4] [0.5 1] [1.5 2]]]
+    (let [release (promise) started (atom 0) active (atom 0) peak (atom 0)
+          task (core/future
+                 (run-handler
+                   (fn [_ _ _ _ _]
+                     (let [n (swap! active inc)] (swap! peak max n))
+                     (swap! started inc)
+                     (try (deref release 5000 :timeout) {:status :success}
+                          (finally (swap! active dec))))
+                   {:max_parallel limit} (range 6) (fn [] false)))]
+      (try
+        (is (await-predicate #(>= @started expected)))
+        (is (= ::pending (deref task 20 ::pending)))
+        (is (= expected @started))
+        (finally (deliver release true)))
+      (is (= :success (:status (deref task 3000 :timeout))))
+      (is (= expected @peak))
+      (is (= 0 @active)))))
+
+(deftest legacy-uncooperative-callback-is-still-joined
+  (let [entered (promise) winner (promise) release (promise) writes (atom [])
+        task (core/future
+               ((handlers/make-parallel-handler
+                  (fn [id _ _ _]
+                    (if (= id "held")
+                      (do (deliver entered true) (deref release 5000 :timeout)
+                          (swap! writes conj :cleanup) {:status :success})
+                      (do (deref entered 3000 :timeout) (deliver winner true) {:status :success}))))
+                {:id "fork" :attrs {:max_parallel 2 :join_policy "first_success"}}
+                (context/make-context) (graph-for ["held" "winner" "queued"]) "run"))]
+    (try
+      (is (= true (deref winner 3000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (is (= [] @writes))
+      (finally (deliver release true)))
+    (let [outcome (deref task 3000 :timeout)]
+      (is (= :success (:status outcome)))
+      (is (= ["held" "winner"] (mapv :id (results outcome))))
+      (is (= [:cleanup] @writes)))))
+
+(deftest launch-error-stops-and-joins-already-started-worker
+  (let [entered (promise) cleanup (promise) release (promise)
+        launches (atom 0) calls (atom []) original-launch core/future*
+        original (ex-info "primary-launch-error" {})
+        task (core/future
+               (with-redefs [core/future* (fn [thunk]
+                                           (if (= 2 (swap! launches inc))
+                                             (do (deref entered 3000 :timeout) (throw original))
+                                             (original-launch thunk)))]
+                 (try
+                   (run-handler
+                     (fn [id _ _ _ stop?]
+                       (swap! calls conj id)
+                       (deliver entered true)
+                       (when (await-predicate stop?) (deliver cleanup true))
+                       (deref release 5000 :timeout)
+                       {:status :cancelled})
+                     {:max_parallel 2} ["held" "launch-fails" "queued"] (fn [] false))
+                   (catch Exception e {:caught e}))))]
+    (try
+      (is (= true (deref cleanup 3000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (is (= ["held"] @calls))
+      (finally (deliver release true)))
+    (is (identical? original (:caught (deref task 3000 :timeout))))
+    (is (= ["held"] @calls))))
+
+(deftest native-channel-loser-is-cancelled-and-cleanup-is-joined
+  (let [blocked (async/chan) entered (promise) cleanup (promise) release (promise)
+        task (core/future
+               (run-handler
+                 (fn [id _ _ _ _]
+                   (if (= id "native")
+                     (try (deliver entered true)
+                          (core/<! blocked)
+                          {:status :cancelled}
+                          (finally (deliver cleanup true) (deref release 5000 :timeout)))
+                     (do (deref entered 3000 :timeout) {:status :success})))
+                 {:max_parallel 2 :join_policy "first_success"}
+                 ["native" "winner" "queued"] (fn [] false)))]
+    (try
+      (is (= true (deref cleanup 1000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (finally (async/close! blocked) (deliver release true)))
+    (let [outcome (deref task 3000 :timeout)]
+      (is (= :success (:status outcome)))
+      (is (= ["native" "winner"] (mapv :id (results outcome)))))))
+
+(deftest wait-all-drains-owned-descendants-before-returning
+  (let [blocked (async/chan) entered (promise) cleanup (promise) release (promise)
+        descendant (promise)
+        task (core/future
+               (run-handler
+                 (fn [_ _ _ _ _]
+                   (deliver descendant
+                            (core/future
+                              (try (deliver entered true) (core/<! blocked) :done
+                                   (finally (deliver cleanup true) (deref release 5000 :timeout)))))
+                   (deref entered 3000 :timeout)
+                   {:status :success})
+                 {:max_parallel 1} ["parent"] (fn [] false)))]
+    (try
+      (is (= true (deref cleanup 1000 :timeout)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (finally (async/close! blocked) (deliver release true)))
+    (is (= :success (:status (deref task 3000 :timeout))))
+    (let [worker (deref descendant 3000 :timeout)]
+      (is (not= :timeout worker))
+      (when (not= :timeout worker) (is (= :done (deref worker 3000 :timeout)))))))
+
+(deftest invocation-close-preserves-sibling-and-restores-caller-scope
+  (doseq [throws? [false true]]
+    (let [caller (core/scope-open) sibling-ch (async/chan) probe-ch (async/chan)
+          sibling-entered (promise) probe-entered (promise)
+          sibling (core/future (deliver sibling-entered true) (core/<! sibling-ch) :sibling-done)
+          original (ex-info "owned-worker-error" {})]
+      (try
+        (is (= true (deref sibling-entered 3000 :timeout)))
+        (let [outcome (try
+                        (run-handler (fn [_ _ _ _ _]
+                                       (if throws? (throw original) {:status :success}))
+                                     {} ["worker"] (fn [] false))
+                        (catch Exception e {:caught e}))
+              probe (core/future (deliver probe-entered true) (core/<! probe-ch) :probe-done)]
+          (if throws? (is (identical? original (:caught outcome)))
+              (is (= :success (:status outcome))))
+          (is (= true (deref probe-entered 3000 :timeout)))
+          (is (= ::pending (deref sibling 20 ::pending)))
+          (is (= ::pending (deref probe 20 ::pending)))
+          (is (await-predicate #(= 2 (core/scope-live caller))))
+          (async/close! probe-ch)
+          (is (= :probe-done (deref probe 3000 :timeout))))
+        (finally (async/close! sibling-ch) (async/close! probe-ch)
+                 (core/scope-close! caller 0)))
+      (is (= :sibling-done (deref sibling 3000 :timeout)))
+      (is (= 0 (core/scope-live caller))))))

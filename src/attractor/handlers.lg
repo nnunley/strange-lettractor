@@ -250,6 +250,61 @@
 
 ;; Parallel Handler (Section 4.8)
 ;; Executes multiple branches concurrently with bounded parallelism
+(defn- coordinate-parallel [branches max-parallel first-success? cancelled? launch]
+  (let [stop (atom false)
+        branch-cancelled? (fn [] (or @stop (cancelled?)))
+        ;; The coordinator owns this child scope but is not one of its workers.
+        ;; Native channel operations and nested go/future work inherit this owner.
+        scope (core/scope-open)
+        closed? (atom false)
+        close-owned! (fn []
+                       (when-not @closed?
+                         (reset! closed? true)
+                         ;; Zero means indefinite drain: cleanup may not escape
+                         ;; through with-scope's default five-second timeout.
+                         (core/scope-close! scope 0)))]
+    (try
+      (loop [pending (map-indexed vector branches)
+             active [] completed {} primary-error nil]
+        ;; A tagged value is read from the actual future, not from a signal sent
+        ;; before its cleanup. A slot is reusable only after its worker has joined.
+        (let [observed (mapv (fn [worker]
+                              [worker (deref (:future worker) 0 ::pending)]) active)
+              finished (mapv second (filter #(not= ::pending (second %)) observed))
+              active (mapv first (filter #(= ::pending (second %)) observed))
+              primary-error (or primary-error (first (keep :error finished)))
+              completed (reduce (fn [acc item]
+                                  (if (contains? item :result)
+                                    (assoc acc (:index item) (:result item)) acc))
+                                completed finished)]
+          ;; Observe all available completions before starting any queued edge.
+          ;; Local early-success cancellation must not become parent cancellation.
+          (when (or primary-error (cancelled?)
+                    (and first-success? (some #(= :success (get-in % [:result :status])) finished)))
+            (reset! stop true))
+          ;; Cancel native blocking operations BEFORE waiting for their futures.
+          ;; Only the owner closes; a worker closing its own scope would self-join.
+          (when @stop (close-owned!))
+          (cond
+            (and (empty? active) (or @stop (empty? pending)))
+            (if primary-error (throw primary-error)
+                (mapv second (sort-by first completed)))
+
+            (and (not @stop) (seq pending) (< (count active) max-parallel))
+            (let [[index edge] (first pending)
+                  ;; Cloning and launching may fail after siblings have started.
+                  ;; Keep the original exception, signal them, and join normally.
+                  launched (try {:worker {:index index :future (launch index edge branch-cancelled?)}}
+                                (catch Exception e {:error e}))]
+              (if (:error launched)
+                (do (reset! stop true)
+                    (recur (rest pending) active completed (:error launched)))
+                (recur (rest pending) (conj active (:worker launched)) completed primary-error)))
+
+            :else (do (when (empty? finished) (core/sleep 1))
+                      (recur pending active completed primary-error)))))
+      (finally (reset! stop true) (close-owned!)))))
+
 (defn- make-parallel-handler* [execute-branch-fn pass-edge? cancellation-aware?]
   (fn [node ctx graph logs-root]
     (let [branches (filter (fn [e] (= (:from e) (:id node))) (:edges graph))
@@ -260,25 +315,22 @@
       (if (empty? branches)
         {:status :fail :failure_reason "Parallel node has no outgoing branches"}
         (let [results
-              (loop [remaining branches
-                     accumulated []]
-                (if (or (empty? remaining) (cancelled?))
-                  accumulated
-                  (let [batch (vec (take max-parallel remaining))
-                        batch-results
-                        (doall
-                          (pmap (fn [branch-edge]
-                                  (let [target-id (:to branch-edge)
-                                        branch-ctx (context/ctx-clone ctx)
-                                        branch-logs (str logs-root "/branches/" target-id)
-                                        branch-start (if pass-edge? branch-edge target-id)
-                                        result (if cancellation-aware?
-                                                 (execute-branch-fn branch-start branch-ctx graph branch-logs cancelled?)
-                                                 (execute-branch-fn branch-start branch-ctx graph branch-logs))]
-                                    (assoc result :id target-id :node_id target-id)))
-                                batch))]
-                    (recur (drop max-parallel remaining)
-                           (into accumulated batch-results)))))
+              (coordinate-parallel
+                branches max-parallel (= join-policy "first_success") cancelled?
+                (fn [index branch-edge branch-cancelled?]
+                  (let [target-id (:to branch-edge)
+                        branch-ctx (context/ctx-clone ctx)
+                        branch-logs (str logs-root "/branches/" target-id)
+                        branch-start (if pass-edge? branch-edge target-id)]
+                    (core/future
+                      ;; let-go futures swallow uncaught exceptions; transport
+                      ;; errors explicitly so the coordinator owns propagation.
+                      (try
+                        (let [result (if cancellation-aware?
+                                       (execute-branch-fn branch-start branch-ctx graph branch-logs branch-cancelled?)
+                                       (execute-branch-fn branch-start branch-ctx graph branch-logs))]
+                          {:index index :result (assoc result :id target-id :node_id target-id)})
+                        (catch Exception e {:index index :error e}))))))
               boundary-ids (vec (distinct (keep :boundary_node_id results)))
               next-node-id (when (= 1 (count boundary-ids)) (first boundary-ids))
               success-count (count (filter (fn [r] (= (:status r) :success)) results))
