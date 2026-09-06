@@ -1,5 +1,6 @@
 (ns attractor.interviewer-contract-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interview]
@@ -32,6 +33,40 @@
             {:value "auto-approved" :text "auto-approved"}]
            (interview/ask-multiple interviewer questions)))
     (is (nil? (interview/inform interviewer "ready" "review")))))
+
+(deftest auto-approve-empty-options-falls-through-to-auto-approved
+  (is (= {:value "auto-approved" :text "auto-approved"}
+         (interview/ask (interview/make-auto-approve-interviewer)
+                        {:type :multiple_choice :options []}))))
+
+(defn- assert-console-answer [question input expected output]
+  ;; Replace only input: the real prompt and flush execute against bound *out*.
+  ;; This tests ready input, not non-blocking reads or timeout behavior.
+  (let [reads (atom 0)
+        answer (atom nil)
+        printed (with-out-str
+                  (with-redefs [core/read-line (fn [] (swap! reads inc) input)]
+                    (reset! answer (interview/ask (interview/make-console-interviewer)
+                                                 question))))]
+    (is (= expected @answer))
+    (is (= output printed))
+    (is (= 1 @reads))))
+
+(deftest console-choice-prints-options-flushes-and-reads-answer
+  (assert-console-answer complete-question " r " default-answer
+                         "\n[?] Review proposal\n  [A] Approve\n  [R] Revise\nSelect option: "))
+
+(deftest console-binary-prints-prompt-flushes-and-reads-answer
+  (doseq [[kind input expected]
+          [[:yes_no " YES " {:value :yes :text "yes"}]
+           [:confirmation "no" {:value :no :text "no"}]]]
+    (assert-console-answer {:type kind :text "Ready?"} input expected
+                           "\n[?] Ready?\n[Y/N]: ")))
+
+(deftest console-freeform-prints-prompt-flushes-and-reads-answer
+  (assert-console-answer {:type :freeform :text "Explain"} "  rationale  "
+                         {:value "rationale" :text "rationale"}
+                         "\n[?] Explain\n> "))
 
 (deftest queue-consumes-supplied-answer-maps-in-order-before-default
   (let [queue (interview/make-queue-interviewer answers)]

@@ -1,6 +1,6 @@
 (ns attractor.interviewer
   (:require [clojure.string :as str]
-            [io :as io]))
+            [term :as term]))
 
 ;; Question types
 (def question-types
@@ -62,14 +62,11 @@
       (#{:yes_no :confirmation} (:type question))
       {:value :yes :text "yes"}
 
-      (= (:type question) :multiple_choice)
-      (let [opts (or (:options question) [])]
-        (if (seq opts)
-          (let [first-opt (first opts)]
-            {:value (:key first-opt)
-             :selected_option first-opt
-             :text (:label first-opt)})
-          {:value :skipped :text "no options available"}))
+      (and (= (:type question) :multiple_choice) (seq (:options question)))
+      (let [first-opt (first (:options question))]
+        {:value (:key first-opt)
+         :selected_option first-opt
+         :text (:label first-opt)})
 
       :else
       {:value "auto-approved" :text "auto-approved"}))
@@ -151,7 +148,7 @@
         (doseq [opt (:options question)]
           (println (str "  [" (:key opt) "] " (:label opt))))
         (print "Select option: ")
-        (io/flush)
+        (term/flush)
         (let [line (str/trim (or (read-line) ""))
               choice (first (filter (fn [o] (or (= (str/lower-case (:key o)) (str/lower-case line))
                                                 (= (str/lower-case (:label o)) (str/lower-case line))))
@@ -166,7 +163,7 @@
       (#{:yes_no :confirmation} (:type question))
       (do
         (print "[Y/N]: ")
-        (io/flush)
+        (term/flush)
         (let [line (str/lower-case (str/trim (or (read-line) "")))]
           (if (or (= line "y") (= line "yes"))
             {:value :yes :text "yes"}
@@ -175,7 +172,7 @@
       :else
       (do
         (print "> ")
-        (io/flush)
+        (term/flush)
         (let [line (str/trim (or (read-line) ""))]
           {:value line :text line}))))
 
