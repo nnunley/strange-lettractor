@@ -93,10 +93,12 @@ Task 5 evidence: `ea08d98`, both review gates approved. Initial mapping RED 2 te
 
 Files: extend composition/capture/recovery tests; adjust runtime modules only for proved gaps.
 
-- [ ] Add public parent-child-grandchild scenarios for independently selected child budgets, one parent step per call, fresh fidelity histories, cancellation during active child work, child join/cleanup before parent terminal events, and no late outputs. Assert exact ordered `subpipeline.child_event` envelopes with parent node, child root, child plan fingerprint, and nested event.
-- [ ] Add file-drift/deletion tests after prepare and before execution/resume. Prove incomplete parent child-node retries under a fresh child root from captured bytes; completed parent node is skipped with outputs retained. Assert old child files/checkpoints remain unchanged, each child checkpoint resumes its selected graph, and restart roots remain captured.
-- [ ] Run focused tests, implement only identified gaps, rerun to green.
-- [ ] Run impacted recovery, lifecycle, CLI, server, manager/handlers, engine, context and status files separately; commit `test(composition): prove cancellation and pinned child recovery`.
+- [x] Add public parent-child-grandchild scenarios for independently selected child budgets, one parent step per call, fresh fidelity histories, cancellation during active child work, child join/cleanup before parent terminal events, and no late outputs. Assert exact ordered `subpipeline.child_event` envelopes with parent node, child root, child plan fingerprint, and nested event.
+- [x] Add file-drift/deletion tests after prepare and before execution/resume. Prove incomplete parent child-node retries under a fresh child root from captured bytes; completed parent node is skipped with outputs retained. Assert old child files/checkpoints remain unchanged, each child checkpoint resumes its selected graph, and restart roots remain captured.
+- [x] Run focused tests, implement only identified gaps, rerun to green.
+- [x] Run impacted recovery and all remaining affected suites through the full default suite; commit `test(composition): prove cancellation and pinned child recovery`.
+
+Task 6 evidence: test-only `49d402a` plus review strengthening `bfdc5a3`, both gates approved. Nested contracts 10/329/0, recovery 52/481/0, root independent full suite 473/3370/0 and fresh local AOT build. Spec review's three evidence gaps (unwrapped pre-cleanup terminal checks, actual nested node-timeout integration, actual custom-handler callback inheritance) are now directly tested. Controlled barriers prove pending parent completion until grandchild cleanup is released; all waits are bounded. No new production fix was needed. Fixture syntax/helper and retry-count expectation corrections were not implementation defects. The reader compatibility command still exits 1 with five failed assertions; full reader support is not claimed.
 
 ## Chunk 3: Audit and integration
 

@@ -92,12 +92,19 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 ### SCN-PIPELINE-COMPOSITION — Context-mapped composition
 
-- Given a valid parent with a project-defined `subpipeline` node whose child declares explicit `input_map` and `output_map` objects
-- When the parent invokes the child through the public lifecycle
-- Then only mapped parent inputs enter the child, mapped outputs return only after SUCCESS/PARTIAL_SUCCESS, and unmapped/colliding/missing mappings are rejected with deterministic diagnostics
-- Parent and child maintain distinct contexts, run-log roots, checkpoints, completed nodes, outcomes, retries, and fidelity sessions
-- Child FAIL/CANCELLED propagates without applying outputs, and invalid parent or child DOT cannot reach a handler
-- Seam: engine end to end
+- Given a valid parent whose project-defined `subpipeline` node declares a child DOT path and quoted `input_map` / `output_map` strings
+- When public preparation recursively resolves authorized sources, transforms and validates each physical source once, and captures the complete closure
+- Then active source cycles, logical identity collisions, unauthorized paths, invalid UTF-8, and invalid descendants stop execution before publication or handlers; completed physical aliases retain their captured identity
+- When the parent invokes a captured child through the public prepared-execution lifecycle, only mapped inputs are deep-copied into the child. Unmapped values are ignored, not rejected. Present `nil` differs from a missing input, which fails before child execution; duplicate or engine-owned destinations fail configuration validation
+- All mapped outputs are gathered before one update map is returned after SUCCESS/PARTIAL_SUCCESS. Missing outputs fail transactionally. FAIL/CANCELLED retain status/category/retryability/reason/notes without mapped outputs
+- Parent, child, grandchild, and sibling runs have distinct contexts, run roots, checkpoints, completed nodes, outcomes, retries, parallel/manager runtime slots, step budgets, and fidelity histories. Evidence must show state consumption or mutation does not leak, not just compare successful outcomes
+- Child budgets select node override, containing graph default, then 10,000 independently of the parent's remaining steps. Each subpipeline call costs one parent step; restart segments share their invocation's budget
+- Each ordered child event has exactly `:type`, `:parent_node_id`, `:child_logs_root`, `:child_plan_fingerprint`, and `:event`; the fingerprint is the selected plan digest, not the shared closure digest
+- Pipeline and node-timeout cancellation propagate through nested children, join held cleanup before any nested or outer terminal event, and prevent late mapped outputs. Caller custom handlers survive actual child callback handoff and restarts without mutating registry templates
+- Safe child/status paths reject escaping and dangling symlinks before cleanup or writes. Fresh UUID child attempts cannot reuse preexisting roots
+- Execution and resume never reparse or adopt changed/deleted current sources. An interrupted parent retries its child under a fresh root while retaining every old artifact byte; completed child calls are skipped with outputs intact. Each interrupted child/grandchild checkpoint resumes its own selected captured graph, and restarts preserve the captured closure
+- Intended mapping syntax is the Clojure reader superset of EDN. The user-approved ordinary string-map workaround remains a known unmet requirement: metadata/discard acceptance lives in the failing compatibility suite, not in the default passing evidence
+- Seam: public pipeline/engine/checkpoint integration, supplemented by compiled CLI file-backed execution and recovery
 
 ### SCN-LOOP-RESTART — Fresh-run restart edge
 
