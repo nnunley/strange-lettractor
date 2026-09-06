@@ -5,6 +5,7 @@
             [os :as os]
             [attractor.execution :as execution]
             [attractor.context :as context]
+            [attractor.composition :as composition]
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
             [attractor.interviewer :as interviewer]
@@ -26,6 +27,7 @@
 (def manager-runtime-key :attractor.handlers/manager-runtime)
 (def parallel-default-handler-key :attractor.handlers/parallel-default-handler)
 (def manager-default-handler-key :attractor.handlers/manager-default-handler)
+(def subpipeline-default-handler-key :attractor.handlers/subpipeline-default-handler)
 
 ;; Start Handler (Section 4.3)
 (defn handle-start [_node _context _graph _logs-root]
@@ -524,6 +526,8 @@
            true true)
          manager-handler (make-manager-loop-handler manager-runtime)]
      (atom {"start" handle-start
+            "subpipeline" composition/unconfigured-handler
+            subpipeline-default-handler-key composition/unconfigured-handler
             "exit" handle-exit
             "codergen" (make-codergen-handler codergen-backend)
             "wait.human" (make-wait-human-handler interviewer)

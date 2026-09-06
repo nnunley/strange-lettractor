@@ -1,6 +1,10 @@
 (ns attractor.composition
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [attractor.context :as context]
+            [attractor.workflow :as workflow]
+            [io :as io]
+            [os :as os]))
 
 (defn- attribute [entity k]
   (if (contains? (:attrs entity) k) (get (:attrs entity) k) (get entity k)))
@@ -101,3 +105,121 @@
                {:dotfile (:value dotfile) :input-map (:value inputs)
                 :output-map (:value outputs) :max-steps (:value steps)})
      :diagnostics diagnostics}))
+
+(defn unconfigured-handler [_node _ctx _graph _logs-root]
+  {:status :fail :category :subpipeline_configuration_error :retryable false
+   :failure_reason "Subpipeline execution requires a captured workflow and executor"})
+
+(defn node-directory-component [node-id]
+  (if (re-matches #"[A-Za-z0-9_-]+" node-id)
+    node-id
+    (str "node-" (workflow/sha256-text node-id))))
+
+(defn checked-node-directory
+  "Resolve a subpipeline stage directory without following an escaping symlink.
+   Used before engine status-file cleanup as well as child publication."
+  [logs-root node-id]
+  (let [parent (os/canonical-path logs-root)
+        node-dir (str parent "/" (node-directory-component node-id))]
+    (doseq [[directory entry] [[parent (node-directory-component node-id)]
+                              [node-dir "status.json"] [node-dir "children"]]]
+      ;; Directory entries include dangling symlinks, unlike file-exists? (stat).
+      ;; A present but unresolvable entry is rejected before cleanup or writes.
+      (when (and (io/file-exists? directory)
+                 (some #(= entry %) (os/ls directory)))
+        (let [resolved (try (os/canonical-path (str directory "/" entry))
+                            (catch Object _ nil))]
+          (when-not (and resolved (str/starts-with? resolved (str parent "/")))
+            (throw (ex-info "Subpipeline child directory escapes parent run"
+                            {:status :fail :retryable false :category :subpipeline_configuration_error}))))))
+    node-dir))
+
+(defn- child-root [logs-root node-id]
+  (let [node-dir (checked-node-directory logs-root node-id)
+        uuid (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+                             (str (random-uuid))))
+        children-dir (str node-dir "/children")
+        child (str children-dir "/" uuid)]
+    (when (and (io/file-exists? children-dir)
+               (some #(= uuid %) (os/ls children-dir)))
+      (throw (ex-info "Subpipeline child directory already exists"
+                      {:status :fail :retryable false :category :subpipeline_configuration_error})))
+    child))
+
+(defn- missing-mapping [node-id direction source destination]
+  {:status :fail :category :subpipeline_mapping_error :retryable false
+   :failure_reason (str "Subpipeline node '" node-id "' is missing "
+                        (if (= direction :input) "parent input" "child output")
+                        " '" source "' for '" destination "'")
+   :mapping {:direction direction :source source :destination destination}})
+
+(defn- mapped-values [node-id direction mapping values]
+  ;; Snapshot only the selected source: unmapped values never enter the copier.
+  ;; Remap its structural path into the user-facing mapping declaration.
+  (reduce
+    (fn [result [source destination]]
+      (when-not (contains? values source)
+        (throw (ex-info "Missing mapped value"
+                        (missing-mapping node-id direction source destination))))
+      (let [copied
+            (try
+              (get (context/ctx-snapshot (context/make-context {source (get values source)})) source)
+              (catch Object error
+                (let [data (ex-data error)]
+                  (if (= :unsupported-context-value (:category data))
+                    (throw (ex-info "Subpipeline mapping contains an unsupported context value"
+                             {:status :fail :category :subpipeline_mapping_error :retryable false
+                              :cause-category :unsupported-context-value
+                              :path (into [(if (= direction :input) :input_map :output_map)
+                                           source destination]
+                                          (drop 2 (:path data)))}))
+                    (throw error)))))]
+        (assoc result destination copied)))
+    {} mapping))
+
+(defn make-handler
+  "Build a handler bound to one selected captured parent plan and engine run."
+  [options registry on-event cancelled?]
+  (fn [node ctx graph logs-root]
+    (let [run-cancelled? cancelled?
+          cancelled? (fn [] (or (run-cancelled?)
+                                (when-let [node-cancelled? (:cancelled? node)] (node-cancelled?))))
+          bundle (:workflow options)
+          plan-id (:attractor.engine/plan-id options)
+          parent-plan (get-in bundle [:plans plan-id])
+          reference (first (filter #(= (:id node) (:node-id %)) (:references parent-plan)))
+          child-plan (get-in bundle [:plans (:plan-id reference)])
+          execute (:execute-subpipeline options)]
+      (if-not (and parent-plan reference child-plan execute)
+        (unconfigured-handler node ctx graph logs-root)
+        (try
+          (let [captured-node (get-in parent-plan [:graph :nodes (:id node)])
+                config (:config (node-config captured-node (:graph parent-plan)))]
+            (when-not config
+              (throw (ex-info "Invalid captured subpipeline configuration"
+                              {:category :subpipeline_configuration_error})))
+            (let [inputs (mapped-values (:id node) :input (:input-map config) (:values @ctx))
+                  child-ctx (context/make-context inputs)
+                  root (child-root logs-root (:id node))
+                  result (execute {:plan-id (:plan-id reference) :context child-ctx
+                                   :logs-root root :registry registry :cancelled? cancelled?
+                                   :max-steps (:max-steps config)
+                                   :on-event (fn [event]
+                                               (on-event {:type :subpipeline.child_event
+                                                          :parent_node_id (:id node)
+                                                          :child_logs_root root
+                                                          :child_plan_fingerprint (:plan-sha256 child-plan)
+                                                          :event event}))})
+                  outcome (select-keys result [:status :category :retryable :failure_reason :notes])]
+              (cond
+                (cancelled?) (if (= :cancelled (:status result)) outcome
+                                {:status :cancelled :failure_reason "Pipeline cancelled"})
+                (#{:success :partial_success} (:status result))
+                (assoc outcome :context_updates
+                       (mapped-values (:id node) :output (:output-map config) (:values @child-ctx)))
+                :else outcome)))
+          (catch Object error
+            (let [data (ex-data error)]
+              (if (#{:subpipeline_mapping_error :subpipeline_configuration_error} (:category data))
+                (merge {:status :fail :retryable false :failure_reason (ex-message error)} data)
+                (throw error)))))))))

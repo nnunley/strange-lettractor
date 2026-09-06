@@ -1,0 +1,287 @@
+(ns attractor.mapped-composition-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.pipeline :as pipeline]
+            [attractor.composition :as composition]
+            [attractor.engine :as engine]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]))
+
+(defn temp-root [] (str (os/temp-dir) "/mapped-composition-" (random-uuid)))
+(def parent-source
+  "digraph Root { start [shape=Mdiamond]; sub [type=subpipeline, subpipeline.dotfile=\"child.dot\", input_map=\"{\\\"payload\\\" \\\"request\\\" \\\"nothing\\\" \\\"nullable\\\"}\", output_map=\"{\\\"answer\\\" \\\"result\\\"}\"]; exit [shape=Msquare]; start -> sub -> exit; }")
+(defn loader [& _]
+  {:logical-id "workflow://child" :physical-id "mapped-child"
+   :source "digraph Child { begin [shape=Mdiamond]; work [shape=box]; end [shape=Msquare]; begin -> work -> end; }"})
+
+(deftest bare-subpipeline-is-a-configuration-failure
+  (let [node {:id "sub" :type "subpipeline"}
+        handler (handlers/resolve-handler (handlers/make-handler-registry) node)
+        result (handler node (context/make-context) {} (temp-root))]
+    (is (= :fail (:status result)))
+    (is (= :subpipeline_configuration_error (:category result)))
+    (is (= false (:retryable result)))))
+
+(deftest public-mapped-child-journey
+  (let [nested [{:items '(1 2) :members #{"a" "b"}} nil]
+        ctx (context/make-context {"payload" nested "nothing" nil "secret" "hidden" "result" "old"})
+        seen (atom []) events (atom []) registry (handlers/make-handler-registry)
+        _ (handlers/register-handler! registry "codergen"
+            (fn [_ child _ _]
+              (swap! seen conj (:values @child))
+              (context/ctx-set! child "request" "changed")
+              {:status :success :context_updates {"answer" nested}}))
+        original @registry
+        result (pipeline/run parent-source {:context ctx :registry registry :logs-root (temp-root)
+                                            :source-loader loader :on-event #(swap! events conj %)})]
+    (is (= :success (:status result)))
+    (is (= 1 (count @seen)))
+    (is (= nested (get (first @seen) "request")))
+    (is (not (identical? nested (get (first @seen) "request"))))
+    (is (not (identical? (first nested) (first (get (first @seen) "request")))))
+    (is (contains? (first @seen) "nullable"))
+    (is (nil? (get (first @seen) "nullable")))
+    (is (not (contains? (first @seen) "secret")))
+    (is (= nested (context/ctx-get ctx "payload")))
+    (is (= nested (context/ctx-get ctx "result")))
+    (is (not (identical? nested (context/ctx-get ctx "result"))))
+    (is (= original @registry))
+    (let [child-events (filter #(= :subpipeline.child_event (:type %)) @events)
+          prepared (pipeline/prepare parent-source {:source-loader loader})
+          digest (get-in prepared [:workflow :plans "workflow://child" :plan-sha256])
+          child-completed-index (first (keep-indexed #(when (= :pipeline.completed (get-in %2 [:event :type])) %1) @events))
+          parent-completed-index (first (keep-indexed #(when (and (= :stage.completed (:type %2)) (= "sub" (:node_id %2))) %1) @events))]
+      (is (seq child-events))
+      (is (every? #(= digest (:child_plan_fingerprint %)) child-events))
+      (is (= :pipeline.started (get-in (first child-events) [:event :type])))
+      (is (= :pipeline.completed (get-in (last child-events) [:event :type])))
+      (is (< child-completed-index parent-completed-index)))))
+
+(defn direct-handler [node callback cancelled?]
+  (let [graph {:nodes {(:id node) node}}
+        bundle {:plans {"alias-parent" {:graph graph :references [{:node-id (:id node) :plan-id "child"}]}
+                        "child" {:plan-sha256 "selected-child-digest"}}}]
+    (composition/make-handler {:workflow bundle :attractor.engine/plan-id "alias-parent"
+                               :execute-subpipeline callback}
+                              (handlers/make-handler-registry) (fn [_] nil) cancelled?)))
+(defn mapped-node [inputs outputs]
+  {:id "sub" :type "subpipeline"
+   :attrs {:subpipeline.dotfile "child.dot" :input_map (pr-str inputs) :output_map (pr-str outputs)}})
+(defn existing-root [] (let [root (temp-root)] (io/mkdir root) root))
+
+(deftest mapping-failures-before-child-state-and-atomic-outputs
+  (let [node (mapped-node {"missing" "request"} {}) root (existing-root) calls (atom 0)
+        handler (direct-handler node (fn [_] (swap! calls inc)) (fn [] false))
+        outcome (handler node (context/make-context) {} root)]
+    (is (= {:status :fail :category :subpipeline_mapping_error :retryable false
+            :failure_reason "Subpipeline node 'sub' is missing parent input 'missing' for 'request'"
+            :mapping {:direction :input :source "missing" :destination "request"}} outcome))
+    (is (= 0 @calls))
+    (is (not (io/file-exists? (str root "/sub")))))
+  (let [node (mapped-node {} {"answer" "result" "missing" "other"}) root (existing-root)
+        ctx (context/make-context {"result" "old"})
+        handler (direct-handler node (fn [r] (context/ctx-set! (:context r) "answer" [1])
+                                               {:status :success}) (fn [] false))
+        outcome (handler node ctx {} root)]
+    (is (= {:status :fail :category :subpipeline_mapping_error :retryable false
+            :failure_reason "Subpipeline node 'sub' is missing child output 'missing' for 'other'"
+            :mapping {:direction :output :source "missing" :destination "other"}} outcome))
+    (is (= "old" (context/ctx-get ctx "result")))
+    (is (not (contains? outcome :context_updates)))))
+
+(deftest opaque-input-path-and-unmapped-opaque-values
+  (let [node (mapped-node {"payload" "request"} {}) root (existing-root) calls (atom 0)
+        handler (direct-handler node (fn [_] (swap! calls inc) {:status :success}) (fn [] false))
+        outcome (handler node (context/make-context {"payload" [1 2 (atom 3)]}) {} root)]
+    (is (= :subpipeline_mapping_error (:category outcome)))
+    (is (= :unsupported-context-value (:cause-category outcome)))
+    (is (= [:input_map "payload" "request" 2] (:path outcome)))
+    (is (= false (:retryable outcome)))
+    (is (= 0 @calls))
+    (is (not (io/file-exists? (str root "/sub"))))
+    (is (= :success (:status (handler node (context/make-context {"payload" nil "secret" (atom 9)}) {} root))))
+    (is (= 1 @calls))))
+
+(deftest exact-status-propagation-and-cancellation-wins
+  (doseq [status [:success :partial_success :fail :cancelled]]
+    (let [node (mapped-node {} {"answer" "result"})
+          result {:status status :category :child_reason :retryable false
+                  :failure_reason "specific reason" :notes "child notes"}
+          handler (direct-handler node (fn [r] (context/ctx-set! (:context r) "answer" nil)
+                                                   (assoc result :context_updates {"leak" 1})) (fn [] false))
+          outcome (handler node (context/make-context) {} (existing-root))]
+      (is (= (if (#{:success :partial_success} status)
+               (assoc result :context_updates {"result" nil}) result) outcome))))
+  (let [cancelled (atom false) node (mapped-node {} {"answer" "result"})
+        handler (direct-handler node (fn [r] (context/ctx-set! (:context r) "answer" 1)
+                                                 (reset! cancelled true) {:status :success}) #(deref cancelled))
+        outcome (handler node (context/make-context) {} (existing-root))]
+    (is (= :cancelled (:status outcome)))
+    (is (not (contains? outcome :context_updates)))))
+
+(deftest child-directory-containment-and-uniqueness
+  (let [roots (atom []) parent (existing-root)]
+    (doseq [id ["safe_ID-0" "a/b" "../escape" "/absolute" "héllo" "a\\b"]]
+      (let [node (assoc (mapped-node {} {}) :id id)
+            handler (direct-handler node (fn [r] (swap! roots conj (:logs-root r)) {:status :success}) (fn [] false))]
+        (dotimes [_ 2]
+          (is (= :success (:status (handler node (context/make-context) {} parent)))))
+        (let [path (last @roots)]
+          (is (str/starts-with? path (str (os/canonical-path parent) "/" (composition/node-directory-component id) "/children/")))
+          (is (re-find #"/children/[0-9a-f-]{36}$" path)))))
+    (is (= 12 (count (set @roots))))
+    (is (= "safe_ID-0" (composition/node-directory-component "safe_ID-0"))))
+  (doseq [link-part ["sub" "sub/children"]]
+    (let [parent (existing-root) outside (existing-root) calls (atom 0)
+          _ (when (= link-part "sub/children") (io/mkdir (str parent "/sub")))
+          _ (os/sh "ln" "-s" outside (str parent "/" link-part))
+          node (mapped-node {} {})
+          handler (direct-handler node (fn [_] (swap! calls inc) {:status :success}) (fn [] false))]
+      (is (= :subpipeline_configuration_error (:category (handler node (context/make-context) {} parent))))
+      (is (= 0 @calls)))))
+
+(deftest public-child-failure-preserves-metadata
+  (let [registry (handlers/make-handler-registry) events (atom [])
+        child-outcome {:status :fail :category :child_failure :retryable false
+                       :failure_reason "specific child failure" :notes "reason details"}
+        _ (handlers/register-handler! registry "codergen" (fn [& _] child-outcome))
+        ctx (context/make-context {"payload" [] "nothing" nil "result" "old"})
+        result (pipeline/run parent-source {:context ctx :registry registry :source-loader loader
+                                             :logs-root (temp-root) :on-event #(swap! events conj %)})
+        stage (first (filter #(and (= "sub" (:node_id %)) (= :stage.failed (:type %))) @events))]
+    (is (= child-outcome (:outcome stage)))
+    (is (= child-outcome (select-keys result (keys child-outcome))))
+    (is (= "old" (context/ctx-get ctx "result")))))
+
+(deftest public-missing-second-output-does-not-apply-first
+  (let [source (str/replace parent-source "\\\"answer\\\" \\\"result\\\""
+                            "\\\"answer\\\" \\\"result\\\" \\\"missing\\\" \\\"other\\\"")
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler! registry "codergen" (fn [& _] {:status :success :context_updates {"answer" 9}}))
+        ctx (context/make-context {"payload" [] "nothing" nil "result" "old"})
+        result (pipeline/run source {:context ctx :registry registry :source-loader loader :logs-root (temp-root)})]
+    (is (= :fail (:status result)))
+    (is (= "old" (context/ctx-get ctx "result")))
+    (is (not (contains? (:values @ctx) "other")))))
+
+(deftest node-cancellation-is-inherited-and-joined
+  (let [cancelled (atom false) seen (atom false) node (assoc (mapped-node {} {}) :cancelled? #(deref cancelled))
+        handler (direct-handler node (fn [r] (reset! cancelled true)
+                                                 (reset! seen ((:cancelled? r)))
+                                                 {:status :success}) (fn [] false))
+        outcome (handler node (context/make-context) {} (existing-root))]
+    (is (= true @seen))
+    (is (= :cancelled (:status outcome)))
+    (is (not (contains? outcome :context_updates)))))
+
+(deftest public-symlink-rejection-preserves-outside-status
+  (let [root (existing-root) outside (existing-root) sentinel (str outside "/status.json")
+        _ (io/spit sentinel "outside sentinel")
+        _ (os/sh "ln" "-s" outside (str root "/sub"))
+        ctx (context/make-context {"payload" [] "nothing" nil})
+        result (pipeline/run parent-source {:context ctx :source-loader loader :logs-root root})]
+    (is (= :fail (:status result)))
+    (is (= "outside sentinel" (io/slurp sentinel))))
+  (let [root (existing-root) unsafe "../outside-node"
+        rename-node (fn [g] (if (get-in g [:nodes "sub"])
+                              (-> g
+                                  (assoc :nodes (assoc (dissoc (:nodes g) "sub") unsafe
+                                                       (assoc (get-in g [:nodes "sub"]) :id unsafe)))
+                                  (assoc :edges (mapv (fn [e] (-> e
+                                                                 (update :from #(if (= % "sub") unsafe %))
+                                                                 (update :to #(if (= % "sub") unsafe %)))) (:edges g)))) g))
+        result (pipeline/run parent-source {:context (context/make-context {"payload" [] "nothing" nil})
+                                      :custom-transforms [rename-node] :source-loader loader :logs-root root})]
+    (is (= :fail (:status result)))
+    (is (io/file-exists? (str root "/" (composition/node-directory-component unsafe) "/status.json")))))
+
+(deftest custom-subpipeline-handler-wins-without-mutating-template
+  (doseq [registry [(handlers/make-handler-registry) (atom {"start" handlers/handle-start})]]
+    (let [calls (atom 0) custom (fn [& _] (swap! calls inc) {:status :success})
+          _ (handlers/register-handler! registry "subpipeline" custom)
+          original @registry
+          result (pipeline/run parent-source {:registry registry :source-loader loader :logs-root (temp-root)})]
+      (is (= :success (:status result)))
+      (is (= 1 @calls))
+      (is (= original @registry)))))
+
+(deftest sibling-child-runtime-atoms-are-distinct
+  (let [source "digraph Root { start [shape=Mdiamond]; a [type=subpipeline, subpipeline.dotfile=\"child.dot\"]; b [type=subpipeline, subpipeline.dotfile=\"child.dot\"]; exit [shape=Msquare]; start -> a -> b -> exit; }"
+        registry (handlers/make-handler-registry) original @registry observations (atom []) roots (atom [])
+        execute engine/run-pipeline
+        result (with-redefs [engine/run-pipeline
+                            (fn [graph options]
+                              (swap! roots conj (:logs-root options))
+                              (execute graph (assoc options :attractor.engine/on-segment-initialized
+                                                     #(swap! observations conj %))))]
+                 (pipeline/run source {:registry registry :source-loader loader :logs-root (temp-root)}))]
+    (is (= :success (:status result)))
+    (is (= 3 (count @observations)))
+    (is (= 3 (count (set @roots))))
+    (doseq [key [:parallel-executor :manager-runtime :retry-counts :fidelity-threads]]
+      (is (not (identical? (get (nth @observations 1) key) (get (nth @observations 2) key)))))
+    (is (= original @registry))))
+
+(deftest mapped-callback-budget-and-cooperative-timeout
+  (let [node (assoc-in (mapped-node {} {}) [:attrs :subpipeline.max_steps] 7)
+        seen (atom nil)
+        handler (direct-handler node (fn [r] (reset! seen r) {:status :success}) (fn [] false))]
+    (is (= :success (:status (handler node (context/make-context) {} (existing-root)))))
+    (is (= 7 (:max-steps @seen)))
+    (is (= "child" (:plan-id @seen)))
+    (is (= {} (:values @(:context @seen)))))
+  (let [node (assoc (mapped-node {} {}) :timeout "20ms")
+        joined (atom false) observed-cancel (atom false)
+        handler (direct-handler node
+                  (fn [r]
+                    (let [deadline (+ (System/currentTimeMillis) 1000)]
+                      (loop []
+                        (if (or ((:cancelled? r)) (> (System/currentTimeMillis) deadline))
+                          (do (reset! observed-cancel ((:cancelled? r)))
+                              (reset! joined true)
+                              {:status :cancelled})
+                          (do (core/sleep 2) (recur)))))) (fn [] false))
+        outcome (engine/execute-with-retry handler node (context/make-context) {} (existing-root)
+                                          (fn [_] nil) {})]
+    (is (= true @joined))
+    (is (= true @observed-cancel))
+    (is (= :fail (:status outcome)))
+    (is (= :timeout_error (:category outcome)))
+    (is (not (contains? outcome :context_updates)))))
+
+(deftest public-child-cancellation-preserves-details
+  (let [registry (handlers/make-handler-registry)
+        child-outcome {:status :cancelled :category :child_cancelled :retryable false
+                       :failure_reason "stopped child" :notes "cancellation details"}
+        _ (handlers/register-handler! registry "codergen" (fn [& _] child-outcome))
+        ctx (context/make-context {"payload" [] "nothing" nil "result" "old"})
+        result (pipeline/run parent-source {:context ctx :registry registry :source-loader loader
+                                             :logs-root (temp-root)})]
+    (is (= child-outcome (select-keys result (keys child-outcome))))
+    (is (= "old" (context/ctx-get ctx "result")))))
+
+(deftest dangling-status-symlink-is-rejected-before-handler-or-write
+  (let [root (existing-root) outside (str (existing-root) "/absent.json") calls (atom 0)
+        _ (io/mkdir (str root "/sub"))
+        _ (os/sh "ln" "-s" outside (str root "/sub/status.json"))
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler! registry "subpipeline" (fn [& _] (swap! calls inc) {:status :success}))
+        result (pipeline/run parent-source {:registry registry :source-loader loader :logs-root root})]
+    (is (= :fail (:status result)))
+    (is (= :subpipeline_configuration_error (:category result)))
+    (is (= 0 @calls))
+    (is (not (io/file-exists? outside)))))
+
+(deftest preexisting-child-root-is-never-reused
+  (let [root (existing-root) outside (existing-root) uuid "00000000-0000-0000-0000-000000000001"
+        _ (io/mkdir (str root "/sub/children"))
+        _ (os/sh "ln" "-s" outside (str root "/sub/children/" uuid))
+        calls (atom 0) node (mapped-node {} {})
+        handler (direct-handler node (fn [_] (swap! calls inc) {:status :success}) (fn [] false))
+        outcome (with-redefs [core/random-uuid (fn [] uuid)]
+                  (handler node (context/make-context) {} root))]
+    (is (= :subpipeline_configuration_error (:category outcome)))
+    (is (= 0 @calls))))

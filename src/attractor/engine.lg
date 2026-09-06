@@ -7,17 +7,28 @@
             [attractor.parser :as parser]
             [attractor.conditions :as conditions]
             [attractor.context :as context]
+            [attractor.composition :as composition]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
             [attractor.status :as status]))
 
 (def default-max-steps 10000)
 
-(defn- write-stage-status! [logs-root node-id outcome]
-  (let [stage-dir (str logs-root "/" node-id)]
-    (os/sh "mkdir" "-p" stage-dir)
-    (io/spit (str stage-dir "/status.json")
-             (status/outcome->status-json outcome))))
+(defn- stage-directory [logs-root node]
+  (if (= "subpipeline" (:type node))
+    (composition/checked-node-directory logs-root (:id node))
+    (str logs-root "/" (:id node))))
+
+(defn- write-stage-status! [logs-root node outcome]
+  (try
+    (let [stage-dir (stage-directory logs-root node)]
+      (os/sh "mkdir" "-p" stage-dir)
+      (io/spit (str stage-dir "/status.json")
+               (status/outcome->status-json outcome)))
+    (catch Object error
+      ;; A rejected subpipeline path must not be used even to write its failure.
+      (when-not (= :subpipeline_configuration_error (:category (ex-data error)))
+        (throw error)))))
 
 (defn- normalize-node-outcomes [outcomes]
   (into {}
@@ -266,21 +277,23 @@
                    "context_updates" "notes")
            contract)))
 
-(defn- attempt-status-path [logs-root node-id]
-  (str logs-root "/" node-id "/status.json"))
+(defn- attempt-status-path [logs-root node]
+  (str (stage-directory logs-root node) "/status.json"))
 
-(defn- clear-attempt-status! [logs-root node-id]
-  (let [path (attempt-status-path logs-root node-id)]
-    (try
+(defn- clear-attempt-status! [logs-root node]
+  (try
+    (let [path (attempt-status-path logs-root node)]
       (when (io/file-exists? path)
         (io/delete-file path))
-      nil
-      (catch Object error
+      nil)
+    (catch Object error
+      (if (= :subpipeline_configuration_error (:category (ex-data error)))
+        (assoc (ex-data error) :failure_reason (ex-message error))
         (status-contract-failure
-          (str "Unable to clear stale status file '" path "': " error))))))
+          (str "Unable to clear stale status file for node '" (:id node) "': " error))))))
 
-(defn- read-attempt-status [logs-root node-id]
-  (let [path (attempt-status-path logs-root node-id)]
+(defn- read-attempt-status [logs-root node]
+  (let [path (attempt-status-path logs-root node)]
     (if-not (io/file-exists? path)
       {:present? false}
       (try
@@ -298,7 +311,7 @@
                       (str "Malformed status file '" path "': " error))})))))
 
 (defn- resolve-attempt-outcome [logs-root node handler-outcome]
-  (let [file-result (read-attempt-status logs-root (:id node))]
+  (let [file-result (read-attempt-status logs-root node)]
     (cond
       (:failure file-result)
       (:failure file-result)
@@ -426,7 +439,7 @@
         {:status :cancelled :failure_reason "Pipeline cancelled"}
         (let [_ (on-event {:type :stage.started :node_id node-id
                            :attempt attempt :max_attempts max-attempts})
-            cleanup-failure (clear-attempt-status! logs-root node-id)
+            cleanup-failure (clear-attempt-status! logs-root node)
             execution (if cleanup-failure
                         {:resolved-outcome cleanup-failure}
                         (if-let [configuration-error (:error timeout-config)]
@@ -597,8 +610,8 @@
             next-completed (conj completed-nodes node-id)
             next-outcomes (assoc node-outcomes node-id outcome)]
         (if (= :cancelled (:status outcome))
-          (clear-attempt-status! logs-root node-id)
-          (write-stage-status! logs-root node-id outcome))
+          (clear-attempt-status! logs-root current-node)
+          (write-stage-status! logs-root current-node outcome))
         (context/ctx-apply-updates! ctx (:context_updates outcome))
         (context/ctx-set! ctx "outcome"
                           (if (keyword? (:status outcome))
@@ -815,7 +828,14 @@
          registry (if (or (get @registry-template handlers/parallel-executor-key)
                           (get @registry-template handlers/manager-runtime-key))
                     (clone-handler-registry registry-template)
-                    registry-template)
+                    (atom @registry-template))
+         _subpipeline-init
+         (when (or (not (contains? @registry "subpipeline"))
+                   (identical? (get @registry "subpipeline")
+                               (get @registry handlers/subpipeline-default-handler-key)))
+           (let [handler (composition/make-handler options registry on-event cancelled?)]
+             (swap! registry assoc "subpipeline" handler
+                    handlers/subpipeline-default-handler-key handler)))
          retry-counts (or (:retry-counts options)
                           (atom (or (:node-retries options) {})))
          fidelity-threads (or (:fidelity-threads options) (atom {}))
@@ -956,16 +976,17 @@
                ;; The engine owns the status-file contract for every handler,
                ;; including no-op, human, tool, and custom handlers.
                (if (= :cancelled st)
-                 (clear-attempt-status! logs-root node-id)
-                 (write-stage-status! logs-root node-id outcome))
+                 (clear-attempt-status! logs-root current-node)
+                 (write-stage-status! logs-root current-node outcome))
 
                (if (= st :cancelled)
                  (let [cancelled-result
+                       (merge (select-keys outcome [:category :retryable :notes])
                        {:status :cancelled
                         :failure_reason (or (:failure_reason outcome)
                                             "Pipeline cancelled")
                         :completed_nodes completed-nodes
-                        :context (context/ctx-snapshot ctx)}]
+                        :context (context/ctx-snapshot ctx)})]
                    (on-event {:type :pipeline.cancelled
                               :completed_nodes completed-nodes})
                    cancelled-result)
@@ -1013,9 +1034,10 @@
                                   new-outcomes
                                   nil
                                   (inc step-count))
-                           (let [fail-res {:status :fail
+                           (let [fail-res (merge (select-keys outcome [:category :retryable :notes :mapping :cause-category :path])
+                                          {:status :fail
                                            :failure_reason (or (:failure_reason outcome) "Stage failed and no route found")
-                                           :completed_nodes new-completed}]
+                                           :completed_nodes new-completed})]
                              (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
                              fail-res)))
                        ;; Succeeded with no outgoing edges
