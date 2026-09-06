@@ -45,6 +45,8 @@ The engine receives `:workflow` and `:execute-subpipeline`. The callback accepts
 
 The handler is installed in a cloned registry. An explicit caller entry named `"subpipeline"` wins. Otherwise the engine replaces only its marked built-in placeholder with the run-scoped handler; the caller's registry template is never mutated.
 
+Mapping configuration is derived by the same pure `node-config` function during capture and execution, from the verified captured node/graph attributes. No unpinned side cache is used. Both fresh and resumed execution supply the full verified runtime bundle, selected plan identity, and child execution callback, preserving them across restarts.
+
 ## Handler Data Flow
 
 `subpipeline` is a standard handler installed in a cloned registry. Caller registry templates remain untouched. For each parent attempt it:
@@ -52,7 +54,7 @@ The handler is installed in a cloned registry. An explicit caller entry named `"
 1. resolves the captured child by parent source identity and node ID;
 2. requires every mapped parent input before creating child state;
 3. deep-copies only mapped values into a new child Context; unsupported values fail as `:subpipeline_mapping_error` with `:cause-category :unsupported-context-value` and a structural path beginning `[:input_map <parent-key> <child-key>]` followed by the nested value path (for example, an opaque value at index 2 under parent `"payload"` mapped to child `"request"` reports `[:input_map "payload" "request" 2]`);
-4. creates a pairwise-unique root under `<parent-root>/<node-id>/children/`;
+4. creates a pairwise-unique root under `<parent-root>/<safe-node-component>/children/`; IDs matching `[A-Za-z0-9_-]+` retain their spelling, others use `node-` plus SHA-256 of the original UTF-8 ID, with canonical parent containment checked before writes to reject symlink escapes;
 5. executes with cloned registry, fresh runtimes/retries/outcomes/fidelity/checkpoint, inherited cancellation/event sink, and child-local step budget selected from node `subpipeline.max_steps`, graph `subpipeline.default_max_steps`, or `10000`, in that order and independently of the parent's remaining steps;
 6. on SUCCESS/PARTIAL_SUCCESS, collects all mapped outputs before returning them together;
 7. on missing output, returns non-retryable `:subpipeline_mapping_error` with no updates; and
@@ -61,6 +63,8 @@ The handler is installed in a cloned registry. An explicit caller entry named `"
 One subpipeline call consumes one parent step. Cancellation wins concurrent completion, propagates to and joins the child, closes child resources, and applies no output.
 
 Child events retain order inside `{:type :subpipeline.child_event :parent_node_id ... :child_logs_root ... :child_plan_fingerprint ... :event ...}`. The parent stage event follows resolution.
+
+The event's `:child_plan_fingerprint` is the selected plan's `:plan-sha256`; the closure fingerprint remains the shared checkpoint workflow identity.
 
 A missing mapped input or output has exact shape `{:status :fail :category :subpipeline_mapping_error :retryable false :failure_reason string :mapping {:direction :input|:output :source string :destination string}}`. Its reason is `Subpipeline node '<id>' is missing <parent|child> <input|output> '<source>' for '<destination>'`.
 

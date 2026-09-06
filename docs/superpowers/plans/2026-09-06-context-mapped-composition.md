@@ -16,6 +16,8 @@ Runtime findings: let-go `io/slurp` preserves raw string bytes and string `seq` 
 
 ## Chunk 1: Configuration and recursive capture
 
+Configuration handoff: capture calls `composition/node-config` for diagnostics; the scoped runtime handler calls the same pure function on the verified captured node and graph attributes. Those original strings/numbers already participate in the plan fingerprint. Do not retain an unpinned side cache or add schema fields for parsed mappings.
+
 ### Task 1: Mapping grammar and node configuration
 
 Files: create `src/attractor/composition.lg` and `test/attractor/composition_contract_test.lg`; modify `src/attractor/validation.lg`.
@@ -46,6 +48,14 @@ Files: modify `src/attractor/capture.lg`, `src/attractor/pipeline.lg`, `src/attr
 - [ ] Commit `feat(capture): snapshot recursive prepared workflow closures`.
 
 ## Chunk 2: Isolated child execution and recovery
+
+Required runtime handoff: both fresh `execute-prepared` and public resume inject the verified full runtime bundle as `:workflow`, selected plan identity, and `:execute-subpipeline` callback into engine options. Resume obtains these from `:captured-bundle`, never the manifest alone or current files. The callback closes over that captured bundle and invokes the same selected-plan public execution seam for every descendant. Internal child options cannot replace the capture, selected graph, or callback. Restart plumbing preserves this handoff.
+
+Child path contract: use an unchanged node ID only when it matches `[A-Za-z0-9_-]+`; otherwise use `node-` plus SHA-256 of the UTF-8 node ID as its directory component. Put child roots below `<parent-root>/<safe-component>/children/<uuid>`. Verify canonical containment beneath the parent root before creating child files, rejecting pre-existing symlink escapes. Add slash, parent traversal, absolute-looking, Unicode, separator, and symlink cases. Original node IDs remain unchanged in graphs, mappings, and event fields.
+
+Event identity: `:child_plan_fingerprint` is the selected child plan's `:plan-sha256`, not the closure fingerprint. Assert it against the captured index while separately proving parent and child checkpoints share closure identity.
+
+Isolation evidence matrix: parent, child, grandchild, and sibling runs must have distinct checkpoint files, completed-node vectors, outcome maps, retry maps, parallel/manager runtime slots, budget counters, and fidelity histories. Mutate or consume each kind in one run and assert the others are unchanged. Cover nested context values and caller registry/runtime templates as well as file paths; successful outcomes alone are insufficient.
 
 ### Task 4: Selectable captured-plan checkpoints
 
