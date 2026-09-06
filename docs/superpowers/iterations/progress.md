@@ -14,9 +14,10 @@ file without a success message. RED: 9 assertion failures / zero errors; GREEN:
 2 tests / 60 assertions. Scoped review approves. Root full suite passes **559
 tests / 4518 assertions / zero failures**, exit 0; AOT builds. This remains a
 scoped tools fix, not full CAL-TOOLS-01 completion. The separate reader failures
-remain unresolved. An independently verified supplementary-Unicode string-count
-difference is filed as let-go #812; explicit UTF-8 encoding avoids depending on
-either runtime's string-count semantics. No local let-go files were changed.
+remain unresolved. The user confirmed that let-go's rune count versus JVM char
+count is a known accepted divergence, not a bug; #812 was filed unnecessarily.
+Explicit UTF-8 encoding remains correct for byte counts. No local let-go files
+were changed.
 
 **Exact-edit repair:** the local environment rejected a single space in
 `alpha beta` as an empty `old_string`, contrary to the §3.3 exact-match contract.
