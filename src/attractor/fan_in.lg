@@ -1,0 +1,108 @@
+(ns attractor.fan-in
+  (:require [clojure.string :as str]
+            [attractor.context :as context]))
+
+(defn- cancelled-outcome []
+  {:status :cancelled :failure_reason "Pipeline cancelled"})
+
+(defn- eligible-candidates [results]
+  (->> results
+       (map-indexed (fn [index candidate]
+                      {:index index :candidate candidate}))
+       (filter (fn [entry]
+                 (#{:success :partial_success :retry}
+                  (:status (:candidate entry)))))
+       vec))
+
+(defn- configuration-error [message]
+  (ex-info message {:category :configuration_error :retryable false}))
+
+(defn- finite-score [candidate]
+  (if-not (contains? candidate :score)
+    0
+    (let [score (:score candidate)]
+      (when-not (and (number? score)
+                     (not (and (float? score)
+                               (or (NaN? score) (infinite? score)))))
+        (throw (configuration-error "Fan-in candidate score must be a finite number")))
+      score)))
+
+(defn- heuristic-index [candidates]
+  (let [status-rank {:success 0 :partial_success 1 :retry 2}]
+    ;; sort-by may skip its key function for a singleton, so validation must
+    ;; be eager and independent of the sorting implementation.
+    (doseq [entry candidates]
+      (finite-score (:candidate entry)))
+    ;; Compare scores directly: negating Long/MIN_VALUE is invalid in Clojure
+    ;; and currently wraps in let-go (nooga/let-go#808; docs/let-go-followups.md).
+    (:index
+      (first
+        (sort
+          (fn [left right]
+            (let [left-candidate (:candidate left)
+                  right-candidate (:candidate right)
+                  status-order (compare
+                                 (get status-rank (:status left-candidate))
+                                 (get status-rank (:status right-candidate)))]
+              (if-not (zero? status-order)
+                status-order
+                (let [score-order (compare (finite-score right-candidate)
+                                           (finite-score left-candidate))]
+                  (if-not (zero? score-order)
+                    score-order
+                    (let [id-order
+                          (compare
+                            (str (or (:id left-candidate)
+                                     (:node_id left-candidate) ""))
+                            (str (or (:id right-candidate)
+                                     (:node_id right-candidate) "")))]
+                      (if-not (zero? id-order)
+                        id-order
+                        (compare (:index left) (:index right)))))))))
+          candidates)))))
+
+(defn- prompted-selection [ranker node prompt candidates cancelled?]
+  (when-not ranker
+    (throw (configuration-error "Prompted fan-in requires a ranker")))
+  (ranker {:node node
+           :prompt prompt
+           :candidates candidates
+           :cancelled? cancelled?}))
+
+(defn- validate-selection [selection candidates]
+  (let [eligible-indices (set (map :index candidates))]
+    (when-not (and (integer? selection) (contains? eligible-indices selection))
+      (throw (configuration-error "Fan-in ranker returned an invalid candidate index")))
+    selection))
+
+(defn- winner-outcome [winner]
+  (let [best-id (str (or (:id winner) (:node_id winner) "winner"))]
+    {:status :success
+     :context_updates {"parallel.fan_in.best_id" best-id
+                       "parallel.fan_in.best_outcome" (str (:status winner))}
+     :notes (str "Selected best candidate: " best-id)}))
+
+(defn make-handler [ranker]
+  (fn [node ctx _graph _logs-root]
+    (let [cancelled? (or (:cancelled? node) (fn [] false))]
+      (if (cancelled?)
+        (cancelled-outcome)
+        (let [results (context/ctx-get ctx "parallel.results" [])]
+          (if (empty? results)
+            {:status :fail :failure_reason "No parallel results to evaluate"}
+            (let [candidates (eligible-candidates results)]
+              (if (empty? candidates)
+                {:status :fail :failure_reason "All parallel branches failed"}
+                (let [prompt (:prompt node)]
+                  (if (str/blank? prompt)
+                    (let [index (heuristic-index candidates)]
+                      (if (cancelled?)
+                        (cancelled-outcome)
+                        (winner-outcome (nth results index))))
+                    (let [selection (prompted-selection
+                                      ranker node prompt candidates cancelled?)]
+                      (if (cancelled?)
+                        (cancelled-outcome)
+                        (winner-outcome
+                          (nth results
+                               (validate-selection selection candidates)))))))))))))))

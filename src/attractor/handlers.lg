@@ -9,6 +9,7 @@
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
             [attractor.interviewer :as interviewer]
+            [attractor.fan-in :as fanin]
             [attractor.status :as status]))
 
 ;; Shape to handler type mapping (Section 2.8)
@@ -361,26 +362,7 @@
 
 ;; Fan-In Handler (Section 4.9)
 (defn handle-fan-in [node ctx _graph _logs-root]
-  (let [results (context/ctx-get ctx "parallel.results" [])]
-    (if (empty? results)
-      {:status :fail :failure_reason "No parallel results to evaluate"}
-      (let [eligible (filter (fn [r] (#{:success :partial_success} (:status r))) results)]
-        (if (empty? eligible)
-          {:status :fail :failure_reason "All parallel branches failed"}
-          ;; Prefer SUCCESS over PARTIAL_SUCCESS; use candidate ID as the
-          ;; deterministic tiebreak when no explicit scoring backend exists.
-          (let [status-rank {:success 0 :partial_success 1}
-                sorted-candidates
-                (sort-by (fn [r]
-                           [(get status-rank (:status r) 9)
-                            (str (or (:id r) (:node_id r) ""))])
-                         eligible)
-                best (first sorted-candidates)
-                best-id (or (:id best) (:node_id best) "winner")]
-            {:status :success
-             :context_updates {"parallel.fan_in.best_id" best-id
-                               "parallel.fan_in.best_outcome" (str (:status best))}
-             :notes (str "Selected best candidate: " best-id)}))))))
+  ((fanin/make-handler nil) node ctx _graph _logs-root))
 
 ;; Manager Loop Handler (Section 4.11). Runtime callbacks keep child
 ;; orchestration injectable and avoid a handlers -> engine dependency cycle.

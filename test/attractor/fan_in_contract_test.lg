@@ -1,0 +1,177 @@
+(ns attractor.fan-in-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.context :as context]
+            [attractor.fan-in :as fanin]
+            [attractor.handlers :as handlers]))
+
+(defn run-default [node results]
+  (let [ctx (context/make-context)]
+    (context/ctx-set! ctx "parallel.results" results)
+    (handlers/handle-fan-in node ctx {} "logs")))
+
+(defn run-with [ranker node results]
+  (let [ctx (context/make-context)]
+    (context/ctx-set! ctx "parallel.results" results)
+    ((fanin/make-handler ranker) node ctx {:id "graph"} "logs")))
+
+(defn thrown [operation]
+  (try (operation) nil (catch Object error error)))
+
+(deftest heuristic-prefers-descending-score-within-status
+  (let [outcome (run-default
+                  {:id "join"}
+                  [{:id "a" :status :success :score 1}
+                   {:id "z" :status :success :score 9}])]
+    (is (= "z" (get-in outcome
+                         [:context_updates "parallel.fan_in.best_id"])))))
+
+(deftest retry-is-an-eligible-fan-in-candidate
+  (let [outcome (run-default
+                  {:id "join"}
+                  [{:id "retry-me" :status :retry :score 2}])]
+    (is (= :success (:status outcome)))
+    (is (= "retry-me" (get-in outcome
+                                [:context_updates "parallel.fan_in.best_id"])))))
+
+(deftest heuristic-orders-status-before-score
+  (let [outcome (run-default
+                  {:id "join" :prompt " \t\n "}
+                  [{:id "retry" :status :retry :score 100}
+                   {:id "partial" :status :partial_success :score 100}
+                   {:id "success" :status :success :score -100}])]
+    (is (= "success" (get-in outcome
+                               [:context_updates "parallel.fan_in.best_id"])))
+    (is (= ":success" (get-in outcome
+                                [:context_updates "parallel.fan_in.best_outcome"])))))
+
+(deftest heuristic-orders-by-score-id-and-original-occurrence
+  (let [scored (run-default {:id "join"}
+                            [{:id "a" :status :success :score 1}
+                             {:id "z" :status :success :score 2}])
+        by-id (run-default {:id "join"}
+                           [{:id "z" :status :success}
+                            {:node_id "a" :status :success :score 0}])
+        duplicate-results [{:id "same" :status :success :score 3}
+                           {:id "same" :status :success :score 3}]
+        seen (atom nil)
+        duplicate (run-with (fn [request]
+                              (reset! seen request)
+                              0)
+                            {:id "join" :prompt "choose"}
+                            duplicate-results)]
+    (is (= "z" (get-in scored [:context_updates "parallel.fan_in.best_id"])))
+    (is (= "a" (get-in by-id [:context_updates "parallel.fan_in.best_id"])))
+    (is (= [0 1] (mapv :index (:candidates @seen))))
+    (is (= duplicate-results (mapv :candidate (:candidates @seen))))
+    (is (= :success (:status duplicate)))))
+
+(deftest heuristic-score-ordering-does-not-overflow-at-long-minimum
+  (let [outcome (run-default {:id "join"}
+                             [{:id "minimum" :status :success
+                               :score Long/MIN_VALUE}
+                              {:id "zero" :status :success :score 0}])]
+    (is (= "zero"
+           (get-in outcome [:context_updates "parallel.fan_in.best_id"])))))
+
+(deftest heuristic-rejects-present-invalid-scores
+  (doseq [score [nil "9" ##NaN ##Inf ##-Inf]]
+    (let [error (thrown #(run-default {:id "join"}
+                                      [{:id "bad" :status :success
+                                        :score score}]))]
+      (is (= :configuration_error (:category (ex-data error))))
+      (is (= false (:retryable (ex-data error)))))))
+
+(deftest prompted-ranking-does-not-interpret-score
+  (let [outcome (run-with (fn [_] 0)
+                          {:id "join" :prompt "rank this"}
+                          [{:id "candidate" :status :success
+                            :score "free-form evidence"}])]
+    (is (= :success (:status outcome)))))
+
+(deftest empty-and-ineligible-results-preserve-failure-reasons
+  (let [calls (atom 0)
+        ranker (fn [_] (swap! calls inc) 0)]
+    (is (= {:status :fail :failure_reason "No parallel results to evaluate"}
+           (run-with ranker {:id "join" :prompt "rank"} [])))
+    (is (= {:status :fail :failure_reason "All parallel branches failed"}
+           (run-with ranker {:id "join" :prompt "rank"}
+                     [{:id "failed" :status :fail}
+                      {:id "cancelled" :status :cancelled}])))
+    (is (= 0 @calls))))
+
+(deftest prompted-ranker-receives-exact-request-once
+  (let [calls (atom [])
+        cancelled? (fn [] false)
+        node {:id "join" :prompt "Choose carefully" :cancelled? cancelled?}
+        results [{:id "failed" :status :fail :context_updates {"x" 0}}
+                 {:id "same" :status :success :context_updates {"x" 1}}
+                 {:id "same" :status :partial_success :context_updates {"x" 2}}]
+        outcome (run-with (fn [request]
+                            (swap! calls conj request)
+                            2)
+                          node results)
+        request (first @calls)]
+    (is (= 1 (count @calls)))
+    (is (= node (:node request)))
+    (is (= "Choose carefully" (:prompt request)))
+    (is (= cancelled? (:cancelled? request)))
+    (is (= [{:index 1 :candidate (nth results 1)}
+            {:index 2 :candidate (nth results 2)}]
+           (:candidates request)))
+    (is (not (contains? request :context)))
+    (is (= ":partial_success"
+           (get-in outcome [:context_updates "parallel.fan_in.best_outcome"])))))
+
+(deftest prompted-ranking-requires-valid-eligible-original-index
+  (let [results [{:id "failed" :status :fail}
+                 {:id "winner" :status :success}]]
+    (doseq [selection [nil "1" 1.0 -1 0 2]]
+      (let [error (thrown #(run-with (fn [_] selection)
+                                     {:id "join" :prompt "rank"}
+                                     results))]
+        (is (= :configuration_error (:category (ex-data error))))
+        (is (= false (:retryable (ex-data error))))))
+    (let [error (thrown #(run-with nil {:id "join" :prompt "rank"} results))]
+      (is (= :configuration_error (:category (ex-data error))))
+      (is (= false (:retryable (ex-data error)))))))
+
+(deftest prompted-ranker-exceptions-retain-identity
+  (doseq [original [(ex-info "ranker failure" {:category :provider_error})
+                    (AssertionError. "ranker assertion")]]
+    (let [caught (thrown #(run-with (fn [_] (throw original))
+                                    {:id "join" :prompt "rank"}
+                                    [{:id "candidate" :status :success}]))]
+      (is (identical? original caught)))))
+
+(deftest cancellation-before-and-after-ranking-publishes-no-updates
+  (let [pre-calls (atom 0)
+        pre (run-with (fn [_] (swap! pre-calls inc) 0)
+                      {:id "join" :prompt "rank" :cancelled? (fn [] true)}
+                      [{:id "candidate" :status :success}])
+        cancelled (atom false)
+        post (run-with (fn [_] (reset! cancelled true) 0)
+                       {:id "join" :prompt "rank"
+                        :cancelled? #(deref cancelled)}
+                       [{:id "candidate" :status :success}])]
+    (is (= 0 @pre-calls))
+    (is (= {:status :cancelled :failure_reason "Pipeline cancelled"} pre))
+    (is (= {:status :cancelled :failure_reason "Pipeline cancelled"} post))))
+
+(deftest cancellation-after-ranking-wins-over-invalid-selection
+  (let [cancelled (atom false)
+        outcome (run-with (fn [_] (reset! cancelled true) nil)
+                          {:id "join" :prompt "rank"
+                           :cancelled? #(deref cancelled)}
+                          [{:id "candidate" :status :success}])]
+    (is (= {:status :cancelled :failure_reason "Pipeline cancelled"}
+           outcome))))
+
+(deftest selection-does-not-mutate-parallel-results
+  (let [results [{:id "a" :status :success :score 1
+                  :context_updates {"answer" "a"}}
+                 {:id "b" :status :retry :score 2
+                  :context_updates {"answer" "b"}}]
+        before results]
+    (run-default {:id "join"} results)
+    (is (= before results))
+    (is (not (contains? (first results) :index)))))
