@@ -109,7 +109,12 @@ Assert the exact root shapes:
 
 - [ ] **Step 2: Run the root-capture and lifecycle files and verify RED**
 
-Run: `LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg test/attractor/lifecycle_contract_test.lg`
+Run separately (lgx accepts one test path):
+
+```bash
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg
+```
 
 Expected: FAIL because prepare returns no workflow bundle.
 
@@ -146,7 +151,7 @@ Use a fresh temporary logs root for every case. Prove: invalid preparation and t
 
 - [ ] **Step 2: Run focused publication tests and verify RED**
 
-Run: `LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg test/attractor/lifecycle_contract_test.lg`
+Run the two focused commands from Task 2, Step 2 separately.
 
 Expected: FAIL because publication and `:on-published` do not exist.
 
@@ -211,7 +216,13 @@ Round-trip `:workflow_fingerprint`, exact relative `:workflow_manifest`, and `:c
 
 - [ ] **Step 2: Run checkpoint tests and verify RED**
 
-Run: `LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/context_test.lg test/attractor/engine_test.lg test/attractor/workflow_recovery_contract_test.lg`
+Run separately:
+
+```bash
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/context_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/engine_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg
+```
 
 Expected: FAIL because `save-checkpoint` drops all three fields.
 
@@ -248,7 +259,7 @@ Corrupt each source, plan, manifest fingerprint, checkpoint fingerprint, format 
 
 - [ ] **Step 2: Run resume tests and verify RED**
 
-Run: `LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg test/attractor/engine_test.lg`
+Run the workflow-recovery and engine test files separately.
 
 Expected: FAIL because public `pipeline/resume` does not exist.
 
@@ -287,7 +298,7 @@ CLI run must pass `:source-path dot-file` into `pipeline/run`. CLI resume must r
 
 - [ ] **Step 2: Run entrypoint tests and verify RED**
 
-Run: `LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/cli_test.lg test/attractor/server_test.lg test/attractor/lifecycle_contract_test.lg test/attractor/workflow_recovery_contract_test.lg`
+Run the CLI, server, lifecycle, and workflow-recovery test files as four separate `lgx test <path>` commands.
 
 Expected: FAIL because CLI parses current DOT and server registers in `:on-prepared`.
 
@@ -340,7 +351,11 @@ Run sequentially:
 ```bash
 rg -q '^;; SCN-PINNED-RECOVERY COMPLETE$' test/attractor/workflow_recovery_contract_test.lg
 LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/workflow_recovery_contract_test.lg
-LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/context_test.lg test/attractor/engine_test.lg test/attractor/lifecycle_contract_test.lg test/attractor/cli_test.lg test/attractor/server_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/context_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/engine_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/cli_test.lg
+LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/server_test.lg
 LGX_LG=/Users/ndn/development/let-go/lg lgx test
 LGX_LG=/Users/ndn/development/let-go/lg lgx build
 ```
