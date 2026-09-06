@@ -336,3 +336,43 @@
                  (core/scope-close! caller 0)))
       (is (= :sibling-done (deref sibling 3000 :timeout)))
       (is (= 0 (core/scope-live caller))))))
+
+(deftest assertion-errors-preserve-identity-stop-queue-and-join-cleanup
+  (doseq [boundary [:worker :clone :launch]]
+    (let [blocked (async/chan) entered (promise) cleanup (promise) release (promise)
+          calls (atom []) writes (atom []) clones (atom 0) launches (atom 0)
+          original (AssertionError. (str "branch-assertion-" boundary))
+          original-clone context/ctx-clone original-launch core/future*
+          task (core/future
+                 (with-redefs
+                   [context/ctx-clone (fn [ctx]
+                                        (if (and (= boundary :clone) (= 2 (swap! clones inc)))
+                                          (do (deref entered 3000 :timeout) (throw original))
+                                          (original-clone ctx)))
+                    core/future* (fn [thunk]
+                                   (if (and (= boundary :launch) (= 2 (swap! launches inc)))
+                                     (do (deref entered 3000 :timeout) (throw original))
+                                     (original-launch thunk)))]
+                   (try
+                     (run-handler
+                       (fn [id _ _ _ _]
+                         (swap! calls conj id)
+                         (case id
+                           "held" (try (deliver entered true) (core/<! blocked) {:status :cancelled}
+                                       (finally (deliver cleanup true) (deref release 5000 :timeout)
+                                                (swap! writes conj :cleanup)))
+                           "throws" (do (deref entered 3000 :timeout) (throw original))
+                           {:status :success}))
+                       {:max_parallel 2} ["held" "throws" "queued"] (fn [] false))
+                     (catch Object e {:caught e}))))]
+      (try
+        (is (= true (deref cleanup 1000 :timeout)))
+        (is (= ::pending (deref task 20 ::pending)))
+        (is (not (some #{"queued"} @calls)))
+        (finally (async/close! blocked) (deliver release true)))
+      (let [outcome (deref task 3000 :timeout)]
+        (is (identical? original (:caught outcome)))
+        (is (= (if (= boundary :worker) #{"held" "throws"} #{"held"}) (set @calls)))
+        (is (= [:cleanup] @writes))
+        (core/sleep 20)
+        (is (= [:cleanup] @writes))))))

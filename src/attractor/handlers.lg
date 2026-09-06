@@ -297,7 +297,7 @@
                   ;; Cloning and launching may fail after siblings have started.
                   ;; Keep the original exception, signal them, and join normally.
                   launched (try {:worker {:index index :future (launch index edge branch-cancelled?)}}
-                                (catch Exception e {:error e}))]
+                                (catch Object e {:error e}))]
               (if (:error launched)
                 (do (reset! stop true)
                     (recur (rest pending) active completed (:error launched)))
@@ -333,7 +333,7 @@
                                        (execute-branch-fn branch-start branch-ctx graph branch-logs branch-cancelled?)
                                        (execute-branch-fn branch-start branch-ctx graph branch-logs))]
                           {:index index :result (assoc result :id target-id :node_id target-id)})
-                        (catch Exception e {:index index :error e}))))))
+                        (catch Object e {:index index :error e}))))))
               boundary-ids (vec (distinct (keep :boundary_node_id results)))
               next-node-id (when (= 1 (count boundary-ids)) (first boundary-ids))
               success-count (count (filter (fn [r] (= (:status r) :success)) results))
