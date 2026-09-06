@@ -8,3 +8,5 @@
     (is (some? (get publics 'test-fidelity-uses-the-exact-selected-edge)))))
 
 ;; Engine-test discovery sentinel: keep this namespace separate from engine-test.
+;; UPSTREAM nooga/let-go#807 can hide unfinished trailing forms. Keep discovery
+;; evidence; revisit extra syntax checks using docs/let-go-followups.md.

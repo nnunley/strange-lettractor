@@ -255,6 +255,8 @@
         branch-cancelled? (fn [] (or @stop (cancelled?)))
         ;; The coordinator owns this child scope but is not one of its workers.
         ;; Native channel operations and nested go/future work inherit this owner.
+        ;; UPSTREAM nooga/let-go#806: async/map still escapes to the root scope.
+        ;; Revisit helper coverage after the fix; see docs/let-go-followups.md.
         scope (core/scope-open)
         closed? (atom false)
         close-owned! (fn []
@@ -323,8 +325,9 @@
                         branch-logs (str logs-root "/branches/" target-id)
                         branch-start (if pass-edge? branch-edge target-id)]
                     (core/future
-                      ;; let-go futures swallow uncaught exceptions; transport
-                      ;; errors explicitly so the coordinator owns propagation.
+                      ;; UPSTREAM nooga/let-go#805: futures swallow exceptions.
+                      ;; Keep explicit transport until verified native error
+                      ;; propagation; restoration: docs/let-go-followups.md.
                       (try
                         (let [result (if cancellation-aware?
                                        (execute-branch-fn branch-start branch-ctx graph branch-logs branch-cancelled?)
