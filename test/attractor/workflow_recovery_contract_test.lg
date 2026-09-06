@@ -840,6 +840,35 @@
       (is (= [] @events))
       (is (= 0 @calls)))))
 
+(deftest plan-byte-mutations-fail-publication-reuse-and-public-resume
+  (doseq [suffix ["\n" " []"]]
+    (let [{:keys [run-root checkpoint-path]} (interrupted-pinned-run)
+          checkpoint (context/load-checkpoint checkpoint-path)
+          verified (workflow/verify-published! run-root (:workflow_fingerprint checkpoint))
+          manifest-path (str run-root "/workflow/manifest.edn")
+          manifest-bytes (io/slurp manifest-path)
+          plan-path (str run-root "/" (get-in verified [:workflow :plans 0 :path]))
+          original (io/slurp plan-path)
+          _ (io/spit plan-path (str original suffix))
+          events (atom [])
+          calls (atom 0)
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler! registry "pinned.original"
+                                        (fn [_ _ _ _]
+                                          (swap! calls inc)
+                                          {:status :success}))
+          reuse-error (workflow-error #(workflow/publish! (:captured-bundle verified) run-root))
+          resume-error (workflow-error #(pipeline/resume checkpoint-path
+                                                        {:registry registry
+                                                         :on-event (fn [e] (swap! events conj e))}))]
+      (is (= :workflow_snapshot_corrupt (:category reuse-error)))
+      (is (= :workflow_snapshot_corrupt (:category resume-error)))
+      (is (= :plan (:kind resume-error)))
+      (is (= [] @events))
+      (is (= 0 @calls))
+      (is (= manifest-bytes (io/slurp manifest-path)))
+      (is (= (str original suffix) (io/slurp plan-path))))))
+
 (deftest public-resume-fails-closed-for-missing-or-corrupt-captures
   (doseq [[label attack expected-category]
           [[:manifest-missing

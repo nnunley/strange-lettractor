@@ -452,7 +452,12 @@
                            :kind :plan :path path})))
         (let [graph
               (try
-                (decode-canonical-tree (edn/read-string (io/slurp path)))
+                (let [bytes (io/slurp path)]
+                  (when-not (= (:plan-sha256 plan) (sha256-text bytes))
+                    (snapshot-error! "Workflow plan bytes do not match their address"
+                                     {:kind :plan :path path
+                                      :logical-id (:logical-id plan)}))
+                  (decode-canonical-tree (edn/read-string bytes)))
                 (catch Object cause
                   (snapshot-error! "Workflow plan is not valid EDN"
                                    {:kind :plan :path path :cause (str cause)})))]
