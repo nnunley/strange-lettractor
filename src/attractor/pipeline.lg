@@ -1,5 +1,6 @@
 (ns attractor.pipeline
   (:require [attractor.engine :as engine]
+            [attractor.capture :as capture]
             [attractor.context :as context]
             [attractor.parser :as parser]
             [attractor.status :as status]
@@ -10,17 +11,18 @@
             [os :as os]))
 
 (defn prepare
-  "Parse, transform, and validate DOT source without starting execution."
+  "Parse, transform, and validate the complete source closure without execution."
   ([dot-source] (prepare dot-source {}))
   ([dot-source options]
-   (let [graph (parser/parse-dot dot-source)
-         prepared-graph (transforms/apply-transforms
-                          graph (or (:custom-transforms options) []))
-         diagnostics (validation/validate
-                       prepared-graph (or (:custom-rules options) []))]
-     {:graph prepared-graph
-     :diagnostics diagnostics
-     :workflow (workflow/root-bundle dot-source prepared-graph options)})))
+   (capture/prepare-closure
+     dot-source options
+     (fn [source]
+       (let [graph (parser/parse-dot source)
+             prepared-graph (transforms/apply-transforms
+                              graph (or (:custom-transforms options) []))
+             diagnostics (validation/validate
+                           prepared-graph (or (:custom-rules options) []))]
+         {:graph prepared-graph :diagnostics diagnostics})))))
 
 (def ^:private wrapper-option-keys
   [:custom-transforms

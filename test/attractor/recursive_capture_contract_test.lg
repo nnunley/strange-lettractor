@@ -1,0 +1,225 @@
+(ns attractor.recursive-capture-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.parser :as parser]
+            [attractor.handlers :as handlers]
+            [attractor.validation :as validation]
+            [attractor.pipeline :as pipeline]
+            [attractor.workflow :as workflow]))
+
+(def leaf "digraph Leaf { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }")
+(defn branch [name nodes]
+  (str "digraph " name " { start [shape=Mdiamond]; exit [shape=Msquare]; "
+       (str/join " " (map (fn [[id ref]] (str id " [type=subpipeline, subpipeline.dotfile=\"" ref "\"]; start -> " id " -> exit;")) nodes)) " }"))
+(defn record [id physical source] {:logical-id id :physical-id physical :source source})
+(defn failure [f] (try (f) nil (catch Exception e (ex-data e))))
+(defn loader [records] (fn [_ reference] (get records reference)))
+
+(deftest lexical-depth-first-transformed-closure-and-physical-aliases
+  (let [root (branch "Root" [["z" "alias.dot"] ["a" "a.dot"]])
+        child (branch "Child" [["deep" "leaf.dot"]])
+        calls (atom []) parsings (atom []) validations (atom [])
+        parse parser/parse-dot validate validation/validate
+        records {"a.dot" (record "workflow://a" "physical-a" child)
+                 "leaf.dot" (record "workflow://leaf" "physical-leaf" leaf)
+                 ;; Later bytes must never replace the first captured bytes.
+                 "alias.dot" (record "workflow://alias" "physical-a" "malformed later bytes")}
+        prepared (with-redefs [parser/parse-dot (fn [s] (swap! parsings conj s) (parse s))
+                               validation/validate (fn [g rules] (swap! validations conj (:id g)) (validate g rules))]
+                   (pipeline/prepare root {:source-loader (loader records)
+                                           :custom-transforms [(fn [g] (swap! calls conj (:id g)) g)]}))
+        bundle (:workflow prepared)]
+    (is (= [root child leaf] @parsings))
+    (is (= ["Root" "Child" "Leaf"] @calls))
+    (is (= @calls @validations))
+    (is (empty? (:diagnostics prepared)))
+    (is (= ["workflow://a" "workflow://alias" "workflow://leaf" "workflow://root"] (mapv :logical-id (:source-records bundle))))
+    (is (= (get-in bundle [:plans "workflow://a"]) (get-in bundle [:plans "workflow://alias"])))
+    (is (= child (:source (second (:source-records bundle)))))
+    (is (= [{:node-id "a" :logical-reference "a.dot" :plan-id "workflow://a"}
+            {:node-id "z" :logical-reference "alias.dot" :plan-id "workflow://alias"}]
+           (get-in bundle [:plans "workflow://root" :references])))
+    (is (= bundle (workflow/verify-bundle! bundle (:graph prepared))))))
+
+(deftest transform-added-references-are-discovered
+  (let [root "digraph Root { start [shape=Mdiamond]; a [type=tool]; exit [shape=Msquare]; start -> a -> exit; }"
+        prepared (pipeline/prepare root {:source-loader (loader {"child.dot" (record "workflow://child" "child" leaf)})
+                                        :custom-transforms [(fn [g]
+                                          (if (get-in g [:nodes "a"])
+                                            (-> g (assoc-in [:nodes "a" :type] "subpipeline")
+                                                  (assoc-in [:nodes "a" :attrs :subpipeline.dotfile] "child.dot")) g))]})]
+    (is (= 2 (count (get-in prepared [:workflow :plans]))))
+    (is (empty? (:diagnostics prepared))))
+  (let [root (branch "Root" [["a" "old.dot"]])
+        prepared (pipeline/prepare root {:source-loader (loader {"added.dot" (record "workflow://added" "added" leaf)})
+                                        :custom-transforms [(fn [g] (if (get-in g [:nodes "a"])
+                                          (assoc-in g [:nodes "a" :attrs :subpipeline.dotfile] "added.dot") g))]})]
+    (is (= "workflow://added" (get-in prepared [:workflow :plans "workflow://root" :references 0 :plan-id])))))
+
+(deftest cycles-collisions-and-child-errors-are-canonical
+  (let [root (branch "Root" [["a" "a.dot"]])
+        child (branch "Child" [["again" "again.dot"]])
+        result (pipeline/prepare root {:source-loader (loader {"a.dot" (record "workflow://a" "a" child)
+                                                               "again.dot" (record "workflow://alias" "a" child)})})
+        d (first (:diagnostics result))]
+    (is (= "subpipeline_cycle" (:rule d)))
+    (is (= "again" (:node_id d)))
+    (is (str/starts-with? (:message d) "Subpipeline node 'again' introduces source cycle: workflow://root -> workflow://a -> workflow://alias")))
+  (let [root (branch "Root" [["a" "a.dot"] ["b" "b.dot"]])
+        result (pipeline/prepare root {:source-loader (loader {"a.dot" (record "workflow://same" "a" leaf)
+                                                               "b.dot" (record "workflow://same" "b" leaf)})})]
+    (is (= "workflow_identity_collision" (:rule (first (:diagnostics result))))))
+  (let [root (branch "Root" [["a" "bad.dot"] ["b" "parse.dot"]])
+        result (pipeline/prepare root {:source-loader (loader {"bad.dot" (record "workflow://bad" "bad" "digraph Bad { x; }")
+                                                               "parse.dot" (record "workflow://parse" "parse" "not dot")})})
+        ds (:diagnostics result)]
+    (is (= ["a" "a" "b"] (mapv :node_id ds)))
+    (doseq [d ds] (is (= #{:rule :severity :node_id :message} (set (keys d)))))
+    (is (str/includes? (:message (first ds)) "workflow://root -> workflow://bad"))
+    (is (str/includes? (:message (first ds)) "start_node"))))
+
+(deftest invalid-closure-run-has-no-side-effects
+  (let [logs (str (os/temp-dir) "/recursive-invalid-" (random-uuid))
+        events (atom []) transforms (atom 0) calls (atom 0)
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler! registry "subpipeline" (fn [& _] (swap! calls inc)))
+        error (failure #(pipeline/run (branch "Root" [["child" "child.dot"]])
+                         {:logs-root logs :registry registry :on-event (fn [e] (swap! events conj e))
+                          :custom-transforms [(fn [g] (swap! transforms inc) g)]
+                          :source-loader (loader {"child.dot" (record "workflow://child" "child" "digraph Bad {}")})}))]
+    (is (= :validation_error (:category error)))
+    (is (= 2 @transforms))
+    (is (= 0 @calls))
+    (is (empty? @events))
+    (is (not (io/file-exists? logs)))))
+
+(defn recursive-prepared []
+  (pipeline/prepare (branch "Root" [["a" "a.dot"] ["b" "alias.dot"]])
+    {:source-loader (loader {"a.dot" (record "workflow://a" "a" leaf)
+                            "alias.dot" (record "workflow://alias" "a" leaf)})}))
+
+(deftest in-memory-root-sentinel-is-not-a-virtual-physical-id
+  (let [p (pipeline/prepare (branch "Root" [["a" "a.dot"]])
+            {:source-loader (loader {"a.dot" (record "workflow://a" "workflow://root" leaf)})})]
+    (is (empty? (:diagnostics p)))
+    (is (= 2 (count (get-in p [:workflow :plans]))))))
+
+(deftest failed-physical-source-is-prepared-only-once
+  (let [parses (atom []) parse parser/parse-dot
+        p (with-redefs [parser/parse-dot (fn [s] (swap! parses conj s) (parse s))]
+            (pipeline/prepare (branch "Root" [["a" "a.dot"] ["b" "b.dot"]])
+              {:source-loader (loader {"a.dot" (record "workflow://a" "bad" "not dot")
+                                      "b.dot" (record "workflow://b" "bad" leaf)})}))]
+    (is (= 2 (count @parses)))
+    (is (= ["a" "b"] (mapv :node_id (:diagnostics p))))))
+
+(deftest diagnostic-order-and-original-targets-survive-child-attribution
+  (let [root (branch "Root" [["z" "z.dot"] ["a" "a.dot"]])
+        rule (fn [g] [{:rule "custom" :severity :warning :edge ["original-from" "original-to"] :message (:id g)}])
+        p (pipeline/prepare root
+            {:custom-rules [rule]
+             :source-loader (loader {"a.dot" (record "workflow://a" "a" (branch "Child" [["deep" "deep.dot"]]))
+                                     "deep.dot" (record "workflow://deep" "deep" leaf)
+                                     "z.dot" (record "workflow://z" "z" leaf)})})
+        ds (:diagnostics p)]
+    (is (= (first (rule (:graph p))) (first ds)))
+    (is (= [nil "a" "deep" "z"] (mapv :node_id ds)))
+    (is (str/includes? (:message (get ds 2)) "workflow://root -> workflow://a -> workflow://deep"))
+    (is (str/includes? (:message (get ds 2)) "custom edge [\"original-from\" \"original-to\"]"))))
+
+(deftest root-source-cycle-and-original-root-parse-errors
+  (let [dir (str (os/temp-dir) "/recursive-root-cycle-" (random-uuid))
+        _ (io/mkdir dir) path (str dir "/root.dot")
+        source (branch "Root" [["again" "root.dot"]])
+        _ (io/spit path source)
+        p (pipeline/prepare source {:source-path path})]
+    (is (= "subpipeline_cycle" (:rule (first (:diagnostics p)))))
+    (is (str/includes? (:message (first (:diagnostics p))) "workflow://root -> workflow://root/root.dot")))
+  (is (= (failure #(parser/parse-dot "not dot")) (failure #(pipeline/prepare "not dot")))))
+
+(defn change-plan [bundle id f]
+  (let [changed (-> bundle
+                 (update-in [:plans id] f)
+                 (update-in [:index :plans]
+                   (fn [ps] (mapv (fn [p] (if (= id (:logical-id p)) (f p) p)) ps))))]
+    (assoc changed :fingerprint (workflow/closure-fingerprint (:index changed)))))
+
+(defn change-index [bundle f]
+  (let [b (update bundle :index f)]
+    (assoc b :fingerprint (workflow/closure-fingerprint (:index b)))))
+
+(deftest rehashed-invalid-reference-and-primary-bindings-rejected
+  (let [p (recursive-prepared) b (:workflow p)
+        mutations [(change-index b #(update % :sources (fn [rs] (vec (reverse rs)))))
+                   (change-index b #(update % :plans (fn [rs] (vec (reverse rs)))))
+                   (change-index b #(update % :sources conj {:logical-id "workflow://extra" :source-sha256 (workflow/sha256-text leaf)}))
+                   (change-plan b "workflow://root" #(assoc-in % [:references 0 :plan-id] "workflow://absent"))
+                   (change-plan b "workflow://root" #(assoc-in % [:references 0 :plan-id] "workflow://root"))
+                   (change-plan b "workflow://root" #(update % :references conj (first (:references %))))
+                   (change-plan b "workflow://root" #(assoc-in % [:references 0 :extra] true))
+                   (change-plan b "workflow://root" #(assoc-in % [:references 0 :logical-reference] 9))
+                   (change-plan b "workflow://root" #(assoc-in % [:references 0 :node-id] "0"))
+                   (change-plan b "workflow://alias" #(assoc % :primary-plan-id "workflow://absent"))
+                   (change-plan b "workflow://alias" #(assoc % :primary-plan-id "workflow://root"))
+                   (change-plan b "workflow://alias" #(assoc % :source-sha256 (workflow/sha256-text "other")))
+                   (change-plan b "workflow://a" #(assoc % :primary-plan-id "workflow://alias"))
+                   (change-plan b "workflow://alias" #(assoc % :references [{:node-id "start" :logical-reference "a.dot" :plan-id "workflow://a"}]))]]
+    (doseq [mutated mutations]
+      (is (= :workflow_snapshot_corrupt (:category (failure #(workflow/verify-bundle! mutated (:graph p)))))))
+    (let [logs (str (os/temp-dir) "/recursive-index-" (random-uuid))
+          _ (workflow/publish! b logs)
+          manifest-path (str logs "/" workflow/manifest-relative-path)
+          manifest (:workflow (workflow/verify-published! logs (:fingerprint b)))]
+      (doseq [mutated mutations]
+        (io/spit manifest-path (pr-str (assoc manifest :index (:index mutated) :fingerprint (:fingerprint mutated))))
+        (is (= :workflow_snapshot_corrupt
+               (:category (failure #(workflow/verify-published! logs (:fingerprint mutated))))))))))
+
+(deftest recursive-publication-reloads-captured-sources
+  (let [p (recursive-prepared) b (:workflow p)
+        logs (str (os/temp-dir) "/recursive-publish-" (random-uuid))]
+    (workflow/publish! b logs)
+    (let [loaded (workflow/verify-published! logs (:fingerprint b))]
+      (is (= b (:captured-bundle loaded)))
+      (is (= (:graph p) (:graph loaded))))))
+
+(deftest captured-plans-must-be-graphs
+  (doseq [g [nil [] "graph"]]
+    (let [b (workflow/root-bundle leaf g {})]
+      (is (= :workflow_snapshot_corrupt (:category (failure #(workflow/verify-bundle! b g))))))))
+
+(deftest child-serialization-failure-is-a-parent-diagnostic
+  (let [result (try
+                 (pipeline/prepare (branch "Root" [["a" "a.dot"]])
+                   {:source-loader (loader {"a.dot" (record "workflow://a" "a" leaf)})
+                    :custom-transforms [(fn [g] (if (= "Leaf" (:id g)) (assoc g :unsupported (fn [] nil)) g))]})
+                 (catch Exception _ {:diagnostics []}))
+        d (first (:diagnostics result))]
+    (is (= "subpipeline_source" (:rule d)))
+    (is (= "a" (:node_id d)))
+    (is (str/includes? (or (:message d) "") "workflow://root -> workflow://a"))))
+
+(deftest filesystem-closure-is-immutable-through-publication
+  (let [dir (str (os/temp-dir) "/recursive-filesystem-" (random-uuid))
+        _ (io/mkdir dir) base (os/canonical-path dir)
+        path (str base "/root.dot") child-path (str base "/child.dot")
+        root (branch "Root" [["a" "child.dot"] ["b" "alias.dot"]])
+        _ (io/spit path root) _ (io/spit child-path leaf)
+        _ (os/sh "ln" "-s" child-path (str base "/alias.dot"))
+        p (pipeline/prepare root {:source-path path}) b (:workflow p)
+        child-id "workflow://root/child.dot"
+        _ (io/spit child-path "changed after prepare")
+        logs (str base "/logs")]
+    (is (empty? (:diagnostics p)))
+    (is (= [{:id "root" :path base}] (:workflow-roots b)))
+    (is (= ["workflow://root" child-id] (mapv :logical-id (:source-records b))))
+    (is (= [child-id child-id] (mapv :plan-id (get-in b [:plans "workflow://root" :references]))))
+    (is (= ["child.dot" "alias.dot"] (mapv :logical-reference (get-in b [:plans "workflow://root" :references]))))
+    (workflow/publish! b logs)
+    (let [loaded (:captured-bundle (workflow/verify-published! logs (:fingerprint b)))]
+      (is (= b loaded))
+      (is (= leaf (:source (second (:source-records loaded)))))
+      (is (= child-path (:physical-id (second (:source-records loaded)))))
+      (is (= (get-in b [:plans child-id :graph]) (get-in loaded [:plans child-id :graph]))))))

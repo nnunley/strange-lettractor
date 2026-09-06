@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [io :as io]
             [os :as os]
+            [attractor.composition :as composition]
             [attractor.workflow :as workflow]))
 
 (defn- source-error! [reason reference]
@@ -85,3 +86,98 @@
   (if (contains? options :source-loader)
     (load-injected (:source-loader options) containing reference)
     (load-filesystem containing reference options)))
+
+(defn- diagnostic [rule node message]
+  {:rule rule :severity :error :node_id (:id node) :message message})
+
+(defn- child-diagnostic [node chain d]
+  {:rule (:rule d) :severity (:severity d) :node_id (:id node)
+   :message (str "Subpipeline node '" (:id node) "' child '" (last chain)
+                 "' (" (str/join " -> " chain) "): " (:rule d)
+                 (when (:node_id d) (str " node '" (:node_id d) "'"))
+                 (when (:edge d) (str " edge " (pr-str (:edge d))))
+                 ": " (:message d))})
+
+(defn prepare-closure
+  "Capture a depth-first closure using a caller-owned single-source preparer.
+   Physical plans are prepared once; logical aliases reuse their captured bytes."
+  [source options prepare-source]
+  (let [root-prepared (prepare-source source)
+        root-bundle (workflow/root-bundle source (:graph root-prepared) options)
+        root-record (first (:source-records root-bundle))
+        options (assoc options :workflow-roots (:workflow-roots root-bundle))
+        records (atom {}) plans (atom {}) completed (atom {})
+        identities (atom {}) active (atom #{})
+        diagnostics (atom (vec (:diagnostics root-prepared)))]
+    (letfn [(physical [record] (:physical-id record))
+            (emit! [d] (swap! diagnostics conj d))
+            (preparation-error! [node reference chain error]
+              (emit! (diagnostic "subpipeline_source" node
+                       (str "Subpipeline node '" (:id node) "' cannot load '" reference "': "
+                            "child '" (last chain) "' (" (str/join " -> " chain)
+                            ") preparation failed: " (str error)))))
+            (visit [record prepared chain]
+              (let [id (:logical-id record) pid (physical record)]
+                (swap! identities assoc id pid)
+                (swap! active conj pid)
+                (swap! records assoc id record)
+                (let [graph (:graph prepared)
+                      references (reduce
+                        (fn [refs [_ node]]
+                          (if (= "subpipeline" (:type node))
+                            (if-let [config (:config (composition/node-config node graph))]
+                              (if-let [target (capture-child record node (:dotfile config) chain)]
+                                (conj refs {:node-id (:id node) :logical-reference (:dotfile config) :plan-id target}) refs)
+                              refs)
+                            refs)) [] (sort-by first (:nodes graph)))
+                      plan (assoc (:captured-plan prepared) :references references)]
+                  (swap! plans assoc id plan)
+                  (swap! completed assoc pid {:record record :plan plan :diagnostics (:diagnostics prepared)})
+                  (swap! active disj pid)
+                  id)))
+            (capture-child [containing node reference chain]
+              (let [resolved (try {:record (resolve-source containing reference options)}
+                                  (catch Exception e {:error e}))]
+                (if-let [error (:error resolved)]
+                  (do (emit! (diagnostic "subpipeline_source" node
+                               (str "Subpipeline node '" (:id node) "' cannot load '" reference "': "
+                                    (or (:reason (ex-data error)) (str error))))) nil)
+                  (let [record (:record resolved) id (:logical-id record)
+                        pid (physical record) child-chain (conj chain id)]
+                    (cond
+                      (contains? @active pid)
+                      (do (emit! (diagnostic "subpipeline_cycle" node
+                                   (str "Subpipeline node '" (:id node) "' introduces source cycle: "
+                                        (str/join " -> " child-chain)))) nil)
+                      (and (contains? @identities id) (not= pid (get @identities id)))
+                      (do (emit! (diagnostic "workflow_identity_collision" node
+                                   (str "Subpipeline node '" (:id node) "' has workflow identity collision for '" id
+                                        "' (" (str/join " -> " child-chain) ")"))) nil)
+                      (contains? @completed pid)
+                      (let [known (get @completed pid)]
+                        (swap! identities assoc id pid)
+                        (if-let [error (:error known)]
+                          (do (preparation-error! node reference child-chain error) nil)
+                          (do
+                            (swap! records assoc id (assoc (:record known) :logical-id id))
+                            (swap! plans assoc id (:plan known))
+                            (doseq [d (:diagnostics known)] (emit! (child-diagnostic node child-chain d)))
+                            id)))
+                      :else
+                      (let [result (try
+                                     (let [prepared (prepare-source (:source record))
+                                           plan (workflow/captured-plan (:source record) (:graph prepared) id [])]
+                                       {:prepared (assoc prepared :captured-plan plan)})
+                                        (catch Exception e {:error e}))]
+                        (if-let [error (:error result)]
+                          (do (swap! identities assoc id pid)
+                              (swap! completed assoc pid {:error error})
+                              (preparation-error! node reference child-chain error) nil)
+                          (let [prepared (:prepared result)]
+                            (doseq [d (:diagnostics prepared)] (emit! (child-diagnostic node child-chain d)))
+                            (visit record prepared child-chain)))))))))]
+      (visit root-record (assoc root-prepared :captured-plan
+                                (get-in root-bundle [:plans workflow/root-plan-id]))
+             [workflow/root-plan-id])
+      {:graph (:graph root-prepared) :diagnostics @diagnostics
+       :workflow (workflow/captured-bundle (vec (vals @records)) @plans (:workflow-roots root-bundle))})))

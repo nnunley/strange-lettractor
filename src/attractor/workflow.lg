@@ -207,6 +207,25 @@
       (:workflow-roots options)
       (default-roots (:source-path options) (:base-dir options)))))
 
+(defn captured-bundle
+  "Construct a closure from captured source records and prepared logical plans."
+  [source-records plans roots]
+  (let [records (vec (sort-by :logical-id source-records))
+        index {:format-version 1 :root-plan-id root-plan-id
+               :sources (mapv (fn [record]
+                                {:logical-id (:logical-id record)
+                                 :source-sha256 (sha256-text (:source record))}) records)
+               :plans (mapv (fn [id] (assoc (dissoc (get plans id) :graph) :logical-id id))
+                            (sort (keys plans)))}]
+    {:format-version 1 :fingerprint (closure-fingerprint index)
+     :root-plan-id root-plan-id :plans plans :index index
+     :source-records records :workflow-roots roots}))
+
+(defn captured-plan [source graph primary references]
+  {:graph graph :plan-sha256 (plan-fingerprint graph)
+   :source-sha256 (sha256-text source) :primary-plan-id primary
+   :references (vec (sort-by (juxt :node-id :logical-reference :plan-id) references))})
+
 (defn root-bundle
   "Capture a prepared root graph and exact DOT source as a portable workflow.
 
@@ -216,32 +235,9 @@
   (let [source-path (:source-path options)
         roots (configured-roots options)
         physical-id (when source-path (os/canonical-path source-path))
-        source-sha (sha256-text source)
-        plan-sha (plan-fingerprint graph)
-        references []
-        plan {:graph graph
-              :plan-sha256 plan-sha
-              :source-sha256 source-sha
-              :primary-plan-id root-plan-id
-              :references references}
-        index {:format-version 1
-               :root-plan-id root-plan-id
-               :sources [{:logical-id root-plan-id
-                          :source-sha256 source-sha}]
-               :plans [{:logical-id root-plan-id
-                        :primary-plan-id root-plan-id
-                        :plan-sha256 plan-sha
-                        :source-sha256 source-sha
-                        :references references}]}]
-    {:format-version 1
-     :fingerprint (closure-fingerprint index)
-     :root-plan-id root-plan-id
-     :plans {root-plan-id plan}
-     :index index
-     :source-records [{:logical-id root-plan-id
-                       :physical-id physical-id
-                       :source source}]
-     :workflow-roots roots}))
+        plan (captured-plan source graph root-plan-id [])]
+    (captured-bundle [{:logical-id root-plan-id :physical-id physical-id :source source}]
+                     {root-plan-id plan} roots)))
 
 (def manifest-relative-path "workflow/manifest.edn")
 (def publish-lock-wait-ms 500)
@@ -285,6 +281,18 @@
     {}
     records))
 
+(defn- validate-reference-cycles! [plans]
+  (let [completed (atom #{})]
+    (letfn [(visit [id active]
+              (let [primary (:primary-plan-id (get plans id))]
+                (when (contains? active primary)
+                  (snapshot-error! "Workflow references contain a source cycle" {:logical-id id}))
+                (when-not (contains? @completed primary)
+                  (doseq [reference (:references (get plans primary))]
+                    (visit (:plan-id reference) (conj active primary)))
+                  (swap! completed conj primary))))]
+      (doseq [id (keys plans)] (visit id #{})))))
+
 (defn- validate-index! [index]
   (when-not (map? index)
     (snapshot-error! "Workflow index must be a map" {}))
@@ -296,9 +304,15 @@
   (let [root-id (:root-plan-id index)
         sources (records-by-logical-id! (:sources index) :source-index)
         plans (records-by-logical-id! (:plans index) :plan-index)]
-    (when-not (and (string? root-id) (contains? plans root-id))
+    (when-not (and (= root-plan-id root-id) (contains? plans root-id))
       (snapshot-error! "Workflow index root plan is missing"
                        {:root-plan-id root-id}))
+    (when-not (= (set (keys sources)) (set (keys plans)))
+      (snapshot-error! "Workflow source and plan identities differ" {}))
+    (doseq [field [:sources :plans]]
+      (when-not (= (mapv :logical-id (get index field))
+                   (vec (sort (map :logical-id (get index field)))))
+        (snapshot-error! "Workflow index records are not ordered" {:field field})))
     (doseq [[logical-id source] sources]
       (when-not (and (exact-keys? source #{:logical-id :source-sha256})
                      (digest? (:source-sha256 source)))
@@ -316,11 +330,45 @@
       (when-not (= (:source-sha256 plan)
                    (:source-sha256 (get sources logical-id)))
         (snapshot-error! "Workflow plan source is not bound to its source index"
-                         {:logical-id logical-id})))
+                         {:logical-id logical-id}))
+      (let [primary-id (:primary-plan-id plan)
+            primary (get plans primary-id)
+            binding #(select-keys % [:source-sha256 :plan-sha256 :references])
+            references (:references plan)]
+        (when-not (and primary (= primary-id (:primary-plan-id primary))
+                       (= (binding plan) (binding primary)))
+          (snapshot-error! "Workflow primary alias binding is invalid" {:logical-id logical-id}))
+        (when-not (= (count references) (count (set (map :node-id references))))
+          (snapshot-error! "Workflow reference node is duplicated" {:logical-id logical-id}))
+        (doseq [reference references]
+          (when-not (and (map? reference)
+                         (exact-keys? reference #{:node-id :logical-reference :plan-id})
+                         (every? (fn [k] (let [v (get reference k)]
+                                          (and (string? v) (not (str/blank? v)))))
+                                 [:node-id :logical-reference :plan-id])
+                         (contains? plans (:plan-id reference)))
+            (snapshot-error! "Workflow reference is invalid" {:logical-id logical-id})))
+        (when-not (= references (vec (sort-by (juxt :node-id :logical-reference :plan-id) references)))
+          (snapshot-error! "Workflow references are not ordered" {:logical-id logical-id}))))
+    (validate-reference-cycles! plans)
     {:root-id root-id :sources sources :plans plans}))
 
 (defn- same-logical-ids? [left right]
   (= (set (keys left)) (set (keys right))))
+
+(defn- validate-graph-references! [logical-id graph references]
+  (when-not (map? graph)
+    (snapshot-error! "Workflow plan must contain a graph map" {:logical-id logical-id}))
+  (let [nodes (:nodes graph)
+        subpipeline-ids (set (map first (filter (fn [[_ n]] (= "subpipeline" (:type n))) nodes)))]
+    (when-not (= subpipeline-ids (set (map :node-id references)))
+      (snapshot-error! "Workflow references do not match its subpipeline nodes" {:logical-id logical-id}))
+    (doseq [reference references]
+      (let [node (get nodes (:node-id reference))
+            literal (if (contains? (:attrs node) :subpipeline.dotfile)
+                      (get-in node [:attrs :subpipeline.dotfile]) (:subpipeline.dotfile node))]
+        (when-not (= literal (:logical-reference reference))
+          (snapshot-error! "Workflow reference differs from its node source" {:logical-id logical-id}))))))
 
 (defn- validate-captured-roots! [roots]
   (when-not (and (vector? roots)
@@ -488,6 +536,9 @@
           (assoc verified-plans (:logical-id plan) graph))))
     {}
     (:plans manifest))]
+    (doseq [plan (get-in manifest [:index :plans])]
+      (validate-graph-references! (:logical-id plan)
+                                  (get verified-plans (:logical-id plan)) (:references plan)))
     {:plans verified-plans :source-records @source-records})))
 
 (defn verify-bundle! [bundle graph]
@@ -535,7 +586,8 @@
                        (= (:plan-sha256 indexed)
                           (plan-fingerprint (:graph runtime))))
           (snapshot-error! "Runtime workflow plan differs from its index"
-                           {:logical-id logical-id}))))
+                           {:logical-id logical-id}))
+        (validate-graph-references! logical-id (:graph runtime) (:references runtime))))
   (let [plan (get runtime-plans root-id)]
     (when-not plan
       (snapshot-error! "Workflow root plan is missing" {:root-plan-id root-id}))
