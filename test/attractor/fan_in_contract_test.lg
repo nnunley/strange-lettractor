@@ -44,6 +44,14 @@
     (is (= ":success" (get-in outcome
                                 [:context_updates "parallel.fan_in.best_outcome"])))))
 
+(deftest heuristic-prefers-partial-success-over-retry
+  (let [outcome (run-default
+                  {:id "join"}
+                  [{:id "retry" :status :retry :score 100}
+                   {:id "partial" :status :partial_success :score -100}])]
+    (is (= "partial"
+           (get-in outcome [:context_updates "parallel.fan_in.best_id"])))))
+
 (deftest heuristic-orders-by-score-id-and-original-occurrence
   (let [scored (run-default {:id "join"}
                             [{:id "a" :status :success :score 1}
@@ -64,6 +72,12 @@
     (is (= [0 1] (mapv :index (:candidates @seen))))
     (is (= duplicate-results (mapv :candidate (:candidates @seen))))
     (is (= :success (:status duplicate)))))
+
+(deftest heuristic-uses-original-occurrence-for-an-exact-tie
+  (let [candidate {:id "same" :status :success :score 3}]
+    (is (= 4 (fanin/heuristic-index
+               [{:index 4 :candidate candidate}
+                {:index 9 :candidate candidate}])))))
 
 (deftest heuristic-score-ordering-does-not-overflow-at-long-minimum
   (let [outcome (run-default {:id "join"}
@@ -166,12 +180,34 @@
     (is (= {:status :cancelled :failure_reason "Pipeline cancelled"}
            outcome))))
 
-(deftest selection-does-not-mutate-parallel-results
+(deftest heuristic-selection-does-not-mutate-parent-context
   (let [results [{:id "a" :status :success :score 1
                   :context_updates {"answer" "a"}}
                  {:id "b" :status :retry :score 2
                   :context_updates {"answer" "b"}}]
-        before results]
-    (run-default {:id "join"} results)
-    (is (= before results))
-    (is (not (contains? (first results) :index)))))
+        ctx (context/make-context
+              {"parallel.results" results
+               "unrelated" {:nested [1 2 3]}})
+        before (context/ctx-snapshot ctx)
+        _ ((fanin/make-handler nil) {:id "join"} ctx {} "logs")
+        after (context/ctx-snapshot ctx)]
+    (is (= before after))
+    (is (= results (get after "parallel.results")))
+    (is (= {:nested [1 2 3]} (get after "unrelated")))
+    (is (nil? (get after "parallel.fan_in.best_id")))
+    (is (nil? (get after "parallel.fan_in.best_outcome")))))
+
+(deftest prompted-selection-does-not-mutate-parent-context
+  (let [results [{:id "a" :status :success :score 1}]
+        ctx (context/make-context
+              {"parallel.results" results
+               "unrelated" {:nested [1 2 3]}})
+        before (context/ctx-snapshot ctx)
+        _ ((fanin/make-handler (fn [_] 0))
+           {:id "join" :prompt "rank"} ctx {} "logs")
+        after (context/ctx-snapshot ctx)]
+    (is (= before after))
+    (is (= results (get after "parallel.results")))
+    (is (= {:nested [1 2 3]} (get after "unrelated")))
+    (is (nil? (get after "parallel.fan_in.best_id")))
+    (is (nil? (get after "parallel.fan_in.best_outcome")))))

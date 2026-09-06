@@ -27,7 +27,9 @@
         (throw (configuration-error "Fan-in candidate score must be a finite number")))
       score)))
 
-(defn- heuristic-index [candidates]
+(defn heuristic-index
+  "Select from validated, eligible candidate envelopes carrying original indices."
+  [candidates]
   (let [status-rank {:success 0 :partial_success 1 :retry 2}]
     ;; sort-by may skip its key function for a singleton, so validation must
     ;; be eager and independent of the sorting implementation.
