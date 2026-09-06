@@ -705,7 +705,7 @@
     (is (= {:type :workflow.drift_detected :changes [expected-change]}
            (first @events)))
     (is (= :pipeline.started (:type (second @events))))
-    (is (= run-root (:logs_root (second @events))))
+    (is (= (os/canonical-path run-root) (:logs_root (second @events))))
     (is (= "exit" (:current_node final-checkpoint)))
     (is (= "workflow/manifest.edn" (:workflow_manifest final-checkpoint)))
     (is (io/file-exists? (str run-root "/work/status.json")))
@@ -878,3 +878,285 @@
       (is (= :workflow_snapshot_missing (:category error)))
       (is (= expected-kind (:kind error)))
       (is (= [] @events)))))
+
+(deftest public-resume-uses-the-once-loaded-checkpoint-after-drift-callbacks
+  (let [{:keys [source-path checkpoint-path]} (interrupted-pinned-run)
+        _ (io/spit source-path "changed after launch")
+        calls (atom 0)
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "pinned.original"
+            (fn [_ _ _ _]
+              (swap! calls inc)
+              {:status :success}))
+        rewrite-checkpoint!
+        (fn [event]
+          (when (= :workflow.drift_detected (:type event))
+            (let [checkpoint (context/load-checkpoint checkpoint-path)]
+              (context/save-checkpoint
+                (assoc checkpoint
+                       :current_node "work"
+                       :completed_nodes ["start" "work"]
+                       :node_outcomes
+                       {"start" {:status :success}
+                        "work" {:status :success}})
+                checkpoint-path))))
+        result (pipeline/resume checkpoint-path
+                                {:registry registry
+                                 :on-event rewrite-checkpoint!})]
+    (is (= :success (:status result)))
+    (is (= 1 @calls))))
+
+(deftest public-resume-pins-the-resolved-checkpoint-and-run-root-across-symlink-swap
+  (let [{:keys [run-root source-path checkpoint-path]} (interrupted-pinned-run)
+        _ (io/spit source-path "changed after launch")
+        other-root (publication-root)
+        _ (io/mkdir other-root)
+        other-checkpoint (str other-root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint checkpoint-path)
+        _ (context/save-checkpoint
+            (assoc checkpoint
+                   :current_node "work"
+                   :completed_nodes ["start" "work"]
+                   :node_outcomes
+                   {"start" {:status :success}
+                    "work" {:status :success}})
+            other-checkpoint)
+        link-parent (str (os/temp-dir) "/lettractor-link-parent-" (random-uuid))
+        link-root (str link-parent "/run")
+        replacement (str link-parent "/replacement")
+        _ (io/mkdir link-parent)
+        link-result (os/sh "ln" "-s" run-root link-root)
+        calls (atom 0)
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "pinned.original"
+            (fn [_ _ _ _]
+              (swap! calls inc)
+              {:status :success}))
+        swap-link!
+        (fn [event]
+          (when (= :workflow.drift_detected (:type event))
+            (os/sh "ln" "-s" other-root replacement)
+            (os/rename replacement link-root)))
+        result (pipeline/resume (str link-root "/checkpoint.edn")
+                                {:registry registry
+                                 :on-event swap-link!})]
+    (is (= 0 (:exit link-result)))
+    (is (= :success (:status result)))
+    (is (= 1 @calls))
+    (is (io/file-exists? (str run-root "/work/status.json")))
+    (is (not (io/file-exists? (str other-root "/work/status.json"))))))
+
+(deftest public-resume-rejects-impossible-checkpoint-structure-before-events
+  (doseq [[label mutate]
+          [[:impossible-transition
+            #(assoc %
+                    :current_node "exit"
+                    :completed_nodes ["start" "exit"])]
+           [:unknown-outcome
+            #(assoc-in % [:node_outcomes "unknown"] {:status :success})]
+           [:uncompleted-outcome
+            #(assoc-in % [:node_outcomes "work"] {:status :success})]
+           [:nonstr-outcome
+            #(assoc-in % [:node_outcomes :start] {:status :success})]
+           [:unknown-retry
+            #(assoc-in % [:node_retries "unknown"] 1)]
+           [:uncompleted-retry
+            #(assoc-in % [:node_retries "work"] 1)]
+           [:nonstr-retry
+            #(assoc-in % [:node_retries :start] 1)]]]
+    (testing (name label)
+      (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+            _ (update-edn-file! checkpoint-path mutate)
+            events (atom [])
+            error (workflow-error
+                    #(pipeline/resume checkpoint-path
+                                      {:on-event #(swap! events conj %)}))]
+        (is (= :workflow_snapshot_corrupt (:category error)))
+        (is (= :checkpoint (:kind error)))
+        (is (= [] @events))))))
+
+(deftest public-resume-allows-a-declared-retry-target-in-completed-history
+  (let [source
+        "digraph RetryHistory {
+           start [shape=Mdiamond]
+           flaky [type=history.flaky, retry_target=repair]
+           repair [type=history.repair]
+           exit [shape=Msquare]
+           start -> flaky
+           start -> repair [condition=\"outcome=fail\"]
+           flaky -> exit [condition=\"outcome=success\"]
+           repair -> flaky
+         }"
+        run-root (publication-root)
+        initial-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            initial-registry "history.flaky"
+            (fn [_ _ _ _] {:status :fail :failure_reason "repair me"}))
+        _ (handlers/register-handler!
+            initial-registry "history.repair"
+            (fn [_ _ _ _] {:status :success}))
+        initial (pipeline/run source {:logs-root run-root
+                                      :registry initial-registry
+                                      :max-steps 3})
+        checkpoint-path (str run-root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint checkpoint-path)
+        resumed-calls (atom 0)
+        resumed-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            resumed-registry "history.flaky"
+            (fn [_ _ _ _]
+              (swap! resumed-calls inc)
+              {:status :success}))
+        result (pipeline/resume checkpoint-path {:registry resumed-registry})]
+    (is (= :fail (:status initial)))
+    (is (= ["start" "flaky" "repair"] (:completed_nodes checkpoint)))
+    (is (= :success (:status result)))
+    (is (= 1 @resumed-calls))))
+
+(deftest public-resume-allows-a-goal-gate-reroute-in-completed-history
+  (let [source
+        "digraph GoalGateHistory {
+           start [shape=Mdiamond]
+           gate [type=history.gate, goal_gate=true, retry_target=repair]
+           after [type=history.after]
+           repair [type=history.repair]
+           exit [shape=Msquare]
+           start -> gate
+           start -> repair [condition=\"outcome=fail\"]
+           gate -> after [condition=\"outcome=fail\"]
+           after -> exit
+           repair -> gate
+         }"
+        run-root (publication-root)
+        initial-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            initial-registry "history.gate"
+            (fn [_ _ _ _] {:status :fail :failure_reason "gate failed"}))
+        _ (handlers/register-handler!
+            initial-registry "history.after"
+            (fn [_ _ _ _] {:status :success}))
+        _ (handlers/register-handler!
+            initial-registry "history.repair"
+            (fn [_ _ _ _] {:status :success}))
+        initial (pipeline/run source {:logs-root run-root
+                                      :registry initial-registry
+                                      :max-steps 5})
+        checkpoint-path (str run-root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint checkpoint-path)
+        resumed-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            resumed-registry "history.gate"
+            (fn [_ _ _ _] {:status :success}))
+        result (pipeline/resume checkpoint-path {:registry resumed-registry})]
+    (is (= :fail (:status initial)))
+    (is (= ["start" "gate" "after" "repair"]
+           (:completed_nodes checkpoint)))
+    (is (= :success (:status result)))))
+
+(deftest public-resume-allows-only-explicit-runtime-options
+  (let [source
+        "digraph SafeResumeOptions {
+           start [shape=Mdiamond]
+           work [type=options.work, retry_target=repair, max_retries=5]
+           repair [type=options.repair]
+           exit [shape=Msquare]
+           start -> work
+           start -> repair [condition=\"outcome=fail\"]
+           work -> exit [condition=\"outcome=success\"]
+           repair -> work
+         }"
+        run-root (publication-root)
+        initial-registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            initial-registry "options.work"
+            (fn [_ _ _ _] {:status :fail :failure_reason "repair first"}))
+        _ (handlers/register-handler!
+            initial-registry "options.repair"
+            (fn [_ _ _ _] {:status :success}))
+        initial (pipeline/run source {:logs-root run-root
+                                      :registry initial-registry
+                                      :max-steps 3})
+        checkpoint-path (str run-root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint checkpoint-path)
+        _ (context/save-checkpoint
+            (assoc-in checkpoint [:node_retries "work"] 2)
+            checkpoint-path)
+        fidelities (atom [])
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "options.work"
+            (fn [node _ _ _]
+              (swap! fidelities conj (:resolved_fidelity node))
+              {:status :success}))
+        events (atom [])
+        result
+        (pipeline/resume
+          checkpoint-path
+          {:registry registry
+           :on-event #(swap! events conj %)
+           :retry-counts (atom {"work" 99})
+           :first-node-fidelity-override "truncate"
+           :context (context/make-context {"poisoned" true})
+           :start-at "exit"})
+        started (first (filter #(= :stage.started (:type %)) @events))]
+    (is (= :fail (:status initial)))
+    (is (= ["start" "work" "repair"] (:completed_nodes checkpoint)))
+    (is (= :success (:status result)))
+    (is (= 3 (:attempt started)))
+    (is (= ["compact"] @fidelities))
+    (is (not (contains? (:context result) "poisoned")))))
+
+(deftest public-resume-validates-current-source-overrides
+  (doseq [invalid [nil "" "  " :root.dot]]
+    (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+          error (workflow-error
+                  #(pipeline/resume checkpoint-path
+                                    {:current-source-path invalid}))]
+      (is (= :workflow_configuration_error (:category error)))
+      (is (= :current-source-path (:option error)))
+      (is (= invalid (:value error))))))
+
+(deftest public-resume-reports-relocated-and-unreadable-current-sources
+  (testing "relocated"
+    (let [{:keys [source-path checkpoint-path]} (interrupted-pinned-run)
+          relocated (str (os/temp-dir) "/lettractor-relocated-" (random-uuid) ".dot")
+          _ (io/spit relocated pinned-resume-dot)
+          events (atom [])
+          result (pipeline/resume checkpoint-path
+                                  {:current-source-path relocated
+                                   :on-event #(swap! events conj %)})
+          change {:logical-id workflow/root-plan-id
+                  :state :relocated
+                  :expected-sha256 (workflow/sha256-text pinned-resume-dot)
+                  :actual-sha256 (workflow/sha256-text pinned-resume-dot)
+                  :path (os/canonical-path relocated)}]
+      (is (io/file-exists? source-path))
+      (is (= {:type :workflow.drift_detected :changes [change]}
+             (first @events)))
+      (is (= (str "Pinned workflow differs from current sources: "
+                  (pr-str [change]))
+             (get-in result [:diagnostics 0 :message])))))
+  (testing "unreadable"
+    (let [{:keys [source-path checkpoint-path]} (interrupted-pinned-run)
+          current-path (os/canonical-path source-path)
+          real-slurp io/slurp
+          events (atom [])
+          result
+          (with-redefs [io/slurp
+                        (fn [path]
+                          (if (= path current-path)
+                            (throw (ex-info "injected unreadable" {}))
+                            (real-slurp path)))]
+            (pipeline/resume checkpoint-path
+                             {:on-event #(swap! events conj %)}))
+          change {:logical-id workflow/root-plan-id
+                  :state :unreadable
+                  :expected-sha256 (workflow/sha256-text pinned-resume-dot)
+                  :path current-path}]
+      (is (= {:type :workflow.drift_detected :changes [change]}
+             (first @events)))
+      (is (= (str "Pinned workflow differs from current sources: "
+                  (pr-str [change]))
+             (get-in result [:diagnostics 0 :message]))))))

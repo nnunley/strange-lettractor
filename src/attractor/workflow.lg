@@ -598,6 +598,14 @@
    the root plan, and :check-current? false disables all filesystem reads."
   ([manifest] (current-drift manifest {}))
   ([manifest options]
+   (when (and (contains? options :current-source-path)
+              (not (and (string? (:current-source-path options))
+                        (not (str/blank? (:current-source-path options))))))
+     (throw
+       (ex-info "Invalid :current-source-path; expected a nonblank string"
+                {:category :workflow_configuration_error
+                 :option :current-source-path
+                 :value (:current-source-path options)})))
    (if (= false (:check-current? options))
      []
      (->> (:sources manifest)

@@ -6,7 +6,7 @@
             [attractor.validation :as validation]
             [attractor.workflow :as workflow]
             [clojure.string :as str]
-            [io :as io]))
+            [os :as os]))
 
 (defn prepare
   "Parse, transform, and validate DOT source without starting execution."
@@ -45,23 +45,15 @@
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
 
-(def ^:private resume-wrapper-option-keys
-  [:check-current?
-   :current-source-path
-   :custom-transforms
-   :custom-rules
-   :on-prepared
-   :on-published
-   :source-loader
-   :base-dir
-   :workflow-roots
-   :source-path
-   :dot-source
-   :graph
-   :workflow
-   :logs-root
-   :workflow-fingerprint
-   :workflow-manifest])
+(def ^:private resume-runtime-option-keys
+  [:registry
+   :on-event
+   :cancelled?
+   :max-steps
+   :now-ms
+   :random-fn
+   :retry-policy
+   :sleep-fn])
 
 (defn- checkpoint-parent [checkpoint-path]
   (let [index (str/last-index-of checkpoint-path "/")]
@@ -76,18 +68,24 @@
 (defn- snapshot-corrupt! [message data]
   (throw (ex-info message (merge {:category :workflow_snapshot_corrupt} data))))
 
-(defn- load-pinned-checkpoint! [checkpoint-path]
+(defn- resolve-checkpoint-path! [checkpoint-path]
   (when-not (and (string? checkpoint-path)
-                 (not (str/blank? checkpoint-path))
-                 (io/file-exists? checkpoint-path))
+                 (not (str/blank? checkpoint-path)))
     (snapshot-missing! "Workflow checkpoint is missing"
                        {:kind :checkpoint :path checkpoint-path}))
   (try
-    (context/load-checkpoint checkpoint-path)
+    (os/canonical-path checkpoint-path)
+    (catch Object _
+      (snapshot-missing! "Workflow checkpoint is missing"
+                         {:kind :checkpoint :path checkpoint-path}))))
+
+(defn- load-pinned-checkpoint! [resolved-checkpoint-path]
+  (try
+    (context/load-checkpoint resolved-checkpoint-path)
     (catch Object cause
       (snapshot-corrupt! "Workflow checkpoint cannot be read"
                          {:kind :checkpoint
-                          :path checkpoint-path
+                          :path resolved-checkpoint-path
                           :cause (str cause)}))))
 
 (defn- require-checkpoint-identity! [checkpoint]
@@ -106,9 +104,64 @@
                          {:kind :fingerprint}))
     fingerprint))
 
+(defn- failed-checkpoint-outcome? [outcome]
+  (let [status (:status outcome)]
+    (or (= :fail status) (= "fail" status))))
+
+(defn- node-retry-target [node]
+  (or (when-not (str/blank? (:retry_target node)) (:retry_target node))
+      (when-not (str/blank? (:fallback_retry_target node))
+        (:fallback_retry_target node))))
+
+(defn- goal-gate-retry-target [node graph]
+  (or (node-retry-target node)
+      (when-not (str/blank? (:retry_target graph)) (:retry_target graph))
+      (when-not (str/blank? (:fallback_retry_target graph))
+        (:fallback_retry_target graph))))
+
+(defn- declared-retry-transition? [graph outcomes prior-node-ids from-id to-id]
+  (let [from-node (parser/find-node graph from-id)
+        from-outcome (get outcomes from-id)]
+    (or
+      ;; Ordinary failure routing can jump from the just-completed node to its
+      ;; declared node-local repair target.
+      (and (failed-checkpoint-outcome? from-outcome)
+           (= to-id (node-retry-target from-node)))
+      ;; A terminal goal-gate check does not append the terminal node. Its
+      ;; reroute therefore appears adjacent to whichever executed node preceded
+      ;; that terminal, while the failed gate may be earlier in history.
+      (some
+        (fn [node-id]
+          (let [node (parser/find-node graph node-id)]
+            (and (:goal_gate node)
+                 (failed-checkpoint-outcome? (get outcomes node-id))
+                 (= to-id (goal-gate-retry-target node graph)))))
+        prior-node-ids))))
+
+(defn- valid-checkpoint-transition?
+  [graph outcomes prior-node-ids [from-id to-id]]
+  (or (some #(= to-id (:to %)) (parser/outgoing-edges graph from-id))
+      (declared-retry-transition?
+        graph outcomes prior-node-ids from-id to-id)))
+
+(defn- validate-checkpoint-map! [checkpoint graph completed-set field]
+  (let [records (get checkpoint field)]
+    (when-not (and (map? records)
+                   (every?
+                     (fn [node-id]
+                       (and (string? node-id)
+                            (parser/find-node graph node-id)
+                            (contains? completed-set node-id)))
+                     (keys records)))
+      (snapshot-corrupt! "Workflow checkpoint records do not match completed nodes"
+                         {:kind :checkpoint
+                          :field field
+                          :node-ids (vec (keys records))}))))
+
 (defn- validate-checkpoint-graph! [checkpoint graph]
   (let [current-node (:current_node checkpoint)
-        completed (:completed_nodes checkpoint)]
+        completed (:completed_nodes checkpoint)
+        completed-set (if (vector? completed) (into #{} completed) #{})]
     (when-not (and (string? current-node)
                    (parser/find-node graph current-node))
       (snapshot-corrupt! "Workflow checkpoint node is not in the captured plan"
@@ -119,6 +172,21 @@
                    (every? #(and (string? %)
                                  (parser/find-node graph %))
                            completed))
+      (snapshot-corrupt! "Workflow checkpoint history does not match the captured plan"
+                         {:kind :checkpoint
+                          :current-node current-node
+                          :completed-nodes completed}))
+    (validate-checkpoint-map! checkpoint graph completed-set :node_outcomes)
+    (validate-checkpoint-map! checkpoint graph completed-set :node_retries)
+    (when-not
+      (every?
+        (fn [[index transition]]
+          (valid-checkpoint-transition?
+            graph
+            (:node_outcomes checkpoint)
+            (subvec completed 0 (inc index))
+            transition))
+        (map-indexed vector (partition 2 1 completed)))
       (snapshot-corrupt! "Workflow checkpoint history does not match the captured plan"
                          {:kind :checkpoint
                           :current-node current-node
@@ -138,15 +206,16 @@
    always delegated with the exact decoded root graph from the published run."
   ([checkpoint-path] (resume checkpoint-path {}))
   ([checkpoint-path options]
-   (let [checkpoint (load-pinned-checkpoint! checkpoint-path)
+   (let [resolved-checkpoint-path (resolve-checkpoint-path! checkpoint-path)
+         checkpoint (load-pinned-checkpoint! resolved-checkpoint-path)
          expected-fingerprint (require-checkpoint-identity! checkpoint)
-         run-root (checkpoint-parent checkpoint-path)
+         run-root (checkpoint-parent resolved-checkpoint-path)
          verified (workflow/verify-published! run-root expected-fingerprint)
          _ (validate-checkpoint-graph! checkpoint (:graph verified))
          changes (workflow/current-drift (:workflow verified) options)
          caller-on-event (or (:on-event options) (fn [_] nil))
          engine-options
-         (assoc (apply dissoc options resume-wrapper-option-keys)
+         (assoc (select-keys options resume-runtime-option-keys)
                 :logs-root run-root
                 :on-event caller-on-event
                 :workflow-fingerprint expected-fingerprint
@@ -154,9 +223,8 @@
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected
                                :changes changes}))
-         outcome (engine/resume-pipeline checkpoint-path
-                                         (:graph verified)
-                                         engine-options)]
+         outcome (engine/resume-pipeline-from-checkpoint
+                   checkpoint (:graph verified) engine-options)]
      (assoc outcome :diagnostics
             (if (seq changes) [(drift-diagnostic changes)] [])))))
 

@@ -595,6 +595,38 @@ digraph Gate {
     (is (not (contains? final-checkpoint :workflow_manifest)))
     ))
 
+(deftest test-in-memory-resume-does-not-reread-a-checkpoint-path
+  (let [graph (p/parse-dot
+                "digraph InMemoryResume {
+                   start [shape=Mdiamond]
+                   work [shape=box]
+                   exit [shape=Msquare]
+                   start -> work -> exit
+                 }")
+        checkpoint {:timestamp "loaded-once"
+                    :current_node "start"
+                    :completed_nodes ["start"]
+                    :node_retries {}
+                    :node_outcomes {"start" {:status :success}}
+                    :context_values {"outcome" "success"}
+                    :logs []}
+        calls (atom 0)
+        registry (h/make-handler-registry
+                   (i/make-auto-approve-interviewer)
+                   (fn [node _ _]
+                     (when (= "work" (:id node)) (swap! calls inc))
+                     {:status :success}))
+        result
+        (with-redefs [c/load-checkpoint
+                      (fn [_]
+                        (throw (ex-info "must not reread" {})))]
+          (e/resume-pipeline-from-checkpoint
+            checkpoint graph
+            {:registry registry
+             :logs-root (test-logs "in-memory-resume")}))]
+    (is (= :success (:status result)))
+    (is (= 1 @calls))))
+
 (deftest test-resume-does-not-repeat-a-completed-failed-node
   (let [graph (p/parse-dot
                 "digraph G {

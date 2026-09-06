@@ -1152,20 +1152,21 @@
                    (close-fidelity-threads! threads))
                  result)))))))))
 
-;; Resume pipeline execution from a saved checkpoint (Section 5.3)
-(defn resume-pipeline [checkpoint-path graph options]
-  (let [cp (context/load-checkpoint checkpoint-path)
-        last-node-id (:current_node cp)
-        ctx (context/make-context (:context_values cp))
-        completed-nodes (:completed_nodes cp)
+;; Resume pipeline execution from an already loaded checkpoint (Section 5.3).
+;; Keeping the state in memory lets trust-boundary callers verify exactly the
+;; value that execution consumes, without reopening a mutable path.
+(defn resume-pipeline-from-checkpoint [checkpoint graph options]
+  (let [last-node-id (:current_node checkpoint)
+        ctx (context/make-context (:context_values checkpoint))
+        completed-nodes (:completed_nodes checkpoint)
         last-node (parser/find-node graph last-node-id)
         last-incoming-edge
         (incoming-edge-for graph (vec (butlast completed-nodes)) last-node-id)
         last-fidelity
-        (or (:current_fidelity cp)
+        (or (:current_fidelity checkpoint)
             (when last-node
               (context/resolve-fidelity last-incoming-edge last-node graph)))
-        node-outcomes (normalize-node-outcomes (:node_outcomes cp))
+        node-outcomes (normalize-node-outcomes (:node_outcomes checkpoint))
         saved-outcome (get node-outcomes last-node-id)
         outcome (or saved-outcome
                     {:status (keyword
@@ -1191,7 +1192,7 @@
                  :start-at next-id
                  :completed-nodes completed-nodes
                  :node-outcomes node-outcomes
-                 :node-retries (:node_retries cp)
+                 :node-retries (:node_retries checkpoint)
                  :initial-incoming-edge next-edge)
           (= "full" last-fidelity)
           (assoc :first-node-fidelity-override "summary:high")))
@@ -1209,3 +1210,9 @@
        :notes "Pipeline checkpoint already represents a completed run"
        :completed_nodes completed-nodes
        :context (context/ctx-snapshot ctx)})))
+
+;; Compatibility path API. Public fingerprint-safe recovery loads and validates
+;; its checkpoint once, then calls resume-pipeline-from-checkpoint directly.
+(defn resume-pipeline [checkpoint-path graph options]
+  (resume-pipeline-from-checkpoint
+    (context/load-checkpoint checkpoint-path) graph options))
