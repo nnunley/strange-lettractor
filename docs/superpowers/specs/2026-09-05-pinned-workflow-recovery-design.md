@@ -116,6 +116,8 @@ Legacy callers retain low-level `engine/resume-pipeline checkpoint graph options
 
 ## Evidence
 
+Integration clarification: `execute-prepared` is itself a public launch path and must publish or verify/reuse its bundle before execution. `run` still publishes before its `:on-published` callback; the execution handoff rechecks the capture. Every fresh loop-restart root receives the same bundle before restart/start events. Published verification retains checked source bytes and decoded plans as a runtime `:captured-bundle`, which resumed execution uses for later restart publication. Resume at a checkpoint immediately preceding a restart edge performs the same fresh-root transition as ordinary execution, preserving the departed checkpoint and resetting segment history.
+
 SCN-PINNED-RECOVERY proves SHA-256 golden vectors including Unicode, numeric distinctions, and aliases; checkout-independent fingerprints; source whitespace sensitivity; map/set construction-order independence; exact unsupported paths; allowed-root and symlink behavior; no writes on invalid preparation or failed pre-publication callback; content-first/manifest-last commit order; concurrent publication and collision verification; callback failure/retry and server registration after commit; checkpoint fields, manifest-path confinement, and legacy reads; resume after current source change/removal/invalidity; exact drift warning/event order with captured behavior; corrupt/missing component failures before execution; and CLI resume routing.
 
 Mutation-sensitive tests alter digests, canonical ordering, current files, and callback order. Focused tests, impacted lifecycle/checkpoint/server tests, the sentinel suite, and AOT close ITER-0004.

@@ -76,6 +76,8 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Then pinned public resume verifies and executes the captured prepared plan, reports deterministic drift, and never adopts current bytes
 - Given a missing, corrupt, mismatched, or partially published workflow bundle
 - Then resume fails before engine events or handlers
+- Direct `execute-prepared` calls publish before engine start, and every loop-restart segment contains a locally resumable capture with the original fingerprint
+- Resume at an outgoing restart edge emits `pipeline.restarting` before starting the fresh segment, preserves the old checkpoint bytes, and resets completed-node history; a restart reached later during resumed execution also republishes the verified captured bundle
 - Seam: public pipeline/checkpoint/server integration
 
 ### SCN-CONTEXT-ISOLATION — Deep branch isolation
