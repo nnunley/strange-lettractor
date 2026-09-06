@@ -1,0 +1,217 @@
+(ns attractor.fan-in-pipeline-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [attractor.context :as context]
+            [attractor.handlers :as handlers]
+            [attractor.llm :as llm]
+            [attractor.pipeline :as pipeline]
+            [attractor.workflow :as workflow]
+            [io :as io]
+            [os :as os]))
+
+(defn uuid-text []
+  (let [printed (str (random-uuid))]
+    (or (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+                         printed))
+        printed)))
+
+(defn temp-root [label]
+  (str (os/temp-dir) "/fan-in-public-" label "-" (uuid-text)))
+
+(defn response [candidate-index]
+  (let [text (str "{\"candidate_index\":" candidate-index "}")]
+    {:provider "memory"
+     :message {:role :assistant :content text :text text}
+     :tool_calls [] :usage {} :finish_reason :stop}))
+
+(defn client-with-provider [provider]
+  (llm/make-client
+    {:providers {"memory" (llm/make-adapter "memory" provider (fn [_] []))}}))
+
+(defn pipeline-dot [prompt extra]
+  (str "digraph FanInPublic {\n"
+       " start [shape=Mdiamond]\n"
+       " fork [shape=component, join_policy=wait_all, max_parallel=2]\n"
+       " a [type=fan.branch]\n"
+       " z [type=fan.branch]\n"
+       " join [shape=tripleoctagon, prompt=" (pr-str prompt) extra "]\n"
+       " exit [shape=Msquare]\n"
+       " start -> fork\n fork -> a -> join\n fork -> z -> join\n join -> exit\n}"))
+
+(defn branch-handler [calls]
+  (fn [node _ _ _]
+    (swap! calls update (:id node) (fnil inc 0))
+    {:status :success
+     :score (if (= "a" (:id node)) 1 9)
+     :context_updates {"branch" (:id node)}}))
+
+(defn configured-registry [provider calls]
+  (let [client (client-with-provider provider)
+        registry (handlers/make-handler-registry
+                   nil nil {:fan-in-llm-options
+                            {:client client :model "memory/model"}})]
+    (handlers/register-handler! registry "fan.branch" (branch-handler calls))
+    {:client client :registry registry}))
+
+(defn terminal-event? [event]
+  (contains? #{:pipeline.completed :pipeline.failed :pipeline.cancelled}
+             (:type event)))
+
+(defn fan-in-terminal-event? [event]
+  (and (= "join" (:node_id event))
+       (contains? #{:stage.completed :stage.failed} (:type event))))
+
+(defn assert-success-contract [result expected-id calls]
+  (is (= :success (:status result)))
+  (is (= ["start" "fork" "join" "exit"] (:completed_nodes result)))
+  (is (= ["a" "z"] (mapv :id (get-in result [:context "parallel.results"]))))
+  (is (= [1 9] (mapv :score (get-in result [:context "parallel.results"]))))
+  (is (= expected-id (get-in result [:context "parallel.fan_in.best_id"])))
+  (is (= ":success" (get-in result [:context "parallel.fan_in.best_outcome"])))
+  (is (= {"a" 1 "z" 1} @calls)))
+
+(deftest public-prompted-and-blank-pipelines-use-real-branches-and-llm-boundary
+  (let [requests (atom []) calls (atom {})
+        provider (fn [sent] (swap! requests conj sent) (response 0))
+        {:keys [registry]} (configured-registry provider calls)
+        registry-before @registry
+        prompted (pipeline/run (pipeline-dot "Prefer a even when its score is lower" "")
+                   {:logs-root (temp-root "prompted") :registry registry})]
+    (assert-success-contract prompted "a" calls)
+    (is (= 1 (count @requests)))
+    (let [sent (first @requests)
+          user-data (get-in sent [:messages 1 :content])]
+      (is (= "memory" (:provider sent)))
+      (is (= "model" (:model sent)))
+      (is (str/includes? user-data "Prefer a even when its score is lower"))
+      (is (< (str/index-of user-data ":id \"a\"")
+             (str/index-of user-data ":id \"z\"")))
+      (is (str/includes? user-data ":score 1"))
+      (is (str/includes? user-data ":score 9")))
+    (reset! calls {})
+    (let [blank (pipeline/run (pipeline-dot "   " "")
+                  {:logs-root (temp-root "blank") :registry registry})]
+      (assert-success-contract blank "z" calls)
+      (is (= 1 (count @requests))))
+    (reset! calls {})
+    (let [checkout (temp-root "nested-source")
+          root-source
+          "digraph Parent { start [shape=Mdiamond]; child [type=subpipeline, subpipeline.dotfile=\"child.dot\", input_map=\"{}\", output_map=\"{\\\"parallel.fan_in.best_id\\\" \\\"winner\\\"}\"]; exit [shape=Msquare]; start -> child -> exit; }"
+          _ (io/mkdir checkout)
+          _ (io/spit (str checkout "/root.dot") root-source)
+          _ (io/spit (str checkout "/child.dot")
+                     (pipeline-dot "Choose a inside the captured child" ""))
+          nested (pipeline/run root-source
+                   {:source-path (str checkout "/root.dot")
+                    :logs-root (temp-root "nested-run")
+                    :registry registry})]
+      (is (= :success (:status nested)))
+      (is (= "a" (get-in nested [:context "winner"])))
+      (is (= {"a" 1 "z" 1} @calls))
+      (is (= 2 (count @requests)))
+      (is (str/includes? (get-in @requests [1 :messages 1 :content])
+                         "Choose a inside the captured child")))
+    (is (= registry-before @registry))))
+
+(defn artifact-digests [root]
+  (let [listing (os/sh "find" root "-type" "f")]
+    (is (= 0 (:exit listing)))
+    (into {}
+          (for [path (remove str/blank? (str/split (:out listing) #"\n"))]
+            [(subs path (count root))
+             (workflow/sha256-text (io/slurp path))]))))
+
+(deftest public-pinned-resume-uses-captured-prompt-without-rerunning-branches
+  (let [source (pipeline-dot "Choose captured candidate a" "")
+        run-root (temp-root "interrupted")
+        checkout (temp-root "checkout")
+        source-path (str checkout "/root.dot")
+        calls (atom {}) requests (atom [])
+        provider (fn [sent] (swap! requests conj sent) (response 0))
+        {:keys [registry]} (configured-registry provider calls)
+        _ (io/mkdir checkout)
+        _ (io/spit source-path source)
+        interrupted (pipeline/run source {:source-path source-path
+                                          :logs-root run-root
+                                          :registry registry
+                                          :max-steps 2})
+        checkpoint (context/load-checkpoint (str run-root "/checkpoint.edn"))
+        original-before (artifact-digests run-root)
+        copy-root (temp-root "copied")
+        copy-result (os/sh "cp" "-R" run-root copy-root)]
+    (is (= :fail (:status interrupted)))
+    (is (= ["start" "fork"] (:completed_nodes checkpoint)))
+    (is (= ["a" "z"] (mapv :id (get-in checkpoint [:context_values "parallel.results"]))))
+    (is (= [1 9] (mapv :score (get-in checkpoint [:context_values "parallel.results"]))))
+    (is (= {"a" 1 "z" 1} @calls))
+    (is (= 0 (count @requests)))
+    (is (= 0 (:exit copy-result)))
+    (io/spit source-path (pipeline-dot "Choose current candidate z" ""))
+    (let [resumed (pipeline/resume (str copy-root "/checkpoint.edn")
+                    {:registry registry :current-source-path source-path})
+          copied-checkpoint (io/slurp (str copy-root "/checkpoint.edn"))]
+      (is (= :success (:status resumed)))
+      (is (= "a" (get-in resumed [:context "parallel.fan_in.best_id"])))
+      (is (= {"a" 1 "z" 1} @calls))
+      (is (= 1 (count @requests)))
+      (is (str/includes? (get-in @requests [0 :messages 1 :content])
+                         "Choose captured candidate a"))
+      (is (not (str/includes? copied-checkpoint "#object")))
+      (is (not (str/includes? copied-checkpoint "fan-in-ranker"))))
+    (is (= original-before (artifact-digests run-root)))))
+
+(defn held-provider-run [mode]
+  (let [entered (promise) cleanup-entered (promise) release (promise)
+        cleaned (promise) cancelled (atom false) clock (atom 0)
+        calls (atom {}) requests (atom []) events (atom [])
+        provider
+        (fn [sent]
+          (swap! requests conj sent)
+          (deliver entered true)
+          (try
+            (loop []
+              (when-not ((get-in sent [:abort_signal :aborted?]))
+                (core/sleep 2)
+                (recur)))
+            (finally
+              (deliver cleanup-entered true)
+              (deref release 3000 nil)
+              (deliver cleaned true)))
+          (throw (ex-info "provider stopped" {:category :local-cancellation})))
+        {:keys [registry]} (configured-registry provider calls)
+        extra (if (= mode :timeout) ", timeout=100, max_retries=0" "")
+        ctx (context/make-context)
+        task (core/future
+               (pipeline/run (pipeline-dot "Rank with held provider" extra)
+                 {:logs-root (temp-root (name mode)) :registry registry :context ctx
+                  :cancelled? #(deref cancelled) :now-ms #(deref clock)
+                  :on-event #(swap! events conj %)}))]
+    (try
+      (is (= true (deref entered 3000 false)))
+      (if (= mode :external) (reset! cancelled true) (reset! clock 100))
+      (is (= true (deref cleanup-entered 3000 false)))
+      (is (= ::pending (deref task 20 ::pending)))
+      (is (not (deref cleaned 0 false)))
+      (is (not-any? fan-in-terminal-event? @events))
+      (is (not-any? terminal-event? @events))
+      (is (nil? (context/ctx-get ctx "parallel.fan_in.best_id")))
+      (is (nil? (context/ctx-get ctx "parallel.fan_in.best_outcome")))
+      (finally (deliver release true)))
+    (let [result (deref task 3000 ::timeout)
+          settled @events]
+      (is (= true (deref cleaned 0 false)))
+      (is (= 1 (count @requests)))
+      (is (= {"a" 1 "z" 1} @calls))
+      (is (= (if (= mode :external) :cancelled :fail) (:status result)))
+      (when (= mode :timeout) (is (= :timeout_error (:category result))))
+      (is (nil? (get-in result [:context "parallel.fan_in.best_id"])))
+      (is (= result (deref task 0 ::pending)))
+      (core/sleep 10)
+      (is (= settled @events)))))
+
+(deftest public-external-cancellation-joins-real-ranker-cleanup
+  (held-provider-run :external))
+
+(deftest public-node-timeout-joins-real-ranker-cleanup
+  (held-provider-run :timeout))
