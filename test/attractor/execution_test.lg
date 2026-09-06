@@ -66,6 +66,71 @@
     (is (str/includes? (:stderr result) "Command timed out after 100ms"))
     (is (false? ((:file_exists environment) "descendant-survived")))))
 
+(deftest test-command-timeout-before-session-start-prevents-user-command
+  (let [root (str (os/temp-dir) "/lettractor-delayed-session-" (random-uuid))
+        launcher (str root "/setsid")
+        timeout-marker (str root "/timeout")
+        cancel-marker (str root "/cancel")
+        late-marker (str root "/late")]
+    (io/mkdir root)
+    (try
+      ;; Model a launcher that has not established its group at the deadline.
+      ;; This stand-in retains its inherited group and exits on its own, so the
+      ;; broken watchdog cannot hang the fixture. PATH changes only in the child.
+      (io/spit launcher
+               "#!/bin/bash\n/bin/sleep 0.3\nexec \"$@\"\n")
+      (is (= 0 (:exit (os/sh "/bin/chmod" "+x" launcher))))
+      (let [result (os/sh "/usr/bin/env"
+                          (str "PATH=" root ":/usr/bin:/bin")
+                          "/bin/bash" "--noprofile" "--norc" "-p" "-c"
+                          execution/command-wrapper "command-wrapper"
+                          root "0.05" "/bin/sleep 0.1; printf late > late"
+                          timeout-marker cancel-marker "all")]
+        (is (= 124 (:exit result)))
+        (is (some? (os/stat timeout-marker)))
+        (is (nil? (os/stat late-marker))))
+      (io/delete-file timeout-marker)
+      (io/spit cancel-marker "")
+      (let [result (os/sh "/usr/bin/env"
+                          (str "PATH=" root ":/usr/bin:/bin")
+                          "/bin/bash" "--noprofile" "--norc" "-p" "-c"
+                          execution/command-wrapper "command-wrapper"
+                          root "0.05" "printf started; printf late > late"
+                          timeout-marker cancel-marker "all")]
+        (is (= 130 (:exit result)))
+        (is (= "" (:out result)))
+        (is (nil? (os/stat late-marker))))
+      (finally
+        (doseq [path [launcher timeout-marker cancel-marker late-marker]]
+          (when (os/stat path) (io/delete-file path)))
+        (io/delete-file root)))))
+
+(deftest test-command-startup-honors-existing-stop-markers
+  (doseq [[stop-name expected-exit] [["timeout" 124] ["cancel" 130]]]
+    (let [root (str (os/temp-dir) "/lettractor-stopped-start-" (random-uuid))
+          timeout-marker (str root "/timeout")
+          cancel-marker (str root "/cancel")
+          startup-file (str root "/startup")
+          startup-marker (str root "/startup-ran")
+          late-marker (str root "/late")]
+      (io/mkdir root)
+      (try
+        (io/spit (str root "/" stop-name) "")
+        (io/spit startup-file "printf startup > startup-ran\n")
+        (let [result (os/sh "/usr/bin/env" (str "BASH_ENV=" startup-file)
+                            "/bin/bash" "--noprofile" "--norc" "-p" "-c"
+                            execution/command-wrapper "command-wrapper"
+                            root "0.05" "printf late > late"
+                            timeout-marker cancel-marker "all")]
+          (is (= expected-exit (:exit result)))
+          (is (nil? (os/stat startup-marker)))
+          (is (nil? (os/stat late-marker))))
+        (finally
+          (doseq [path [timeout-marker cancel-marker startup-file
+                       startup-marker late-marker]]
+            (when (os/stat path) (io/delete-file path)))
+          (io/delete-file root))))))
+
 (deftest test-local-command-filters-secrets-and-allows-explicit-environment
   (let [_ (os/setenv "lettractor_execution_test_token" "lowercase-secret")
         _ (os/setenv "Lettractor_Execution_Test_CREDENTIAL" "mixed-secret")
