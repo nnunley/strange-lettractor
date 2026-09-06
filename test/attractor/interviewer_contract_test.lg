@@ -8,7 +8,7 @@
             [attractor.pipeline :as pipeline]
             [os :as os]))
 
-;; Evidence for §§4.6 and 6, excluding console input and actual elapsed timers.
+;; Evidence for §§4.6 and 6, including ready console input, not actual timers.
 (def first-option {:key "A" :label "Approve" :metadata {:scope "review"}})
 (def second-option {:key "R" :label "Revise"})
 (def default-answer {:value "R" :text "Revise" :selected_option second-option})
@@ -160,8 +160,10 @@
              {:key "R" :label "[R] Revise"}]})
 
 (defn- assert-gate-recording [recordings answer]
-  ;; Compare the sequence at its own level: native nested map equality treats
-  ;; the handler's lazy options differently from the expected vector.
+  ;; let-go #810: nested equality is asymmetric for lazy options vs vectors.
+  ;; Compare all other fields and the complete ordered options separately.
+  ;; Restore whole-question equality after both operand orders are fixed:
+  ;; https://github.com/nooga/let-go/issues/810
   (is (= 1 (count recordings)))
   (is (= answer (:answer (first recordings))))
   (is (= (dissoc gate-question :options)

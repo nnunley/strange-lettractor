@@ -13,6 +13,7 @@ the actual configured compiler and rerun the relevant behavior checks.
 | [#807: unfinished trailing forms](https://github.com/nooga/let-go/issues/807) | Test discovery checks and independent JVM reader checks | Verify malformed sources fail visibly across evaluation, namespace loading, and AOT; then reassess the extra manual syntax cross-check. |
 | [#808: unary negation overflow](https://github.com/nooga/let-go/issues/808) | `src/attractor/fan_in.lg` descending score comparison | Verify ordinary `(- Long/MIN_VALUE)` and first-class/apply calls throw overflow. Retain direct comparison: Clojure also cannot safely negate this score. |
 | [#809: UUID string coercion](https://github.com/nooga/let-go/issues/809) | Unique manager-test fixture names in `test/attractor/engine_test.lg` | Verify `str` returns canonical UUID text while `pr-str` and direct UUID printing remain tagged. Reassess fixture-name sanitization separately from general path escaping. |
+| [#810: asymmetric nested sequence equality](https://github.com/nooga/let-go/issues/810) | Complete human-question comparisons in `test/attractor/interviewer_contract_test.lg` | Verify vector/lazy-sequence values compare equally inside maps in both operand orders, then restore whole-question equality instead of comparing options separately. |
 
 ## Restoration checks
 
@@ -53,6 +54,16 @@ is a boundary-safe algorithm, not a workaround to remove when overflow starts
 throwing correctly.
 
 Detailed reproducers and current limitations:
+
+For #810, `(let [xs (map identity [1 2]) ys [1 2]]
+[(= xs ys) (= ys xs) (= {:options xs} {:options ys})
+(= {:options ys} {:options xs})])` returns `[true true true false]` in the
+configured local let-go binary at the same source revision above. JVM Clojure
+returns true for both nested-map operand orders. Cover vectors of nested maps
+and complete recorded option records as well as the minimal scalar example.
+The test workaround preserves all fields; it is not evidence of full nested
+equality compatibility.
+
 [reader](let-go-reader-compatibility.md),
 [future errors](let-go-future-compatibility.md), and
 [native supervision](let-go-supervision-compatibility.md).

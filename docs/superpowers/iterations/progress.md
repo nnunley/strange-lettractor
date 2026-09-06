@@ -1,7 +1,28 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** handler dispatch matrix reviewed and verified; native console API proposal awaits user approval, artifact recovery remains pending
+**Task:** interviewer contract fixes reviewed; fixing reproduced tool-launch timeout race; native timed-input and artifact-index proposals await approval
+
+**Interviewer checkpoint:** `82a7461` adds adapter/public-routing evidence and
+`1ca62bb` fixes zero-argument console flushing and the auto-approve empty-choice
+fallback. RED: one assertion failure plus three flush-arity errors. Final focused
+12 tests / 109 assertions / zero failures, independently approved by spec and
+quality reviewers. Root AOT exits 0 and real PTY input succeeds without replacing
+the reader. Actual console timeout remains unmet; no SCN-INTERVIEWERS completion
+marker is added. New let-go nested equality bug [#810](https://github.com/nooga/let-go/issues/810)
+has an independently verified JVM control and a test-side restoration breadcrumb.
+
+Root full suite at `1ca62bb` reports **547 tests / 4307 assertions / 1 failure**:
+`test-timed-tool-node-keeps-partial-output-and-never-accepts-late-success` in
+`engine_test.lg` observes its forbidden late marker. An adjacent implementer run
+also failed the corresponding `handlers_test.lg` assertion. Do not dismiss these
+as passing because isolated reruns succeed. A deterministic root reproduction
+delays session creation by 200ms with a temporary `setsid` launcher and requests
+a 50ms command timeout: the result reports timeout/exit124 yet the command starts
+and creates its marker. Evidence: `/tmp/lettractor-launch-race.bjIJBu/`.
+The wrapper stops its watchdog when group termination fails before the child
+group exists; startup cancellation needs a regression and scoped runtime fix.
+This is an Attractor execution bug, not a let-go compatibility finding.
 
 **Dispatch matrix checkpoint:** `5ea986f` adds evidence only: 5 tests / 324
 assertions, independently approved by spec and quality reviewers. Root full suite

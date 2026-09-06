@@ -2,6 +2,12 @@
 
 Inspected 2026-09-06 after fan-in checkpoint `1fe6bd6`.
 
+Update: `1ca62bb` fixes prompt flushing with the existing `term/flush` primitive.
+Independent spec/quality reviews approve; 12 interviewer tests / 109 assertions
+pass. A real PTY question now displays its prompt, reads supplied text, and exits
+successfully. The original failure below is historical; question deadlines remain
+unimplemented. Auto-approve's empty-choice fallback now matches upstream §6.4.
+
 ## Observed failures
 
 Calling the real console interviewer with a freeform question and
@@ -18,7 +24,12 @@ No process or blocked input reader from this probe remains running.
 
 The human handler constructs questions without `timeout_seconds`, so fixing
 console input alone would not connect DOT execution to question deadlines.
-The upstream snapshot §§6.4–6.5 requires nonblocking console input, returning
+However, upstream §4.6 constructs the question the same way and does not define
+a DOT attribute supplying that field. Automatic forwarding is an integration
+design decision, not a separate demonstrated spec violation. In particular,
+reusing the engine's node-attempt deadline risks making its timeout failure race
+the interviewer's default-answer handling. The upstream snapshot §§6.4–6.5
+does require nonblocking console input for a supplied question timeout, returning
 the question default on expiry or `:timeout` when no default exists.
 
 ## Native input boundary
