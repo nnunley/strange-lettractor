@@ -104,6 +104,17 @@
                 (reset! cancelled true)
                 (throw (ex-info "Pipeline preparation was abandoned"
                                 {:category :preparation_abandoned}))))
+            matching-registration?
+            (fn [fingerprint manifest-path]
+              (let [registered (get @active-pipelines pipeline-id)]
+                (and (= fingerprint (:workflow_fingerprint registered))
+                     (= manifest-path (:workflow_manifest registered)))))
+            require-matching-registration!
+            (fn [fingerprint manifest-path]
+              (when-not (matching-registration? fingerprint manifest-path)
+                (throw (ex-info "Published workflow registration does not match"
+                                {:category :workflow_snapshot_corrupt
+                                 :path manifest-path}))))
             on-published
             (fn [{:keys [graph diagnostics workflow]} manifest-path]
               ;; The callback is the HTTP visibility boundary. Verify the exact
@@ -118,44 +129,66 @@
                   (throw (ex-info "Published workflow manifest does not match prepared workflow"
                                   {:category :workflow_snapshot_corrupt
                                    :path manifest-path})))
-                (cond
-                  (= :registered @preparation-phase)
-                  (let [registered (get @active-pipelines pipeline-id)]
-                    (when-not (and (= fingerprint (:workflow_fingerprint registered))
-                                   (= manifest-path (:workflow_manifest registered)))
-                      (throw (ex-info "Published workflow registration does not match"
-                                      {:category :workflow_snapshot_corrupt
-                                       :path manifest-path}))))
+                (loop []
+                  (case @preparation-phase
+                    :registered
+                    (require-matching-registration! fingerprint manifest-path)
 
-                  (compare-and-set! preparation-phase :waiting :registering)
-                  (try
-                    (swap! active-pipelines assoc pipeline-id
-                           {:id pipeline-id
-                            :graph graph
-                            :dot dot-source
-                            :status :running
-                            :diagnostics diagnostics
-                            :events events-atom
-                            :questions questions-atom
-                            :pending-answers pending-answers
-                            :cancelled cancelled
-                            :context ctx
-                            :logs_root logs-dir
-                            :workflow_fingerprint fingerprint
-                            :workflow_manifest manifest-path})
-                    (reset! preparation-phase :registered)
-                    (deliver prepared-signal {:graph graph})
-                    (catch Object e
-                      (swap! active-pipelines dissoc pipeline-id)
-                      (reset! preparation-phase :failed)
-                      (deliver prepared-signal {:error e})
-                      (throw e)))
+                    :registering
+                    (let [observed
+                          (deref prepared-signal preparation-timeout-ms
+                                 :attractor.server/registration-timeout)]
+                      (if (= observed :attractor.server/registration-timeout)
+                        (if (= :registered @preparation-phase)
+                          (require-matching-registration! fingerprint manifest-path)
+                          (throw (ex-info "Pipeline publication registration timed out"
+                                          {:category :preparation_timeout})))
+                        (if-let [error (:error observed)]
+                          (throw error)
+                          (require-matching-registration!
+                            fingerprint manifest-path))))
 
-                  :else
-                  (do
-                    (reset! cancelled true)
-                    (throw (ex-info "Pipeline publication was abandoned"
-                                    {:category :preparation_abandoned}))))))]
+                    :waiting
+                    (if (compare-and-set! preparation-phase :waiting :registering)
+                      (try
+                        (swap! active-pipelines assoc pipeline-id
+                               {:id pipeline-id
+                                :graph graph
+                                :dot dot-source
+                                :status :running
+                                :diagnostics diagnostics
+                                :events events-atom
+                                :questions questions-atom
+                                :pending-answers pending-answers
+                                :cancelled cancelled
+                                :context ctx
+                                :logs_root logs-dir
+                                :workflow_fingerprint fingerprint
+                                :workflow_manifest manifest-path})
+                        (if (compare-and-set! preparation-phase
+                                              :registering :registered)
+                          (deliver prepared-signal {:graph graph})
+                          (do
+                            (swap! active-pipelines dissoc pipeline-id)
+                            (throw (ex-info "Pipeline publication was abandoned"
+                                            {:category :preparation_abandoned}))))
+                        (catch Object e
+                          (swap! active-pipelines dissoc pipeline-id)
+                          (deliver prepared-signal {:error e})
+                          (compare-and-set! preparation-phase
+                                            :registering :failed)
+                          (throw e)))
+                      (recur))
+
+                    :failed
+                    (throw (ex-info "Pipeline publication registration failed"
+                                    {:category :preparation_failed}))
+
+                    :abandoned
+                    (do
+                      (reset! cancelled true)
+                      (throw (ex-info "Pipeline publication was abandoned"
+                                      {:category :preparation_abandoned})))))))]
 
         ;; Run in background future
         (core/future
@@ -173,8 +206,10 @@
               (if (= :registered @preparation-phase)
                 (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e))
                 (do
+                  (swap! active-pipelines dissoc pipeline-id)
+                  (deliver prepared-signal {:error e})
                   (compare-and-set! preparation-phase :waiting :failed)
-                  (deliver prepared-signal {:error e}))))))
+                  (compare-and-set! preparation-phase :registering :failed))))))
 
         (let [timeout-error (ex-info "Pipeline preparation timed out"
                                      {:category :preparation_timeout})
@@ -182,13 +217,44 @@
                              :attractor.server/preparation-timeout)
               prepared
               (if (= initial :attractor.server/preparation-timeout)
-                (if (compare-and-set! preparation-phase :waiting :abandoned)
-                  (do
-                    (reset! cancelled true)
-                    {:error timeout-error})
-                  ;; Registration or failure already won the phase transition;
-                  ;; its callback/catch owns delivery and cannot be pre-empted.
-                  @prepared-signal)
+                (loop []
+                  (case @preparation-phase
+                    :waiting
+                    (if (compare-and-set! preparation-phase :waiting :abandoned)
+                      (do
+                        (reset! cancelled true)
+                        {:error timeout-error})
+                      (recur))
+
+                    :registering
+                    (let [observed
+                          (deref prepared-signal preparation-timeout-ms
+                                 :attractor.server/registration-timeout)]
+                      (if (= observed :attractor.server/registration-timeout)
+                        (if (compare-and-set! preparation-phase
+                                              :registering :abandoned)
+                          (do
+                            (reset! cancelled true)
+                            (swap! active-pipelines dissoc pipeline-id)
+                            {:error timeout-error})
+                          (recur))
+                        observed))
+
+                    :registered
+                    (if-let [registered (get @active-pipelines pipeline-id)]
+                      {:graph (:graph registered)}
+                      {:error (ex-info "Published pipeline registration is missing"
+                                       {:category :preparation_failed})})
+
+                    :failed
+                    (deref prepared-signal 0
+                           {:error (ex-info "Pipeline preparation failed"
+                                            {:category :preparation_failed})})
+
+                    :abandoned
+                    (do
+                      (reset! cancelled true)
+                      {:error timeout-error})))
                 initial)]
           (if-let [error (:error prepared)]
             (throw error)

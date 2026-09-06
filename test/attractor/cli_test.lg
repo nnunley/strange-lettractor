@@ -80,19 +80,22 @@
   (let [checkpoint (str (os/temp-dir) "/attractor-cli-checkpoint-only-" (random-uuid) ".edn")
         calls (atom [])
         exits (atom [])
-        usage (with-out-str (cli/print-usage))]
+        usage (with-out-str (cli/print-usage))
+        output (atom nil)]
     (io/spit checkpoint "{}")
     (with-redefs [pipeline/resume
                   (fn [checkpoint-path options]
                     (swap! calls conj [checkpoint-path options])
                     {:status :success})
                   os/exit #(swap! exits conj %)]
-      (with-out-str
-        (cli/cmd-resume ["--checkpoint" checkpoint "--mock"])))
+      (reset! output
+              (with-out-str
+                (cli/cmd-resume ["--checkpoint" checkpoint "--mock"]))))
     (is (str/includes? usage "resume [dotfile] --checkpoint <path>"))
     (is (= 1 (count @calls)))
     (is (= checkpoint (get-in @calls [0 0])))
     (is (= #{:registry} (set (keys (get-in @calls [0 1])))))
+    (is (not (str/includes? @output "workflow_drift")))
     (is (= [0] @exits))))
 
 (def pinned-cli-dot
@@ -115,6 +118,7 @@
           run-calls (atom [])
           resume-calls (atom [])
           resume-result (atom nil)
+          resume-output (atom nil)
           exits (atom [])
           real-run pipeline/run
           real-resume pipeline/resume]
@@ -142,8 +146,10 @@
                         (reset! resume-result result)
                         result))
                     os/exit #(swap! exits conj %)]
-        (with-out-str
-          (cli/cmd-resume [dot-path "--checkpoint" checkpoint-path "--mock"])))
+        (reset! resume-output
+                (with-out-str
+                  (cli/cmd-resume
+                    [dot-path "--checkpoint" checkpoint-path "--mock"]))))
       (is (= 1 (count @run-calls)))
       (is (= dot-path (get-in @run-calls [0 1 :source-path])))
       (is (= 1 (count @resume-calls)))
@@ -153,6 +159,9 @@
              (set (keys (get-in @resume-calls [0 1])))))
       (is (str/includes? (get-in @resume-result [:diagnostics 0 :message])
                          (str ":state " expected-state)))
+      (is (str/includes? @resume-output "[WARN] [workflow_drift]"))
+      (is (str/includes? @resume-output "workflow://root"))
+      (is (str/includes? @resume-output (str ":state " expected-state)))
       (is (= :success (:status @resume-result)))
       (is (= 1 @handler-calls))
       (is (= [1 0] @exits)))))

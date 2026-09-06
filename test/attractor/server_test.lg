@@ -1,5 +1,6 @@
 (ns attractor.server-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
             [clojure.string :as str]
             [io :as io]
             [json :as json]
@@ -83,25 +84,30 @@
         first-registration (atom nil)
         second-registration (atom nil)
         callback-count (atom 0)
+        background-complete (promise)
         response
         (with-redefs
           [pipeline/run
            (fn [source options]
-             (let [prepared (pipeline/prepare source)]
-               ((:on-prepared options) prepared)
-               (reset! before-publication @server/active-pipelines)
-               (let [manifest-path
-                     (workflow/publish! (:workflow prepared) (:logs-root options))]
-                 ((:on-published options) prepared manifest-path)
-                 (swap! callback-count inc)
-                 (reset! first-registration
-                         (first (vals @server/active-pipelines)))
-                 ((:on-published options) prepared manifest-path)
-                 (swap! callback-count inc)
-                 (reset! second-registration
-                         (first (vals @server/active-pipelines)))
-                 {:status :success})))]
+             (try
+               (let [prepared (pipeline/prepare source)]
+                 ((:on-prepared options) prepared)
+                 (reset! before-publication @server/active-pipelines)
+                 (let [manifest-path
+                       (workflow/publish! (:workflow prepared) (:logs-root options))]
+                   ((:on-published options) prepared manifest-path)
+                   (swap! callback-count inc)
+                   (reset! first-registration
+                           (first (vals @server/active-pipelines)))
+                   ((:on-published options) prepared manifest-path)
+                   (swap! callback-count inc)
+                   (reset! second-registration
+                           (first (vals @server/active-pipelines)))
+                   {:status :success}))
+               (finally
+                 (deliver background-complete true))))]
           (server/handle-start-pipeline {:body server-dot}))
+        _ (deref background-complete 1000 :timeout)
         body (json/read-json (:body response))
         pipeline-id (get body "id")
         registered (get @server/active-pipelines pipeline-id)
@@ -132,7 +138,242 @@
                 prepared
                 (str (:logs-root options) "/workflow/manifest.edn"))))]]
     (reset! server/active-pipelines {})
-    (let [response (with-redefs [pipeline/run run-fn]
+    (let [background-complete (promise)
+          joined-run (fn [source options]
+                       (try
+                         (run-fn source options)
+                         (finally
+                           (deliver background-complete true))))
+          response (with-redefs [pipeline/run joined-run]
                      (server/handle-start-pipeline {:body server-dot}))]
+      (is (= true (deref background-complete 1000 :timeout)))
       (is (= 400 (:status response)))
       (is (= {} @server/active-pipelines)))))
+
+(deftest concurrent-publication-callbacks-share-the-winning-registration
+  (reset! server/active-pipelines {})
+  (let [registration-entered (promise)
+        release-registration (promise)
+        second-verified (promise)
+        background-complete (promise)
+        callback-results (atom nil)
+        registered-identities (atom nil)
+        observed-cancelled (atom nil)
+        real-verify workflow/verify-published!
+        verify-count (atom 0)
+        watch-key (keyword (str "registration-" (random-uuid)))]
+    (add-watch server/active-pipelines watch-key
+               (fn [_ _ old-state new-state]
+                 (when (and (empty? old-state) (seq new-state))
+                   (deliver registration-entered true)
+                   @release-registration)))
+    (try
+      (let [response
+            (with-redefs
+              [workflow/verify-published!
+               (fn [run-root fingerprint]
+                 (let [verified (real-verify run-root fingerprint)
+                       count (swap! verify-count inc)]
+                   (when (= 2 count) (deliver second-verified true))
+                   verified))
+               pipeline/run
+               (fn [source options]
+                 (try
+                   (let [prepared (pipeline/prepare source)
+                         manifest-path
+                         (workflow/publish! (:workflow prepared) (:logs-root options))
+                         invoke (fn []
+                                  (try
+                                    ((:on-published options) prepared manifest-path)
+                                    :ok
+                                    (catch Object error error)))
+                         first-callback (core/future (invoke))]
+                     (is (= true (deref registration-entered 1000 :timeout)))
+                     (let [first-record (first (vals @server/active-pipelines))
+                           second-callback (core/future (invoke))]
+                       (is (= true (deref second-verified 1000 :timeout)))
+                       (deliver release-registration true)
+                       (let [first-result (deref first-callback 1000 :timeout)
+                             second-result (deref second-callback 1000 :timeout)
+                             second-record (first (vals @server/active-pipelines))]
+                         (reset! callback-results [first-result second-result])
+                         (reset! registered-identities [first-record second-record])
+                         (reset! observed-cancelled @(:cancelled second-record))))
+                     {:status :success})
+                   (finally
+                     (deliver background-complete true))))]
+              (server/handle-start-pipeline {:body server-dot}))]
+        (is (= true (deref background-complete 1000 :timeout)))
+        (is (= 201 (:status response)))
+        (is (= [:ok :ok] @callback-results))
+        (is (apply identical? @registered-identities))
+        (is (false? @observed-cancelled)))
+      (finally
+        (deliver release-registration true)
+        (remove-watch server/active-pipelines watch-key)))))
+
+(deftest timeout-that-wins-during-publication-verification-prevents-late-registration
+  (reset! server/active-pipelines {})
+  (let [verification-entered (promise)
+        release-verification (promise)
+        background-complete (promise)
+        engine-entered (atom false)
+        real-verify workflow/verify-published!
+        response
+        (with-redefs
+          [workflow/verify-published!
+           (fn [run-root fingerprint]
+             (deliver verification-entered true)
+             @release-verification
+             (real-verify run-root fingerprint))
+           pipeline/run
+           (fn [source options]
+             (try
+               (let [prepared (pipeline/prepare source)
+                     manifest-path
+                     (workflow/publish! (:workflow prepared) (:logs-root options))]
+                 ((:on-published options) prepared manifest-path)
+                 (reset! engine-entered true)
+                 {:status :success})
+               (finally
+                 (deliver background-complete true))))]
+          (let [request (core/future
+                          (server/handle-start-pipeline
+                            {:body server-dot :preparation-timeout-ms 20}))]
+            (is (= true (deref verification-entered 1000 :timeout)))
+            (let [timed-out-response (deref request 1000 :timeout)]
+              (deliver release-verification true)
+              timed-out-response)))]
+    (is (= 400 (:status response)))
+    (is (= true (deref background-complete 1000 :timeout)))
+    (is (= {} @server/active-pipelines))
+    (is (false? @engine-entered))))
+
+(deftest timeout-before-publication-prevents-late-registration-and-execution
+  (reset! server/active-pipelines {})
+  (let [prepublication-entered (promise)
+        release-publication (promise)
+        background-complete (promise)
+        engine-entered (atom false)
+        result
+        (with-redefs
+          [pipeline/run
+           (fn [source options]
+             (try
+               (let [prepared (pipeline/prepare source)]
+                 ((:on-prepared options) prepared)
+                 (deliver prepublication-entered true)
+                 @release-publication
+                 (let [manifest-path
+                       (workflow/publish! (:workflow prepared) (:logs-root options))]
+                   ((:on-published options) prepared manifest-path)
+                   (reset! engine-entered true)
+                   {:status :success}))
+               (finally
+                 (deliver background-complete true))))]
+          (let [request
+                (core/future
+                  (server/handle-start-pipeline
+                    {:body server-dot :preparation-timeout-ms 20}))
+                entered (deref prepublication-entered 1000 :timeout)
+                response (deref request 1000 :timeout)]
+            (deliver release-publication true)
+            {:entered entered
+             :response response
+             :background (deref background-complete 1000 :timeout)}))]
+    (is (= true (:entered result)))
+    (is (= 400 (:status (:response result))))
+    (is (= true (:background result)))
+    (is (= {} @server/active-pipelines))
+    (is (false? @engine-entered))))
+
+(deftest timeout-during-registration-ownership-cleans-provisional-state
+  (reset! server/active-pipelines {})
+  (let [registration-entered (promise)
+        release-registration (promise)
+        background-complete (promise)
+        engine-entered (atom false)
+        observed-cancelled (atom nil)
+        watch-key (keyword (str "timeout-registration-" (random-uuid)))]
+    (add-watch server/active-pipelines watch-key
+               (fn [_ _ old-state new-state]
+                 (when (and (empty? old-state) (seq new-state))
+                   (reset! observed-cancelled
+                           (:cancelled (first (vals new-state))))
+                   (deliver registration-entered true)
+                   @release-registration)))
+    (try
+      (let [result
+            (with-redefs
+              [pipeline/run
+               (fn [source options]
+                 (try
+                   (let [prepared (pipeline/prepare source)
+                         manifest-path
+                         (workflow/publish! (:workflow prepared) (:logs-root options))]
+                     ((:on-published options) prepared manifest-path)
+                     (reset! engine-entered true)
+                     {:status :success})
+                   (finally
+                     (deliver background-complete true))))]
+              (let [request
+                    (core/future
+                      (server/handle-start-pipeline
+                        {:body server-dot :preparation-timeout-ms 20}))
+                    entered (deref registration-entered 1000 :timeout)
+                    response (deref request 1000 :timeout)]
+                (deliver release-registration true)
+                {:entered entered
+                 :response response
+                 :background (deref background-complete 1000 :timeout)}))]
+        (is (= true (:entered result)))
+        (is (= 400 (:status (:response result))))
+        (is (= true (:background result)))
+        (is (= {} @server/active-pipelines))
+        (is (true? (deref @observed-cancelled)))
+        (is (false? @engine-entered)))
+      (finally
+        (deliver release-registration true)
+        (remove-watch server/active-pipelines watch-key)))))
+
+(deftest registered-publication-never-causes-an-unbounded-response-wait
+  (reset! server/active-pipelines {})
+  (let [delivery-entered (promise)
+        release-delivery (promise)
+        background-complete (promise)
+        real-deliver deliver
+        result
+        (with-redefs
+          [deliver
+           (fn [signal value]
+             (if (and (map? value) (:graph value))
+               (do
+                 (real-deliver delivery-entered true)
+                 @release-delivery
+                 (real-deliver signal value))
+               (real-deliver signal value)))
+           pipeline/run
+           (fn [source options]
+             (try
+               (let [prepared (pipeline/prepare source)
+                     manifest-path
+                     (workflow/publish! (:workflow prepared) (:logs-root options))]
+                 ((:on-published options) prepared manifest-path)
+                 {:status :success})
+               (finally
+                 (real-deliver background-complete true))))]
+          (let [response-future
+                (core/future
+                  (server/handle-start-pipeline
+                    {:body server-dot :preparation-timeout-ms 20}))
+                entered (deref delivery-entered 1000 :timeout)
+                response (deref response-future 200 :timeout)]
+            (real-deliver release-delivery true)
+            {:entered entered
+             :response response
+             :background (deref background-complete 1000 :timeout)}))]
+    (is (= true (:entered result)))
+    (is (not= :timeout (:response result)))
+    (is (= 201 (:status (:response result))))
+    (is (= true (:background result)))
+    (is (= 1 (count @server/active-pipelines)))))

@@ -197,6 +197,8 @@
                              (not (str/blank? dot-file))
                              (assoc :current-source-path dot-file))
             outcome (pipeline/resume cp-path resume-options)]
+        (doseq [diagnostic (:diagnostics outcome)]
+          (println (format-validation-diagnostic diagnostic)))
         (println (str "Resumed execution finished with status: " (:status outcome)))
         (if (= (:status outcome) :success)
           (os/exit 0)
