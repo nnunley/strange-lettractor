@@ -41,12 +41,16 @@
     (is (= :success (:status (pipeline/resume checkpoint-path {}))))
     ;; Resuming the pre-restart checkpoint must publish the newly allocated segment too.
     (let [resumed-events (atom [])
+          old-checkpoint (io/slurp (str root "/checkpoint.edn"))
           resumed (pipeline/resume (str root "/checkpoint.edn")
                                    {:on-event (fn [event] (swap! resumed-events conj event))})
           final-root (:logs_root (last (filterv (fn [event] (= :pipeline.started (:type event)))
                                                 @resumed-events)))]
       (is (= :success (:status resumed)))
-      (is (not= root final-root))
+      (is (= :pipeline.restarting (:type (first @resumed-events))))
+      (is (not= (os/canonical-path root) (os/canonical-path final-root)))
+      (is (= old-checkpoint (io/slurp (str root "/checkpoint.edn"))))
+      (is (= ["work" "exit"] (:completed_nodes resumed)))
       (is (= :success (:status (pipeline/resume (str final-root "/checkpoint.edn") {})))))))
 
 (defn- serialization-error [value]

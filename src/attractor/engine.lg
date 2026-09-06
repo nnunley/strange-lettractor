@@ -1116,7 +1116,7 @@
          caller-threads (:fidelity-threads options)
          first-threads (or caller-threads (atom {}))
          base-options
-         (assoc (dissoc options :fidelity-threads)
+         (assoc (dissoc options :fidelity-threads :attractor.engine/resume-restart)
                 :max-steps max-steps
                 :step-counter step-counter
                 :context ctx
@@ -1124,13 +1124,19 @@
                 :on-event on-event)]
      (loop [segment-options base-options
             threads first-threads
-            owns-threads? (nil? caller-threads)]
+            owns-threads? (nil? caller-threads)
+            pending-restart (:attractor.engine/resume-restart options)]
        (let [execution
              (try
                {:result
-                (run-pipeline*
-                  graph
-                  (assoc segment-options :fidelity-threads threads))}
+                (if pending-restart
+                  {:attractor.engine/restart true
+                   :target (:to pending-restart)
+                   :edge pending-restart
+                   :old_logs_root root-base}
+                  (run-pipeline*
+                    graph
+                    (assoc segment-options :fidelity-threads threads)))}
                (catch Object error
                  {:error error}))]
          (if-let [error (:error execution)]
@@ -1159,7 +1165,8 @@
                      (restarted-segment-options
                        base-options (:target result) (:edge result) new-root)
                      (atom {})
-                     true)))
+                     true
+                     nil)))
                (do
                  (when owns-threads?
                    (close-fidelity-threads! threads))
@@ -1208,6 +1215,8 @@
                  :node-outcomes node-outcomes
                  :node-retries (:node_retries checkpoint)
                  :initial-incoming-edge next-edge)
+          (:loop_restart next-edge)
+          (assoc :attractor.engine/resume-restart next-edge)
           (= "full" last-fidelity)
           (assoc :first-node-fidelity-override "summary:high")))
 
