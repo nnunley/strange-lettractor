@@ -2,6 +2,7 @@
   (:require [attractor.engine :as engine]
             [attractor.context :as context]
             [attractor.parser :as parser]
+            [attractor.status :as status]
             [attractor.transforms :as transforms]
             [attractor.validation :as validation]
             [attractor.workflow :as workflow]
@@ -158,6 +159,57 @@
                           :field field
                           :node-ids (vec (keys records))}))))
 
+(defn- invalid-checkpoint-value!
+  [field node-id value & [outcome-field]]
+  (snapshot-corrupt!
+    "Workflow checkpoint contains an invalid value"
+    (cond-> {:kind :checkpoint
+             :field field
+             :node-id node-id
+             :value value}
+      outcome-field (assoc :outcome-field outcome-field))))
+
+(defn- outcome-field-present? [outcome field]
+  (or (contains? outcome field)
+      (contains? outcome (name field))))
+
+(defn- outcome-field-value [outcome field]
+  (if (contains? outcome field)
+    (get outcome field)
+    (get outcome (name field))))
+
+(defn- validate-checkpoint-outcome! [node-id outcome]
+  (when-not (map? outcome)
+    (invalid-checkpoint-value! :node_outcomes node-id outcome))
+  (when-not (status/normalize-contract outcome :status)
+    (let [status-value (outcome-field-value outcome :status)
+          invalid-optional
+          (first
+            (filter
+              (fn [[field valid?]]
+                (and (outcome-field-present? outcome field)
+                     (not (valid? (outcome-field-value outcome field)))))
+              [[:preferred_label string?]
+               [:suggested_next_ids
+                (fn [ids]
+                  (and (sequential? ids) (every? string? ids)))]
+               [:context_updates map?]
+               [:notes string?]]))]
+      (if invalid-optional
+        (let [field (first invalid-optional)]
+          (invalid-checkpoint-value!
+            :node_outcomes node-id (outcome-field-value outcome field) field))
+        (invalid-checkpoint-value!
+          :node_outcomes node-id status-value :status)))))
+
+(defn- validate-checkpoint-values! [checkpoint]
+  (doseq [[node-id retry-count] (:node_retries checkpoint)]
+    (when-not (and (integer? retry-count) (not (neg? retry-count)))
+      (invalid-checkpoint-value!
+        :node_retries node-id retry-count)))
+  (doseq [[node-id outcome] (:node_outcomes checkpoint)]
+    (validate-checkpoint-outcome! node-id outcome)))
+
 (defn- validate-checkpoint-graph! [checkpoint graph]
   (let [current-node (:current_node checkpoint)
         completed (:completed_nodes checkpoint)
@@ -178,6 +230,7 @@
                           :completed-nodes completed}))
     (validate-checkpoint-map! checkpoint graph completed-set :node_outcomes)
     (validate-checkpoint-map! checkpoint graph completed-set :node_retries)
+    (validate-checkpoint-values! checkpoint)
     (when-not
       (every?
         (fn [[index transition]]

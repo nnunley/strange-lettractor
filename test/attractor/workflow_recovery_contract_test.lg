@@ -977,6 +977,71 @@
         (is (= :checkpoint (:kind error)))
         (is (= [] @events))))))
 
+(deftest public-resume-rejects-invalid-checkpoint-values-before-events-or-handlers
+  (doseq [[label field node-id value mutate]
+          [[:retry-string :node_retries "start" "oops"
+            #(assoc-in % [:node_retries "start"] "oops")]
+           [:retry-negative :node_retries "start" -1
+            #(assoc-in % [:node_retries "start"] -1)]
+           [:outcome-not-map :node_outcomes "start" :success
+            #(assoc-in % [:node_outcomes "start"] :success)]
+           [:outcome-status :node_outcomes "start" :unknown
+            #(assoc-in % [:node_outcomes "start" :status] :unknown)]
+           [:preferred-label :node_outcomes "start" 1
+            #(assoc-in % [:node_outcomes "start" :preferred_label] 1)]
+           [:suggested-ids :node_outcomes "start" ["work" 2]
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success"
+                              "suggested_next_ids" ["work" 2]}})]
+           [:context-updates :node_outcomes "start" []
+            #(assoc-in % [:node_outcomes "start" :context_updates] [])]
+           [:notes :node_outcomes "start" 42
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success" "notes" 42}})]]]
+    (testing (name label)
+      (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+            _ (update-edn-file! checkpoint-path mutate)
+            events (atom [])
+            calls (atom 0)
+            registry (handlers/make-handler-registry)
+            _ (handlers/register-handler!
+                registry "pinned.original"
+                (fn [_ _ _ _]
+                  (swap! calls inc)
+                  {:status :success}))
+            error (workflow-error
+                    #(pipeline/resume checkpoint-path
+                                      {:registry registry
+                                       :on-event #(swap! events conj %)}))]
+        (is (= :workflow_snapshot_corrupt (:category error)))
+        (is (= :checkpoint (:kind error)))
+        (is (= field (:field error)))
+        (is (= node-id (:node-id error)))
+        (is (= value (:value error)))
+        (is (= [] @events))
+        (is (= 0 @calls))))))
+
+(deftest public-resume-accepts-legacy-string-keyed-outcomes
+  (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
+        _ (update-edn-file!
+            checkpoint-path
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success"
+                              "preferred_label" ""
+                              "suggested_next_ids" []
+                              "context_updates" {}
+                              "notes" "legacy"}}))
+        calls (atom 0)
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "pinned.original"
+            (fn [_ _ _ _]
+              (swap! calls inc)
+              {:status :success}))
+        result (pipeline/resume checkpoint-path {:registry registry})]
+    (is (= :success (:status result)))
+    (is (= 1 @calls))))
+
 (deftest public-resume-allows-a-declared-retry-target-in-completed-history
   (let [source
         "digraph RetryHistory {
