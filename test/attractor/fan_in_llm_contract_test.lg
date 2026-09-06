@@ -1,0 +1,289 @@
+(ns attractor.fan-in-llm-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [attractor.fan-in-llm :as ranker]
+            [attractor.llm :as llm]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.context :as context]))
+
+(defn response [text]
+  {:provider "memory"
+   :message {:role :assistant :content text :text text}
+   :tool_calls [] :usage {} :finish_reason :stop})
+
+(defn memory-ranker [reply options]
+  (let [requests (atom [])
+        adapter (llm/make-adapter
+                  "memory"
+                  (fn [request]
+                    (swap! requests conj request)
+                    (if (fn? reply) (reply request) (response reply)))
+                  (fn [_] []))
+        client (llm/make-client {:providers {"memory" adapter}})]
+    {:requests requests :client client
+     :rank (ranker/make-ranker (merge {:client client} options))}))
+
+(def candidates
+  [{:index 0 :candidate {:id "heuristic" :status :success :score 100}}
+   {:index 2 :candidate {:id "prompt-winner" :status :success :score 0}}])
+
+(def request
+  {:node {:id "join" :llm_model "memory/node-model"
+          :llm_provider "ignored" :reasoning_effort "high"}
+   :prompt "Prefer the safer implementation"
+   :candidates candidates
+   :cancelled? (fn [] false)})
+
+(defn thrown [operation]
+  (try (operation) nil (catch Object error error)))
+
+(deftest adapter-sends-one-strict-object-request-and-selects-against-heuristic
+  (let [{:keys [rank requests]} (memory-ranker "{\"candidate_index\":2}" {})]
+    (is (= 2 (rank request)))
+    (is (= 1 (count @requests)))
+    (let [sent (first @requests)
+          schema (get-in sent [:response_format :json_schema])]
+      (is (= "memory" (:provider sent)))
+      (is (= "node-model" (:model sent)))
+      (is (= "high" (:reasoning_effort sent)))
+      (is (= {:type "object"
+              :properties {:candidate_index {:type "integer"}}
+              :required ["candidate_index"]
+              :additionalProperties false}
+             schema))
+      (is (= true (get-in sent [:response_format :strict])))
+      (is (= 2 (count (:messages sent))))
+      (is (= :system (get-in sent [:messages 0 :role])))
+      (is (= :user (get-in sent [:messages 1 :role])))
+      (is (str/includes? (get-in sent [:messages 1 :content]) (:prompt request)))
+      (is (str/includes? (get-in sent [:messages 1 :content]) (pr-str candidates)))
+      (is (= [] (:tools sent))))))
+
+(deftest explicit-default-model-settings-resolve-below-node-and-prefix-wins
+  (let [{:keys [rank requests]}
+        (memory-ranker "{\"candidate_index\":0}"
+                       {:model "memory/default-model"
+                        :provider "other"
+                        :reasoning_effort "medium"})]
+    (rank (assoc request :node {:id "join"}))
+    (is (= "memory" (:provider (first @requests))))
+    (is (= "default-model" (:model (first @requests))))
+    (is (= "medium" (:reasoning_effort (first @requests))))
+    (reset! requests [])
+    (rank (assoc request :node {:id "join" :llm_model "memory/node"
+                                :llm_provider "other"}))
+    (is (= "memory" (:provider (first @requests))))
+    (is (= "node" (:model (first @requests))))))
+
+(deftest explicit-cli-style-overrides-resolve-above-node-and-prefix-wins
+  (let [{:keys [rank requests]}
+        (memory-ranker "{\"candidate_index\":0}"
+                       {:model_override "memory/cli-model"
+                        :provider_override "ignored"})]
+    (rank request)
+    (is (= "memory" (:provider (first @requests))))
+    (is (= "cli-model" (:model (first @requests))))))
+
+(deftest abort-signal-delegates-to-the-selector-cancellation-predicate
+  (let [cancelled (atom false)
+        observed (atom nil)
+        {:keys [rank]} (memory-ranker
+                         (fn [sent]
+                           (reset! observed ((get-in sent [:abort_signal :aborted?])))
+                           (response "{\"candidate_index\":0}")) {})]
+    (rank (assoc request :cancelled? #(deref cancelled)))
+    (is (= false @observed))
+    (reset! cancelled true)
+    (let [error (thrown #(rank (assoc request :cancelled? #(deref cancelled))))]
+      (is (some? error))
+      (is (not= :configuration_error (:category (ex-data error)))))))
+
+(deftest malformed-and-schema-invalid-outputs-become-configuration-errors-with-causes
+  (doseq [reply ["not json"
+                 "{}"
+                 "{\"candidate_index\":0,\"extra\":true}"
+                 "{\"candidate_index\":1.5}"]]
+    (let [{:keys [rank]} (memory-ranker reply {})
+          error (thrown #(rank request))]
+      (is (= :configuration_error (:category (ex-data error))))
+      (is (= false (:retryable (ex-data error))))
+      (is (some? (.getCause error)))))
+  (let [{:keys [rank]} (memory-ranker "{\"candidate_index\":1.0}" {})]
+    (is (= 1 (rank (assoc request :candidates
+                          [{:index 1 :candidate {:id "one" :status :success}}]))))))
+
+(deftest structurally-valid-output-is-normalized-without-truncation-or-overflow
+  (doseq [reply ["{\"candidate_index\":1.5}"
+                 "{\"candidate_index\":1e100}"
+                 "{\"candidate_index\":9223372036854775808}"
+                 "{\"candidate_index\":1}"]]
+    (let [{:keys [rank]} (memory-ranker reply {})
+          error (thrown #(rank request))]
+      (is (= :configuration_error (:category (ex-data error))))
+      (is (= false (:retryable (ex-data error)))))))
+
+(deftest transport-errors-retain-identity-and-missing-model-is-explicit
+  (let [original (ex-info "transport" {:category :server :retryable true})
+        {:keys [rank]} (memory-ranker (fn [_] (throw original)) {})]
+    (is (identical? original (thrown #(rank request)))))
+  (let [{:keys [rank]} (memory-ranker "{\"candidate_index\":0}" {})
+        error (thrown #(rank (assoc request :node {:id "join"})))]
+    (is (= :configuration_error (:category (ex-data error))))
+    (is (= false (:retryable (ex-data error))))))
+
+(deftest adversarial-tool-call-does-not-execute-or-trigger-another-request
+  (let [calls (atom 0)
+        adapter (llm/make-adapter
+                  "memory"
+                  (fn [_]
+                    (swap! calls inc)
+                    {:provider "memory"
+                     :message {:role :assistant :content "{\"candidate_index\":0}"
+                               :text "{\"candidate_index\":0}"}
+                     :tool_calls [{:id "evil" :name "shell" :arguments {}}]
+                     :usage {} :finish_reason :tool_calls})
+                  (fn [_] []))
+        client (llm/make-client {:providers {"memory" adapter}})
+        rank (ranker/make-ranker {:client client :model "memory/model"})]
+    (is (= 0 (rank request)))
+    (is (= 1 @calls))))
+
+(deftest cancellation-does-not-return-before-held-provider-cleanup
+  (let [entered (promise) cleanup-entered (promise) release (promise)
+        cleaned (promise) cancelled (atom false)
+        adapter (llm/make-adapter
+                  "memory"
+                  (fn [sent]
+                    (deliver entered true)
+                    (try
+                      (loop []
+                        (when-not ((get-in sent [:abort_signal :aborted?]))
+                          (core/sleep 2)
+                          (recur)))
+                      (finally
+                        (deliver cleanup-entered true)
+                        (deref release 1000 nil)
+                        (deliver cleaned true)))
+                    (throw (ex-info "provider observed cancellation"
+                                    {:category :local-cancellation})))
+                  (fn [_] []))
+        client (llm/make-client {:providers {"memory" adapter}})
+        rank (ranker/make-ranker {:client client :model "memory/model"})
+        task (core/future
+               (thrown #(rank (assoc request :cancelled?
+                                     #(deref cancelled)))))]
+    (is (= true (deref entered 1000 false)))
+    (reset! cancelled true)
+    (try
+      (is (= true (deref cleanup-entered 1000 false)))
+      (is (= :pending (deref task 30 :pending)))
+      (is (= false (deref cleaned 0 false)))
+      (finally (deliver release true)))
+    (is (some? (deref task 1000 nil)))
+    (is (= true (deref cleaned 0 false)))))
+
+(deftest normal-return-waits-for-provider-descendants
+  (let [entered (promise) release (promise) cleaned (promise) escape (atom false)
+        adapter (llm/make-adapter
+                  "memory"
+                  (fn [sent]
+                    (core/future
+                      (try
+                        (loop []
+                          (when-not (or @escape
+                                        ((get-in sent [:abort_signal :aborted?])))
+                            (core/sleep 2)
+                            (recur)))
+                        (deliver entered true)
+                        (deref release 1000 nil)
+                           (finally (deliver cleaned true))))
+                    (response "{\"candidate_index\":0}"))
+                  (fn [_] []))
+        client (llm/make-client {:providers {"memory" adapter}})
+        rank (ranker/make-ranker {:client client :model "memory/model"})
+        task (core/future (rank request))]
+    (is (= true (deref entered 1000 false)))
+    (try
+      (is (= :pending (deref task 30 :pending)))
+      (finally (reset! escape true) (deliver release true)))
+    (is (= 0 (deref task 1000 nil)))
+    (is (= true (deref cleaned 0 false)))))
+
+(deftest error-return-waits-for-descendants-and-preserves-primary-error
+  (let [entered (promise) release (promise) cleaned (promise) escape (atom false)
+        original (ex-info "primary provider failure"
+                          {:category :authentication :retryable false})
+        adapter (llm/make-adapter
+                  "memory"
+                  (fn [sent]
+                    (core/future
+                      (try
+                        (loop []
+                          (when-not (or @escape
+                                        ((get-in sent [:abort_signal :aborted?])))
+                            (core/sleep 2)
+                            (recur)))
+                        (deliver entered true)
+                        (deref release 1000 nil)
+                           (finally (deliver cleaned true))))
+                    (throw original))
+                  (fn [_] []))
+        client (llm/make-client {:providers {"memory" adapter}})
+        rank (ranker/make-ranker {:client client :model "memory/model"})
+        task (core/future (thrown #(rank request)))]
+    (is (= true (deref entered 1000 false)))
+    (try
+      (is (= :pending (deref task 30 :pending)))
+      (finally (reset! escape true) (deliver release true)))
+    (is (identical? original (deref task 1000 nil)))
+    (is (= true (deref cleaned 0 false)))))
+
+(deftest ranker-scope-does-not-capture-an-existing-caller-sibling
+  (let [release (promise) sibling-entered (promise)
+        sibling (core/future
+                  (deliver sibling-entered true)
+                  (deref release 1000 nil)
+                  :sibling-done)
+        {:keys [rank]} (memory-ranker "{\"candidate_index\":0}"
+                                      {:model "memory/model"})]
+    (is (= true (deref sibling-entered 1000 false)))
+    (try
+      (is (= 0 (rank request)))
+      (is (= :pending (deref sibling 0 :pending)))
+      (finally (deliver release true)))
+    (is (= :sibling-done (deref sibling 1000 nil)))))
+
+(deftest registry-default-and-override-rankers-are-wired-to-fan-in
+  (let [{:keys [requests client]}
+        (memory-ranker "{\"candidate_index\":2}" {:model "memory/model"})
+        registry (handlers/make-handler-registry
+                   (interviewer/make-auto-approve-interviewer) nil
+                   {:fan-in-llm-options
+                    {:client client :model "memory/model"}})
+        ctx (context/make-context
+              {"parallel.results"
+               [{:id "heuristic" :status :success :score 100}
+                {:id "failed" :status :fail}
+                {:id "prompt-winner" :status :success :score 0}]})
+        outcome ((get @registry "parallel.fan_in")
+                 {:id "join" :prompt "rank"} ctx {} "logs")]
+    (is (= 1 (count @requests)))
+    (is (= "prompt-winner"
+           (get-in outcome [:context_updates "parallel.fan_in.best_id"]))))
+  (let [calls (atom 0)
+        selected (fn [_] (swap! calls inc) 2)
+        registry (handlers/make-handler-registry
+                   (interviewer/make-auto-approve-interviewer) nil
+                   {:fan-in-ranker selected})
+        ctx (context/make-context
+              {"parallel.results"
+               [{:id "heuristic" :status :success :score 100}
+                {:id "failed" :status :fail}
+                {:id "prompt-winner" :status :success :score 0}]})
+        outcome ((get @registry "parallel.fan_in")
+                 {:id "join" :prompt "rank"} ctx {} "logs")]
+    (is (= 1 @calls))
+    (is (= "prompt-winner"
+           (get-in outcome [:context_updates "parallel.fan_in.best_id"])))))

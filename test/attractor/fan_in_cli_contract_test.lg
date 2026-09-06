@@ -1,0 +1,73 @@
+(ns attractor.fan-in-cli-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [io :as io]
+            [os :as os]
+            [attractor.cli :as cli]
+            [attractor.pipeline :as pipeline]
+            [attractor.fan-in-llm :as ranker]
+            [attractor.context :as context]))
+
+(def cli-dot "digraph CLI { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+
+(defn invoke-prompted-fan-in [options]
+  (let [ctx (context/make-context
+              {"parallel.results" [{:id "winner" :status :success}]})]
+    ((get @(:registry options) "parallel.fan_in")
+     {:id "join" :prompt "choose"
+      :llm_model "node-provider/node-model"
+      :llm_provider "node-provider"}
+     ctx {} "logs")))
+
+(defn exercise-cli [command args]
+  (let [ranker-options (atom []) requests (atom []) outcomes (atom [])
+        exits (atom [])]
+    (with-redefs [ranker/make-ranker
+                  (fn [options]
+                    (swap! ranker-options conj options)
+                    (fn [request] (swap! requests conj request) 0))
+                  pipeline/run (fn [_ options]
+                                 (swap! outcomes conj
+                                        (invoke-prompted-fan-in options))
+                                 {:status :success})
+                  pipeline/resume (fn [_ options]
+                                    (swap! outcomes conj
+                                           (invoke-prompted-fan-in options))
+                                    {:status :success})
+                  os/exit #(swap! exits conj %)]
+      (with-out-str (command args)))
+    {:options @ranker-options :requests @requests
+     :outcomes @outcomes :exits @exits}))
+
+(deftest run-and-resume-pass-explicit-model-provider-to-ranker
+  (let [dot-path (str (os/temp-dir) "/fanin-cli-" (random-uuid) ".dot")
+        checkpoint (str (os/temp-dir) "/fanin-cli-" (random-uuid) ".edn")]
+    (io/spit dot-path cli-dot)
+    (io/spit checkpoint "{}")
+    (doseq [[command args]
+            [[cli/cmd-run [dot-path "--model" "prefixed/node"
+                           "--provider" "ignored" "--auto-approve"]]
+             [cli/cmd-resume ["--checkpoint" checkpoint
+                              "--model" "prefixed/node"
+                              "--provider" "ignored"]]]]
+      (let [result (exercise-cli command args)]
+        (is (= [{:model_override "prefixed/node"
+                 :provider_override "ignored"}]
+               (:options result)))
+        (is (= 1 (count (:requests result))))
+        (is (= :success (:status (first (:outcomes result)))))
+        (is (= [0] (:exits result)))))))
+
+(deftest explicit-mock-run-and-resume-reject-prompted-ranking-without-live-construction
+  (let [dot-path (str (os/temp-dir) "/fanin-cli-mock-" (random-uuid) ".dot")
+        checkpoint (str (os/temp-dir) "/fanin-cli-mock-" (random-uuid) ".edn")]
+    (io/spit dot-path cli-dot)
+    (io/spit checkpoint "{}")
+    (doseq [[command args]
+            [[cli/cmd-run [dot-path "--mock" "--model" "live/model"]]
+             [cli/cmd-resume ["--checkpoint" checkpoint "--mock"
+                              "--model" "live/model"]]]]
+      (let [error (try (exercise-cli command args) nil
+                       (catch Object error error))]
+        (is (some? error))
+        (is (= :configuration_error (:category (ex-data error))))
+        (is (= false (:retryable (ex-data error))))))))

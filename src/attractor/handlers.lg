@@ -10,6 +10,7 @@
             [attractor.parser :as parser]
             [attractor.interviewer :as interviewer]
             [attractor.fan-in :as fanin]
+            [attractor.fan-in-llm :as fanin-llm]
             [attractor.status :as status]))
 
 ;; Shape to handler type mapping (Section 2.8)
@@ -361,8 +362,7 @@
    (make-parallel-handler* execute-branch-fn pass-edge? cancellation-aware?)))
 
 ;; Fan-In Handler (Section 4.9)
-(defn handle-fan-in [node ctx _graph _logs-root]
-  ((fanin/make-handler nil) node ctx _graph _logs-root))
+(def handle-fan-in (fanin/make-handler (fanin-llm/make-ranker {})))
 
 ;; Manager Loop Handler (Section 4.11). Runtime callbacks keep child
 ;; orchestration injectable and avoid a handlers -> engine dependency cycle.
@@ -551,8 +551,15 @@
 (defn make-handler-registry
   ([] (make-handler-registry (interviewer/make-auto-approve-interviewer) nil))
   ([interviewer codergen-backend]
+   (make-handler-registry interviewer codergen-backend {}))
+  ([interviewer codergen-backend options]
    (let [branch-executor (atom nil)
          manager-runtime (atom {})
+         fan-in-ranker (if (contains? options :fan-in-ranker)
+                         (:fan-in-ranker options)
+                         (fanin-llm/make-ranker
+                           (:fan-in-llm-options options)))
+         fan-in-handler (fanin/make-handler fan-in-ranker)
          parallel-handler
          (make-parallel-handler
            (fn [branch-edge branch-ctx graph logs-root branch-cancelled?]
@@ -571,7 +578,7 @@
             "conditional" handle-conditional
             "tool" handle-tool
             "parallel" parallel-handler
-            "parallel.fan_in" handle-fan-in
+            "parallel.fan_in" fan-in-handler
             "stack.manager_loop" manager-handler
             parallel-executor-key branch-executor
             manager-runtime-key manager-runtime

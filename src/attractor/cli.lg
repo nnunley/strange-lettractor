@@ -9,6 +9,7 @@
             [attractor.interviewer :as interviewer]
             [attractor.server :as server]
             [attractor.llm :as llm]
+            [attractor.fan-in-llm :as fanin-llm]
             [attractor.agent :as agent]
             [attractor.dotenv :as dotenv]))
 
@@ -41,6 +42,19 @@
              {:model (str (:provider parsed) "/" (:model parsed))
               :reasoning_effort (:reasoning_effort node)}))})
       nil)))
+
+(defn- make-fan-in-ranker-from-args [args]
+  (if (some #{"--mock"} args)
+    (fn [_]
+      (throw (ex-info
+               "Prompted fan-in requires a real or injected ranker; --mock disables live ranking"
+               {:category :configuration_error :retryable false})))
+    (let [model (find-arg-val args "--model")
+          provider (find-arg-val args "--provider")]
+      (fanin-llm/make-ranker
+        (cond-> {}
+          (some? model) (assoc :model_override model)
+          (some? provider) (assoc :provider_override provider))))))
 
 (defn print-usage []
   (println "Attractor - Workflow Orchestration Engine for Multi-Stage LLM Pipelines")
@@ -147,7 +161,10 @@
                           (interviewer/make-auto-approve-interviewer)
                           (interviewer/make-console-interviewer))
             codergen-backend (make-codergen-backend-from-args args)
-            registry (handlers/make-handler-registry interviewer codergen-backend)
+            fan-in-ranker (make-fan-in-ranker-from-args args)
+            registry (handlers/make-handler-registry
+                       interviewer codergen-backend
+                       {:fan-in-ranker fan-in-ranker})
             on-event (fn [ev]
                        (case (:type ev)
                          :pipeline.started
@@ -192,7 +209,10 @@
         (os/exit 1))
       (let [interviewer (interviewer/make-console-interviewer)
             codergen-backend (make-codergen-backend-from-args args)
-            registry (handlers/make-handler-registry interviewer codergen-backend)
+            fan-in-ranker (make-fan-in-ranker-from-args args)
+            registry (handlers/make-handler-registry
+                       interviewer codergen-backend
+                       {:fan-in-ranker fan-in-ranker})
             resume-options (cond-> {:registry registry}
                              (not (str/blank? dot-file))
                              (assoc :current-source-path dot-file))
