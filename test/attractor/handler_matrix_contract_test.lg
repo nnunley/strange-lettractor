@@ -1,0 +1,169 @@
+(ns attractor.handler-matrix-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.context :as context]
+            [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [os :as os]))
+
+;; Dispatch-seam evidence only: these registry spies do not establish native
+;; handler behavior (parallel scheduling, human interaction, tools, or children).
+;; Expectations are deliberately independent of handlers/shape-to-type.
+(def ^:private dispatch-types
+  ["start" "exit" "codergen" "wait.human" "conditional" "parallel"
+   "parallel.fan_in" "tool" "stack.manager_loop" "subpipeline" "matrix.custom"])
+
+(defn- run-dispatch-case [shape explicit-type wrong-registration?]
+  (let [logs (str (os/temp-dir) "/attractor-handler-matrix-" (random-uuid))
+        calls (atom [])
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        graph (parser/parse-dot
+                (str "digraph Matrix {
+                       start [shape=Mdiamond, type=matrix.bootstrap]
+                       probe [shape=" shape
+                     (when explicit-type (str ", type=\"" explicit-type "\"")) "]
+                       a_default [type=matrix.branch]
+                       z_selected [type=matrix.branch]
+                       terminal [shape=Msquare]
+                       start -> probe
+                       probe -> a_default [weight=100]
+                       probe -> z_selected [weight=1]
+                       a_default -> terminal
+                       z_selected -> terminal
+                     }"))
+        ctx (context/make-context {"matrix.input" "caller-seed"})]
+    (doseq [handler-type dispatch-types]
+      (handlers/register-handler!
+        registry handler-type
+        (fn [node handler-ctx handler-graph handler-logs]
+          (swap! calls conj {:handler handler-type
+                             :id (:id node) :shape (:shape node) :type (:type node)
+                             :input (context/ctx-get handler-ctx "matrix.input")
+                             :bootstrap (context/ctx-get handler-ctx "matrix.bootstrap")
+                             :same-context (identical? ctx handler-ctx)
+                             :same-graph (= graph handler-graph)
+                             :logs handler-logs})
+          {:status :success
+           :notes (str "dispatch:" handler-type)
+           :suggested_next_ids ["z_selected"]
+           :context_updates {"matrix.witness" handler-type}})))
+    (handlers/register-handler!
+      registry "matrix.bootstrap"
+      (fn [_ _ _ _]
+        {:status :success :context_updates {"matrix.bootstrap" "engine-update"}}))
+    (handlers/register-handler!
+      registry "matrix.branch"
+      (fn [node branch-ctx _ _]
+        {:status :success
+         :context_updates {"matrix.route" (:id node)
+                           "matrix.branch-witness"
+                           (context/ctx-get branch-ctx "matrix.witness")}}))
+    ;; A bounded negative control: wrong registry entry loses both the expected
+    ;; witness and the handler's suggested route. No production source mutation.
+    (when wrong-registration?
+      (handlers/register-handler!
+        registry "conditional"
+        (fn [_ _ _ _]
+          {:status :success :context_updates {"matrix.witness" "wrong-handler"}})))
+    (let [before @registry
+          executor-before @(get before handlers/parallel-executor-key)
+          manager-before @(get before handlers/manager-runtime-key)
+          result (engine/run-pipeline
+                   graph {:registry registry :logs-root logs :context ctx
+                          ;; Two Mdiamond nodes in the start-shape row must not
+                          ;; make this test depend on map iteration order.
+                          :start-at "start"
+                          :on-event #(swap! events conj %)})]
+      {:result result :calls @calls :events @events :logs logs
+       :probe (parser/find-node graph "probe")
+       :checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))
+       :registry-preserved (= before @registry)
+       :executor-preserved (= executor-before @(get @registry handlers/parallel-executor-key))
+       :manager-preserved (= manager-before @(get @registry handlers/manager-runtime-key))})))
+
+(defn- dispatch-witness? [evidence expected]
+  (and (= ["start" "probe" "z_selected" "terminal"]
+          (get-in evidence [:result :completed_nodes]))
+       (= expected (get-in evidence [:checkpoint :context_values "matrix.witness"]))
+       (= expected (get-in evidence [:checkpoint :context_values "matrix.branch-witness"]))
+       (= "z_selected" (get-in evidence [:checkpoint :context_values "matrix.route"]))))
+
+(defn- assert-dispatch [shape explicit-type expected]
+  (let [evidence (run-dispatch-case shape explicit-type false)
+        checkpoint (:checkpoint evidence)
+        call (first (:calls evidence))]
+    (is (= :success (get-in evidence [:result :status])))
+    (is (dispatch-witness? evidence expected))
+    (is (= ["start" "probe" "z_selected" "terminal"] (:completed_nodes checkpoint)))
+    (is (= "terminal" (:current_node checkpoint)))
+    (is (= 1 (count (:calls evidence))))
+    (is (= {:handler expected :id "probe" :shape shape :type (or explicit-type "")
+            :input "caller-seed" :bootstrap "engine-update" :same-context true
+            :same-graph true :logs (:logs evidence)} call))
+    (is (= (str "dispatch:" expected) (get-in checkpoint [:node_outcomes "probe" :notes])))
+    (is (= ["z_selected"] (get-in checkpoint [:node_outcomes "probe" :suggested_next_ids])))
+    (is (= :success (get-in checkpoint [:node_outcomes "probe" :status])))
+    (is (= ["start" "probe" "z_selected"]
+           (mapv :node_id (filter #(= :stage.started (:type %)) (:events evidence)))))
+    (is (nil? (get-in checkpoint [:node_outcomes "terminal"])))
+    (is (:registry-preserved evidence))
+    (is (:executor-preserved evidence))
+    (is (:manager-preserved evidence))))
+
+(deftest built-in-shapes-dispatch-through-engine-registry
+  (doseq [[shape expected]
+          [["Mdiamond" "start"]
+           ["box" "codergen"]
+           ["hexagon" "wait.human"]
+           ["diamond" "conditional"]
+           ["component" "parallel"]
+           ["tripleoctagon" "parallel.fan_in"]
+           ["parallelogram" "tool"]
+           ["house" "stack.manager_loop"]]]
+    (testing (str shape " resolves to " expected)
+      (assert-dispatch shape nil expected))))
+
+(deftest explicit-built-in-and-custom-types-beat-conflicting-shapes
+  (doseq [[explicit-type shape]
+          [["start" "diamond"] ["exit" "diamond"]
+           ["codergen" "diamond"] ["wait.human" "diamond"]
+           ["conditional" "box"] ["parallel" "diamond"]
+           ["parallel.fan_in" "diamond"] ["tool" "diamond"]
+           ["stack.manager_loop" "diamond"] ["subpipeline" "diamond"]
+           ["matrix.custom" "diamond"]]]
+    (testing explicit-type
+      (assert-dispatch shape explicit-type explicit-type))))
+
+(deftest unknown-types-and-shapes-use-the-documented-fallback-order
+  (assert-dispatch "hexagon" "matrix.unregistered" "wait.human")
+  (assert-dispatch "unregistered_shape" "matrix.unregistered" "codergen")
+  (assert-dispatch "unregistered_shape" nil "codergen"))
+
+(deftest msquare-resolves-to-exit-but-terminal-engine-boundary-skips-dispatch
+  (let [registry (handlers/make-handler-registry)
+        exit-spy (fn [_ _ _ _] {:status :fail})
+        _ (handlers/register-handler! registry "exit" exit-spy)
+        evidence (run-dispatch-case "Msquare" nil false)]
+    (is (identical? exit-spy (handlers/resolve-handler registry (:probe evidence))))
+    (is (= :success (get-in evidence [:result :status])))
+    (is (= ["start" "probe"] (get-in evidence [:result :completed_nodes])))
+    (is (empty? (:calls evidence)))
+    (is (= "probe" (get-in evidence [:checkpoint :current_node])))
+    (is (= ["start"]
+           (mapv :node_id (filter #(= :stage.started (:type %)) (:events evidence)))))
+    (is (nil? (get-in evidence [:checkpoint :node_outcomes "probe"])))
+    (is (nil? (get-in evidence [:checkpoint :context_values "matrix.witness"])))
+    (is (nil? (get-in evidence [:checkpoint :context_values "matrix.route"])))
+    (is (:registry-preserved evidence))))
+
+(deftest dispatch-witness-rejects-wrong-registration-and-default-route
+  (let [correct (run-dispatch-case "diamond" nil false)
+        wrong (run-dispatch-case "diamond" nil true)]
+    (is (dispatch-witness? correct "conditional"))
+    (is (not (dispatch-witness? wrong "conditional")))
+    (is (= :success (get-in wrong [:result :status])))
+    (is (= ["start" "probe" "a_default" "terminal"]
+           (get-in wrong [:result :completed_nodes])))
+    (is (= "wrong-handler" (get-in wrong [:checkpoint :context_values "matrix.witness"])))
+    (is (= "a_default" (get-in wrong [:checkpoint :context_values "matrix.route"])))))
