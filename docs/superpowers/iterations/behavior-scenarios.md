@@ -106,6 +106,21 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Intended mapping syntax is the Clojure reader superset of EDN. The user-approved ordinary string-map workaround remains a known unmet requirement: metadata/discard acceptance lives in the failing compatibility suite, not in the default passing evidence
 - Seam: public pipeline/engine/checkpoint integration, supplemented by compiled CLI file-backed execution and recovery
 
+### SCN-GRAPH-MERGE — Transform-based graph composition
+
+- Given two independently parsed graphs and a caller custom transform that merges nodes and edges into one valid graph
+- When public preparation validates and captures the transformed graph, then execution runs it
+- Then the merged nodes and edges are present in validation and the captured plan, execution traverses the intended merged route, and the original parsed inputs remain unchanged
+- Seam: public transform/validation/pipeline/checkpoint integration; pending reusable proof, not a requirement for a new built-in merger API
+
+### SCN-CLOJURE-READER — Safe Clojure data-reading syntax
+
+- Given valid metadata and reader-discard forms in project data, including quoted context-mapping strings
+- When data is read without evaluation and validated against the artifact's schema
+- Then the resulting values preserve Clojure reader semantics; mappings contain exactly one resulting string/string map and files retain `.edn` names
+- The temporary scanner must not be mistaken for completion: the five compatibility acceptance assertions currently fail and must move into default discovery when native support is restored
+- Seam: native reader/application integration; dependent on upstream compatibility fixes, not a local PEG redesign
+
 ### SCN-LOOP-RESTART — Fresh-run restart edge
 
 - Given a selected edge with `loop_restart=true`

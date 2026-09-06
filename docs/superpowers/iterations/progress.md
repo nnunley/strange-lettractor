@@ -1,8 +1,8 @@
 # Progress
 
 **Phase:** implementing ITER-0005
-**Task:** paired three-tier iteration audit (Task 7)
-**Iterations:** 5 complete, 8 pending
+**Task:** audited iteration integration and main verification (Task 7)
+**Iterations:** 5 complete, 9 pending
 **Sentinel corpus:** 4 established; latest default suite at `bfdc5a3`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0005 — context-mapped composition
 

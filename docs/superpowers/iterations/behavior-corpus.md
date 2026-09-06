@@ -14,7 +14,7 @@ Commands are run from the repository root with the configured local compiler at 
 | SCN-STATUS-FILE | engine integration | impacted | `rg -q '^;; SCN-STATUS-FILE COMPLETE$' test/attractor/status_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in ITER-0001 |
 | SCN-AUTO-STATUS | parser/engine integration | impacted | `rg -q '^;; SCN-AUTO-STATUS COMPLETE$' test/attractor/status_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | passing in ITER-0001 |
 | SCN-CONTEXT-ISOLATION | context integration | impacted | `rg -q '^;; SCN-CONTEXT-ISOLATION COMPLETE$' test/attractor/context_isolation_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/context_isolation_contract_test.lg` | passing in ITER-0003 |
-| SCN-PIPELINE-COMPOSITION | public pipeline/engine/checkpoint integration | impacted | `rg -q '^;; SCN-PIPELINE-COMPOSITION COMPLETE$' test/attractor/composition_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending audit in ITER-0005; full suite includes configuration, capture, selected-plan, mapped, and nested contracts; reader compatibility remains separate and failing |
+| SCN-PIPELINE-COMPOSITION | public pipeline/engine/checkpoint integration | impacted | `rg -q '^;; SCN-PIPELINE-COMPOSITION COMPLETE$' test/attractor/composition_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | audited ITER-0005; full suite 473/3370/0 includes configuration, capture, selected-plan, mapped, and nested contracts; ATTR-READ-01 remains separate and failing |
 | SCN-VALIDATION | validation/engine integration | impacted | `rg -q '^;; SCN-VALIDATION COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg` | passing in ITER-0002 |
 | SCN-LOOP-RESTART | engine integration | impacted | `rg -q '^;; SCN-LOOP-RESTART COMPLETE$' test/attractor/loop_restart_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/loop_restart_contract_test.lg` | passing in ITER-0003 |
 | SCN-TRANSFORM-ORDER | transform/validation integration | impacted | `rg -q '^;; SCN-TRANSFORM-ORDER COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg` | passing in ITER-0002 |
@@ -45,5 +45,10 @@ Commands are run from the repository root with the configured local compiler at 
 | SCN-OPENAI-COMPAT | local HTTP integration | impacted | `rg -q 'SCN-OPENAI-COMPAT' test/attractor/llm_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0011 |
 | SCN-ATTR-SMOKE-LIVE | end to end | release/manual residual | `test -x scripts/test-live-providers && LIVE_LLM_TESTS=1 scripts/test-live-providers attractor-smoke` | pending ITER-0012; requires credentials |
 | SCN-PROVIDER-MATRIX | live provider contract | release/manual residual | `test -x scripts/test-live-providers && LIVE_LLM_TESTS=1 scripts/test-live-providers provider-matrix` | pending ITER-0012; requires credentials |
+
+Additional full-goal residual gates from the ITER-0005 audit:
+
+- `SCN-GRAPH-MERGE`: `rg -q '^;; SCN-GRAPH-MERGE COMPLETE$' test/attractor/lifecycle_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test test/attractor/lifecycle_contract_test.lg` — pending valid nodes-and-edges merge execution proof.
+- `SCN-CLOJURE-READER`: `/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg` — currently 1 test / 5 failed assertions / exit 1. This is failing acceptance evidence, not a skip or pass; broader artifact-reader checks must accompany restoration.
 
 Build/AOT release check: `LGX_LG=/Users/ndn/development/let-go/lg lgx build`.

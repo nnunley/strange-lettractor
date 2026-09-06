@@ -106,7 +106,7 @@ Task 6 evidence: test-only `49d402a` plus review strengthening `bfdc5a3`, both g
 
 Files: `docs/superpowers/iterations/{behavior-scenarios,behavior-corpus,progress,roadmap}.md`, `docs/superpowers/iterations/requirements/attractor.md`, `README.md`, composition tests.
 
-- [ ] Run the complete suite and AOT with the local compiler; compare baseline 405/2531/0. Preserve failures as evidence and fix them before completion claims.
-- [ ] Run paired three-tier adversarial audits: deep ATTR-COMPOSE-01/SCN-PIPELINE-COMPOSITION; impacted pinned recovery/lifecycle/context/engine/status/manager/CLI/server; established parser/engine/timeout/checkpoint sentinels. Require explicit inspection of authorization-before-read, alias identity, exact child selection, transactional output, cancellation join, and interrupted-child recovery. Remediate and re-review every finding.
-- [ ] Add `;; SCN-PIPELINE-COMPOSITION COMPLETE` only after scenario proof, update corpus and requirements to done:ITER-0005, and document child-run semantics in README/tutorial without claiming whole-spec completion.
+- [x] Run the complete suite and AOT with the local compiler; compare baseline 405/2531/0. Preserve failures as evidence and fix them before completion claims.
+- [x] Run paired three-tier adversarial audits: deep ATTR-COMPOSE-01/SCN-PIPELINE-COMPOSITION; impacted pinned recovery/lifecycle/context/engine/status/manager/CLI/server; established parser/engine/timeout/checkpoint sentinels. Require explicit inspection of authorization-before-read, alias identity, exact child selection, transactional output, cancellation join, and interrupted-child recovery. Remediate and re-review every finding.
+- [x] Add `;; SCN-PIPELINE-COMPOSITION COMPLETE` only after scenario proof, update corpus and requirements to done:ITER-0005, and document child-run semantics in README/tutorial without claiming whole-spec completion.
 - [ ] Commit, fast-forward main while preserving unrelated changes/worktrees, run full suite/AOT on main, push public main and verify remote commit. Next roadmap work remains ITER-0006.

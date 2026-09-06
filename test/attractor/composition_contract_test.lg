@@ -1,3 +1,5 @@
+;; SCN-PIPELINE-COMPOSITION COMPLETE
+;; Scoped composition delivery; ATTR-READ-01 retains the failing full-reader gate.
 (ns attractor.composition-contract-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
