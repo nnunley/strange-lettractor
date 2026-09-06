@@ -119,6 +119,15 @@
       (when-not (str/blank? (:fallback_retry_target graph))
         (:fallback_retry_target graph))))
 
+(defn- outcome-field-present? [outcome field]
+  (or (contains? outcome field)
+      (contains? outcome (name field))))
+
+(defn- outcome-field-value [outcome field]
+  (if (contains? outcome field)
+    (get outcome field)
+    (get outcome (name field))))
+
 (defn- declared-retry-transition? [graph outcomes prior-node-ids from-id to-id]
   (let [from-node (parser/find-node graph from-id)
         from-outcome (get outcomes from-id)]
@@ -141,6 +150,9 @@
 (defn- valid-checkpoint-transition?
   [graph outcomes prior-node-ids [from-id to-id]]
   (or (some #(= to-id (:to %)) (parser/outgoing-edges graph from-id))
+      (let [from-outcome (get outcomes from-id)]
+        (and (outcome-field-present? from-outcome :next_node_id)
+             (= to-id (outcome-field-value from-outcome :next_node_id))))
       (declared-retry-transition?
         graph outcomes prior-node-ids from-id to-id)))
 
@@ -168,16 +180,7 @@
              :value value}
       outcome-field (assoc :outcome-field outcome-field))))
 
-(defn- outcome-field-present? [outcome field]
-  (or (contains? outcome field)
-      (contains? outcome (name field))))
-
-(defn- outcome-field-value [outcome field]
-  (if (contains? outcome field)
-    (get outcome field)
-    (get outcome (name field))))
-
-(defn- validate-checkpoint-outcome! [node-id outcome]
+(defn- validate-checkpoint-outcome! [graph node-id outcome]
   (when-not (map? outcome)
     (invalid-checkpoint-value! :node_outcomes node-id outcome))
   (when-not (status/normalize-contract outcome :status)
@@ -199,15 +202,21 @@
           (invalid-checkpoint-value!
             :node_outcomes node-id (outcome-field-value outcome field) field))
         (invalid-checkpoint-value!
-          :node_outcomes node-id status-value :status)))))
+          :node_outcomes node-id status-value :status))))
+  (when (outcome-field-present? outcome :next_node_id)
+    (let [next-node-id (outcome-field-value outcome :next_node_id)]
+      (when-not (and (string? next-node-id)
+                     (parser/find-node graph next-node-id))
+        (invalid-checkpoint-value!
+          :node_outcomes node-id next-node-id :next_node_id)))))
 
-(defn- validate-checkpoint-values! [checkpoint]
+(defn- validate-checkpoint-values! [checkpoint graph]
   (doseq [[node-id retry-count] (:node_retries checkpoint)]
     (when-not (and (integer? retry-count) (not (neg? retry-count)))
       (invalid-checkpoint-value!
         :node_retries node-id retry-count)))
   (doseq [[node-id outcome] (:node_outcomes checkpoint)]
-    (validate-checkpoint-outcome! node-id outcome)))
+    (validate-checkpoint-outcome! graph node-id outcome)))
 
 (defn- validate-checkpoint-graph! [checkpoint graph]
   (let [current-node (:current_node checkpoint)
@@ -229,7 +238,7 @@
                           :completed-nodes completed}))
     (validate-checkpoint-map! checkpoint graph completed-set :node_outcomes)
     (validate-checkpoint-map! checkpoint graph completed-set :node_retries)
-    (validate-checkpoint-values! checkpoint)
+    (validate-checkpoint-values! checkpoint graph)
     (when-not
       (every?
         (fn [[index transition]]

@@ -22,18 +22,29 @@
 (defn- normalize-node-outcomes [outcomes]
   (into {}
         (map (fn [[node-id outcome]]
-               (let [status (or (:status outcome) (get outcome "status"))]
+               (let [status (or (:status outcome) (get outcome "status"))
+                     next-node-id-present?
+                     (or (contains? outcome :next_node_id)
+                         (contains? outcome "next_node_id"))
+                     next-node-id
+                     (if (contains? outcome :next_node_id)
+                       (:next_node_id outcome)
+                       (get outcome "next_node_id"))
+                     normalized
+                     {:status (if (keyword? status) status (keyword (str status)))
+                      :preferred_label (or (:preferred_label outcome)
+                                           (get outcome "preferred_label") "")
+                      :suggested_next_ids (or (:suggested_next_ids outcome)
+                                              (get outcome "suggested_next_ids") [])
+                      :context_updates (or (:context_updates outcome)
+                                           (get outcome "context_updates") {})
+                      :notes (or (:notes outcome) (get outcome "notes") "")
+                      :failure_reason (or (:failure_reason outcome)
+                                          (get outcome "failure_reason") "")}]
                  [(str node-id)
-                  {:status (if (keyword? status) status (keyword (str status)))
-                   :preferred_label (or (:preferred_label outcome)
-                                        (get outcome "preferred_label") "")
-                   :suggested_next_ids (or (:suggested_next_ids outcome)
-                                           (get outcome "suggested_next_ids") [])
-                   :context_updates (or (:context_updates outcome)
-                                        (get outcome "context_updates") {})
-                   :notes (or (:notes outcome) (get outcome "notes") "")
-                   :failure_reason (or (:failure_reason outcome)
-                                       (get outcome "failure_reason") "")}]))
+                  (cond-> normalized
+                    next-node-id-present?
+                    (assoc :next_node_id next-node-id))]))
              (or outcomes {}))))
 
 ;; Best edge by weight descending, then target node id ascending (lexical tiebreak)
@@ -1174,13 +1185,14 @@
                      :preferred_label
                      (context/ctx-get-string ctx "preferred_label" "")})
         failed? (= :fail (:status outcome))
-        next-edge (when last-node
+        saved-next-id (:next_node_id saved-outcome)
+        next-edge (when (and last-node (nil? saved-next-id))
                     (if failed?
                       (select-failure-edge last-node outcome ctx graph)
                       (select-edge last-node outcome ctx graph)))
-        retry-target (when (and failed? (nil? next-edge))
+        retry-target (when (and (nil? saved-next-id) failed? (nil? next-edge))
                        (resolve-node-retry-target last-node))
-        next-id (or (:to next-edge) retry-target)]
+        next-id (or saved-next-id (:to next-edge) retry-target)]
 
     (cond
       (and next-id (parser/find-node graph next-id))

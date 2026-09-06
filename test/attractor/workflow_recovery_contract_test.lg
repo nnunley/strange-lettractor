@@ -997,7 +997,15 @@
             #(assoc-in % [:node_outcomes "start" :context_updates] [])]
            [:notes :node_outcomes "start" 42
             #(assoc % :node_outcomes
-                    {"start" {"status" "success" "notes" 42}})]]]
+                    {"start" {"status" "success" "notes" 42}})]
+           [:next-node-id :node_outcomes "start" 42
+            #(assoc-in % [:node_outcomes "start" :next_node_id] 42)]
+           [:legacy-next-node-id :node_outcomes "start" 42
+            #(assoc % :node_outcomes
+                    {"start" {"status" "success" "next_node_id" 42}})]
+           [:unknown-next-node-id :node_outcomes "start" "not-in-captured-plan"
+            #(assoc-in % [:node_outcomes "start" :next_node_id]
+                       "not-in-captured-plan")]]]
     (testing (name label)
       (let [{:keys [checkpoint-path]} (interrupted-pinned-run)
             _ (update-edn-file! checkpoint-path mutate)
@@ -1041,6 +1049,73 @@
         result (pipeline/resume checkpoint-path {:registry registry})]
     (is (= :success (:status result)))
     (is (= 1 @calls))))
+
+(deftest public-resume-preserves-a-parallel-forks-legacy-next-node-id
+  (let [source
+        "digraph ParallelResume {
+           start [shape=Mdiamond]
+           fork [shape=component, max_parallel=2]
+           left [type=parallel.count]
+           right [type=parallel.count]
+           join [shape=tripleoctagon]
+           exit [shape=Msquare]
+           start -> fork
+           fork -> left -> join
+           fork -> right -> join
+           join -> exit
+         }"
+        run-root (publication-root)
+        checkout (str (os/temp-dir) "/lettractor-parallel-current-"
+                      (random-uuid))
+        source-path (str checkout "/root.dot")
+        _ (io/mkdir checkout)
+        _ (io/spit source-path source)
+        calls (atom {})
+        registry (handlers/make-handler-registry)
+        _ (handlers/register-handler!
+            registry "parallel.count"
+            (fn [node _ _ _]
+              (swap! calls update (:id node) (fnil inc 0))
+              {:status :success
+               :context_updates {(str "branch." (:id node)) true}}))
+        initial (pipeline/run source {:source-path source-path
+                                      :logs-root run-root
+                                      :registry registry
+                                      :max-steps 2})
+        initial-calls @calls
+        checkpoint-path (str run-root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint checkpoint-path)
+        fork-outcome (get-in checkpoint [:node_outcomes "fork"])
+        _ (update-edn-file!
+            checkpoint-path
+            #(assoc-in % [:node_outcomes "fork"]
+                       {"status" "success"
+                        "next_node_id" "join"
+                        "context_updates" (:context_updates fork-outcome)
+                        "notes" (:notes fork-outcome)}))
+        events (atom [])
+        resumed (pipeline/resume checkpoint-path
+                                 {:registry registry
+                                  :on-event #(swap! events conj %)})
+        resumed-calls @calls
+        final-checkpoint (context/load-checkpoint checkpoint-path)
+        completed-resume (pipeline/resume checkpoint-path
+                                          {:registry registry})]
+    (is (= :fail (:status initial)))
+    (is (= ["start" "fork"] (:completed_nodes checkpoint)))
+    (is (= {"left" 1 "right" 1} initial-calls))
+    (is (= :success (:status resumed)))
+    (is (= "join"
+           (:node_id (first (filter #(= :stage.started (:type %)) @events)))))
+    (is (= {"left" 1 "right" 1} resumed-calls))
+    (is (= ["start" "fork" "join" "exit"]
+           (:completed_nodes final-checkpoint)))
+    (is (= "join"
+           (get-in final-checkpoint [:node_outcomes "fork" :next_node_id])))
+    ;; A second public resume validates the persisted non-edge fork -> join
+    ;; history rather than accepting arbitrary jumps.
+    (is (= :success (:status completed-resume)))
+    (is (= {"left" 1 "right" 1} @calls))))
 
 (deftest public-resume-allows-a-declared-retry-target-in-completed-history
   (let [source
