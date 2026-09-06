@@ -12,6 +12,7 @@ the actual configured compiler and rerun the relevant behavior checks.
 | [#806: async helper scope ownership](https://github.com/nooga/let-go/issues/806) | Parallel invocation scope; `test/attractor/parallel_join_contract_test.lg` | Add real async-helper descendant cancellation/join evidence and remove the documented ownership exception only when proved. |
 | [#807: unfinished trailing forms](https://github.com/nooga/let-go/issues/807) | Test discovery checks and independent JVM reader checks | Verify malformed sources fail visibly across evaluation, namespace loading, and AOT; then reassess the extra manual syntax cross-check. |
 | [#808: unary negation overflow](https://github.com/nooga/let-go/issues/808) | `src/attractor/fan_in.lg` descending score comparison | Verify ordinary `(- Long/MIN_VALUE)` and first-class/apply calls throw overflow. Retain direct comparison: Clojure also cannot safely negate this score. |
+| [#809: UUID string coercion](https://github.com/nooga/let-go/issues/809) | Unique manager-test fixture names in `test/attractor/engine_test.lg` | Verify `str` returns canonical UUID text while `pr-str` and direct UUID printing remain tagged. Reassess fixture-name sanitization separately from general path escaping. |
 
 ## Restoration checks
 

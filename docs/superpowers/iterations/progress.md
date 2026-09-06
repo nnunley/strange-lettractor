@@ -1,10 +1,22 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** fan-in Task 1 selector reviewed; Task 2 unified LLM adapter and entrypoint wiring next
+**Task:** fan-in Task 2 adapter/wiring reviewed; Task 3 public lifecycle, recovery and cancellation proof next
 **Iterations:** 6 complete, 8 pending
 **Sentinel corpus:** 4 established; post-merge main at `ac7b241`: 473 tests / 3,370 assertions / 0 failures. Separate deferred reader check: 1 test / 5 failed assertions.
 **Current iteration:** ITER-0006 — interactive concurrency; ATTR-PAR-02 component complete, iteration incomplete
+
+**Latest fan-in adapter checkpoint:** `3f8e9f5` adds the real unified-client ranker
+and CLI run/resume wiring; `4c704cb` rejects empty parsed model/provider before any
+provider call; `6608811` proves exceptional caller-scope restoration. Both Task 2
+reviews approve. Root full suite passes 526/3764/0 after reviewed test-only manager
+deadline stabilization `c4bbc15`; the original 100ms deadline is unchanged. AOT
+passes; compiled prompted --mock execution fails explicitly and persists no winner.
+Separate reader acceptance remains 5 failures. Public real-ranker lifecycle,
+pinned recovery, and cancellation/timeout evidence are still Task 3. The shared
+client caller-abort/worker-cleanup distinction is recorded under ULLM-CANCEL-01;
+ranker-owned native scopes supply the workflow's stronger joined-cleanup guarantee.
+UUID string coercion difference is tracked as let-go #809 with restoration notes.
 
 **Fan-in checkpoint:** `cf03766` implements score-aware deterministic and injected
 selection; `901dfa4` strengthens parent-context, status-order and tie evidence.

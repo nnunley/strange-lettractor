@@ -881,6 +881,7 @@ digraph Gate {
     (io/delete-file child-dotfile)))
 
 (deftest test-manager-real-child-observes-attempt-cancellation
+  ;; nooga/let-go#809: UUID str includes EDN quotes; revisit via docs/let-go-followups.md.
   (let [fixture-id (str/replace (str (random-uuid)) #"[^A-Za-z0-9-]" "")
         child-dotfile (str (os/temp-dir) "/lettractor-manager-cancel-" fixture-id ".dot")
         logs (str (os/temp-dir) "/lettractor-manager-logs-" fixture-id)
