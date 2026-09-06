@@ -2,6 +2,10 @@
   (:require [clojure.test :refer [deftest is]]
             [clojure.core :as core]
             [async :as async]
+            [io :as io]
+            [os :as os]
+            [clojure.string :as str]
+            [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]))
 
@@ -17,6 +21,142 @@
    {:id "fork" :attrs attrs :cancelled? cancelled?}
    (context/make-context) (graph-for ids) "run"))
 (defn results [outcome] (get-in outcome [:context_updates "parallel.results"]))
+
+(def public-dot
+  "digraph Join { start [shape=Mdiamond]; fork [shape=component, join_policy=first_success, max_parallel=2]; slow [type=probe, timeout=10s]; winner [type=probe, timeout=10s]; join [shape=tripleoctagon]; exit [shape=Msquare]; start -> fork; fork -> slow; fork -> winner; slow -> join; winner -> join; join -> exit; }")
+(defn public-root [] (str (os/temp-dir) "/public-parallel-" (random-uuid)))
+(defn parent-terminal? [event]
+  (or (contains? #{:pipeline.completed :pipeline.failed :pipeline.cancelled} (:type event))
+      (and (= "fork" (:node_id event))
+           (contains? #{:stage.completed :stage.failed} (:type event)))))
+
+(deftest public-first-success-joins-native-attempt-workers-before-routing
+  (doseq [external? [false true]]
+    (let [blocked (async/chan) entered (promise) cleanup (promise) release (promise)
+          cancelled (atom false) cleaned (atom false) events (atom []) seen (atom {})
+          root (public-root) ctx (context/make-context {"shared" ["parent"]})
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler!
+              registry "probe"
+              (fn [node branch _ _]
+                (swap! seen assoc (:id node) (context/ctx-get branch "shared"))
+                (context/ctx-set! branch "shared" [(:id node)])
+                (if (= "slow" (:id node))
+                  (try
+                    (deliver entered true)
+                    (core/<! blocked)
+                    (deliver cleanup ((:cancelled? node)))
+                    (deref release 5000 :timeout)
+                    {:status :cancelled}
+                    (finally (reset! cleaned true)))
+                  (do (deref entered 3000 :timeout) {:status :success}))))
+          fanins (atom [])
+          _ (handlers/register-handler!
+              registry "parallel.fan_in"
+              (fn [node parent graph logs]
+                (swap! fanins conj @cleaned)
+                (handlers/handle-fan-in node parent graph logs)))
+          task (core/future
+                 (try
+                   (pipeline/run public-dot
+                     {:logs-root root :context ctx :registry registry
+                      :cancelled? #(deref cancelled)
+                      :on-event #(swap! events conj %)})
+                   (catch Object e {:caught e})))]
+      (try
+        (is (= true (deref cleanup 3000 :timeout)))
+        (when external? (reset! cancelled true))
+        (is (= ::pending (deref task 20 ::pending)))
+        (is (false? @cleaned))
+        (is (empty? @fanins))
+        (is (not-any? parent-terminal? @events))
+        (finally (async/close! blocked) (deliver release true)))
+      (let [outcome (deref task 3000 :timeout)]
+        (is (= (if external? :cancelled :success) (:status outcome)))
+        (is @cleaned)
+        (is (= {"slow" ["parent"] "winner" ["parent"]} @seen))
+        (is (= ["parent"] (context/ctx-get ctx "shared")))
+        (is (= (if external? [] [true]) @fanins))
+        (if external?
+          (do (is (nil? (context/ctx-get ctx "parallel.results")))
+              (is (= :pipeline.cancelled (:type (last @events)))))
+          (let [checkpoint (read-string (io/slurp (str root "/checkpoint.edn")))
+                branches (get-in checkpoint [:context_values "parallel.results"])]
+            (is (= ["slow" "winner"] (mapv :id branches)))
+            (is (= [:cancelled :success] (mapv :status branches)))
+            (is (= "join" (:boundary_node_id (second branches))))
+            (is (= ["start" "fork" "join" "exit"] (:completed_nodes checkpoint)))
+            (is (= :pipeline.completed (:type (last @events))))))))))
+
+(deftest public-branch-primary-exception-survives-fidelity-cleanup-failure
+  (let [primary (ex-info "primary-branch-event" {:category :configuration_error :retryable false})
+        secondary (ex-info "secondary-fidelity-close" {:category :configuration_error :retryable false})
+        closed (atom 0) events (atom []) registry (handlers/make-handler-registry)]
+    (handlers/register-handler!
+      registry "probe"
+      (fn [node _ _ _]
+        (swap! (:fidelity_threads node) assoc "owned"
+               {:close (fn [] (swap! closed inc) (throw secondary))})
+        {:status :success}))
+    (let [outcome (pipeline/run (str/replace public-dot "max_parallel=2" "max_parallel=1")
+                    {:logs-root (public-root) :registry registry
+                     :on-event (fn [event]
+                                 (swap! events conj event)
+                                 (when (and (= "slow" (:node_id event))
+                                            (= :stage.completed (:type event)))
+                                   (throw primary)))})]
+      (is (= :fail (:status outcome)))
+      (is (str/includes? (:failure_reason outcome) "primary-branch-event"))
+      (is (not (str/includes? (:failure_reason outcome) "secondary-fidelity-close")))
+      (is (= 1 @closed))
+      (is (not-any? #(= "winner" (:node_id %)) @events)))))
+
+(deftest public-returned-fail-and-handler-exception-keep-retry-semantics
+  (doseq [[mode expected-status expected-calls expected-close]
+          [[:returned-fail :success {"slow" 1 "winner" 1} 1]
+           [:retryable-throw :success {"slow" 2} 1]
+           [:returned-fail-and-close-throw :fail {"slow" 1} 1]
+           [:success-and-close-throw :fail {"slow" 1} 1]]]
+    (let [calls (atom {}) closed (atom 0) events (atom [])
+          registry (handlers/make-handler-registry)
+          _ (handlers/register-handler!
+              registry "probe"
+              (fn [node _ _ _]
+                (let [id (:id node) attempt (get (swap! calls update id (fnil inc 0)) id)]
+                  (when (= id "slow")
+                    (swap! (:fidelity_threads node) assoc "owned"
+                           {:close (fn []
+                                     (swap! closed inc)
+                                     (when (contains? #{:returned-fail-and-close-throw
+                                                        :success-and-close-throw} mode)
+                                       (throw (ex-info "cleanup-without-thrown-primary"
+                                                      {:retryable false}))))}))
+                  (cond
+                    (= id "winner") {:status :success}
+                    (contains? #{:returned-fail :returned-fail-and-close-throw} mode)
+                    {:status :fail :failure_reason "ordinary-fail"}
+                    (and (= mode :retryable-throw) (= attempt 1))
+                    (throw (ex-info "retryable-handler-error" {:retryable true}))
+                    :else {:status :success}))))
+          outcome (pipeline/run
+                    (-> public-dot
+                        (str/replace "max_parallel=2" "max_parallel=1")
+                        (str/replace "slow [type=probe," "slow [type=probe, max_retries=1,"))
+                    {:logs-root (public-root) :registry registry
+                     :retry-policy {:initial_delay_ms 0} :sleep-fn (fn [_] nil)
+                     :on-event #(swap! events conj %)})]
+      (is (= expected-status (:status outcome)))
+      (is (= expected-calls @calls))
+      (is (= expected-close @closed))
+      (is (= (if (= mode :retryable-throw) ["slow"] [])
+             (mapv :node_id (filter #(= :stage.retrying (:type %)) @events))))
+      (when (= :fail expected-status)
+        (is (str/includes? (:failure_reason outcome) "cleanup-without-thrown-primary")))
+      (when (= mode :returned-fail)
+        (let [fork (first (filter #(and (= "fork" (:node_id %))
+                                       (= :stage.completed (:type %))) @events))]
+          (is (= [:fail :success] (mapv :status (results (:outcome fork)))))
+          (is (= "ordinary-fail" (:failure_reason (first (results (:outcome fork)))))))))))
 
 (deftest first-success-cancels-and-joins-before-return
   (let [entered (promise) cleanup (promise) release (promise)

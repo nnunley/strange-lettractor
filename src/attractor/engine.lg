@@ -847,19 +847,28 @@
          _parallel-init (when parallel-executor
                           (reset! parallel-executor
                                   (fn [branch-edge branch-ctx branch-graph branch-logs branch-cancelled?]
-                                    (let [branch-threads (atom {})]
-                                      (try
-                                        (execute-subgraph
-                                          branch-edge branch-ctx branch-graph
-                                          branch-logs registry on-event
-                                          (assoc retry-options
-                                                 :retry-counts (atom {})
-                                                 :branch-cancelled? (fn [] (or (cancelled?)
-                                                                                (branch-cancelled?)))
-                                                 :fidelity-threads branch-threads))
-                                        (finally
-                                          (close-fidelity-threads!
-                                            branch-threads)))))))
+                                    (let [branch-threads (atom {})
+                                          execution
+                                          (try
+                                            {:result
+                                             (execute-subgraph
+                                               branch-edge branch-ctx branch-graph
+                                               branch-logs registry on-event
+                                               (assoc retry-options
+                                                      :retry-counts (atom {})
+                                                      :branch-cancelled? (fn [] (or (cancelled?)
+                                                                                     (branch-cancelled?)))
+                                                      :fidelity-threads branch-threads))}
+                                            (catch Object error {:error error}))]
+                                      ;; A thrown branch error remains primary. Returned FAIL
+                                      ;; outcomes retain their ordinary retry/routing semantics.
+                                      (if-let [error (:error execution)]
+                                        (do
+                                          (try (close-fidelity-threads! branch-threads)
+                                               (catch Object _ nil))
+                                          (throw error))
+                                        (do (close-fidelity-threads! branch-threads)
+                                            (:result execution)))))))
          _manager-init (when manager-runtime
                          (reset! manager-runtime
                                  (or (:manager-runtime options)
