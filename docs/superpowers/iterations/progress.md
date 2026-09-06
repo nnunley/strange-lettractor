@@ -3,6 +3,18 @@
 **Phase:** implementing ITER-0006
 **Task:** file-write byte confirmations repaired and filesystem failures verified through sessions; hook design remains awaiting approval
 
+**Partial main integration:** the reviewed range `38e9c9e..5d9d445` is now
+fast-forwarded into local main. Cumulative review found no material interaction
+findings; the fresh default suite passed **559 tests / 4518 assertions / zero
+failures**, exit 0. AOT rebuilt from the main checkout, and its compiled
+`examples/composition-parent.dot` run succeeded with persisted `child.result =
+"hello-from-child"` in `/tmp/lettractor-integration.y2LHRw/composition/checkpoint.edn`.
+All worktrees are retained; private `docs/notes.md` remains untracked and untouched.
+This integrates verified components, not a completed iteration or release:
+ITER-0006/0007 and the full goal remain incomplete. The five reader acceptance
+failures, timed console input, recoverable artifact discovery, tool hooks, and
+broader agent/transport/provider contracts remain explicit residuals.
+
 **Write-tool repair:** §3.3 requires confirmation with bytes written; all provider
 profiles previously returned only `File written`. The shared executor now counts
 explicit UTF-8 bytes and returns confirmation only after the environment write
