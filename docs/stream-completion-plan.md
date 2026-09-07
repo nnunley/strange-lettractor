@@ -17,8 +17,12 @@
 - [x] Re-run focused tests, existing `attractor.llm-test` and `attractor.qwen-reasoning-test` together; fix regressions.
 - [x] Independent spec review, then quality review; resolve findings.
 - [x] Parent runs full `env PATH="/Users/ndn/development/let-go:$PATH" lgx test`, build, standalone bundled focused tests, and the original audit probe. Only one full suite at a time; do not edit tests during it.
-- [ ] Update audit evidence, commit scoped files, integrate and push only after verification. Preserve all other worktrees and private `docs/notes.md`.
+- [x] Update audit evidence, commit scoped files, integrate and push only after verification. Preserve all other worktrees and private `docs/notes.md`.
 
 ## Baseline and limitations
 
 Baseline `5e811b1`: existing LLM suite 83 tests / 494 assertions / zero failures. The root offline probe reports six missing native completion fields. Native HTTP/live model coverage remains separate. This task is not full Attractor completion.
+
+Delivered as `6353f57`, fast-forwarded into main and pushed on both main and
+stream-completion. Fresh main verification passed 588 tests / 4,923 assertions /
+zero failures, and rebuilt CLI help exited 0. Worktrees and private notes remain.

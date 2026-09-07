@@ -99,6 +99,7 @@ full streaming conformance, live provider parity, or complete Attractor support.
   six assertion failures before the corrective change.
 - Final focused tests: 11 tests, 143 assertions, zero failures/errors, exit 0.
 - Final worktree full suite: 588 tests, 4,923 assertions, zero failures, exit 0.
+- Fresh main full suite after integrating `6353f57`: the same 588/4,923/0, exit 0.
 - Combined LLM/Qwen/completion tests: 101 tests, 694 assertions, zero failures.
 - The same 11/143 checks pass in a standalone bundle run from `/tmp`, exit 0.
   This is packaged let-go bytecode evidence, not native Go AOT lowering.
