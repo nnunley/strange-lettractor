@@ -1,0 +1,156 @@
+(ns edit-format.report
+  (:require [edit-format.core :as core]
+            [edit-format.fixtures :as fixtures]
+            [clojure.string :as str]
+            [clojure.edn :as edn]
+            [io :as io]))
+
+(defn- ensure! [condition message data]
+  (when-not condition (throw (ex-info message data))))
+
+(defn- natural? [value]
+  (and (integer? value) (>= value 0)))
+
+(defn- validate-record! [row expected seeds]
+  (let [id (:id row)
+        target (:task expected)
+        data {:id id}
+        bools [:first_edit_matched :eventual_edit_matched :behavior_correct
+               :protected_preserved :correct]
+        counts [:edit_attempts :failed_edits :read_calls :repeated_failed_edits
+                :model_requests :model_responses :elapsed_ms]]
+    (ensure! (and (map? row) expected) "Unknown or malformed run" data)
+    (ensure! (= (select-keys expected [:id :format :repeat :seed])
+                (select-keys row [:id :format :repeat :seed]))
+             "Run identity differs from paired schedule" data)
+    (ensure! (and (= (:task_id row) (:id target))
+                  (= (:language row) (:language target))
+                  (= (:seed row) (nth seeds (:repeat row))))
+             "Task, language, or paired seed differs" data)
+    (ensure! (every? #(boolean? (get row %)) bools) "Missing or malformed outcome" data)
+    (ensure! (every? #(natural? (get row %)) counts) "Missing or malformed count" data)
+    (ensure! (and (map? (:usage row)) (every? natural? (vals (:usage row))))
+             "Malformed usage" data)
+    (ensure! (or (zero? (:model_responses row))
+                  (every? #(natural? (get (:usage row) %))
+                          [:input_tokens :output_tokens :total_tokens]))
+             "Responses require complete token usage" data)
+    (ensure! (or (nil? (:error row)) (string? (:error row))) "Malformed provider error" data)
+    (ensure! (and (vector? (:wire_parameters row))
+                  (= (:model_requests row) (count (:wire_parameters row)))
+                  (<= (:model_responses row) (:model_requests row))
+                  (every? #(and (map? %) (= (:seed row) (get % "seed")))
+                          (:wire_parameters row)))
+             "Wire requests do not preserve paired seed" data)
+    (ensure! (and (<= (:failed_edits row) (:edit_attempts row))
+                  (<= (:repeated_failed_edits row) (:failed_edits row))
+                  (or (zero? (:failed_edits row))
+                      (< (:repeated_failed_edits row) (:failed_edits row)))
+                  (= (:eventual_edit_matched row)
+                     (> (:edit_attempts row) (:failed_edits row)))
+                  (or (not (:first_edit_matched row)) (pos? (:edit_attempts row)))
+                  (or (:first_edit_matched row) (zero? (:edit_attempts row))
+                      (pos? (:failed_edits row)))
+                  (or (not (:first_edit_matched row)) (:eventual_edit_matched row)))
+             "Inconsistent edit counts" data)
+    (ensure! (and (map? (:check row))
+                  (integer? (get-in row [:check :exit_code]))
+                  (string? (get-in row [:check :stdout])))
+             "Missing executable check evidence" data)
+    (ensure! (= (:behavior_correct row)
+                (and (= 0 (get-in row [:check :exit_code]))
+                     (str/includes? (get-in row [:check :stdout]) "EDIT_BENCH_CHECK_PASS")))
+             "Behavior outcome contradicts executable check" data)
+    (ensure! (= (:correct row) (and (:behavior_correct row) (:protected_preserved row)))
+             "Correctness contradicts behavior or protected blocks" data)
+    (ensure! (and (string? (:source_hash row)) (not (str/blank? (:source_hash row)))
+                  (string? (:final_source_hash row)) (not (str/blank? (:final_source_hash row))))
+             "Missing source hashes" data)))
+
+(defn- totals [rows]
+  {:runs (count rows)
+   :first_edit_matches (count (filter :first_edit_matched rows))
+   :eventual_edit_matches (count (filter :eventual_edit_matched rows))
+   :behavior_correct (count (filter :behavior_correct rows))
+   :protected_preserved (count (filter :protected_preserved rows))
+   :protected_violations (count (filter #(not (:protected_preserved %)) rows))
+   :correct (count (filter :correct rows))
+   ;; :error is the harness generation exception, not necessarily an HTTP error.
+   :provider_errors (count (filter :error rows))
+   :edit_attempts (reduce + 0 (map :edit_attempts rows))
+   :edit_retries (reduce + 0 (map #(max 0 (dec (:edit_attempts %))) rows))
+   :failed_edits (reduce + 0 (map :failed_edits rows))
+   :repeated_failed_edits (reduce + 0 (map :repeated_failed_edits rows))
+   :read_calls (reduce + 0 (map :read_calls rows))
+   :model_requests (reduce + 0 (map :model_requests rows))
+   :model_responses (reduce + 0 (map :model_responses rows))
+   :elapsed_ms (reduce + 0 (map :elapsed_ms rows))
+   :usage (reduce #(merge-with + %1 (:usage %2)) {} rows)})
+
+(defn- grouped-totals [rows key-fn]
+  (into {} (map (fn [[key group]] [key (totals group)]) (group-by key-fn rows))))
+
+(defn- paired-totals [rows left right]
+  (let [pairs (vals (group-by #(vector (:task_id %) (:repeat %)) rows))
+        outcomes (map (fn [pair]
+                        (let [by-format (into {} (map #(vector (:format %) %) pair))
+                              a (:correct (get by-format left))
+                              b (:correct (get by-format right))]
+                          (cond (and a b) :both_correct
+                                a :left_only
+                                b :right_only
+                                :else :both_incorrect))) pairs)
+        counts (frequencies outcomes)]
+    {:pairs (count pairs)
+     :left_only (get counts :left_only 0)
+     :right_only (get counts :right_only 0)
+     :both_correct (get counts :both_correct 0)
+     :both_incorrect (get counts :both_incorrect 0)
+     :ties (+ (get counts :both_correct 0) (get counts :both_incorrect 0))}))
+
+(defn summarize [records manifest]
+  (ensure! (and (map? manifest) (= :full (:mode manifest))
+                (= 108 (:expected_runs manifest)) (= [4101 4102 4103] (:seeds manifest))
+                (= true (get-in manifest [:fixture_validation :passed]))
+                (= 12 (get-in manifest [:fixture_validation :tasks])))
+           "Manifest is not a validated full benchmark" {})
+  (ensure! (and (vector? records) (= 108 (count records)) (every? map? records))
+           "Complete report requires 108 record maps" {})
+  (let [schedule (core/schedule fixtures/tasks)
+        expected (into {} (map #(vector (:id %) %) schedule))
+        ids (map :id records)]
+    (ensure! (= 108 (count (set ids))) "Duplicate run ids" {})
+    (ensure! (= (set (keys expected)) (set ids)) "Missing or unexpected run ids" {})
+    (doseq [row records] (validate-record! row (get expected (:id row)) (:seeds manifest))))
+  (ensure! (= {:spaced 36 :tight 36 :raw 36} (frequencies (map :format records)))
+           "Unbalanced formats" {})
+  (ensure! (every? #(= 3 (count %)) (vals (group-by #(vector (:task_id %) (:format %)) records)))
+           "Task/format requires three repeats" {})
+  (doseq [pair (vals (group-by #(vector (:task_id %) (:repeat %)) records))]
+    (ensure! (and (= 1 (count (set (map :seed pair))))
+                  (= 1 (count (set (map :source_hash pair)))))
+             "Paired runs differ in seed or starting source" {}))
+  (doseq [[task-id rows] (group-by :task_id records)]
+    (ensure! (= 1 (count (set (map :source_hash rows))))
+             "Task starting source differs across repeats" {:task_id task-id}))
+  {:validated true :expected_runs 108 :seeds (:seeds manifest)
+   :definitions {:edit_retries "Sum of max(0, edit_attempts - 1) per run."
+                 :provider_errors "Runs with a non-nil generation exception in the harness :error field."
+                 :correct "Executable behavior check passed and all protected blocks preserved."
+                 :paired_correctness "Matched task and repeat; left_only/right_only count exclusive correctness."}
+   :totals (totals records)
+   :by_format (grouped-totals records :format)
+   :by_language (grouped-totals records :language)
+   :by_task (grouped-totals records :task_id)
+   :by_format_language (grouped-totals records #(vector (:format %) (:language %)))
+   :by_format_task (grouped-totals records #(vector (:format %) (:task_id %)))
+   :paired_correctness (into {} (map (fn [[left right]]
+                                      [[left right] (paired-totals records left right)])
+                                    [[:spaced :tight] [:spaced :raw] [:tight :raw]]))})
+
+(defn report! [root]
+  (let [records (edn/read-string (io/slurp (str root "/results.edn")))
+        manifest (edn/read-string (io/slurp (str root "/manifest.edn")))
+        result (summarize records manifest)]
+    (io/spit (str root "/report.edn") (pr-str result))
+    result))

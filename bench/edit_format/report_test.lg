@@ -1,0 +1,97 @@
+(ns edit-format.report-test
+  (:require [clojure.test :refer [deftest is run-tests *test-result*]]
+            [edit-format.core :as core]
+            [edit-format.fixtures :as fixtures]
+            [edit-format.report :as report]
+            [os :as os]))
+
+(def manifest {:mode :full :expected_runs 108 :seeds [4101 4102 4103]
+               :fixture_validation {:passed true :tasks 12}})
+(def records
+  (mapv (fn [run]
+          (merge (dissoc run :task)
+            {:task_id (get-in run [:task :id]) :language (get-in run [:task :language])
+             :first_edit_matched true :eventual_edit_matched true
+             :behavior_correct true :protected_preserved true :correct true
+             :edit_attempts 1 :failed_edits 0 :read_calls 1 :repeated_failed_edits 0
+             :model_requests 2 :model_responses 2 :elapsed_ms 10
+             :usage {:input_tokens 100 :output_tokens 20 :total_tokens 120}
+             :check {:exit_code 0 :stdout "EDIT_BENCH_CHECK_PASS\n" :timed_out false}
+             :error nil :wire_parameters [{"seed" (:seed run)} {"seed" (:seed run)}]
+             :source_hash "source" :final_source_hash "final"}))
+        (core/schedule fixtures/tasks)))
+
+(defn rejects? [rows metadata]
+  (try (report/summarize rows metadata) false (catch Object error true)))
+
+(deftest complete-paired-totals
+  (let [result (report/summarize records manifest)]
+    (is (= 108 (get-in result [:totals :runs])))
+    (is (= 108 (get-in result [:totals :correct])))
+    (is (= 12960 (get-in result [:totals :usage :total_tokens])))
+    (is (= 36 (get-in result [:by_format :raw :runs])))
+    (is (= 54 (get-in result [:by_language :lg :runs])))
+    (is (= 9 (get-in result [:by_task "lg-tabs" :runs])))
+    (is (= 36 (get-in result [:paired_correctness [:spaced :tight] :both_correct])))
+    (is (= 0 (get-in result [:paired_correctness [:spaced :tight] :left_only])))))
+
+(deftest failed-outcomes-are-counted
+  (let [row (first records)
+        failure (assoc row :first_edit_matched false :eventual_edit_matched false
+                  :behavior_correct false :protected_preserved false :correct false
+                  :edit_attempts 3 :failed_edits 3 :repeated_failed_edits 1
+                  :error "provider failure"
+                  :check {:exit_code 1 :stdout "" :timed_out false})
+        result (report/summarize (assoc records 0 failure) manifest)]
+    (is (= 107 (get-in result [:totals :correct])))
+    (is (= 1 (get-in result [:totals :protected_violations])))
+    (is (= 2 (get-in result [:totals :edit_retries])))
+    (is (= 1 (get-in result [:totals :provider_errors])))
+    (is (= 1 (get-in result [:paired_correctness [:spaced :tight] :right_only])))
+    (is (= 35 (get-in result [:paired_correctness [:spaced :tight] :ties])))))
+
+(deftest paired-wins-and-both-failures
+  (let [fail-row (fn [row]
+                   (assoc row :behavior_correct false :correct false
+                              :check {:exit_code 1 :stdout "" :timed_out false}))
+        rows (assoc records 1 (fail-row (nth records 1))
+                            2 (fail-row (nth records 2)))
+        result (report/summarize rows manifest)]
+    (is (= 1 (get-in result [:paired_correctness [:spaced :tight] :left_only])))
+    (is (= 1 (get-in result [:paired_correctness [:spaced :raw] :left_only])))
+    (is (= 1 (get-in result [:paired_correctness [:tight :raw] :both_incorrect])))
+    (is (= 36 (get-in result [:paired_correctness [:tight :raw] :ties])))))
+
+(deftest invalid-evidence-is-rejected
+  (is (rejects? (subvec records 1) manifest))
+  (is (rejects? (assoc records 1 (first records)) manifest))
+  (is (rejects? (assoc-in records [0 :id] "unknown") manifest))
+  (is (rejects? (assoc-in records [0 :seed] 9999) manifest))
+  (is (rejects? (assoc-in records [0 :wire_parameters 0 "seed"] 9999) manifest))
+  (is (rejects? (assoc-in records [0 :source_hash] "other-source") manifest))
+  (is (rejects? (assoc-in records [0 :format] :other) manifest))
+  (is (rejects? (assoc-in records [0 :language] :python) manifest))
+  (is (rejects? (assoc-in records [0 :correct] nil) manifest))
+  (is (rejects? (assoc-in records [0 :protected_preserved] false) manifest))
+  (is (rejects? (assoc-in records [0 :check :stdout] "") manifest))
+  (is (rejects? (assoc-in records [0 :usage :total_tokens] "120") manifest))
+  (is (rejects? (assoc-in records [0 :usage] {}) manifest))
+  (is (rejects? (assoc-in records [0 :usage] {:input_tokens 1 :total_tokens 1}) manifest))
+  (is (rejects? (assoc-in records [0 :first_edit_matched] false) manifest))
+  (is (rejects? (assoc records 0 (assoc (first records)
+                                :edit_attempts 0 :eventual_edit_matched false)) manifest))
+  (is (rejects? (assoc records 0 (assoc (first records)
+                                :edit_attempts 2 :failed_edits 1 :repeated_failed_edits 1)) manifest))
+  (is (rejects? (mapv #(if (and (= "lg-nested" (:task_id %)) (= 0 (:repeat %)))
+                        (assoc % :source_hash "changed-for-one-repeat") %) records) manifest))
+  (is (rejects? (assoc-in records [0 :elapsed_ms] -1) manifest))
+  (is (rejects? records (assoc manifest :mode :pilot))))
+
+(deftest zero-response-failure-may-have-empty-usage
+  (let [row (assoc (first records) :model_requests 0 :model_responses 0
+                   :wire_parameters [] :usage {} :error "failed before response")
+        result (report/summarize (assoc records 0 row) manifest)]
+    (is (= 1 (get-in result [:totals :provider_errors])))
+    (is (= 12840 (get-in result [:totals :usage :total_tokens])))))
+
+(do (run-tests) (os/exit (if *test-result* 0 1)))
