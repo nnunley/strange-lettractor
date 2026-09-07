@@ -1,0 +1,68 @@
+;; Local JSONL peer. Run: lg this-file.lg MODE [DELAY-MS] [LIFETIME-MS].
+;; Every request emits two notifications followed by its correlated response.
+;; Modes: normal, split, coalesced, malformed, partial-eof, stderr-flood,
+;; delayed, ignore-eof. No network or real Codex state is accessed.
+(require '[json :as json] '[os :as os] '[term :as term] '[syscall :as syscall])
+
+(def mode (or (first *command-line-args*) "normal"))
+(def delay-ms (if (second *command-line-args*)
+                (parse-long (second *command-line-args*)) 150))
+(def lifetime-ms (if (nth *command-line-args* 2 nil)
+                   (parse-long (nth *command-line-args* 2)) 10000))
+;; Even ignore-eof cannot leave a permanent child after a broken transport test.
+(future (sleep lifetime-ms) (os/exit 124))
+
+(defn json-safe [value]
+  ;; let-go's JSON writer expects keyword object keys, including echoed params.
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(keyword k) (json-safe v)]) value))
+    (vector? value) (mapv json-safe value)
+    :else value))
+
+(defn emit! [text]
+  (print text)
+  (term/flush))
+
+(defn frames [request]
+  (let [id (get request "id") method (get request "method")]
+    [{"method" "fixture/started" "params" {"requestId" id}}
+     {"method" "fixture/progress"
+      "params" {"requestId" id "message" "ready" "pid" (syscall/getpid)}}
+     {"id" id
+      "result" (if (= "initialize" method)
+                 {"codexHome" (os/absolute-path "test/fixtures/fake-codex-home")
+                  "platformFamily" "unix" "platformOs" "macos" "userAgent" "fake"}
+                 {"method" method "params" (get request "params")})}]))
+
+(defn respond! [request]
+  (let [lines (mapv #(str (json/write-json (json-safe %)) "\n") (frames request))]
+    (cond
+      (= mode "malformed") (emit! "{not-json}\n")
+      (= mode "partial-eof") (do (emit! "{\"id\":") (os/exit 0))
+      (= mode "split")
+      (doseq [line lines]
+        (let [at (quot (count line) 2)]
+          (emit! (subs line 0 at))
+          (sleep 10)
+          (emit! (subs line at))))
+      (= mode "coalesced") (emit! (apply str lines))
+      :else
+      (do
+        (when (= mode "stderr-flood")
+          ;; More than a pipe buffer: stdout cannot advance unless stderr drains.
+          (binding [*out* *err*]
+            (dotimes [_ 256] (emit! (str (apply str (repeat 1024 "x")) "\n")))))
+        (when (= mode "delayed") (sleep delay-ms))
+        (doseq [line lines] (emit! line))))))
+
+(loop []
+  (if-let [line (read-line)]
+    (do
+      (when (seq line)
+        (let [request (json/read-json line)]
+          ;; Notifications have no response.
+          (when (contains? request "id") (respond! request))))
+      (recur))
+    (if (= mode "ignore-eof")
+      (loop [] (sleep 1000) (recur))
+      (os/exit 0))))

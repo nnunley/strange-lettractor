@@ -29,7 +29,7 @@ Work in `.worktrees/codex-app-server`. Do not modify the user-owned let-go check
 Focused command (repeat after each task, require exit zero and no failed assertions):
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test))' -e '(let [r (clojure.test/run-tests (quote attractor.codex-transport-test))] (os/exit (if (zero? (+ (:fail r) (:error r))) 0 1)))'
+/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
 ```
 
 ### Task 2: Implement the smallest owned duplex transport
@@ -84,7 +84,7 @@ Public contract:
 - [ ] Implement pending-request correlation; register a waiter before writing its request. On terminal transport failure, settle every pending waiter exactly once. Unknown notifications are ignored unless a subscriber is registered; unknown or duplicate response IDs fail the connection. Unsupported server requests receive JSON-RPC method-not-found, not silence.
 - [ ] Implement handshake state `:uninitialized -> :initializing -> :ready`: send initialize using generated-schema fields, await its matching successful response, then send initialized. Become ready only after that write succeeds. Reject regular requests before readiness, and reject repeated initialize. A failed handshake closes and joins the transport. Test explicit rejection and a live child that never replies. The 10-second deadline covers startup plus handshake, not just response waiting.
 - [ ] Add an explicit test that initialization emits neither thread/start nor turn/start and requires no account credential payload. Retain only server/version diagnostics; no raw auth/account records.
-- [ ] Run the same focused command as Task 1 with `attractor.codex-rpc-test` replacing the namespace twice. Expect all cases green. Commit RPC and its tests separately.
+- [ ] Run the same focused command as Task 1 with `attractor.codex-rpc-test` replacing the required namespace. Expect all cases green. Commit RPC and its tests separately.
 
 ### Task 4: Probe the installed server and verify the slice
 

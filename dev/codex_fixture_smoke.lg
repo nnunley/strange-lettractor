@@ -1,0 +1,69 @@
+;; Run from repository root: lg dev/codex_fixture_smoke.lg
+;; Independent Go interop evidence; does not load the unfinished transport.
+(require '[os :as os] '[io :as io] '[json :as json]
+         '[clojure.core :as core] '[clojure.string :as str])
+(def lg (let [configured (os/getenv "LG_EXECUTABLE")]
+          (if (seq configured) configured (first os/args))))
+(def fixture "test/fixtures/codex_app_server.lg")
+(def initialize "{\"id\":1,\"method\":\"initialize\"}\n")
+(def echo "{\"id\":2,\"method\":\"fixture/echo\",\"params\":{\"value\":\"second\"}}\n")
+
+(defn process-alive? [pid]
+  (and (integer? pid) (pos? pid)
+       (nil? (.Run (os/exec "/bin/kill" "-0" (str pid))))))
+
+;; Batch smoke checks each mode, including actual JSON object keys.
+(doseq [mode ["normal" "split" "coalesced" "delayed" "stderr-flood" "malformed" "partial-eof"]]
+  (let [cmd (os/with-stdin (os/exec lg fixture mode "10") (str initialize echo))
+        output (str (.Output cmd))]
+    (cond
+      (= mode "malformed") (assert (= "{not-json}\n{not-json}\n" output))
+      (= mode "partial-eof") (assert (= "{\"id\":" output))
+      :else
+      (let [frames (mapv json/read-json (remove empty? (str/split output #"\n")))]
+        (assert (= 6 (count frames)))
+        (assert (= "fake" (get-in frames [2 "result" "userAgent"])))
+        (assert (= {"value" "second"} (get-in frames [5 "result" "params"])))))
+    (prn mode :pass)))
+
+;; Native futures read replies while the parent keeps stdin open.
+(let [scope (core/scope-open)
+      cmd (os/exec lg fixture "normal")
+      stdin (.StdinPipe cmd)
+      stdout (.StdoutPipe cmd)
+      reader (.Buffered (io/reader stdout))
+      pid (atom nil)]
+  (.Start cmd)
+  (try
+    (doseq [[request id] [[initialize 1] [echo 2]]]
+      (.WriteString stdin request)
+      (let [reply (core/future
+                    (mapv (fn [_] (json/read-json (.ReadString reader 10))) (range 3)))
+            frames (deref reply 2000 ::timeout)]
+        (assert (not= ::timeout frames))
+        (assert (= id (get-in frames [2 "id"])))
+        (reset! pid (get-in frames [1 "params" "pid"]))
+        (assert (process-alive? @pid))))
+    (finally
+      (.Close stdin)
+      (let [waiter (core/future (.Wait cmd))]
+        (assert (nil? (deref waiter 2000 ::timeout)))
+        (assert (and (integer? @pid) (pos? @pid) (not (process-alive? @pid)))))
+      (.Close stdout)
+      (core/scope-close! scope 2000)))
+  (prn :live-two-request-exchange :pass :reaped))
+
+;; ignore-eof survives closed stdin but its safety deadline still reaps it.
+(let [scope (core/scope-open)
+      cmd (os/exec lg fixture "ignore-eof" "10" "250")
+      stdin (.StdinPipe cmd)]
+  (.Start cmd)
+  (.Close stdin)
+  (let [waiter (core/future (try (str (.Wait cmd))
+                               (catch Object e (str e))))]
+    (assert (= ::pending (deref waiter 40 ::pending)))
+    (let [result (deref waiter 2000 ::timeout)]
+      (assert (not= ::timeout result))
+      (assert (str/includes? result "exit status 124"))))
+  (core/scope-close! scope 2000)
+  (prn :ignore-eof :pass :deadline-reaped))

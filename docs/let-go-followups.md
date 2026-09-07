@@ -73,3 +73,15 @@ equality compatibility.
 [reader](let-go-reader-compatibility.md),
 [future errors](let-go-future-compatibility.md), and
 [native supervision](let-go-supervision-compatibility.md).
+
+Codex subprocess integration findings (2026-09-07):
+
+- [#813: mutable byte-array interop](let-go-byte-array-interop.md): reflected
+  Go slice arguments are copied, so `.Read` does not mutate the caller's buffer.
+  Buffered `ReadByte` is a verified possible workaround for bounded framing.
+- [#814: boxed pointer field lookup](let-go-boxed-pointer-fields.md): lookup of
+  `exec.Cmd.Process` fails without pointer dereference. Keep exact-child forced
+  shutdown unverified until this or an equivalent owned-process path is tested.
+
+These are Go interop issues, not a reason to introduce JVM-shaped APIs. No
+runtime source changes accompany these findings.

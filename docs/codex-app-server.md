@@ -1,6 +1,7 @@
 # Codex app-server integration
 
-Status: design and first-slice plan reviewed; connector not implemented yet.
+Status: design and first-slice plan reviewed; fake child and RED transport
+contract added. Production connector not implemented yet.
 This backend will use Attractor's existing orchestration rather than create a
 shared cross-provider conversation or a second workflow engine.
 
@@ -59,3 +60,25 @@ planning documents.
 Neither finding changes the orchestration design. Neither runtime checkout nor
 production connector code has been changed. Use native let-go/Go facilities,
 not JVM-shaped replacements; retain the shutdown gate while resolving #814.
+
+## Deterministic fixture evidence
+
+Run from the Codex worktree root:
+
+```sh
+/Users/ndn/development/let-go/lg dev/codex_fixture_smoke.lg
+/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
+```
+
+On 2026-09-07 the smoke harness exited zero: normal, split, coalesced, delayed,
+stderr-flood, malformed, partial-EOF and ignore-EOF modes behaved as specified.
+The live two-request probe kept stdin open and independently checked fixture
+PID liveness before close and disappearance afterward. Every fixture has a
+finite safety lifetime; the ignore-EOF check observes that deadline, not a
+production transport kill.
+
+The transport contract intentionally exited 1: one test, one missing-namespace
+failure, zero errors. The feature branch is therefore not suite-green and must
+not merge to main as a completed connector. The fixture is tested scaffolding;
+production transport, bounded shutdown, RPC initialization and AOT evidence
+remain pending. The existing main branch is unchanged.
