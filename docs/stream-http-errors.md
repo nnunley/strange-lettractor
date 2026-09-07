@@ -27,6 +27,8 @@ The same 8/208 tests pass as a standalone bundle executed outside the checkout.
 This is packaged bytecode evidence, not native Go AOT lowering. `lgx build` and
 the rebuilt CLI's `help` command also exit 0. Spec and code-quality reviews approve.
 Final worktree full suite: 596 tests, 5,131 assertions, zero failures, exit 0.
+Fresh main verification after integrating `9543aaa` passes the same 596/5,131/0;
+the rebuilt main CLI's `help` also exits 0.
 
 Real socket checks use `dev/http_error_server.go` and `dev/http_error_check.lg`:
 
