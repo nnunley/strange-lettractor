@@ -1,0 +1,13 @@
+;; Explicit production require packages the decoder into a standalone bundle.
+;; Run with argument "run"; no test execution during the bundle build.
+(ns main
+  (:require [attractor.codex.framing]
+            [attractor.codex-framing-test]))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

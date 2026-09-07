@@ -37,6 +37,15 @@ Focused command (repeat after each task, require exit zero and no failed asserti
 **Files:**
 - Create `src/attractor/codex/transport.lg`.
 - Extend `test/attractor/codex_transport_test.lg`.
+- Create `src/attractor/codex/framing.lg` and
+  `test/attractor/codex_framing_test.lg`: isolate byte-bounded incremental frame
+  decoding from process lifecycle. This lets protocol correctness proceed while
+  exact-process shutdown awaits resolution of the runtime prerequisite below.
+  A passing decoder does not satisfy the live transport contract.
+  Decoder API: `make-decoder`, `feed!`, `finish!`; feed returns explicit
+  `{:raw-json exact-frame-string :message parsed-object}` envelopes so exact
+  wire evidence survives EDN serialization. The parsed object currently inherits
+  native JSON numeric limitations; RPC must honor the #815 prerequisite below.
 
 Public contract:
 
@@ -81,6 +90,10 @@ Public contract:
 ```
 
 - [ ] Write failing tests for out-of-order response IDs, notifications before a response, server requests, duplicate/unknown response IDs, response errors, deadline expiry, EOF with outstanding requests and repeated initialization. Start request IDs at 1 and allocate monotonically per connection; preserve server request IDs verbatim in responses.
+  Include incoming integer ID `9007199254740993`: current native JSON decoding
+  rounds it to `9007199254740992` ([nooga/let-go#815](https://github.com/nooga/let-go/issues/815)).
+  Exact incoming IDs are a separate runtime/decoder prerequisite; never claim
+  full correlation correctness merely because small test IDs work.
 - [ ] Implement pending-request correlation; register a waiter before writing its request. On terminal transport failure, settle every pending waiter exactly once. Unknown notifications are ignored unless a subscriber is registered; unknown or duplicate response IDs fail the connection. Unsupported server requests receive JSON-RPC method-not-found, not silence.
 - [ ] Implement handshake state `:uninitialized -> :initializing -> :ready`: send initialize using generated-schema fields, await its matching successful response, then send initialized. Become ready only after that write succeeds. Reject regular requests before readiness, and reject repeated initialize. A failed handshake closes and joins the transport. Test explicit rejection and a live child that never replies. The 10-second deadline covers startup plus handshake, not just response waiting.
 - [ ] Add an explicit test that initialization emits neither thread/start nor turn/start and requires no account credential payload. Retain only server/version diagnostics; no raw auth/account records.

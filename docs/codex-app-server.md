@@ -1,7 +1,7 @@
 # Codex app-server integration
 
-Status: design and first-slice plan reviewed; fake child and RED transport
-contract added. Production connector not implemented yet.
+Status: bounded framing implemented and reviewed; fake child and RED transport
+contract added. Process transport and agent integration remain unimplemented.
 This backend will use Attractor's existing orchestration rather than create a
 shared cross-provider conversation or a second workflow engine.
 
@@ -43,8 +43,9 @@ I/O through existing interop; it does not establish resource cleanup under
 failure, bounded framing, app-server readiness, AOT compatibility, or agent
 integration. Those are explicit mechanical gates in the transport plan.
 
-No production source changes or live Qwen/Codex model trials accompany these
-planning documents.
+The initial planning checkpoint included no production changes or model trials.
+The framing implementation and its evidence are described below; no live
+Qwen/Codex model trial has been performed for this connector.
 
 ## Runtime findings (2026-09-07)
 
@@ -57,8 +58,8 @@ planning documents.
   `exec.Cmd.Process` field fails before pointer dereference. Exact-child forced
   termination remains unverified; stdin closure alone is not sufficient.
 
-Neither finding changes the orchestration design. Neither runtime checkout nor
-production connector code has been changed. Use native let-go/Go facilities,
+Neither finding changes the orchestration design. The runtime checkout has not
+been changed. Use native let-go/Go facilities,
 not JVM-shaped replacements; retain the shutdown gate while resolving #814.
 
 ## Deterministic fixture evidence
@@ -80,5 +81,37 @@ production transport kill.
 The transport contract intentionally exited 1: one test, one missing-namespace
 failure, zero errors. The feature branch is therefore not suite-green and must
 not merge to main as a completed connector. The fixture is tested scaffolding;
-production transport, bounded shutdown, RPC initialization and AOT evidence
+production transport, bounded shutdown and RPC initialization evidence
 remain pending. The existing main branch is unchanged.
+
+## Bounded framing implementation
+
+`attractor.codex.framing` incrementally accepts byte chunks and returns explicit
+`{:raw-json ... :message ...}` frame envelopes. It bounds payload bytes, validates
+UTF-8 before parsing, rejects malformed/non-object JSON and partial EOF, and
+latches failures. If any frame in a feed is invalid the entire feed fails;
+callers must close the connection rather than retry or assume partial delivery.
+
+Focused direct tests passed 128 assertions (one test), zero failures/errors.
+A standalone bundle containing both the decoder and its test ran outside the
+repository and passed the same 128 assertions. This tests packaged bytecode,
+not native Go AOT lowering or the unimplemented process transport.
+
+The full feature-branch suite completed with 569 tests, 4,839 assertions and one
+failure. The missing-transport contract remains deliberately failing; this is
+not a green release checkpoint.
+
+```sh
+/Users/ndn/development/let-go/lg -source-paths src:test dev/codex_framing_check.lg run
+/Users/ndn/development/let-go/lg -source-paths src:test -b <temporary-output>/framing-check dev/codex_framing_check.lg
+# From outside the repository:
+<temporary-output>/framing-check run
+```
+
+The entrypoint explicitly requires the decoder so bundling includes it; a
+runtime-only require from inside the test does not establish that dependency.
+
+Parsed numbers still inherit [JSON precision issue #815](let-go-json-integer-precision.md).
+The exact raw JSON survives EDN serialization, but lossless RPC correlation is
+not implemented or proven. No pending process-lifecycle requirement is waived
+by passing framing tests.

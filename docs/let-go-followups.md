@@ -85,3 +85,7 @@ Codex subprocess integration findings (2026-09-07):
 
 These are Go interop issues, not a reason to introduce JVM-shaped APIs. No
 runtime source changes accompany these findings.
+
+- [#815: JSON integer precision](let-go-json-integer-precision.md): float64
+  decoding rounds valid int64 values above 2^53. Preserve a large-ID regression
+  for Codex RPC; small locally generated IDs do not fix server-supplied IDs.
