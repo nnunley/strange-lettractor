@@ -1,0 +1,56 @@
+(ns attractor.qwen-reasoning-test
+  (:require [clojure.test :refer [deftest is]]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+(defn- complete-with [message]
+  (llm/openai-compatible-complete
+   {:provider "ollama" :model "qwen-test" :messages []
+    :transport (fn [_]
+                 {:status 200
+                  :body (json/write-json
+                         {:id "probe" :model "qwen-test"
+                          :choices [{:finish_reason "stop" :message message}]
+                          :usage {:prompt_tokens 2 :completion_tokens 3 :total_tokens 5}})})}))
+
+(deftest reasoning-is-kept
+  (is (= "First reason.\nThen conclude." (:reasoning (complete-with {:content "Answer" :reasoning_content "First reason.\nThen conclude."})))
+      "reasoning is kept")
+  (is (= "" (:reasoning (complete-with {:content "Answer" :reasoning_content ""})))
+      "empty string reasoning is kept")
+  (is (nil? (:reasoning (complete-with {:content "Answer"})))
+      "absent reasoning is nil")
+  (is (nil? (:reasoning (complete-with {:content "Answer" :reasoning_content nil})))
+      "nil reasoning is nil")
+  (is (nil? (:reasoning (complete-with {:content "Answer" :reasoning_content 42})))
+      "non-string reasoning is nil"))
+
+(deftest reasoning-does-not-replace-answer-or-tool-calls
+  (let [message {:content "Answer" :reasoning_content "Use lookup"
+                 :tool_calls [{:id "call-1" :type "function"
+                               :function {:name "lookup" :arguments "{}"}}]}
+        response (complete-with message)]
+    (is (= "Use lookup" (:reasoning response)))
+    (is (= "Answer" (get-in response [:message :text])))
+    (is (= [{:kind :text :text "Answer"}]
+           (vec (filter #(= :text (:kind %)) (get-in response [:message :content])))))
+    (is (= "lookup" (get-in response [:tool_calls 0 :name])))
+    (is (= "Use lookup" (get-in response [:raw "choices" 0 "message" "reasoning_content"])))
+    (is (= {:input_tokens 2 :output_tokens 3 :total_tokens 5} (:usage response))))
+  (let [response (complete-with {:content nil :reasoning_content "Still thinking"})]
+    (is (= "Still thinking" (:reasoning response)))
+    (is (= "" (get-in response [:message :text]))))
+  (is (nil? (:reasoning (complete-with {:reasoning_content {:unexpected true}})))))
+
+(deftest reasoning-propagates-to-generation-and-step-results
+  (let [client (llm/make-client
+                 {:default_provider "ollama"
+                  :providers {"ollama" (llm/make-provider-adapter "ollama"
+                    {:transport (fn [_]
+                      {:status 200 :body (json/write-json
+                        {:choices [{:finish_reason "stop" :message
+                                    {:content "Answer" :reasoning_content "Reason"}}]})})})}})
+        result (llm/generate "qwen-test" "question" {:client client :max_retries 0})]
+    (is (= "Reason" (:reasoning result)))
+    (is (= "Reason" (get-in result [:steps 0 :reasoning])))
+    (is (= "Answer" (:text result)))))

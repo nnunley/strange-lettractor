@@ -1066,6 +1066,8 @@
          :provider provider
          :message {:role :assistant :content parts :parts parts :text text}
          :tool_calls tool-calls
+         :reasoning (when (string? (get message "reasoning_content"))
+                      (get message "reasoning_content"))
          :usage (openai-compatible-usage usage)
          :finish_reason (finish-reason (get choice "finish_reason"))
          :warnings (adapter-warnings "openai-compatible" request)
