@@ -1,0 +1,15 @@
+(require '[edit-format.runner :as runner] '[clojure.test :refer [deftest is]]
+         '[test :as t] '[os :as os])
+(deftest mechanical-assessment-requires-both-check-and-preservation
+  (let [task {:protected ["\n\nKEEP\t"]}
+        good {:exit_code 0 :stdout "EDIT_BENCH_CHECK_PASS\n"}]
+    (is (= {:correct true :behavior_correct true :protected_preserved true}
+           (runner/assess task "before\n\nKEEP\tafter" good)))
+    (is (= {:correct false :behavior_correct true :protected_preserved false}
+           (runner/assess task "before\nKEEP after" good)))
+    (is (not (:correct (runner/assess task "\n\nKEEP\t" {:exit_code 0 :stdout ""}))))
+    (is (not (:correct (runner/assess task "\n\nKEEP\t" (assoc good :exit_code 1)))))))
+(let [out (with-out-str (t/run-tests)) c t/*report-counters*]
+  (prn c)
+  (when (pos? (+ (:fail c) (:error c))) (println out))
+  (os/exit (if (zero? (+ (:fail c) (:error c))) 0 1)))

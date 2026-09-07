@@ -1,0 +1,21 @@
+(require '[edit-format.core :as c] '[clojure.test :refer [deftest is]]
+         '[test :as t] '[os :as os])
+(deftest render-preserves-source-whitespace
+  (let [source "         x\n\ty\n\n  z"]
+    (is (= "1 |          x\n2 | \ty\n3 | \n4 |   z" (c/render source 1 10 :spaced)))
+    (is (= "1 |         x\n2 |\ty\n3 |\n4 |  z" (c/render source 1 10 :tight)))
+    (is (= (str "File lines 1-4 (metadata; source text follows on the next line):\n" source)
+           (c/render source 1 10 :raw)))
+    (is (= "2 |\ty\n3 |" (c/render source 2 2 :tight)))))
+(deftest schedule-is-paired-and-counterbalanced
+  (let [runs (c/schedule (mapv #(hash-map :id (str %)) (range 12)))]
+    (is (= 108 (count runs)))
+    (is (= 108 (count (set (map :id runs)))))
+    (is (= {:spaced 36 :tight 36 :raw 36} (frequencies (map :format runs))))
+    (doseq [triple (partition 3 runs)]
+      (is (= 1 (count (set (map :seed triple)))))
+      (is (= 1 (count (set (map #(get-in % [:task :id]) triple))))))))
+(let [out (with-out-str (t/run-tests)) counters t/*report-counters*]
+  (prn counters)
+  (when (pos? (+ (:fail counters) (:error counters))) (println out))
+  (os/exit (if (zero? (+ (:fail counters) (:error counters))) 0 1)))

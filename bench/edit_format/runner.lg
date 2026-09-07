@@ -1,0 +1,225 @@
+(ns edit-format.runner
+  (:require [edit-format.core :as bench] [edit-format.fixtures :as fixtures]
+            [attractor.llm :as llm] [attractor.execution :as execution]
+            [attractor.workflow :as workflow] [clojure.string :as str]
+            [clojure.edn :as edn] [http :as http] [json :as json]
+            [io :as io] [os :as os]))
+
+(def settings {:model "qwen3.8-27b" :base_url "http://ndn.local:8080/v1"
+               :temperature 0.2 :max_tokens 1600 :max_tool_rounds 4
+               :timeout 90 :max_retries 0})
+(def lg "/Users/ndn/development/let-go/lg")
+(def python "/usr/bin/python3")
+
+(defn check-passed? [result]
+  (and (= 0 (:exit_code result))
+       (str/includes? (or (:stdout result) "") "EDIT_BENCH_CHECK_PASS")))
+
+(defn assess [task source check]
+  (let [behavior (check-passed? check)
+        protected (every? #(str/includes? source %) (:protected task))]
+    {:behavior_correct behavior :protected_preserved protected
+     :correct (and behavior protected)}))
+
+(defn check-source [task source directory]
+  (let [path (str directory "/check." (if (= :lg (:language task)) "lg" "py"))
+        _ (io/spit path (str source "\n" (:check task) "\n"))
+        environment (execution/make-local-environment
+                      {:working_dir directory :env_policy :none})]
+    (try
+      ((:exec_command environment)
+       (str (if (= :lg (:language task)) lg python) " " path) 10000 nil nil)
+      (finally ((:cleanup environment))))))
+
+(defn- read-server []
+  (let [response (http/request {:method :get :url "http://ndn.local:8080/props"})
+        body (json/read-json (str (:body response)))]
+    (when-not (= 200 (:status response))
+      (throw (ex-info "Cannot snapshot llama.cpp properties" {:status (:status response)})))
+    {:model_alias (get body "model_alias") :model_ftype (get body "model_ftype")
+     :build_info (get body "build_info")
+     :context (get-in body ["default_generation_settings" "n_ctx"])
+     :default_params (get-in body ["default_generation_settings" "params"])
+     :model_path_hash (workflow/sha256-text (or (get body "model_path") ""))
+     :chat_template_hash (workflow/sha256-text (or (get body "chat_template") ""))}))
+
+(defn run-one! [root run]
+  (let [task (:task run) directory (str root "/" (:id run))
+        _ (io/mkdir directory)
+        filename (:filename task) path (str directory "/" filename)
+        _ (io/spit path (:source task))
+        environment (execution/make-local-environment {:working_dir directory :env_policy :none})
+        edits (atom []) reads (atom []) exchanges (atom []) wire-parameters (atom [])
+        client (llm/make-client
+                 {:default_provider "ollama"
+                  :providers {"ollama" (llm/make-provider-adapter "ollama"
+                                         {:base_url (:base_url settings) :api_key ""
+                                          :transport (fn [request]
+                                                       (let [body (json/read-json (:body request))]
+                                                         (when-not (= (:seed run) (get body "seed"))
+                                                           (throw (ex-info "Seed missing from wire request" {})))
+                                                         (swap! wire-parameters conj
+                                                           (select-keys body ["seed" "temperature" "max_tokens" "model" "parallel_tool_calls"]))
+                                                         (http/request request)))})}
+                  :middleware [(fn [request next]
+                                 (let [response (next request)]
+                                   (swap! exchanges conj {:response response
+                                     :seed (get-in request [:provider_options :ollama :seed])})
+                                   response))]})
+        validate-path (fn [args]
+                        (when-not (contains? #{filename path} (get args "file_path"))
+                          (throw (ex-info (str "Only " filename " is available") {}))))
+        tools [(llm/make-tool "read_file" "Read a line-numbered file"
+                 {:type "object" :properties {:file_path {:type "string"}
+                                               :offset {:type "integer"} :limit {:type "integer"}}
+                  :required ["file_path"]}
+                 (fn [args]
+                   (validate-path args)
+                   (let [text (bench/render (io/slurp path) (get args "offset")
+                                (get args "limit") (:format run))]
+                     (swap! reads conj {:args args :text text}) text)))
+               (llm/make-tool "edit_file" "Modify files"
+                 {:type "object" :properties {:file_path {:type "string"}
+                                               :old_string {:type "string"} :new_string {:type "string"}}
+                  :required ["file_path" "old_string" "new_string"]}
+                 (fn [args]
+                   (validate-path args)
+                   (let [before (io/slurp path)]
+                     (try
+                       (let [result ((:edit_file environment) filename (get args "old_string")
+                                      (get args "new_string") false)]
+                         (swap! edits conj {:args args :matched true
+                                            :before_hash (workflow/sha256-text before)}) result)
+                       (catch Object e
+                         (swap! edits conj {:args args :matched false :error (str e)
+                                            :before_hash (workflow/sha256-text before)})
+                         (throw e))))))]
+        started (System/currentTimeMillis)
+        attempt (try
+                  {:result (llm/generate (:model settings)
+                             (str "Read " filename " with read_file, then make the requested change with edit_file. "
+                                  "Preserve unrelated code and whitespace. Use tools, not a suggested patch. "
+                                  (:prompt task) " Briefly report when finished.")
+                             (merge (dissoc settings :model :base_url)
+                                    {:client client :tools tools
+                                     :provider_options {:ollama {:seed (:seed run)
+                                                               :parallel_tool_calls false}}}))}
+                  (catch Object e {:error (str e)}))
+        elapsed (- (System/currentTimeMillis) started)
+        final-source (io/slurp path)
+        _ ((:cleanup environment))
+        check (check-source task final-source directory)
+        failed-edits (filter #(not (:matched %)) @edits)
+        failure-keys (map #(select-keys (:args %) ["old_string" "new_string"]) failed-edits)
+        record (merge (dissoc run :task) (assess task final-source check)
+                 {:task_id (:id task) :language (:language task)
+                  :first_edit_matched (boolean (:matched (first @edits)))
+                  :eventual_edit_matched (boolean (some :matched @edits))
+                  :edit_attempts (count @edits) :failed_edits (count failed-edits)
+                  :read_calls (count @reads)
+                  :repeated_failed_edits (- (count failure-keys) (count (set failure-keys)))
+                  :exact_expected_source (= (:expected task) final-source)
+                  :model_requests (count @wire-parameters) :model_responses (count @exchanges)
+                  :elapsed_ms elapsed
+                  :usage (reduce #(merge-with + %1 (get-in %2 [:response :usage])) {} @exchanges)
+                  :check check :error (:error attempt) :wire_parameters @wire-parameters
+                  :source_hash (workflow/sha256-text (:source task))
+                  :final_source_hash (workflow/sha256-text final-source)})]
+    (io/spit (str directory "/evidence.edn")
+      (pr-str {:reads @reads :edits @edits :exchanges @exchanges :attempt attempt
+               :final_source final-source}))
+    (io/spit (str directory "/result.edn") (pr-str record))
+    record))
+
+(defn summary [records]
+  (into {} (map (fn [format]
+                 (let [rows (filter #(= format (:format %)) records)]
+                   [format {:runs (count rows)
+                            :first_edit_matches (count (filter :first_edit_matched rows))
+                            :eventual_edit_matches (count (filter :eventual_edit_matched rows))
+                            :correct (count (filter :correct rows))
+                            :behavior_correct (count (filter :behavior_correct rows))
+                            :protected_preserved (count (filter :protected_preserved rows))
+                            :errors (count (filter :error rows))
+                            :failed_edits (reduce + 0 (map :failed_edits rows))
+                            :repeated_failed_edits (reduce + 0 (map :repeated_failed_edits rows))
+                            :elapsed_ms (reduce + 0 (map :elapsed_ms rows))
+                            :usage (reduce #(merge-with + %1 (:usage %2)) {} rows)}])) bench/formats)))
+
+(declare validate-fixtures! pilot-gate!)
+
+(defn harness-hashes []
+  (into {} (map (fn [file] [file (workflow/sha256-text (io/slurp file))])
+                ["bench/edit_format/core.lg" "bench/edit_format/runner.lg"
+                 "bench/edit_format/fixtures.lg"])))
+
+(defn run! [root mode & [pilot-root]]
+  (when-not (contains? #{:pilot :full} mode)
+    (throw (ex-info "Benchmark mode must be :pilot or :full" {:mode mode})))
+  (when (os/stat (str root "/manifest.edn"))
+    (throw (ex-info "Use a fresh run root to preserve earlier evidence" {:root root})))
+  (io/mkdir root)
+  (when (= mode :full)
+    (when-not pilot-root (throw (ex-info "Full batch requires a passed pilot root" {})))
+    (pilot-gate! pilot-root))
+  (let [validation (validate-fixtures! (str root "/fixture-validation"))
+        runs (if (= mode :pilot) (take 3 (bench/schedule fixtures/tasks))
+                 (bench/schedule fixtures/tasks))
+        manifest {:mode mode :settings settings :seeds [4101 4102 4103]
+                  :expected_runs (count runs) :server (read-server)
+                  :fixture_hash (workflow/sha256-text (pr-str fixtures/tasks))
+                  :source_revision (:out (os/sh "git" "rev-parse" "HEAD"))
+                  :runtime lg :python python :fixture_validation validation
+                  :harness_hashes (harness-hashes)}
+        records (atom [])]
+    (io/spit (str root "/manifest.edn") (pr-str manifest))
+    (doseq [run runs]
+      (let [record (run-one! root run)]
+        (swap! records conj record)
+        (io/spit (str root "/results.edn") (pr-str @records))
+        (io/spit (str root "/summary.edn") (pr-str (summary @records)))
+        (prn {:completed (count @records) :total (count runs)
+              :id (:id record) :matched (:first_edit_matched record)
+              :correct (:correct record) :error (:error record)})))
+    (prn (summary @records))
+    @records))
+
+(defn validate-fixtures! [root]
+  (io/mkdir root)
+  (let [records (mapv (fn [task]
+                        (let [directory (str root "/" (:id task))
+                              _ (io/mkdir directory)
+                              original (check-source task (:source task) directory)
+                              expected (check-source task (:expected task) directory)]
+                          {:id (:id task) :original original :expected expected
+                           :passed (and (not (check-passed? original))
+                                        (check-passed? expected)
+                                        (every? #(and (str/includes? (:source task) %)
+                                                      (str/includes? (:expected task) %))
+                                                (:protected task)))})) fixtures/tasks)
+        passed (and (= 12 (count records))
+                    (= 12 (count (set (map :id records))))
+                    (= {:lg 6 :python 6} (frequencies (map :language fixtures/tasks)))
+                    (every? :passed records))]
+    (io/spit (str root "/validation.edn") (pr-str {:passed passed :records records}))
+    (when-not passed (throw (ex-info "Fixture validation gate failed" {:root root :records records})))
+    {:passed passed :tasks (count records)}))
+
+(defn pilot-gate! [root]
+  (let [records (edn/read-string (io/slurp (str root "/results.edn")))
+        manifest (edn/read-string (io/slurp (str root "/manifest.edn")))
+        passed (and (= 3 (count records))
+                    (= :pilot (:mode manifest))
+                    (= (harness-hashes) (:harness_hashes manifest))
+                    (= true (get-in manifest [:fixture_validation :passed]))
+                    (= (set bench/formats) (set (map :format records)))
+                    (every? #(and (nil? (:error %)) (pos? (:model_requests %))
+                                   (seq (:wire_parameters %))
+                                   (every? (fn [wire] (= (:seed %) (get wire "seed")))
+                                           (:wire_parameters %))
+                                   (pos? (:read_calls %)) (pos? (:edit_attempts %))
+                                   (contains? #{0 1} (get-in % [:check :exit_code]))
+                                   (not (get-in % [:check :timed_out]))
+                                   (boolean? (:correct %)) (map? (:check %))) records))]
+    (when-not passed (throw (ex-info "Pilot infrastructure gate failed" {:records records})))
+    {:passed true :records (count records)}))

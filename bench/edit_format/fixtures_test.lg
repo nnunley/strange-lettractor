@@ -1,0 +1,37 @@
+(ns edit-format.fixtures-test
+  (:require [clojure.test :refer [deftest is run-tests *test-result*]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [edit-format.fixtures :as fixtures]))
+
+(deftest balanced-and-distinct-corpus
+  (is (= 12 (count fixtures/tasks)))
+  (is (= 12 (count (set (map :id fixtures/tasks)))))
+  (is (= {:lg 6 :python 6} (frequencies (map :language fixtures/tasks)))))
+
+(deftest every-check-rejects-original-and-accepts-reference
+  (let [root (str (os/temp-dir) "/edit-format-fixtures-" (System/nanoTime))
+        configured-lg (os/getenv "LG_BIN")
+        lg (if (str/blank? configured-lg) "/Users/ndn/development/let-go/lg" configured-lg)]
+    (io/mkdir root)
+    (try
+      (doseq [task fixtures/tasks]
+        (is (not= (:source task) (:expected task)) (:id task))
+        (doseq [block (:protected task)]
+          (is (str/includes? (:source task) block) (:id task))
+          (is (str/includes? (:expected task) block) (:id task)))
+        (doseq [[field passes?] [[:source false] [:expected true]]]
+          (let [path (str root "/" (:id task) "-" (name field)
+                          (if (= :lg (:language task)) ".lg" ".py"))
+                _ (io/spit path (str (get task field) "\n" (:check task)))
+                result (os/sh (if (= :lg (:language task)) lg "python3") path)]
+            (is (= passes? (str/includes? (:out result) "EDIT_BENCH_CHECK_PASS")) (:id task))
+            (is (= passes? (= 0 (:exit result)))
+                (str (:id task) " " field
+                     (if (= passes? (= 0 (:exit result))) "" (str " " (:err result))))))))
+      (finally (os/delete-tree root)))))
+
+(do
+  (run-tests)
+  (os/exit (if *test-result* 0 1)))

@@ -1,0 +1,100 @@
+(ns edit-format.fixtures
+  (:require [clojure.string :as str]))
+
+;; References establish that the oracle is attainable, not an exact-output rule.
+(defn- task [id language source old replacement prompt assertions protected]
+  {:id id :language language
+   :filename (if (= language :lg) "task.lg" "task.py")
+   :source source :expected (str/replace source old replacement)
+   :prompt (str "In " (if (= language :lg) "task.lg" "task.py") ", " prompt)
+   :check (if (= language :lg)
+            (str "(require '[os :as os])\n(if (and " assertions ") (do (println \"EDIT_BENCH_CHECK_PASS\") (os/exit 0)) (os/exit 1))\n")
+            (str assertions "\nprint('EDIT_BENCH_CHECK_PASS')\n"))
+   :protected protected})
+
+(def lg-large-prefix
+  (apply str (map (fn [i] (str "(def sentinel-" i " " i ")\n")) (range 75))))
+(def lg-large-suffix
+  (apply str (map (fn [i] (str "(def sentinel-" i " " i ")\n")) (range 75 150))))
+(def py-large-prefix
+  (apply str (map (fn [i] (str "SENTINEL_" i " = " i "\n")) (range 75))))
+(def py-large-suffix
+  (apply str (map (fn [i] (str "SENTINEL_" i " = " i "\n")) (range 75 150))))
+
+(def tasks
+  [(task "lg-nested" :lg
+     "(defn settings []\n  {:service\n         {:retry\n                  {:attempts 2\n                   :delay 10}\n          :port 8080}\n   :label \"stable\"})\n"
+     ":attempts 2" ":attempts 3"
+     "fix settings so the nested retry attempts default is 3. Preserve the delay, port, and label."
+     "(= 3 (get-in (settings) [:service :retry :attempts])) (= 10 (get-in (settings) [:service :retry :delay])) (= 8080 (get-in (settings) [:service :port])) (= \"stable\" (:label (settings)))"
+     ["                   :delay 10}" "          :port 8080}"])
+   (task "lg-tabs" :lg
+     "(defn total [price count]\n\t(let [subtotal (* price count)]\n\t\t(+ subtotal 1)))\n\n(defn label []\n\t\"tab-preserved\")\n"
+     "(+ subtotal 1)" "(+ subtotal 2)"
+     "fix total to charge a flat handling fee of 2 in addition to price times count. Preserve label."
+     "(= 14 (total 3 4)) (= 2 (total 5 0)) (= 9 (total 7 1)) (= \"tab-preserved\" (label))"
+     ["(defn label []\n\t\"tab-preserved\")"])
+   (task "lg-blank-lines" :lg
+     "(defn eligible? [age]\n\n  ;; The threshold is inclusive.\n\n  (> age 18))\n\n\n(defn category [] :adult)\n"
+     "(> age 18)" "(>= age 18)"
+     "fix eligible? to include age 18 while rejecting younger ages. Preserve category and surrounding blank lines."
+     "(eligible? 18) (eligible? 19) (not (eligible? 17)) (not (eligible? 0)) (= :adult (category))"
+     ["\n\n\n(defn category [] :adult)\n"])
+   (task "lg-duplicate-block" :lg
+     "(defn preview-cost [n]\n  (let [base (* n 10)]\n    (+ base 1)))\n\n(defn invoice-cost [n]\n  (let [base (* n 10)]\n    (+ base 1)))\n"
+     "(defn invoice-cost [n]\n  (let [base (* n 10)]\n    (+ base 1)))"
+     "(defn invoice-cost [n]\n  (let [base (* n 10)]\n    (+ base 2)))"
+     "fix invoice-cost to add a fee of 2 to n times 10. preview-cost must retain its fee of 1."
+     "(= 22 (invoice-cost 2)) (= 2 (invoice-cost 0)) (= 72 (invoice-cost 7)) (= 21 (preview-cost 2)) (= 1 (preview-cost 0))"
+     ["(defn preview-cost [n]\n  (let [base (* n 10)]\n    (+ base 1)))"])
+   (task "lg-multiline-string" :lg
+     "(def help-text \"Usage:\n  retry COUNT\n\n  COUNT is inclusive.\n\")\n\n(defn retries-left [limit used]\n  (- limit used 1))\n"
+     "(- limit used 1)" "(- limit used)"
+     "fix retries-left to return limit minus used with no extra decrement. Preserve help-text exactly."
+     "(= 3 (retries-left 5 2)) (= 0 (retries-left 5 5)) (= 8 (retries-left 8 0)) (= \"Usage:\n  retry COUNT\n\n  COUNT is inclusive.\n\" help-text)"
+     ["(def help-text \"Usage:\n  retry COUNT\n\n  COUNT is inclusive.\n\")"])
+   (task "lg-large-file" :lg
+     (str lg-large-prefix "\n(defn page-offset [page size]\n  (* page size))\n\n" lg-large-suffix)
+     "(* page size)" "(* (- page 1) size)"
+     "fix page-offset for one-based pages: page 1 starts at offset 0. Preserve every sentinel definition."
+     (str "(= 0 (page-offset 1 20)) (= 20 (page-offset 2 20)) (= 28 (page-offset 5 7)) "
+          (str/join " " (map (fn [i] (str "(= " i " sentinel-" i ")")) (range 150))))
+     [lg-large-prefix lg-large-suffix])
+   (task "py-nested" :python
+     "def settings():\n    return {\n        'service': {\n            'retry': {\n                'attempts': 2,\n                'delay': 10,\n            },\n            'port': 8080,\n        },\n        'label': 'stable',\n    }\n"
+     "'attempts': 2" "'attempts': 3"
+     "fix settings so the nested retry attempts default is 3. Preserve the delay, port, and label."
+     "assert settings() == {'service': {'retry': {'attempts': 3, 'delay': 10}, 'port': 8080}, 'label': 'stable'}"
+     ["                'delay': 10," "            'port': 8080,"])
+   (task "py-tabs" :python
+     "def total(price, count):\n\tsubtotal = price * count\n\treturn subtotal + 1\n\ndef label():\n\treturn 'tab-preserved'\n"
+     "return subtotal + 1" "return subtotal + 2"
+     "fix total to charge a flat handling fee of 2 in addition to price times count. Preserve label."
+     "assert total(3, 4) == 14\nassert total(5, 0) == 2\nassert total(7, 1) == 9\nassert label() == 'tab-preserved'"
+     ["def label():\n\treturn 'tab-preserved'\n"])
+   (task "py-blank-lines" :python
+     "def eligible(age):\n\n    # The threshold is inclusive.\n\n    return age > 18\n\n\ndef category():\n    return 'adult'\n"
+     "age > 18" "age >= 18"
+     "fix eligible to include age 18 while rejecting younger ages. Preserve category and surrounding blank lines."
+     "assert eligible(18)\nassert eligible(19)\nassert not eligible(17)\nassert not eligible(0)\nassert category() == 'adult'"
+     ["\n\n\ndef category():\n    return 'adult'\n"])
+   (task "py-duplicate-block" :python
+     "def preview_cost(n):\n    base = n * 10\n    return base + 1\n\ndef invoice_cost(n):\n    base = n * 10\n    return base + 1\n"
+     "def invoice_cost(n):\n    base = n * 10\n    return base + 1"
+     "def invoice_cost(n):\n    base = n * 10\n    return base + 2"
+     "fix invoice_cost to add a fee of 2 to n times 10. preview_cost must retain its fee of 1."
+     "assert invoice_cost(2) == 22\nassert invoice_cost(0) == 2\nassert invoice_cost(7) == 72\nassert preview_cost(2) == 21\nassert preview_cost(0) == 1"
+     ["def preview_cost(n):\n    base = n * 10\n    return base + 1\n"])
+   (task "py-multiline-string" :python
+     "HELP_TEXT = \"\"\"Usage:\n  retry COUNT\n\n  COUNT is inclusive.\n\"\"\"\n\ndef retries_left(limit, used):\n    return limit - used - 1\n"
+     "return limit - used - 1" "return limit - used"
+     "fix retries_left to return limit minus used with no extra decrement. Preserve HELP_TEXT exactly."
+     "assert retries_left(5, 2) == 3\nassert retries_left(5, 5) == 0\nassert retries_left(8, 0) == 8\nassert HELP_TEXT == 'Usage:\\n  retry COUNT\\n\\n  COUNT is inclusive.\\n'"
+     ["HELP_TEXT = \"\"\"Usage:\n  retry COUNT\n\n  COUNT is inclusive.\n\"\"\""])
+   (task "py-large-file" :python
+     (str py-large-prefix "\ndef page_offset(page, size):\n    return page * size\n\n" py-large-suffix)
+     "return page * size" "return (page - 1) * size"
+     "fix page_offset for one-based pages: page 1 starts at offset 0. Preserve every sentinel definition."
+     (str "assert page_offset(1, 20) == 0\nassert page_offset(2, 20) == 20\nassert page_offset(5, 7) == 28\n"
+          (str/join "\n" (map (fn [i] (str "assert SENTINEL_" i " == " i)) (range 150))))
+     [py-large-prefix py-large-suffix])])

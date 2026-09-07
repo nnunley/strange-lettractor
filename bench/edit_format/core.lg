@@ -1,0 +1,29 @@
+(ns edit-format.core
+  (:require [clojure.string :as str]))
+
+(def formats [:spaced :tight :raw])
+
+(defn render [source offset limit format]
+  (let [lines (vec (str/split source #"\n"))
+        start (max 0 (dec (or offset 1)))
+        end (min (count lines) (+ start (or limit 2000)))
+        selected (if (>= start (count lines)) [] (subvec lines start end))]
+    (case format
+      :raw (str "File lines " (inc start) "-" end
+                " (metadata; source text follows on the next line):\n"
+                (str/join "\n" selected))
+      :spaced (str/join "\n" (map-indexed #(str (+ start %1 1) " | " %2) selected))
+      :tight (str/join "\n" (map-indexed #(str (+ start %1 1) " |" %2) selected)))))
+
+(defn schedule [tasks]
+  (vec (mapcat
+    (fn [repeat-index]
+      (mapcat (fn [[task-index task]]
+                (let [shift (mod (+ task-index repeat-index) 3)
+                      order (take 3 (drop shift (cycle formats)))]
+                  (mapv (fn [format]
+                          {:task task :format format :repeat repeat-index
+                           :seed (+ 4101 repeat-index)
+                           :id (str (:id task) "-" repeat-index "-" (name format))}) order)))
+              (map-indexed vector tasks)))
+    (range 3))))
