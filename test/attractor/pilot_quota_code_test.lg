@@ -1,0 +1,22 @@
+(ns attractor.pilot-quota-code-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+(deftest test-provider-error-classifies-openai-insufficient-quota-at-429
+  (let [payload {"code" "insufficient_quota" "message" "Request rejected"}
+        raw {"error" payload}
+        wire (json/write-json {:error {:code "insufficient_quota" :message "Request rejected"}})]
+    (doseq [body [payload raw wire]]
+      (let [data (ex-data (llm/provider-error "openai" {:status 429 :body body
+                                                       :headers {"Retry-After" "0.02"}}))]
+        (is (= :quota-exceeded (:category data)))
+        (is (false? (:retryable data)))
+        (is (= "openai" (:provider data)))
+        (is (= "insufficient_quota" (:error_code data)))
+        (is (= 429 (:status_code data)))
+        (is (= 429 (:status data)))
+        (is (= 0.02 (:retry_after data)))
+        (is (= (if (= body payload) payload raw) (:raw data)))))))

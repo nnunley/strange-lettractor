@@ -41,7 +41,8 @@
 (defn- classify-provider-error [status body-map body-text]
   (let [message (str/lower-case
                   (str (or (error-field body-map "message") body-text "")))
-        grpc-code (error-field body-map "status")]
+        grpc-code (error-field body-map "status")
+        error-code (error-field body-map "code")]
     (cond
       (or (str/includes? message "context length")
           (str/includes? message "too many tokens")) :context-length
@@ -49,6 +50,7 @@
           (str/includes? message "safety")) :content-filter
       (and (str/includes? message "quota")
            (not (str/includes? message "rate"))) :quota-exceeded
+      (and (= error-code "insufficient_quota") (= status 429)) :quota-exceeded
       (or (= grpc-code "UNAUTHENTICATED") (= status 401)
           (str/includes? message "unauthorized")
           (str/includes? message "invalid key")) :authentication
