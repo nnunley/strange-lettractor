@@ -1,6 +1,6 @@
 [{:id "quota-code"
   :code "insufficient_quota" :status 429 :category :quota-exceeded
-  :prompt "Fix provider-error so an OpenAI insufficient_quota error code at HTTP 429 is classified as :quota-exceeded and non-retryable even when its message is generic. Preserve ordinary rate-limit behavior and all existing error fields."}
+  :prompt "Fix provider-error so an OpenAI insufficient_quota error code at HTTP 429 is classified as :quota-exceeded and non-retryable even when its message is generic. Preserve ordinary rate-limit behavior and all existing error fields. Navigation context: classify-provider-error starts at src/attractor/llm.lg line 41, and provider-error starts at line 72; the first 100 lines contain both functions. Mechanical baseline: the quota acceptance gate has 8 checks; 3 target checks fail because they return :rate-limit with :retryable true instead of :quota-exceeded with :retryable false, and all 5 control checks pass. The prior attempt used 12 model requests without edits. The new regression test does not exist yet."}
  {:id "context-code"
   :code "context_length_exceeded" :status 400 :category :context-length
   :prompt "Fix provider-error so an OpenAI context_length_exceeded error code at HTTP 400 is classified as :context-length and non-retryable even when its message is generic. Preserve ordinary invalid-request behavior and all existing error fields."}
