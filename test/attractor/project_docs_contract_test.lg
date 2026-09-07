@@ -1,0 +1,113 @@
+(ns attractor.project-docs-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+(def budget 32768)
+(def marker "\n[Project instructions truncated at 32KB]")
+(defn- byte-count [text] (count (bytes text)))
+(defn- copies [text n] (apply str (repeat n text)))
+(defn- environment [files reads root cwd]
+  (execution/make-environment
+    {:working_directory (fn [] cwd)
+     :file_exists #(contains? files %)
+     :read_text (fn [path] (swap! reads conj path) (get files path))
+     :inspect_command (fn [command]
+                        (if (and root (= command "git rev-parse --show-toplevel"))
+                          {:exit_code 0 :stdout root}
+                          {:exit_code 1 :stdout ""}))}))
+
+(deftest all-provider-discovery-is-root-first-and-does-not-read-other-providers
+  (let [names ["AGENTS.md" "CLAUDE.md" "GEMINI.md" ".codex/instructions.md"]
+        files (into {} (for [directory ["/repo" "/repo/sub"] name names]
+                         [(str directory "/" name) (str directory ":" name)]))]
+    (doseq [[provider selected] [["openai" ["AGENTS.md" ".codex/instructions.md"]]
+                                ["ANTHROPIC" ["AGENTS.md" "CLAUDE.md"]]
+                                ["gemini" ["AGENTS.md" "GEMINI.md"]]
+                                ["custom" ["AGENTS.md"]]]]
+      (let [reads (atom []) expected-paths (vec (for [directory ["/repo" "/repo/sub"] name selected]
+                                                 (str directory "/" name)))
+            docs (agent/discover-project-docs (environment files reads "/repo" "/repo/sub") provider)]
+        (is (= expected-paths @reads))
+        (is (= (mapv #(str "# " % "\n" (get files %)) expected-paths) docs))))))
+
+(deftest utf8-budget-preserves-complete-characters-and-truncation-marker
+  (let [path "/repo/AGENTS.md" header (str "# " path "\n")
+        reads (atom [])
+        docs (agent/discover-project-docs
+               (environment {path (copies "😀" 9000)
+                             "/repo/CLAUDE.md" "must not read after cutoff"}
+                            reads "/repo" "/repo") "anthropic")
+        rendered (str/join "\n\n" docs)
+        expected (str header (copies "😀" (quot (- budget (byte-count header) (byte-count marker)) 4)) marker)]
+    (is (= expected rendered))
+    (is (<= (byte-count rendered) budget))
+    (is (str/ends-with? rendered marker))
+    (is (not (str/includes? rendered "�")))
+    (is (= [path] @reads))))
+
+(deftest exact-rendered-budget-is-not-truncated-but-next-byte-is
+  (let [path "/repo/AGENTS.md" header (str "# " path "\n")]
+    (doseq [extra [0 1]]
+      (let [raw (copies "a" (+ (- budget (byte-count header)) extra))
+            rendered (str/join "\n\n"
+                              (agent/discover-project-docs
+                                (environment {path raw} (atom []) nil "/repo") "custom"))]
+        (is (= budget (byte-count rendered)))
+        (is (= (if (zero? extra)
+                 (str header raw)
+                 (str header (copies "a" (- budget (byte-count header) (byte-count marker))) marker))
+               rendered))))))
+
+(deftest labels-and-separators-across-files-share-the-byte-budget
+  (let [files {"/repo/AGENTS.md" (copies "a" 16000)
+               "/repo/CLAUDE.md" (copies "b" 18000)
+               "/repo/sub/AGENTS.md" "unread descendant"}
+        reads (atom [])
+        docs (agent/discover-project-docs (environment files reads "/repo" "/repo/sub") "anthropic")
+        rendered (str/join "\n\n" docs)
+        combined (str "# /repo/AGENTS.md\n" (get files "/repo/AGENTS.md")
+                      "\n\n# /repo/CLAUDE.md\n" (get files "/repo/CLAUDE.md"))]
+    (is (= budget (byte-count rendered)))
+    (is (= (str (subs combined 0 (- budget (byte-count marker))) marker) rendered))
+    (is (= ["/repo/AGENTS.md" "/repo/CLAUDE.md"] @reads))))
+
+(deftest later-document-reclaims-marker-space-from-exactly-full-earlier-document
+  (let [path "/repo/AGENTS.md"
+        header (str "# " path "\n")
+        raw (copies "a" (- budget (byte-count header)))
+        reads (atom [])
+        files {path raw
+               "/repo/CLAUDE.md" "later instructions"
+               "/repo/sub/AGENTS.md" "unread descendant"}
+        docs (agent/discover-project-docs
+               (environment files reads "/repo" "/repo/sub") "anthropic")
+        rendered (str/join "\n\n" docs)]
+    (is (= budget (byte-count rendered)))
+    (is (= (str header (copies "a" (- budget (byte-count header) (byte-count marker))) marker)
+           rendered))
+    (is (str/ends-with? rendered marker))
+    (is (= [path "/repo/CLAUDE.md"] @reads))))
+
+(deftest session-system-prompt-consumes-the-bounded-discovered-block
+  (let [reads (atom []) requests (atom [])
+        env (environment {"/repo/AGENTS.md" (copies "😀" 9000)} reads nil "/repo")
+        profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+        session (agent/make-session
+                  {:provider_profile profile :execution_env env :max_subagent_depth 0
+                   :user_instructions "FINAL USER RULE"
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (try
+      (is (= "done" (agent/process-input! session "work")))
+      (let [system-text (get-in @requests [0 :messages 0 :content])
+            block (second (re-find #"(?s)<project_instructions>\n(.*)\n</project_instructions>" system-text))]
+        (is (some? block))
+        (is (= (str/join "\n\n" (:project_docs @session)) block))
+        (is (<= (byte-count block) budget))
+        (is (str/ends-with? block marker))
+        (is (str/ends-with? system-text "FINAL USER RULE")))
+      (finally (agent/close-session! session)))))
