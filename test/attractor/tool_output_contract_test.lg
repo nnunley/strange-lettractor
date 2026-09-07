@@ -1,0 +1,128 @@
+(ns attractor.tool-output-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.agent :as agent]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]))
+
+;; These executors supply controlled output to the real session/client boundary.
+;; They test output handling, not the internals of the named built-in tools.
+;; SCN-CAL-TRUNCATION COMPLETE
+(defn- exercise-output [tool-name execute options]
+  (let [requests (atom []) events (atom [])
+        tool {:definition {:name tool-name :description "Output fixture"
+                           :parameters {:type "object" :properties {}}}
+              :executor execute}
+        registry (profiles/make-tool-registry (if (:missing-tool options) [] [tool]))
+        adapter (llm/make-adapter
+                  "contract"
+                  (fn [request]
+                    (swap! requests conj request)
+                    (if (= 1 (count @requests))
+                      {:message {:role :assistant :content ""}
+                       :tool_calls [{:id "output-call" :name tool-name :arguments {}}]}
+                      {:message {:role :assistant :content "done"} :tool_calls []})) nil)
+        session (agent/make-session
+                  (merge {:provider_profile
+                          (profiles/make-profile {:id "contract" :model "output-test"
+                                                  :supports_streaming false
+                                                  :tool_registry registry})
+                          :llm_client (llm/make-client {:providers {"contract" adapter}})
+                          :project_docs [] :max_subagent_depth 0
+                          :on_event #(swap! events conj %)} (dissoc options :missing-tool)))]
+    ;; Session depth policy removes native subagent tools; install only the
+    ;; controlled output fixture afterward. This does not exercise child agents.
+    (when (= tool-name "spawn_agent")
+      (profiles/register-tool! (get-in @session [:provider_profile :tool_registry]) tool))
+    (try
+      (is (= "done" (agent/process-input! session "inspect output")))
+      (is (= 2 (count @requests)))
+      (let [model-result (get-in @requests [1 :messages 3 :content 0])
+            stored-result (get-in @session [:history 2 :results 0])
+            ends (filter #(= :tool_call_end (:type %)) @events)]
+        (is (= 1 (count ends)))
+        (is (= stored-result model-result))
+        (is (= "output-call" (:tool_call_id model-result)))
+        {:model model-result :event (first ends)})
+      (finally (agent/close-session! session)))))
+
+(defn- repeated [text n] (apply str (repeat n text)))
+
+(deftest specified-default-character-limits-and-modes-reach-the-model
+  ;; Independent §5.2 oracle, not generated from implementation constants.
+  (doseq [[tool-name limit head-tail?]
+          [["read_file" 50000 true] ["shell" 30000 true]
+           ["grep" 20000 false] ["glob" 20000 false]
+           ["edit_file" 10000 false] ["apply_patch" 10000 false]
+           ["write_file" 1000 false] ["spawn_agent" 20000 true]]]
+    (let [raw (str (repeated "H" limit) "X" (repeated "T" limit))
+          result (exercise-output tool-name (fn [_ _] raw) {})
+          content (:content (:model result))]
+      (is (= raw (:output (:event result))))
+      (is (false? (:is_error (:model result))))
+      (is (str/includes? content (str (inc limit) " characters were removed")))
+      (is (str/includes? content "The full output is available in the event stream."))
+      (is (not (str/includes? content "X")))
+      (is (str/ends-with? content (repeated "T" (if head-tail? (quot limit 2) limit))))
+      (is (= (if head-tail? (quot limit 2) 0)
+             (count (filter #(= % \H) content))))
+      (is (= (if head-tail? (quot limit 2) limit)
+             (count (re-find #"T+$" content)))))))
+
+(deftest huge-single-and-two-line-outputs-remain-raw-only-in-events
+  (let [megabyte (repeated (repeated "x" 1024) 1024)
+        ten-megabytes (repeated megabyte 10)]
+    (doseq [raw [(str "HEAD" ten-megabytes "TAIL")
+                 (str "HEAD" ten-megabytes "\n" ten-megabytes "TAIL")]]
+      (let [result (exercise-output "shell" (fn [_ _] raw)
+                                   {:tool_output_limits {"shell" 1000}})
+            content (:content (:model result))]
+        (is (= raw (:output (:event result))))
+        (is (str/starts-with? content "HEAD"))
+        (is (str/ends-with? content "TAIL"))
+        (is (str/includes? content (str (- (count raw) 1000) " characters were removed")))
+        (is (< (count content) 1400))))))
+
+(deftest tool-errors-are-bounded-for-the-model-but-complete-in-events
+  (let [error (ex-info (str "HEAD" (repeated "x" 100000) "TAIL") {})
+        expected-raw (str "Tool error (read_file): " error)
+        result (exercise-output "read_file" (fn [_ _] (throw error))
+                                {:tool_output_limits {"read_file" 1000}})
+        content (:content (:model result))]
+    (is (true? (:is_error (:model result))))
+    (is (= expected-raw (:error (:event result))))
+    (is (nil? (:output (:event result))))
+    (is (str/starts-with? content (subs expected-raw 0 500)))
+    (is (str/ends-with? content (subs expected-raw (- (count expected-raw) 500))))
+    (is (str/includes? content (str (- (count expected-raw) 1000) " characters were removed")))
+    (is (< (count content) 1400))))
+
+(deftest unknown-tool-error-content-also-obeys-output-limits
+  (let [tool-name (str "missing-" (repeated "x" 30000))
+        expected-raw (str "Unknown tool: " tool-name)
+        result (exercise-output tool-name (fn [_ _] (throw (ex-info "must not execute" {})))
+                                {:missing-tool true :tool_output_limits {tool-name 1000}})
+        content (:content (:model result))]
+    (is (true? (:is_error (:model result))))
+    (is (= expected-raw (:error (:event result))))
+    (is (str/includes? content "Tool output was truncated"))
+    (is (str/ends-with? content (repeated "x" 1000)))
+    (is (< (count content) 1300))))
+
+(deftest default-line-limits-and-character-before-line-order
+  (doseq [[tool-name limit] [["shell" 256] ["grep" 200] ["glob" 500]]]
+    (let [lines (mapv #(str "line-" %) (range (inc limit)))
+          raw (str/join "\n" lines)
+          half (quot limit 2)
+          expected (str (str/join "\n" (subvec lines 0 half))
+                        "\n[... 1 lines omitted ...]\n"
+                        (str/join "\n" (subvec lines (inc half))))
+          result (exercise-output tool-name (fn [_ _] raw) {})]
+      (is (= raw (:output (:event result))))
+      (is (= expected (:content (:model result))))))
+  (let [raw "aaaa\nbbbb\ncccc\ndddd"
+        result (exercise-output "shell" (fn [_ _] raw)
+                                {:tool_output_limits {"shell" 12}
+                                 :tool_line_limits {"shell" 2}})]
+    (is (= raw (:output (:event result))))
+    (is (= "aaaa\n[... 5 lines omitted ...]\ndddd" (:content (:model result))))))

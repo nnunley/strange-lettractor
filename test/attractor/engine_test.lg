@@ -250,17 +250,32 @@ digraph Gate {
 (deftest test-timed-tool-node-keeps-partial-output-and-never-accepts-late-success
   (let [late-marker (str (os/temp-dir) "/attractor-engine-tool-timeout-late-"
                          (System/nanoTime))
+        ready-marker (str late-marker "-ready")
         command (str "printf 'partial stdout\\n'; "
                      "printf 'partial stderr\\n' >&2; "
+                     "printf ready > " ready-marker "; "
                      "sleep 1; printf late > " late-marker)
+        factory h/*tool-environment-factory*
         started (System/currentTimeMillis)
         task (core/future
-               (e/execute-with-retry
-                 h/handle-tool
-                 {:id "timed-tool"
-                  :timeout "50ms"
-                  :attrs {:tool_command command}}
-                 (c/make-context) {} "" (fn [_] nil) {}))
+               ;; This proves engine cancellation preserves *produced* output.
+               ;; Do not spend the 50ms virtual deadline on process startup.
+               ;; The native command watchdog remains a bounded fallback; the
+               ;; engine must cancel within the shorter assertion window below.
+               (binding [h/*tool-environment-factory*
+                         (fn [options]
+                           (let [environment (factory (assoc options :max_command_timeout_ms 5000))
+                                 exec-command (:exec_command environment)]
+                             (assoc environment :exec_command
+                                    (fn [cmd _timeout dir vars]
+                                      (exec-command cmd 5000 dir vars)))))]
+                 (e/execute-with-retry
+                   h/handle-tool
+                   {:id "timed-tool"
+                    :timeout "50ms"
+                    :attrs {:tool_command command}}
+                   (c/make-context) {} "" (fn [_] nil)
+                   {:now-ms (fn [] (if (os/stat ready-marker) 50 0))})))
         outcome (deref task 4000 ::timed-out)
         elapsed (- (System/currentTimeMillis) started)]
     (is (not= ::timed-out outcome))
@@ -268,6 +283,7 @@ digraph Gate {
     (is (= :fail (:status outcome)))
     (is (= :timeout_error (:category outcome)))
     (is (= true (:retryable outcome)))
+    (is (some? (os/stat ready-marker)))
     (is (= "partial stdout\n"
            (get-in outcome [:context_updates "tool.output"])))
     (is (str/includes? (get-in outcome [:context_updates "tool.error"])

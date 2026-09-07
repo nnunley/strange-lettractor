@@ -673,7 +673,8 @@
     (if (nil? registered)
       (let [error-msg (str "Unknown tool: " tool-name)
             result {:tool_call_id call-id :tool_name tool-name
-                    :content error-msg :is_error true}]
+                    :content (truncate-tool-output error-msg tool-name (:config @session))
+                    :is_error true}]
         (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
         result)
       (try
@@ -696,7 +697,8 @@
         (catch Object e
           (let [error-msg (str "Tool error (" tool-name "): " e)
                 result {:tool_call_id call-id :tool_name tool-name
-                        :content error-msg :is_error true}]
+                        :content (truncate-tool-output error-msg tool-name (:config @session))
+                        :is_error true}]
             (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
             result))))))
 

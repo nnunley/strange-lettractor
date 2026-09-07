@@ -1,7 +1,28 @@
 # Progress
 
 **Phase:** implementing ITER-0006
-**Task:** file-write byte confirmations repaired and filesystem failures verified through sessions; hook design remains awaiting approval
+**Task:** raw/model output bounds verified, including previously unbounded error results; hook design remains awaiting approval
+
+**Output bounds checkpoint:** the shared tool path previously truncated success
+output but sent exception and unknown-tool error content to the model unbounded.
+Both error paths now apply the same configured character-then-line limits while
+retaining complete errors in events. `tool_output_contract_test.lg` verifies all
+eight specified default character limits/modes, default line limits and ordering,
+10 MiB single-line output, two 10 MiB lines, overrides, and complete raw events
+versus bounded history/next-request content. Controlled executors isolate this
+common handling path; no native tool or streaming conformance is inferred. RED:
+four error-bound assertions failed; GREEN: 5 tests / 174 assertions. Scoped review
+approved. CAL-TRUNC-01 / SCN-CAL-TRUNCATION are complete components only.
+
+Initial full verification found two failures in the existing engine partial-output
+fixture (missing stdout/stderr, no late-write failure). A forced 100ms environment
+startup reproduced valid cancellation before any output under its 50ms deadline.
+The fixture now advances its injected engine clock only after a file marker proves
+both output writes occurred; a 5s native watchdog is only a test fallback, longer
+than its 4s completion assertion. Production timing is unchanged. The focused
+9 assertions pass normally and with the forced startup delay; review approved.
+Final root full suite passes **564 tests / 4693 assertions / zero failures**,
+exit 0, and AOT builds. Five separate reader acceptance failures remain unresolved.
 
 **Partial main integration:** the reviewed range `38e9c9e..5d9d445` is now
 fast-forwarded into local main. Cumulative review found no material interaction

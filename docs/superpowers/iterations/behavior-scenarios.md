@@ -274,7 +274,8 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Given pathological 10 MB, single-line, and two-line tool output
 - When it is recorded and returned to the model
 - Then events retain full raw output while model history receives deterministic bounded head/tail content with an explicit marker
-- Seam: coding-loop integration
+- Also verify all eight specified default character limits/modes, the three default line limits, character-before-line order, configuration overrides, and bounded tool errors whose full messages remain in events
+- Seam: coding-loop integration; complete component in `tool_output_contract_test.lg` (5 tests / 174 assertions). Controlled executors feed the real session/unified-client boundary; this is not proof of native tool internals or streaming transport.
 
 ### SCN-SYSTEM-PROMPT-BOUND — Bounded repository context
 
