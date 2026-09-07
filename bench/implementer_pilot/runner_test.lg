@@ -1,0 +1,51 @@
+(require '[clojure.test :refer [deftest is run-tests]])
+(require '[implementer-pilot.runner :refer [authorize check-commands verified? workflow-dot verify-checks completion? sandbox-profile]])
+(deftest bounded-os-reads
+  (let [profile (sandbox-profile {:candidate "/candidate" :trusted "/trusted"})]
+    (is (clojure.string/includes? profile "(deny file-read-data (subpath \"/Users\") (subpath \"/Volumes\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\"))"))
+    (is (clojure.string/includes? profile "(subpath \"/candidate/src\")"))
+    (is (clojure.string/includes? profile "(subpath \"/trusted\")"))))
+(deftest permissions
+  (let [cfg {:candidate "/candidate" :task-id "quota-code" :trusted "/trusted"}
+        read (authorize cfg "read_file" {"file_path" "/candidate/src/attractor/llm.lg" "limit" 999})]
+    (is (= "src/attractor/llm.lg" (get read "file_path")))
+    (is (= 160 (get read "limit")))
+    (doseq [[tool path] [["edit_file" "../src/attractor/llm.lg"]
+                       ["write_file" "src/attractor/llm.lg"]
+                       ["edit_file" "/trusted/acceptance.lg"]
+                       ["read_file" "/candidate/src/../src/attractor/llm.lg"]
+                       ["spawn_agent" "src/attractor/llm.lg"]
+                       ["read_file" "docs/notes.md"]]]
+      (is (try (authorize cfg tool {"file_path" path}) false (catch Object _ true))))
+    (is (= "test/attractor/pilot_quota_code_test.lg"
+           (get (authorize cfg "write_file" {"file_path" "test/attractor/pilot_quota_code_test.lg"}) "file_path")))
+    (is (try (authorize cfg "shell" {"command" "echo yes"}) false (catch Object _ true)))
+    (doseq [command (check-commands cfg)]
+      (is (= {"command" command "timeout_ms" 30000}
+             (authorize cfg "shell" {"command" command "working_dir" "/evil" "env" {"X" "Y"}}))))))
+(deftest gate-contract
+  (let [good {:acceptance {:exit_code 0 :completion true} :regression {:exit_code 0 :completion true}
+              :test-exists true :integrity true :limit-reached false}]
+    (is (verified? good))
+    (doseq [bad [(assoc good :test-exists false) (assoc good :integrity false)
+                 (assoc good :limit-reached true) (dissoc good :acceptance)
+                 (assoc good :regression {:exit_code 0})
+                 (assoc good :regression {:exit_code 1})]]
+      (is (not (verified? (assoc bad :model-claim "done")))))
+    (is (clojure.string/includes? (workflow-dot) "implement -> verify"))
+    (is (clojure.string/includes? (workflow-dot) "verify -> exit"))))
+(deftest both-checks-run-even-when-first-fails
+  (let [seen (atom []) cfg {:trusted "/trusted" :task-id "quota-code"}
+        result (verify-checks cfg
+                 (fn [command] (swap! seen conj command) {:exit_code 1})
+                 true true false)]
+    (is (= (check-commands cfg) @seen))
+    (is (not (verified? result)))))
+(deftest completion-markers
+  (is (not (completion? :regression "quota-code" "")))
+  (is (not (completion? :regression "quota-code" "{:pilot-regression true :task \"quota-code\" :counters {:test 1 :pass 0 :fail 0 :error 0}}")))
+  (is (completion? :regression "quota-code" "{:pilot-regression true :task \"quota-code\" :counters {:test 1 :pass 2 :fail 0 :error 0}}"))
+  (is (completion? :acceptance "quota-code" "{:task \"quota-code\" :passed true :checks 8}"))
+  (is (not (completion? :acceptance "context-code" "{:task \"quota-code\" :passed true :checks 8}"))))
+(run-tests)
+(os/exit (if clojure.test/*test-result* 0 1))

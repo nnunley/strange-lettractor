@@ -1,0 +1,21 @@
+(require '[implementer-pilot.runner :as runner] '[json :as json] '[io :as io])
+(let [[candidate output] *command-line-args*
+      cfg {:task-id "quota-code" :candidate candidate :output output
+           :trusted (str (os/cwd) "/bench/implementer_pilot") :mode :offline
+           :endpoint "http://offline.invalid/v1"
+           :transport (fn [_] {:status 200 :body (json/write-json
+                              {:id "offline" :model "stub" :choices [{:message {:role "assistant" :content "done"}
+                                                                        :finish_reason "stop"}]})})}
+      before (runner/candidate-hashes cfg)
+      outcome (runner/run-pilot! cfg {:prompt "Say done without modifying any files."})
+      gate (read-string (io/slurp (str output "/verification.edn")))
+      passed (and (false? (:verified outcome)) (= 1 (:requests outcome))
+                  (= before (runner/candidate-hashes cfg))
+                  (= 1 (get-in gate [:acceptance :exit_code]))
+                  (not= 130 (get-in gate [:regression :exit_code]))
+                  (false? (:test-exists gate))
+                  (clojure.string/includes? (get-in gate [:acceptance :stdout]) ":checks 8"))]
+  (prn {:offline-pilot-negative-control passed :outcome (select-keys outcome [:verified :requests])
+        :acceptance-exit (get-in gate [:acceptance :exit_code])
+        :regression-exit (get-in gate [:regression :exit_code])})
+  (os/exit (if passed 0 1)))

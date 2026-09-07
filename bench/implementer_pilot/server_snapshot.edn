@@ -1,0 +1,8 @@
+{:endpoint "http://ndn.local:8080/v1"
+ :server "llama.cpp"
+ :model "qwen3.8-27b"
+ :build "b10830-465e49b9c"
+ :context 131072
+ :earlier_context 32768
+ :quantization "Q4_K - Medium"
+ :note "Read-only /v1/models and /props snapshot before pilot; no model task has run yet."}

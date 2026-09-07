@@ -1,0 +1,2 @@
+(require '[implementer-pilot.runner :as runner])
+(apply runner/-main *command-line-args*)

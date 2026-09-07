@@ -1,0 +1,202 @@
+(ns implementer-pilot.runner
+  (:require [clojure.string :as str] [io :as io] [os :as os] [http :as http]
+            [attractor.llm :as llm] [attractor.agent :as agent]
+            [attractor.profiles :as profiles] [attractor.execution :as execution]
+            [attractor.handlers :as handlers] [attractor.interviewer :as interviewer]
+            [attractor.pipeline :as pipeline] [attractor.workflow :as workflow]))
+
+(def lg "/Users/ndn/development/let-go/lg")
+(defn sandbox-profile [cfg]
+  ;; Scoped protection, not a universal filesystem read allowlist: dyld needs
+  ;; system locations beyond the strict policy tested during pilot setup.
+  (str "(version 1) (allow default) (deny network*) (deny file-write*) (deny file-read-data (subpath \"/Users\") (subpath \"/Volumes\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\")) (allow file-read-data "
+       (str/join " " (concat
+         [(str "(literal " (pr-str lg) ")")]
+         (map #(str "(subpath " (pr-str %) ")") [(str (:candidate cfg) "/src")
+                                                    (str (:candidate cfg) "/test") (:trusted cfg)]))) ")"))
+(def task-ids #{"quota-code" "context-code" "filter-code"})
+(defn test-path [id] (str "test/attractor/pilot_" (str/replace id "-" "_") "_test.lg"))
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn check-commands [cfg]
+  (mapv (fn [file]
+          (str "/usr/bin/sandbox-exec -p " (quote-shell (sandbox-profile cfg)) " " lg
+               " -source-paths src:test " (quote-shell (str (:trusted cfg) "/" file))
+               " " (quote-shell (:task-id cfg))))
+        ["acceptance.lg" "regression.lg"]))
+
+(defn authorize [cfg tool args]
+  (if (= tool "shell")
+    (let [command (or (get args "command") (:command args))]
+      (when-not (some #(= command %) (check-commands cfg))
+        (throw (ex-info "Command outside fixed verification allowlist" {:tool tool})))
+      {"command" command "timeout_ms" 30000})
+    (let [writable #{"src/attractor/llm.lg" (test-path (:task-id cfg))}
+          readable (conj writable "test/attractor/llm_test.lg")
+          aliases (into {} (map (fn [p] [(str (:candidate cfg) "/" p) p]) readable))
+          raw (or (get args "file_path") (:file_path args))
+          path (get aliases raw raw)
+          allowed (case tool
+                    "read_file" (or (contains? readable path)
+                                    (= path (str (:trusted cfg) "/acceptance.lg")))
+                    "edit_file" (contains? writable path)
+                    "write_file" (= path (test-path (:task-id cfg)))
+                    false)]
+      (when-not allowed (throw (ex-info "Path outside task allowlist" {:tool tool :path path})))
+      (let [normalized (assoc (dissoc args :file_path :limit :offset) "file_path" path)]
+        (if (= tool "read_file")
+          (assoc normalized "limit" (max 1 (min 160 (or (get args "limit") (:limit args) 160)))
+                            "offset" (max 1 (or (get args "offset") (:offset args) 1)))
+          normalized)))))
+
+(defn verified? [e]
+  (and (= 0 (get-in e [:acceptance :exit_code]))
+       (= 0 (get-in e [:regression :exit_code]))
+       (true? (get-in e [:acceptance :completion]))
+       (true? (get-in e [:regression :completion]))
+       (true? (:test-exists e)) (true? (:integrity e))
+       (false? (:limit-reached e))))
+(defn workflow-dot []
+  "digraph pilot { graph [default_max_retries=0]; start [shape=Mdiamond]; implement [shape=box, timeout=\"180s\", max_retries=0]; verify [type=\"pilot.verify\", max_retries=0]; exit [shape=Msquare]; start -> implement; implement -> verify; verify -> exit; }")
+
+(defn completion? [kind id stdout]
+  (let [record (try (read-string (last (remove str/blank? (str/split (or stdout "") #"\r?\n"))))
+                    (catch Object _ nil))
+        counters (:counters record)]
+    (and (= id (:task record))
+         (if (= kind :acceptance)
+           (and (true? (:passed record)) (= 8 (:checks record)))
+           (and (true? (:pilot-regression record))
+                (number? (:test counters)) (pos? (:test counters))
+                (number? (:pass counters)) (pos? (:pass counters))
+                (= 0 (:fail counters)) (= 0 (:error counters)))))))
+
+(defn verify-checks [cfg execute test-exists integrity limit-reached]
+  (let [[acceptance regression] (mapv (fn [[kind command]]
+                                      (try (let [result (execute command)]
+                                             (assoc result :completion (boolean (completion? kind (:task-id cfg) (:stdout result)))))
+                                           (catch Object e {:exit_code -1 :error (str e)})))
+                                    (map vector [:acceptance :regression] (check-commands cfg)))]
+    {:acceptance acceptance :regression regression :test-exists test-exists
+     :integrity integrity :limit-reached limit-reached}))
+
+(defn data-only [v]
+  (cond (or (nil? v) (string? v) (number? v) (boolean? v) (keyword? v)) v
+        (map? v) (into {} (map (fn [[k x]] [(data-only k) (data-only x)]) v))
+        (sequential? v) (mapv data-only v)
+        :else (str v)))
+(defn fingerprint [path]
+  (when (os/stat path) (workflow/sha256-text (io/slurp path))))
+(defn verifier-hashes [cfg]
+  (into {} (map (fn [file] [file (fingerprint (str (:trusted cfg) "/" file))])
+                ["acceptance.lg" "regression.lg"])))
+(defn candidate-hashes [cfg]
+  (into {} (map (fn [file] [file (fingerprint (str (:candidate cfg) "/" file))])
+                ["src/attractor/llm.lg" (test-path (:task-id cfg))])))
+
+(defn run-pilot! [cfg task]
+  (when (os/stat (:output cfg)) (throw (ex-info "Refusing existing output directory" {})))
+  (io/mkdir (:output cfg))
+  (let [events (atom []) calls (atom []) responses (atom []) requests (atom 0)
+        limit (atom false) gate (atom nil)
+        save (fn [file value] (io/spit (str (:output cfg) "/" file ".edn") (pr-str (data-only value))))
+        before (verifier-hashes cfg) source-before (candidate-hashes cfg)
+        env (execution/make-local-environment {:working_dir (:candidate cfg) :env_policy :none
+                                             :default_command_timeout_ms 30000 :max_command_timeout_ms 30000})
+        client (llm/make-client
+                 {:providers {"ollama" (llm/make-provider-adapter "ollama"
+                    {:base_url (:endpoint cfg) :max_tokens 3000 :temperature 0.2 :adapter_timeout 90000
+                     :transport (fn [request]
+                                  (when (> (swap! requests inc) 12)
+                                    (reset! limit true)
+                                    (throw (ex-info "Pilot model request budget exhausted" {:retryable false})))
+                                  (save (str "request-" @requests) (dissoc request :headers))
+                                  ((or (:transport cfg) http/request) request))})}
+                  :default_provider "ollama"
+                  :middleware [(fn [request next]
+                                 (try
+                                   (let [response (next request)]
+                                     (swap! responses conj response) (save "responses" @responses) response)
+                                   (catch Object e
+                                     (swap! responses conj {:error (str e) :data (ex-data e)})
+                                     (save "responses" @responses) (throw e))))]})
+        profile (assoc (profiles/create-profile "ollama" "qwen3.8-27b")
+                       :context_window_size 131072 :supports_streaming false)
+        on-event (fn [event]
+                   (when (= :turn_limit (:type event)) (reset! limit true))
+                   (swap! events conj event) (save "events" @events))]
+    (save "configuration" cfg)
+    (save "effective-settings" {:provider "ollama" :model "qwen3.8-27b"
+                                :context_window_size 131072 :stream false
+                                :max_tokens 3000 :temperature 0.2 :max_model_requests 12
+                                :max_tool_rounds_per_input 12 :max_turns 20
+                                :node_timeout_ms 180000 :adapter_timeout_ms 90000
+                                :verification_timeout_ms 30000})
+    (save "before" {:verifiers before :candidate source-before})
+    (swap! (:tool_registry profile) select-keys ["read_file" "edit_file" "write_file" "shell"])
+    (doseq [[name tool] @(:tool_registry profile)]
+      (profiles/register-tool! (:tool_registry profile)
+        (assoc tool :executor
+          (fn [args execution-env]
+            (try
+              (let [safe (authorize cfg name args)
+                    result (if (= name "shell")
+                             ((:exec_command env) (get safe "command") 30000 (:candidate cfg) nil)
+                             ((:executor tool) safe execution-env))]
+                (swap! calls conj {:tool name :arguments safe :output result})
+                (save "tools" @calls) result)
+              (catch Object e
+                (swap! calls conj {:tool name :arguments args :error (str e) :data (ex-data e)})
+                (save "tools" @calls) (throw e)))))))
+    (let [backend (agent/make-agent-codergen-backend
+                    {:provider_profile profile :llm_client client :project_docs [] :max_subagent_depth 0
+                     :max_tool_rounds_per_input 12 :max_turns 20 :execution_env env :on_event on-event})
+          registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
+          verify (fn [_node _ctx _graph _logs]
+                   (let [verifier-env (execution/make-local-environment
+                                        {:working_dir (:candidate cfg) :env_policy :none
+                                         :default_command_timeout_ms 30000 :max_command_timeout_ms 30000})]
+                     (try
+                       (let [evidence (verify-checks cfg
+                                        (fn [command] ((:exec_command verifier-env) command 30000 (:candidate cfg) nil))
+                                        (some? (os/stat (str (:candidate cfg) "/" (test-path (:task-id cfg)))))
+                                        (= before (verifier-hashes cfg)) @limit)
+                             evidence (assoc evidence :integrity (= before (verifier-hashes cfg)))]
+                         (reset! gate evidence) (save "verification" evidence)
+                         {:status (if (verified? evidence) :success :fail)
+                          :failure_reason (when-not (verified? evidence) "Mechanical pilot verification failed")})
+                       (finally ((:cleanup verifier-env))))))
+          prompt (str (:prompt task) "\nOnly modify src/attractor/llm.lg and " (test-path (:task-id cfg))
+                      ". Add a focused regression test in namespace attractor.pilot-" (:task-id cfg) "-test."
+                      " Full write_file is permitted only for the new test. read_file is capped at 160 lines."
+                      " Read the trusted acceptance contract at " (:trusted cfg) "/acceptance.lg."
+                      " Existing test example: test/attractor/llm_test.lg. Use exact edit_file matches; line numbers are not source."
+                      " Run exactly these verification commands (no other shell commands permitted):\n"
+                      (str/join "\n" (check-commands cfg)))]
+      (handlers/register-handler! registry "pilot.verify" verify)
+      (try
+        (let [result (pipeline/run (workflow-dot)
+                       {:logs-root (str (:output cfg) "/pipeline") :registry registry
+                        :custom-transforms [(fn [graph] (assoc-in graph [:nodes "implement" :prompt] prompt))]})
+              outcome {:pipeline result :verified (and (= :success (:status result)) (verified? @gate))
+                       :requests @requests :limit-reached @limit
+                       :after {:verifiers (verifier-hashes cfg) :candidate (candidate-hashes cfg)}}]
+          (save "outcome" outcome) outcome)
+        (catch Object e
+          (let [outcome {:verified false :error (str e) :data (ex-data e) :requests @requests
+                         :after {:verifiers (verifier-hashes cfg) :candidate (candidate-hashes cfg)}}]
+            (save "outcome" outcome) outcome))))))
+
+(defn -main [& args]
+  (if (or (empty? args) (= "--help" (first args)))
+    (println "runner.lg TASK-ID ABSOLUTE-CANDIDATE ABSOLUTE-NEW-OUTPUT [ENDPOINT]\nRun from the known-good pilot checkout. No implicit retry.")
+    (let [[id candidate output endpoint] args
+          _ (when-not (and (contains? task-ids id) (str/starts-with? candidate "/") (str/starts-with? output "/"))
+              (throw (ex-info "Expected known task and absolute candidate/output paths" {})))
+          trusted (str (os/cwd) "/bench/implementer_pilot")
+          task (first (filter #(= id (:id %)) (read-string (io/slurp (str trusted "/tasks.edn")))))
+          outcome (run-pilot! {:task-id id :candidate candidate :output output :trusted trusted
+                              :endpoint (or endpoint "http://ndn.local:8080/v1")} task)]
+      (prn (select-keys outcome [:verified :requests :limit-reached :error]))
+      (os/exit (if (:verified outcome) 0 1)))))
+
+;; Require is side-effect free. CLI wrapper invokes -main explicitly.

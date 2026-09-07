@@ -1,0 +1,47 @@
+;; Independent acceptance gate: run using the candidate's source path, never
+;; copy this file into a model-writable location. No model-written tests loaded.
+(ns implementer-pilot.acceptance (:require [attractor.llm :as llm] [json :as json]))
+
+(def tasks
+  {"quota-code" ["insufficient_quota" 429 :quota-exceeded]
+   "context-code" ["context_length_exceeded" 400 :context-length]
+   "filter-code" ["content_filter" 400 :content-filter]})
+
+(defn checks [id]
+  (let [[code status category] (get tasks id)
+        _ (when-not code (throw (ex-info "Unknown pilot task" {:task id})))
+        payload {"code" code "message" "Request rejected"}
+        raw {"error" payload}
+        wire (json/write-json {:error {:code code :message "Request rejected"}})
+        target-results
+        (mapv
+          (fn [body]
+            (let [data (ex-data (llm/provider-error "openai" {:status status :body body
+                                                           :headers {"Retry-After" "0.02"}}))]
+              {:kind :target
+               :pass (and (= category (:category data)) (false? (:retryable data))
+                          (= "openai" (:provider data)) (= code (:error_code data))
+                          (= status (:status_code data)) (= status (:status data))
+                          (= 0.02 (:retry_after data))
+                          (= (if (= body payload) payload raw) (:raw data)))
+               :category (:category data) :retryable (:retryable data)}))
+          [payload raw wire])
+        controls
+        (mapv
+          (fn [[status expected retryable]]
+            (let [data (ex-data (llm/provider-error
+                                 "openai" {:status status :headers {"Retry-After" "0.02"}
+                                           :body {"error" {"code" "unrelated" "message" "Request rejected"}}}))]
+              {:kind :control :status status
+               :pass (and (= expected (:category data)) (= retryable (:retryable data))
+                          (= "unrelated" (:error_code data)) (= 0.02 (:retry_after data)))}))
+          [[400 :invalid-request false] [401 :authentication false]
+           [403 :access-denied false] [429 :rate-limit true] [500 :server true]])]
+    (vec (concat target-results controls))))
+
+(defn -main [id]
+  (let [results (checks id) passed (every? :pass results)]
+    (prn {:task id :checks (count results) :passed passed :results results})
+    (os/exit (if passed 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

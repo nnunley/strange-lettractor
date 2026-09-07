@@ -1,0 +1,8 @@
+(require '[clojure.test :as test])
+(let [id (first *command-line-args*)]
+  (when-not (contains? #{"quota-code" "context-code" "filter-code"} id)
+    (throw (ex-info "Unknown pilot task" {})))
+  (require (symbol (str "attractor.pilot-" id "-test")))
+  (test/run-tests)
+  (prn {:pilot-regression true :task id :counters test/*report-counters*})
+  (os/exit (if (and test/*test-result* (pos? (:test test/*report-counters*))) 0 1)))

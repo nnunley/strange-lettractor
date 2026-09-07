@@ -1,0 +1,13 @@
+(require '[clojure.test :refer [deftest is run-tests]])
+(require '[implementer-pilot.bounded-run :as bounded])
+(deftest command-contract
+  (is (= "/Users/ndn/development/let-go/lg -source-paths src:test:bench bench/implementer_pilot/run.lg 'quota-code' '/candidate' '/output'"
+         (bounded/command "quota-code" "/candidate" "/output")))
+  (is (clojure.string/includes? (bounded/command "quota-code" "/candidate'quoted" "/output")
+                               "'/candidate'\"'\"'quoted'"))
+  (doseq [[id candidate output] [["invalid" "/candidate" "/output"]
+                                 ["quota-code" "relative" "/output"]
+                                 ["quota-code" "/candidate" "relative"]]]
+    (is (try (bounded/command id candidate output) false (catch Object _ true)))))
+(run-tests)
+(os/exit (if clojure.test/*test-result* 0 1))

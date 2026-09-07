@@ -1,0 +1,34 @@
+(ns implementer-pilot.bounded-run
+  (:require [clojure.string :as str] [io :as io] [os :as os]
+            [attractor.execution :as execution]))
+
+(defn- quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn command [id candidate output]
+  (when-not (and (contains? #{"quota-code" "context-code" "filter-code"} id)
+                (string? candidate) (str/starts-with? candidate "/")
+                (string? output) (str/starts-with? output "/"))
+    (throw (ex-info "Expected known task ID and absolute candidate/output paths" {})))
+  (str "/Users/ndn/development/let-go/lg -source-paths src:test:bench bench/implementer_pilot/run.lg "
+       (str/join " " (map quote-shell [id candidate output]))))
+
+(defn -main [& args]
+  (if (= ["--help"] (vec args))
+    (println "bounded_run.lg TASK-ID ABSOLUTE-CANDIDATE ABSOLUTE-NEW-OUTPUT\nRun from the known-good pilot checkout; 240-second outer deadline.")
+    (let [_ (when-not (= 3 (count args)) (throw (ex-info "Expected exactly three arguments" {})))
+          [id candidate output] args
+          cmd (command id candidate output)
+          outer (str output "-outer.edn")
+          _ (when (or (os/stat output) (os/stat outer))
+              (throw (ex-info "Refusing existing output directory or outer evidence artifact" {:output output})))
+          environment (execution/make-local-environment
+                        {:working_dir (os/cwd) :env_policy :none :max_command_timeout_ms 240000})
+          result (try
+                   (let [result ((:exec_command environment) cmd 240000 nil
+                                 {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"})]
+                     (io/spit outer (pr-str result))
+                     (prn result)
+                     result)
+                   (finally ((:cleanup environment))))]
+      (os/exit (:exit_code result)))))
+
+(when *command-line-args* (apply -main *command-line-args*))

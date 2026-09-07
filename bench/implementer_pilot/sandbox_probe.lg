@@ -1,0 +1,19 @@
+(ns main (:require [io :as io] [http :as http] [clojure.string :as str]))
+
+(defn denied? [f]
+  (try (f) false
+       (catch Object e
+         (or (str/includes? (str e) "operation not permitted")
+             (str/includes? (str e) "permission denied")))))
+
+(defn -main [sentinel private-sentinel]
+  (let [before (io/slurp sentinel)
+        denied-write (denied? #(io/spit sentinel "unexpected write"))
+        denied-network (denied? #(http/request {:url "http://127.0.0.1:8080/"}))
+        denied-read (denied? #(io/slurp private-sentinel))
+        same (= before (io/slurp sentinel))]
+    (prn {:write-denied denied-write :network-denied denied-network
+          :private-read-denied denied-read :unchanged same})
+    (os/exit (if (and denied-write denied-network denied-read same) 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

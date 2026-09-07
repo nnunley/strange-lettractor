@@ -1,0 +1,9 @@
+[{:id "quota-code"
+  :code "insufficient_quota" :status 429 :category :quota-exceeded
+  :prompt "Fix provider-error so an OpenAI insufficient_quota error code at HTTP 429 is classified as :quota-exceeded and non-retryable even when its message is generic. Preserve ordinary rate-limit behavior and all existing error fields."}
+ {:id "context-code"
+  :code "context_length_exceeded" :status 400 :category :context-length
+  :prompt "Fix provider-error so an OpenAI context_length_exceeded error code at HTTP 400 is classified as :context-length and non-retryable even when its message is generic. Preserve ordinary invalid-request behavior and all existing error fields."}
+ {:id "filter-code"
+  :code "content_filter" :status 400 :category :content-filter
+  :prompt "Fix provider-error so an OpenAI content_filter error code at HTTP 400 is classified as :content-filter and non-retryable even when its message is generic. Preserve ordinary invalid-request behavior and all existing error fields."}]

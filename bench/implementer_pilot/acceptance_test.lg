@@ -1,0 +1,39 @@
+(ns implementer-pilot.acceptance-test
+  (:require [clojure.test :refer [deftest is]]
+            [implementer-pilot.acceptance :as gate]
+            [attractor.llm :as llm]))
+
+;; These are verifier controls, not candidate implementations or Qwen successes.
+(defn- adjusted-provider [original code category corrupt-field]
+  (fn [provider response]
+    (let [error (original provider response)
+          data (ex-data error)]
+      (if (= code (:error_code data))
+        (ex-info "verifier positive control"
+                 (cond-> (assoc data :category category :retryable false)
+                   corrupt-field (dissoc corrupt-field)))
+        error))))
+
+(deftest wrong-classifications-are-rejected-with-controls-intact
+  (doseq [[id [code _ _]] gate/tasks]
+    (let [original llm/provider-error]
+      (with-redefs [llm/provider-error (adjusted-provider original code :wrong-category nil)]
+        (let [results (gate/checks id)]
+          (is (= 8 (count results)))
+          (is (every? #(false? (:pass %)) (take 3 results)))
+          (is (every? :pass (drop 3 results))))))))
+
+(deftest correct-classification-with-preserved-fields-is-accepted
+  (doseq [[id [code _ category]] gate/tasks]
+    (let [original llm/provider-error]
+      (with-redefs [llm/provider-error (adjusted-provider original code category nil)]
+        (is (every? :pass (gate/checks id)))))))
+
+(deftest classification-alone-cannot-hide-lost-error-fields
+  (doseq [[id [code _ category]] gate/tasks
+          field [:provider :error_code :status_code :status :raw :retry_after :retryable]]
+    (let [original llm/provider-error]
+      (with-redefs [llm/provider-error (adjusted-provider original code category field)]
+        (let [results (gate/checks id)]
+          (is (not-every? :pass (take 3 results)))
+          (is (every? :pass (drop 3 results))))))))
