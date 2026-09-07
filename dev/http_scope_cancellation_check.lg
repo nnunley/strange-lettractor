@@ -1,0 +1,41 @@
+(ns main (:require [http :as http] [json :as json]))
+
+(defn await-state [state predicate milliseconds]
+  (let [deadline (+ (System/currentTimeMillis) milliseconds)]
+    (loop []
+      (let [snapshot (state)]
+        (if (or (predicate snapshot) (>= (System/currentTimeMillis) deadline))
+          snapshot
+          (do (sleep 5) (recur)))))))
+
+(defn -main [base]
+  (let [get-url #(http/request {:url (str base %)})
+        state #(json/read-json (:body (get-url "/state")))
+        cleanup-ok (atom false)
+        scope (scope-open)
+        worker (future
+                 (try
+                   (get-url "/hold/responses")
+                   (catch Object e {:error (str e)})))
+        passed
+        (try
+          (let [before (await-state state #(= 1 (get % "active")) 2000)
+                _ (scope-close! scope 100)
+                after (await-state state #(and (= 0 (get % "active")) (= 1 (get % "canceled"))) 500)
+                result (deref worker 10 ::pending)
+                live (scope-live scope)]
+            (prn {:before before :result (if (= ::pending result) :pending :settled) :after after :live live})
+            (and (= 1 (get before "active"))
+                 (not= ::pending result)
+                 (= 0 live) (= 0 (get after "active")) (= 1 (get after "canceled"))))
+          (catch Object e (prn {:probe-error (str e)}) false)
+          (finally
+            (try (get-url "/release") (catch Object _ nil))
+            (let [settled (not= ::pending (deref worker 2000 ::pending))]
+              (scope-close! scope 2000)
+              (reset! cleanup-ok (and settled (= 0 (scope-live scope))))
+              (prn {:cleanup-settled settled :cleanup-live (scope-live scope)}))
+            (try (get-url "/shutdown") (catch Object _ nil))))]
+    (os/exit (if (and passed @cleanup-ok) 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

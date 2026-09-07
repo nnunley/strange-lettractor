@@ -1,0 +1,48 @@
+(ns main (:require [http :as http] [json :as json] [attractor.llm :as llm]))
+
+(defn await-state [state predicate milliseconds]
+  (let [deadline (+ (System/currentTimeMillis) milliseconds)]
+    (loop []
+      (let [snapshot (state)]
+        (if (or (predicate snapshot) (>= (System/currentTimeMillis) deadline))
+          snapshot
+          (do (sleep 5) (recur)))))))
+
+(defn -main [base]
+  (let [get-url #(http/request {:url (str base %)})
+        state #(json/read-json (:body (get-url "/state")))
+        cleanup-ok (atom false)
+        controller (llm/make-abort-controller)
+        client (llm/make-client
+                 {:default_provider "openai"
+                  :providers {"openai" (llm/make-provider-adapter
+                                         "openai" {:api_key "fixture" :base_url (str base "/hold")})}})
+        scope (scope-open)
+        worker (future
+                 (try
+                   (llm/generate "test" "probe" {:client client :abort_signal (:signal controller)
+                                                :max_retries 0})
+                   {:category :unexpected-success}
+                   (catch Object e {:category (:category (ex-data e))})))
+        passed
+        (try
+          (let [before (await-state state #(= 1 (get % "active")) 2000)
+                _ ((:abort controller))
+                result (deref worker 1000 ::pending)
+                after (await-state state #(and (= 0 (get % "active")) (= 1 (get % "canceled"))) 500)
+                live (scope-live scope)]
+            (prn {:before before :result result :after after :live live})
+            (and (= 1 (get before "active"))
+                 (= :abort (:category result))
+                 (= 0 live) (= 0 (get after "active")) (= 1 (get after "canceled"))))
+          (catch Object e (prn {:probe-error (str e)}) false)
+          (finally
+            (try (get-url "/release") (catch Object _ nil))
+            (let [settled (not= ::pending (deref worker 2000 ::pending))]
+              (scope-close! scope 2000)
+              (reset! cleanup-ok (and settled (= 0 (scope-live scope))))
+              (prn {:cleanup-settled settled :cleanup-live (scope-live scope)}))
+            (try (get-url "/shutdown") (catch Object _ nil))))]
+    (os/exit (if (and passed @cleanup-ok) 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))
