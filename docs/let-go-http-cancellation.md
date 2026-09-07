@@ -2,6 +2,7 @@
 
 Verified 2026-09-07 using local `lg dev (bdd8268)`, source HEAD
 `bdd8268c9cb3acf369f0854bada47af79d1d673d`. No runtime source was edited.
+Tracked upstream as [nooga/let-go #816](https://github.com/nooga/let-go/issues/816).
 
 `http/request` creates `http.NewRequest` and executes `http.DefaultClient.Do`
 in `pkg/rt/http.go` without the current VM scope context. Thus closing the

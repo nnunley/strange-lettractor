@@ -73,3 +73,19 @@ equality compatibility.
 [reader](let-go-reader-compatibility.md),
 [future errors](let-go-future-compatibility.md), and
 [native supervision](let-go-supervision-compatibility.md).
+
+## HTTP cancellation: #816
+
+[Native HTTP scope cancellation](let-go-http-cancellation.md) now has real
+loopback evidence, tracked as [nooga/let-go #816](https://github.com/nooga/let-go/issues/816).
+`http/request` does not attach its invoking scope context. A held request remains
+active after scope close; public Attractor generation returns `:abort` while its
+HTTP worker remains live. Both probes explicitly release/drain during cleanup.
+
+After the runtime fix, rerun both `dev/http_scope_cancellation_check.lg` and
+`dev/http_llm_cancellation_check.lg` against fresh instances of the bounded
+`dev/http_cancellation_server.go` fixture. Require server-observed cancellation
+and zero live workers before fixture release, not just a caller-side error.
+Then address Attractor's `controlled-invoke` and stream-monitor ownership and
+extend coverage to held response bodies and streams. Adding an indefinite join
+before the HTTP request is cancellable would introduce an unbounded wait.
