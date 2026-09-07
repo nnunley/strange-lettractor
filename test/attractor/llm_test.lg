@@ -2262,7 +2262,8 @@
     (is (= [:stream_start :text_start :text_delta :error]
            (mapv :type events)))
     (is (= "partial" (:delta (nth events 2))))
-    (is (= "server_error" (get-in (last events) [:error "code"])))
+    (is (= "server_error" (:error_code (ex-data (:error (last events))))))
+    (is (= "server_error" (get-in (last events) [:raw "error" "code"])))
     (is (empty? (filter (fn [event] (= :finish (:type event))) events)))))
 
 (deftest test-sse-parser-handles-multiline-retry-comments-and-eof

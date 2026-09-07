@@ -1,0 +1,65 @@
+(ns main (:require [attractor.llm :as llm] [http :as http] [json :as json]))
+
+(defn counts [base]
+  (json/read-json (:body (http/request {:url (str base "/counts")}))))
+
+(defn await-cleanup [base canceled]
+  (loop [remaining 200]
+    (let [state (counts base)]
+      (if (or (and (= 0 (get state "held")) (= canceled (get state "canceled")))
+              (zero? remaining))
+        state
+        (do (sleep 5) (recur (dec remaining)))))))
+
+(defn check-provider [base provider]
+  (let [before (counts base)
+        delays (atom [])
+        client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter
+                                         provider {:api_key "fixture"
+                                                   :base_url (str base "/" provider "/terminal")})}})
+        scope (scope-open)
+        result (llm/stream "test" "probe"
+                 {:client client :max_retries 2
+                  :retry_policy {:sleep_fn #(swap! delays conj %)}})
+        worker (future (try {:events (vec (:events result))}
+                            (catch Object e {:thrown (ex-data e)})))]
+    (try
+      (let [delivery (deref worker 1500 ::pending)
+            events (:events delivery)
+            error-event (first (filter #(= :error (:type %)) events))
+            error (when error-event (ex-data (:error error-event)))
+            final-error (when (not= ::pending delivery)
+                          (try ((:response result)) nil
+                               (catch Object e (ex-data e))))
+            partial ((:partial_response result))
+            after (await-cleanup base (inc (get before "canceled")))
+            text (when (not= ::pending delivery) (apply str (:text_stream result)))
+            pass (and (not= ::pending delivery) (nil? (:thrown delivery))
+                      (= :error (:type (last events)))
+                      (= 1 (count (filter #(= :error (:type %)) events)))
+                      (not-any? #(= :finish (:type %)) events)
+                      (= "partial" (get-in partial [:message :text])) (= "partial" text)
+                      (= provider (:provider error)) (keyword? (:category error))
+                      (map? (:raw error-event)) (= error final-error)
+                      (= 1 (get-in after ["requests" (str provider "/terminal")]))
+                      (empty? @delays) (= 0 (get after "held"))
+                      (= (inc (get before "canceled")) (get after "canceled")))]
+        {:provider provider :pass pass :delivery (if (= ::pending delivery) :pending :settled)
+         :types (mapv :type events) :text text :partial (get-in partial [:message :text])
+         :error error :final-error final-error :delays @delays :after after})
+      (finally
+        ((:close result))
+        (deref worker 1000 ::pending)
+        (scope-close! scope 2000)))))
+
+(defn -main [base]
+  (if (= base "--help")
+    (println "Run with the URL printed by go run dev/http_error_server.go")
+    (let [results (try (mapv #(check-provider base %) ["openai" "anthropic" "gemini" "ollama"])
+                       (finally (http/request {:url (str base "/shutdown")})))]
+      (doseq [result results] (prn result))
+      (os/exit (if (every? :pass results) 0 1)))))
+
+(when *command-line-args* (apply -main *command-line-args*))

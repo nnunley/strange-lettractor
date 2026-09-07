@@ -89,3 +89,17 @@ and zero live workers before fixture release, not just a caller-side error.
 Then address Attractor's `controlled-invoke` and stream-monitor ownership and
 extend coverage to held response bodies and streams. Adding an indefinite join
 before the HTTP request is cancellable would introduce an unbounded wait.
+
+## JSON string keys: #817
+
+At local source revision `bdd8268c9cb3acf369f0854bada47af79d1d673d`,
+`(json/write-json {"key" "value"})` emits a key containing literal quote characters;
+reading it back does not equal the original map. `fromMapValue` uses the printed
+`k.String()` representation rather than the underlying Go string for string keys.
+Tracked in [nooga/let-go #817](https://github.com/nooga/let-go/issues/817).
+
+`test/attractor/stream_terminal_error_test.lg` temporarily converts its fixed
+fixture keys to keywords before JSON encoding. After the configured binary is
+fixed, verify nested string-key roundtrips and escaped/Unicode keys, remove that
+fixture-only conversion, and rerun the terminal-error corpus and bundle. Do not
+apply keywordization as a general lossless workaround for arbitrary keys.

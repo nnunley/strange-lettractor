@@ -1,0 +1,180 @@
+(ns attractor.stream-terminal-error-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [io :as io]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+(def fixtures
+  [{:provider "openai" :stream #(llm/openai-stream % "offline")
+    :partial [{"type" "response.output_text.delta" "item_id" "text" "content_index" 0 "delta" "partial"}]
+    :error {"type" "response.failed" "response" {"error" {"code" "server_error" "message" "failed"}}}
+    :late [{"type" "response.output_text.delta" "item_id" "text" "content_index" 0 "delta" "late"}
+           {"type" "response.completed" "response" {"output" []}}]}
+   {:provider "anthropic" :stream #(llm/anthropic-stream % "offline")
+    :partial [{"type" "content_block_start" "index" 0 "content_block" {"type" "text" "text" ""}}
+              {"type" "content_block_delta" "index" 0 "delta" {"type" "text_delta" "text" "partial"}}]
+    :error {"type" "error" "error" {"type" "overloaded_error" "message" "failed"}}
+    :late [{"type" "content_block_delta" "index" 0 "delta" {"type" "text_delta" "text" "late"}}
+           {"type" "message_stop"}]}
+   {:provider "gemini" :stream #(llm/gemini-stream % "offline")
+    :partial [{"candidates" [{"content" {"parts" [{"text" "partial"}]}}]}]
+    :error {"error" {"code" 503 "status" "UNAVAILABLE" "message" "failed"}}
+    :late [{"candidates" [{"content" {"parts" [{"text" "late"}]} "finishReason" "STOP"}]}]}
+   {:provider "ollama" :stream llm/openai-compatible-stream
+    :partial [{"choices" [{"delta" {"content" "partial"}}]}]
+    :error {"error" {"code" "server_error" "message" "failed"}}
+    :late [{"choices" [{"delta" {"content" "late"} "finish_reason" "stop"}]}]}])
+
+(defn- wire-value [value]
+  ;; Fixture-only workaround for nooga/let-go#817: string keys are double-quoted
+  ;; by json/write-json. Revisit after verifying the configured runtime is fixed.
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(keyword k) (wire-value v)]) value))
+    (vector? value) (mapv wire-value value)
+    :else value))
+
+(defn- wire [frames]
+  (apply str (map #(str "data: " (json/write-json (wire-value %)) "\n\n") frames)))
+
+(defn- caught [f]
+  (try (f) nil (catch Object e e)))
+
+(defn- client [provider transport]
+  (llm/make-client {:default_provider provider
+                    :providers {provider (llm/make-provider-adapter provider {:api_key "offline" :transport transport})}}))
+
+(deftest native-and-configured-errors-are-terminal-and-typed
+  (doseq [{:keys [provider stream partial error late]} fixtures
+          first? [false true]
+          configured? [false true]]
+    (let [body (wire (concat (when-not first? partial) [error] late [error]))
+          transport (fn [_] {:status 200 :body body})
+          request {:provider provider :model "test" :messages [] :transport transport}
+          events (vec (if configured?
+                        (llm/client-stream (client provider transport) request)
+                        (stream request)))
+          failure (last events)
+          data (ex-data (:error failure))]
+      (is (= :error (:type failure)))
+      (is (= 1 (count (filter #(= :error (:type %)) events))))
+      (is (not-any? #(= :finish (:type %)) events))
+      (is (= (if first? "" "partial") (apply str (map :delta (filter #(= :text_delta (:type %)) events)))))
+      (is (= error (:raw failure)))
+      (is (= provider (:provider data)))
+      (is (= :server (:category data)))
+      (is (= true (:retryable data)))
+      (is (= (case provider "anthropic" "overloaded_error" "gemini" "503" "server_error") (:error_code data)))
+      (is (= (when (= provider "gemini") 503) (:status_code data)))
+      (is (= error (:raw data))))))
+
+(deftest native-high-level-failure-preserves-partial-not-final-response
+  (doseq [{:keys [provider partial error late]} fixtures first? [false true]]
+    (let [attempts (atom 0)
+          result (llm/stream "test" "go"
+                   {:client (client provider (fn [_] (swap! attempts inc)
+                                                {:status 200 :body (wire (concat (when-not first? partial) [error] late))}))
+                    :max_retries 2 :retry_policy {:sleep_fn (fn [_] nil)}})
+          events (vec (:events result))
+          raised (caught (:response result))]
+      (is (= 1 @attempts))
+      (is (= :error (:type (last events))))
+      (is (= (if first? "" "partial") (apply str (:text_stream result))))
+      (is (= (if first? "" "partial") (or (get-in ((:partial_response result)) [:message :text]) "")))
+      (is (= provider (:provider (ex-data raised))))
+      (is (= (ex-data (:error (last events))) (ex-data raised))))))
+
+(deftest native-terminal-error-does-not-read-tail-and-closes-once
+  (doseq [{:keys [provider stream partial error]} fixtures first? [false true]]
+    (let [closed (atom 0) read-tail (atom false) registered (atom nil)
+          reader (io/string-reader "")
+          lines (concat (str/split (wire (concat (when-not first? partial) [error])) #"\n")
+                        [""]
+                        (lazy-seq (reset! read-tail true) (throw (ex-info "read forbidden tail" {}))))]
+      (with-redefs [io/line-seq (fn [_] (is (fn? @registered)) lines)
+                    io/close (fn [_] (swap! closed inc))]
+        (let [events (atom nil)
+              thrown (caught #(reset! events (vec (stream {:provider provider :model "test" :messages []
+                                                          :register_stream_close #(reset! registered %)
+                                                          :transport (fn [_] {:status 200 :body reader})}))))]
+          (is (nil? thrown))
+          (is (= :error (:type (last @events))))
+          (is (= false @read-tail))
+          (is (= 1 @closed))
+          (when (fn? @registered) (@registered) (@registered))
+          (is (= 1 @closed)))))))
+
+(deftest custom-errors-stop-before-reset-tools-and-poisoned-tail
+  (doseq [first? [false true] poison? [false true]]
+    (let [attempts (atom 0) executed (atom 0) tails (atom 0)
+          failure (ex-info "failed" {:category :server :provider "custom" :retryable true :error_code "broken"})
+          adapter (llm/make-adapter "custom" (fn [_] nil)
+                    (fn [_]
+                      (swap! attempts inc)
+                      (concat (when-not first? [{:type :text_delta :delta "partial"}])
+                              [{:type :error :error failure :raw {:source "custom"}}]
+                              (lazy-seq
+                                (swap! tails inc)
+                                (if poison? (throw (ex-info "forbidden tail" {}))
+                                  [{:type :stream_start}
+                                   {:type :finish :response {:finish_reason :tool_calls
+                                                            :tool_calls [{:id "call" :name "danger" :arguments {}}]}}])))))
+          result (llm/stream "test" "go"
+                   {:client (llm/make-client {:default_provider "custom" :providers {"custom" adapter}})
+                    :tools [{:name "danger" :parameters {:type "object"} :execute (fn [_] (swap! executed inc))}]
+                    :max_tool_rounds 1 :max_retries 2 :retry_policy {:sleep_fn (fn [_] nil)}})
+          events (vec (:events result))]
+      (is (= (if first? [:error] [:text_delta :error]) (mapv :type events)))
+      (is (= 1 @attempts))
+      (is (= 0 @executed))
+      (is (= 0 @tails))
+      (is (= (ex-data failure) (ex-data (:error (last events)))))
+      (is (= (ex-data failure) (ex-data (caught (:response result)))))
+      (is (= (if first? "" "partial") (apply str (:text_stream result))))
+      (is (= (if first? "" "partial") (or (get-in ((:partial_response result)) [:message :text]) ""))))))
+
+(deftest openai-generic-error-is-typed
+  (let [raw {"type" "error" "code" "invalid_api_key" "message" "unauthorized"}
+        events (vec (llm/openai-stream {:model "test" :messages []
+                                        :transport (fn [_] {:status 200 :body (wire [raw])})} "offline"))]
+    (is (= [:error] (mapv :type events)))
+    (is (= raw (:raw (first events))))
+    (is (= :authentication (:category (ex-data (:error (first events))))))
+    (is (= false (:retryable (ex-data (:error (first events))))))))
+
+(deftest custom-raw-errors-are-normalized-and-closed
+  (doseq [first? [false true]]
+    (let [raw {"error" {"code" "invalid_api_key" "message" "unauthorized"}}
+          closed (atom 0)
+          adapter (llm/make-adapter "custom" (fn [_] nil)
+                    (fn [request]
+                      ((:register_stream_close request) #(swap! closed inc))
+                      (concat (when-not first? [{:type :text_delta :delta "partial"}])
+                              [{:type :error :error (get raw "error") :raw raw}])))
+          result (llm/stream "test" "go" {:client (llm/make-client {:default_provider "custom" :providers {"custom" adapter}})})
+          events (vec (:events result))
+          data (ex-data (caught (:response result)))]
+      (is (= :error (:type (last events))))
+      (is (= :authentication (:category data)))
+      (is (= "invalid_api_key" (:error_code data)))
+      (is (= false (:retryable data)))
+      (is (= raw (:raw data)))
+      (is (= 1 @closed))
+      ((:close result))
+      (is (= 1 @closed)))))
+
+(deftest native-error-codes-classify-without-invented-http-status
+  (doseq [[code category retryable]
+          [["server_error" :server true]
+           ["rate_limit_exceeded" :rate-limit true]
+           ["invalid_api_key" :authentication false]
+           ["insufficient_quota" :quota-exceeded false]
+           ["future_error" :provider true]
+           [42 :provider true]]]
+    (let [raw {"type" "error" "code" code "message" "failed"}
+          events (vec (llm/openai-stream {:model "test" :messages [] :transport (fn [_] {:status 200 :body (wire [raw])})} "offline"))
+          data (ex-data (:error (first events)))]
+      (is (= category (:category data)))
+      (is (= retryable (:retryable data)))
+      (is (= (str code) (:error_code data)))
+      (is (nil? (:status_code data))))))

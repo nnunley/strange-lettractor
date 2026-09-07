@@ -1677,10 +1677,68 @@
     (io/line-seq body)))
 
 (defn- register-provider-stream-close! [request body]
-  (when (and (not (string? body))
-             (fn? (:register_stream_close request)))
-    ((:register_stream_close request) (fn [] (io/close body))))
-  nil)
+  (let [closed (atom false)
+        close! (fn []
+                 (when-not (first (swap-vals! closed (fn [_] true)))
+                   (when (and (some? body) (not (string? body)))
+                     (try (io/close body) (catch Object _ nil)))))]
+    (when (fn? (:register_stream_close request))
+      ((:register_stream_close request) close!))
+    close!))
+
+(defn- stream-error [provider error raw]
+  (if (:category (ex-data error))
+    error
+    (let [payload (or (get-in raw ["response" "error"])
+                      (get raw "error") error)
+          code (or (get payload "code") (get payload "type"))
+          ;; Gemini's native error.code is the HTTP status. Other providers'
+          ;; numeric codes are not assumed to be HTTP statuses.
+          status (when (and (= provider "gemini") (number? code)
+                            (<= 400 code 599)) code)
+          normalized (provider-error provider {:status status :body payload})
+          data (ex-data normalized)
+          category (if (= :provider (:category data))
+                     (case code
+                       ("server_error" "api_error" "overloaded_error") :server
+                       ("rate_limit_exceeded" "rate_limit_error") :rate-limit
+                       ("invalid_api_key" "authentication_error") :authentication
+                       "permission_error" :access-denied
+                       "not_found_error" :not-found
+                       "invalid_request_error" :invalid-request
+                       "insufficient_quota" :quota-exceeded
+                       "context_length_exceeded" :context-length
+                       "content_filter" :content-filter
+                       :provider)
+                     (:category data))]
+      (ex-info (str provider " stream error: " (or (get payload "message") payload))
+               (assoc data :category category
+                           :retryable (not (contains? non-retryable-error-categories category))
+                           :error_code (when (some? code) (str code))
+                           :raw (or raw payload))))))
+
+(defn- terminal-stream-events [events provider close!]
+  (lazy-seq
+    (when-let [remaining (seq events)]
+      (let [event (first remaining)]
+        (if (= :error (:type event))
+          (do
+            (close!)
+            (list (assoc event :error (stream-error provider (:error event) (:raw event)))))
+          (cons event (lazy-seq
+                        (terminal-stream-events (rest remaining) provider close!))))))))
+
+(defn- native-stream-events [request body provider normalize]
+  ;; Register ownership before line-seq can read. Defer the next native frame
+  ;; until every event from this frame has been consumed; error never reads it.
+  (let [close! (register-provider-stream-close! request body)]
+    (letfn [(step [frames]
+              (lazy-seq
+                (when-let [remaining (seq frames)]
+                  (concat (normalize (first remaining))
+                          (lazy-seq (step (rest remaining)))))))]
+      (terminal-stream-events
+        (step (parse-sse-lines (stream-lines body))) provider close!))))
 
 (defn- raise-stream-provider-error! [provider request response]
   (let [body (:body response)]
@@ -1833,6 +1891,9 @@
           "response.failed"
           [{:type :error :error (or (get body "error") body) :raw body}]
 
+          "error"
+          [{:type :error :error body :raw body}]
+
           [{:type :provider_event :raw body}])))))
 
 (defn openai-stream [request & [api-key base-url]]
@@ -1847,13 +1908,11 @@
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-stream-provider-error! "openai" request resp)
-      (do
-        (register-provider-stream-close! request (:body resp))
-        (let [state (atom {:text_started #{} :text_ended #{}
+      (let [state (atom {:text_started #{} :text_ended #{}
                            :reasoning_started #{} :reasoning_ended #{}
                            :tools {}})]
-          (mapcat (fn [event] (openai-stream-events request state event))
-                  (parse-sse-lines (stream-lines (:body resp)))))))))
+        (native-stream-events request (:body resp) "openai"
+                              #(openai-stream-events request state %))))))
 
 (defn- append-string [value delta]
   (str (or value "") (or delta "")))
@@ -2020,12 +2079,10 @@
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-stream-provider-error! provider request resp)
-      (do
-        (register-provider-stream-close! request (:body resp))
-        (let [state (atom {:started false :text_started false :text ""
+      (let [state (atom {:started false :text_started false :text ""
                            :tools {} :tool_order [] :usage {}})]
-          (mapcat (fn [event] (compatible-stream-events request state event))
-                  (parse-sse-lines (stream-lines (:body resp)))))))))
+        (native-stream-events request (:body resp) provider
+                              #(compatible-stream-events request state %))))))
 
 (defn- anthropic-stream-event [request state event]
   (let [body (json/read-json (:data event))
@@ -2151,11 +2208,10 @@
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-stream-provider-error! "anthropic" request resp)
-      (do
-        (register-provider-stream-close! request (:body resp))
-        (let [state (atom {:blocks {} :order [] :usage {}})]
-          (keep (fn [event] (anthropic-stream-event request state event))
-                (parse-sse-lines (stream-lines (:body resp)))))))))
+      (let [state (atom {:blocks {} :order [] :usage {}})]
+        (native-stream-events request (:body resp) "anthropic"
+                              #(when-let [event (anthropic-stream-event request state %)]
+                                 (list event)))))))
 
 (defn- gemini-stream-url [url]
   (str/replace url ":generateContent" ":streamGenerateContent?alt=sse"))
@@ -2188,8 +2244,10 @@
      :raw raw}))
 
 (defn- gemini-stream-events [request state event]
-  (let [body (json/read-json (:data event))
-        candidate (first (or (get body "candidates") []))
+  (let [body (json/read-json (:data event))]
+    (if-let [error (get body "error")]
+      [{:type :error :error error :raw body}]
+      (let [candidate (first (or (get body "candidates") []))
         parts (or (get-in candidate ["content" "parts"]) [])
         text-parts (filter (fn [part]
                              (and (some? (get part "text"))
@@ -2256,7 +2314,7 @@
                              :usage (:usage response)
                              :response response
                              :raw body}]))) ]
-      (vec (concat start-events text-events reasoning-events tool-events end-events)))))
+      (vec (concat start-events text-events reasoning-events tool-events end-events)))))))
 
 (defn gemini-stream [request & [api-key base-url]]
   (let [{:keys [url headers payload]}
@@ -2271,13 +2329,11 @@
         status (:status resp)]
     (if (and (number? status) (not= status 200))
       (raise-stream-provider-error! "gemini" request resp)
-      (do
-        (register-provider-stream-close! request (:body resp))
-        (let [state (atom {:started false :text_started false
+      (let [state (atom {:started false :text_started false
                            :reasoning_started false :text "" :reasoning ""
                            :tool_calls [] :usage {}})]
-          (mapcat (fn [event] (gemini-stream-events request state event))
-                  (parse-sse-lines (stream-lines (:body resp)))))))))
+        (native-stream-events request (:body resp) "gemini"
+                              #(gemini-stream-events request state %))))))
 
 (defn- provider-stream [request & [client-opts]]
   (let [opts (merge request client-opts)
@@ -3300,11 +3356,14 @@
              (fn []
                (controlled-invoke
                  control false
-                 #(let [events (seq (client-stream client request))]
+                 #(let [provider (first (client-provider client request))
+                        events (seq (terminal-stream-events
+                                      (client-stream client request) provider
+                                      (fn [] (close-active-stream! control))))]
                     (if events
                       {:empty false
                        :first (first events)
-                       :rest (rest events)}
+                       :rest (lazy-seq (rest events))}
                       {:empty true}))
                  step-deadline))
              retry-policy)}
@@ -3437,7 +3496,9 @@
        :text_stream
        (map :delta (filter (fn [event] (= :text_delta (:type event))) events))
        :close (fn [] (close-stream! control))
-       :response (fn [] (stream-accumulator-response accumulator))
+       :response (fn []
+                   (when-let [error (:error @accumulator)] (throw error))
+                   (stream-accumulator-response accumulator))
        :partial_response (fn [] (stream-accumulator-response accumulator))})))
 
 ;; A map request selects the low-level provider API. A model string selects
