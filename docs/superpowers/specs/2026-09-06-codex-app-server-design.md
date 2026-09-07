@@ -35,6 +35,10 @@ native Codex history into Qwen is included.
 
 ## Boundaries
 
+Prefer native let-go primitives and Go-oriented host interop. Do not introduce
+JVM stream/process APIs merely because the surface language resembles Clojure.
+Report runtime gaps upstream and preserve explicit return points for workarounds.
+
 1. `attractor.codex.transport`: owns one child process and its stdio lifecycle;
    sends/receives newline-delimited JSON. JSON is only the external protocol;
    internal data and durable records remain EDN. Use native let-go supervision

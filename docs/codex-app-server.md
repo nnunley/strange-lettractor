@@ -44,3 +44,18 @@ integration. Those are explicit mechanical gates in the transport plan.
 
 No production source changes or live Qwen/Codex model trials accompany these
 planning documents.
+
+## Runtime findings (2026-09-07)
+
+- [Mutable byte-array interop](let-go-byte-array-interop.md), upstream
+  [#813](https://github.com/nooga/let-go/issues/813): Go reads mutate a copied
+  slice rather than the caller's array. Buffered single-byte reads were verified
+  as a possible bounded-framing workaround.
+- [Boxed pointer field lookup](let-go-boxed-pointer-fields.md), upstream
+  [#814](https://github.com/nooga/let-go/issues/814): accessing the owned
+  `exec.Cmd.Process` field fails before pointer dereference. Exact-child forced
+  termination remains unverified; stdin closure alone is not sufficient.
+
+Neither finding changes the orchestration design. Neither runtime checkout nor
+production connector code has been changed. Use native let-go/Go facilities,
+not JVM-shaped replacements; retain the shutdown gate while resolving #814.
