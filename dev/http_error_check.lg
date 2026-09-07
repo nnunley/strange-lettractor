@@ -1,0 +1,77 @@
+(ns main (:require [attractor.llm :as llm] [http :as http] [json :as json]))
+
+(defn client-for [base provider kind]
+  (llm/make-client {:default_provider provider
+                    :providers {provider (llm/make-provider-adapter
+                                           provider {:api_key "fixture"
+                                                     :base_url (str base "/" provider "/" kind)})}}))
+
+(defn check-errors [base]
+  (mapv
+    (fn [[provider kind category code attempts]]
+      (let [delays (atom [])
+            error (try
+                    (doall (:events (llm/stream "test" "probe"
+                                      {:client (client-for base provider kind) :max_retries 2
+                                       :retry_policy {:jitter false :base_delay 0
+                                                      :sleep_fn #(swap! delays conj %)}})))
+                    nil
+                    (catch Object e (ex-data e)))
+            counts (json/read-json (:body (http/request {:url (str base "/counts")})))
+            n (get-in counts ["requests" (str provider "/" kind)])
+            pass (and (= category (:category error)) (= code (:error_code error))
+                      (= code (get-in error [:raw "error" "code"]))
+                      (= (= kind "rate") (:retryable error)) (= attempts n)
+                      (= (if (= kind "rate") [0.02 0.02] []) @delays))]
+        {:provider provider :case kind :error error :requests n :delays @delays :pass pass}))
+    (for [provider ["openai" "anthropic" "gemini" "ollama"]
+          [kind category code attempts] [["quota" :quota-exceeded "insufficient_quota" 1]
+                                         ["auth" :authentication "invalid_api_key" 1]
+                                         ["rate" :rate-limit "rate_limit" 3]]]
+      [provider kind category code attempts])))
+
+(defn await-counts [read-counts predicate]
+  (let [deadline (+ (System/currentTimeMillis) 1000)]
+    (loop []
+      (let [counts (read-counts)]
+        (if (or (predicate counts) (>= (System/currentTimeMillis) deadline))
+          counts (do (sleep 5) (recur)))))))
+
+(defn check-held-body [base]
+  (let [read-counts #(json/read-json (:body (http/request {:url (str base "/counts")})))
+        controller (llm/make-abort-controller)
+        scope (scope-open)
+        worker (future
+                 (try
+                   (doall (:events (llm/stream "test" "probe"
+                                     {:client (client-for base "openai" "held")
+                                      :abort_signal (:signal controller) :max_retries 2})))
+                   {:category :unexpected-success}
+                   (catch Object e (ex-data e))))]
+    (try
+      (let [before (await-counts read-counts #(= 1 (get % "held")))
+            _ ((:abort controller))
+            result (deref worker 1000 ::pending)
+            after (await-counts read-counts #(and (= 0 (get % "held")) (= 1 (get % "canceled"))))
+            _ (let [deadline (+ (System/currentTimeMillis) 1000)]
+                (loop []
+                  (when (and (> (scope-live scope) 0) (< (System/currentTimeMillis) deadline))
+                    (sleep 5) (recur))))
+            live (scope-live scope)]
+        {:case "held-error-body" :result result :before before :after after :live live
+         :pass (and (= 1 (get before "held")) (= :abort (:category result))
+                    (= 0 live) (= 0 (get after "held")) (= 1 (get after "canceled"))
+                    (= 1 (get-in after ["requests" "openai/held"])) )})
+      (finally
+        (http/request {:url (str base "/release")})
+        (scope-close! scope 2000)))))
+
+(defn -main [base]
+  (if (= base "--help")
+    (println "Run with the URL printed by go run dev/http_error_server.go")
+    (let [results (try (conj (check-errors base) (check-held-body base))
+                      (finally (http/request {:url (str base "/shutdown")})))]
+      (doseq [result results] (prn result))
+      (os/exit (if (every? :pass results) 0 1)))))
+
+(when *command-line-args* (apply -main *command-line-args*))

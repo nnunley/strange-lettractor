@@ -1682,6 +1682,24 @@
     ((:register_stream_close request) (fn [] (io/close body))))
   nil)
 
+(defn- raise-stream-provider-error! [provider request response]
+  (let [body (:body response)]
+    (if (or (nil? body) (string? body) (map? body))
+      (raise-provider-error! provider response)
+      (let [closed (atom false)
+            close! (fn []
+                     (when-not (first (swap-vals! closed (fn [_] true)))
+                       (try (io/close body) (catch Object _ nil))))]
+        (try
+          ;; Publish ownership before a potentially blocking read. A cancelled
+          ;; operation may invoke this immediately, or concurrently with finally.
+          (when (fn? (:register_stream_close request))
+            ((:register_stream_close request) close!))
+          (let [text (try (io/slurp body) (catch Object _ nil))]
+            ;; A broken body must not erase HTTP status/retry classification.
+            (raise-provider-error! provider (assoc response :body text)))
+          (finally (close!)))))))
+
 (defn- mark-stream-part! [state key id]
   (let [seen? (contains? (get @state key #{}) id)]
     (when-not seen? (swap! state update key conj id))
@@ -1828,7 +1846,7 @@
                           (json-safe (assoc payload :stream true)))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (raise-provider-error! "openai" resp)
+      (raise-stream-provider-error! "openai" request resp)
       (do
         (register-provider-stream-close! request (:body resp))
         (let [state (atom {:text_started #{} :text_ended #{}
@@ -2001,7 +2019,7 @@
                   :body (json/write-json (json-safe stream-payload))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (raise-provider-error! provider resp)
+      (raise-stream-provider-error! provider request resp)
       (do
         (register-provider-stream-close! request (:body resp))
         (let [state (atom {:started false :text_started false :text ""
@@ -2132,7 +2150,7 @@
                           (json-safe (assoc payload :stream true)))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (raise-provider-error! "anthropic" resp)
+      (raise-stream-provider-error! "anthropic" request resp)
       (do
         (register-provider-stream-close! request (:body resp))
         (let [state (atom {:blocks {} :order [] :usage {}})]
@@ -2252,7 +2270,7 @@
                   :body (json/write-json (json-safe payload))}))
         status (:status resp)]
     (if (and (number? status) (not= status 200))
-      (raise-provider-error! "gemini" resp)
+      (raise-stream-provider-error! "gemini" request resp)
       (do
         (register-provider-stream-close! request (:body resp))
         (let [state (atom {:started false :text_started false
@@ -2708,9 +2726,14 @@
                   result (deref task wait-ms pending)]
               (if (identical? pending result)
                 (recur)
-                (if (:ok result)
-                  (:value result)
-                  (throw (:error result)))))))))))
+                (do
+                  ;; Cancellation can close a body while we are waiting, making
+                  ;; its read fail. Local control takes precedence over that
+                  ;; resulting provider error (or a concurrently ready value).
+                  (check-operation! control)
+                  (if (:ok result)
+                    (:value result)
+                    (throw (:error result))))))))))))
 
 (defn- controlled-sleep! [control seconds]
   (let [finish (+ (System/currentTimeMillis)

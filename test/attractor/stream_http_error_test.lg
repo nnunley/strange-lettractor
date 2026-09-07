@@ -1,0 +1,165 @@
+(ns attractor.stream-http-error-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [io :as io]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+(def providers
+  [["openai" #(llm/openai-stream % "offline-test")]
+   ["anthropic" #(llm/anthropic-stream % "offline-test")]
+   ["gemini" #(llm/gemini-stream % "offline-test")]
+   ["ollama" llm/openai-compatible-stream]])
+
+(def quota "{\"error\":{\"message\":\"quota exhausted\",\"code\":\"insufficient_quota\"}}")
+
+(defn- caught [f]
+  (try (f) nil (catch Object error (ex-data error))))
+
+(defn- client [provider transport]
+  (llm/make-client
+    {:default_provider provider
+     :providers {provider (llm/make-provider-adapter provider {:api_key "offline-test" :transport transport})}}))
+
+(deftest reader-errors-preserve-provider-payload
+  (doseq [[provider stream-fn] providers]
+    (let [error (caught #(vec (stream-fn
+                              {:provider provider :model "test" :messages []
+                               :transport (fn [_] {:status 429 :body (io/string-reader quota)})})))]
+      (is (= :quota-exceeded (:category error)))
+      (is (= false (:retryable error)))
+      (is (= "insufficient_quota" (:error_code error)))
+      (is (= (json/read-json quota) (:raw error)))
+      (is (= provider (:provider error)))
+      (is (= 429 (:status_code error))))))
+
+(deftest client-reader-errors-and-bounded-retries
+  (doseq [[provider _] providers
+          [status body category attempts-expected]
+          [[429 quota :quota-exceeded 1]
+           [401 "{\"error\":{\"message\":\"unauthorized\"}}" :authentication 1]
+           [429 "{\"error\":{\"message\":\"rate limited\"}}" :rate-limit 3]]]
+    (let [attempts (atom 0)
+          delays (atom [])
+          c (client provider (fn [_]
+                               (swap! attempts inc)
+                               {:status status :headers {"Retry-After" "0.25"}
+                                :body (io/string-reader body)}))
+          error (caught #(vec (:events
+                                (llm/stream "test" "go"
+                                  {:client c :max_retries 2
+                                   :retry_policy {:sleep_fn (fn [delay] (swap! delays conj delay))}}))))]
+      (is (= category (:category error)))
+      (is (= attempts-expected @attempts))
+      (is (= (dec attempts-expected) (count @delays)))
+      (is (every? #(>= % 0.25) @delays))
+      (is (= 0.25 (:retry_after error))))))
+
+(deftest client-stream-preserves-error-without-retrying
+  (doseq [[provider _] providers]
+    (let [attempts (atom 0)
+          c (client provider (fn [_]
+                               (swap! attempts inc)
+                               {:status 429 :body (io/string-reader quota)}))
+          error (caught #(vec (llm/client-stream c {:model "test" :messages []})))]
+      (is (= :quota-exceeded (:category error)))
+      (is (= (json/read-json quota) (:raw error)))
+      (is (= 1 @attempts)))))
+
+(deftest reader-closes-after-valid-or-malformed-error
+  (doseq [[provider stream-fn] providers
+          body [quota "{not json"]]
+    (let [closed (atom 0)
+          close-original io/close]
+      (with-redefs [io/close (fn [reader] (swap! closed inc) (close-original reader))]
+        (let [error (caught #(vec (stream-fn
+                                   {:provider provider :model "test" :messages []
+                                    :transport (fn [_] {:status 429 :body (io/string-reader body)})})))]
+          (is (= (if (= body quota) :quota-exceeded :rate-limit) (:category error)))
+          (is (= 1 @closed)))))))
+
+(deftest reader-close-is-registered-before-reading-and-idempotent
+  (doseq [[provider stream-fn] providers]
+    (let [closed (atom 0)
+          registered (atom nil)
+          close-original io/close]
+      (with-redefs [io/close (fn [body] (swap! closed inc) (close-original body))]
+        (caught #(vec (stream-fn
+                        {:provider provider :model "test" :messages []
+                         :register_stream_close (fn [close-fn]
+                                                  (reset! registered close-fn)
+                                                  (close-fn))
+                         :transport (fn [_] {:status 401 :body (io/string-reader "bad json")})})))
+        (is (fn? @registered))
+        (when (fn? @registered) (@registered) (@registered))
+        (is (= 1 @closed))))))
+
+(deftest read-failure-retains-status-and-closes
+  (doseq [[provider stream-fn] providers]
+    (let [closed (atom 0)
+          close-original io/close]
+      (with-redefs [io/slurp (fn [_] (throw (ex-info "broken reader" {})))
+                    io/close (fn [body] (swap! closed inc) (close-original body))]
+        (let [error (caught #(vec (stream-fn
+                                   {:provider provider :model "test" :messages []
+                                    :transport (fn [_] {:status 401 :body (io/string-reader "")})})))]
+          (is (= :authentication (:category error)))
+          (is (= false (:retryable error)))
+          (is (= 401 (:status_code error)))
+          (is (= 1 @closed)))))))
+
+(deftest already-materialized-error-bodies-remain-supported
+  (doseq [[provider stream-fn] providers
+          body [quota (json/read-json quota) nil]]
+    (let [error (caught #(vec (stream-fn
+                               {:provider provider :model "test" :messages []
+                                :transport (fn [_] {:status 401 :body body})})))]
+      (is (= (if (nil? body) :authentication :quota-exceeded) (:category error)))
+      (is (= false (:retryable error))))))
+
+(deftest cancellation-during-error-read-wins-over-http-error
+  (doseq [[provider _] providers
+          status [401 429]]
+    (let [controller (llm/make-abort-controller)
+          reading (promise)
+          waiting (promise)
+          gated (atom [])
+          closed (atom 0)
+          attempts (atom 0)
+          delays (atom [])
+          original-deref core/deref
+          original-close io/close
+          c (client provider (fn [_]
+                               (swap! attempts inc)
+                               {:status status :body (io/string-reader "")}))]
+      ;; Force the read failure to occur after controlled-invoke's pre-wait
+      ;; cancellation check, not before it. One-argument derefs are untouched.
+      (with-redefs [core/deref
+                    (fn [& args]
+                      (if (= 3 (count args))
+                        (do
+                          (swap! gated conj (original-deref reading 1000 false))
+                          (deliver waiting true)
+                          ;; Keep this observation open until the released read
+                          ;; settles, rather than letting a polling timeout hide
+                          ;; the completed-result race. Still bounded on failure.
+                          (original-deref (first args) 1000 (nth args 2)))
+                        (apply original-deref args)))
+                    io/close (fn [body] (swap! closed inc) (original-close body))
+                    io/slurp
+                    (fn [_]
+                      (deliver reading true)
+                      (swap! gated conj (original-deref waiting 1000 false))
+                      ((:abort controller))
+                      (throw (ex-info "read interrupted by close" {})))]
+        (let [error (caught #(vec (:events
+                                    (llm/stream "test" "go"
+                                      {:client c :max_retries 2
+                                       :abort_signal (:signal controller)
+                                       :retry_policy {:sleep_fn (fn [delay] (swap! delays conj delay))}}))))]
+          (is (= :abort (:category error)))
+          (is (= false (:retryable error)))
+          (is (= 1 @attempts))
+          (is (= [true true] @gated))
+          (is (= 1 @closed))
+          (is (= [] @delays)))))))
