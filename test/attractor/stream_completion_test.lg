@@ -1,0 +1,157 @@
+(ns attractor.stream-completion-test
+  (:require [clojure.test :refer [deftest is]] [json :as json]
+            [attractor.llm :as llm]))
+
+(defn- events-for [provider chunks]
+  (let [body (str (apply str (map #(str "data: " (json/write-json %) "\n\n") chunks))
+                  (when (= provider "ollama") "data: [DONE]\n\n"))
+        client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter provider
+                                         {:api_key "offline-test" :transport (fn [_] {:status 200 :body body})})}})]
+    (vec (:events (llm/stream "test" "question" {:client client :max_retries 0})))))
+
+(defn- ends [events kind] (vec (filter #(= kind (:type %)) events)))
+
+(deftest buffered-providers-complete-with-exact-values
+  (doseq [s ["" " λ\n😀 "]]
+    (let [a (events-for "anthropic"
+              [{:type "content_block_start" :index 0 :content_block {:type "text" :text ""}}
+               {:type "content_block_delta" :index 0 :delta {:type "text_delta" :text s}}
+               {:type "content_block_stop" :index 0}
+               {:type "content_block_start" :index 1 :content_block {:type "thinking" :thinking ""}}
+               {:type "content_block_delta" :index 1 :delta {:type "thinking_delta" :thinking s}}
+               {:type "content_block_stop" :index 1} {:type "message_stop"}])
+          g (events-for "gemini" [{:candidates [{:content {:parts [{:text s} {:text s :thought true}]}
+                                               :finishReason "STOP"}]}])
+          c (events-for "ollama" [{:choices [{:delta {:content s} :finish_reason "stop"}]}])]
+      (doseq [events [a g]]
+        (is (= [s] (mapv :text (ends events :text_end))))
+        (is (= [s] (mapv :reasoning (ends events :reasoning_end)))))
+      (is (= [s] (mapv :text (ends c :text_end)))))))
+
+(deftest openai-completion-paths-and-precedence
+  (doseq [[kind delta-type done-type part-type value-key]
+          [[:text_end "response.output_text.delta" "response.output_text.done" "output_text" :text]
+           [:reasoning_end "response.reasoning_text.delta" "response.reasoning_text.done" "reasoning_text" :reasoning]]
+          path [:direct :part :item]
+          explicit [nil "" " final λ\n😀 "]]
+    (let [part (cond-> {:type part-type} (some? explicit) (assoc :text explicit))
+          done (case path
+                 :direct (cond-> {:type done-type :item_id "i" :content_index 0}
+                           (some? explicit) (assoc :text explicit))
+                 :part {:type "response.content_part.done" :item_id "i" :content_index 0 :part part}
+                 :item {:type "response.output_item.done" :item {:id "i" :type (if (= kind :text_end) "message" "reasoning")
+                                                                :content [part]}})
+          events (events-for "openai" [{:type delta-type :item_id "i" :content_index 0 :delta " λ\n"}
+                                       {:type delta-type :item_id "i" :content_index 0 :delta "😀 "}
+                                       done done])
+          end (first (ends events kind))]
+      (is (= 1 (count (ends events kind))))
+      (is (= (if (some? explicit) explicit " λ\n😀 ") (get end value-key)))
+      (is (= (json/read-json (json/write-json done)) (:raw end)))
+      (is (not (contains? end :delta)))
+      (is (not (contains? end :reasoning_delta))))))
+
+(deftest openai-indexed-interleaving-and-dedup
+  (let [events (events-for "openai"
+                 [{:type "response.output_text.delta" :item_id "i" :content_index 0 :delta "A"}
+                  {:type "response.output_text.delta" :item_id "i" :content_index 1 :delta "B"}
+                  {:type "response.output_text.delta" :item_id "i" :content_index 0 :delta "C"}
+                  {:type "response.output_text.done" :item_id "i" :content_index 0 :text "AC"}
+                  {:type "response.content_part.done" :item_id "i" :content_index 0 :part {:type "output_text" :text "AC"}}
+                  {:type "response.output_item.done" :item {:type "message" :id "i" :content [{:type "output_text" :text "AC"} {:type "output_text" :text "B"}]}}])
+        completed (ends events :text_end)]
+    (is (= ["AC" "B"] (mapv :text completed)))
+    (is (= 2 (count (set (map :text_id completed)))))
+    (is (= (mapv :text_id (ends events :text_start)) (mapv :text_id completed)))))
+
+(deftest openai-identities-cannot-collide-with-provider-item-ids
+  (let [events (events-for "openai"
+                 [{:type "response.output_text.done" :item_id "i" :content_index 1 :text "first"}
+                  {:type "response.output_text.done" :item_id "segment:1:i:1" :content_index 0 :text "second"}])]
+    (is (= ["first" "second"] (mapv :text (ends events :text_end))))
+    (is (= 2 (count (set (map :text_id (ends events :text_end))))))))
+
+(deftest done-only-empty-and-unindexed-segments
+  (doseq [[event-type kind key] [["response.output_text.done" :text_end :text]
+                                ["response.reasoning_text.done" :reasoning_end :reasoning]]
+          value [nil "" " λ\n"]]
+    (let [events (events-for "openai" [(cond-> {:type event-type}
+                                       (some? value) (assoc :text value))])]
+      (is (= [(or value "")] (mapv key (ends events kind))))
+      (is (= [(name key)] (mapv :text_id (ends events kind)))))))
+
+(deftest opaque-anthropic-reasoning-stays-opaque
+  (let [events (events-for "anthropic"
+                 [{:type "content_block_start" :index 0 :content_block {:type "redacted_thinking" :data "opaque-secret"}}
+                  {:type "content_block_stop" :index 0} {:type "message_stop"}])]
+    (is (= [""] (mapv :reasoning (ends events :reasoning_end))))
+    (is (empty? (ends events :reasoning_delta)))
+    (is (= "opaque-secret" (get-in (first events) [:raw "content_block" "data"])))))
+
+(deftest completion-values-do-not-double-accumulate
+  (let [events (events-for "openai"
+                 [{:type "response.output_text.delta" :item_id "i" :delta "Answer"}
+                  {:type "response.output_text.done" :item_id "i" :text "Answer"}
+                  {:type "response.reasoning_text.delta" :item_id "r" :delta "Think"}
+                  {:type "response.reasoning_text.done" :item_id "r" :text "Think"}])
+        accumulator (llm/make-stream-accumulator)]
+    (doseq [event events] (llm/stream-accumulator-process! accumulator event))
+    (is (= "Answer" (get-in (llm/stream-accumulator-response accumulator) [:message :text])))
+    (is (= "Think" (:reasoning (llm/stream-accumulator-response accumulator))))))
+
+(deftest item-completion-without-content-closes-known-segments
+  (doseq [[part-type item-type kind key] [["output_text" "message" :text_end :text]
+                                         ["reasoning_text" "reasoning" :reasoning_end :reasoning]]]
+    (let [events (events-for "openai"
+                   [{:type "response.content_part.added" :item_id "i" :content_index 2
+                     :part {:type part-type :text "initial λ"}}
+                    {:type "response.content_part.added" :item_id "i" :content_index 2
+                     :part {:type part-type :text "wrong"}}
+                    {:type "response.output_item.done" :item {:id "i" :type item-type}}
+                    {:type "response.output_item.done" :item {:id "i" :type item-type}}])]
+      (is (= ["initial λ"] (mapv key (ends events kind))))
+      (is (empty? (ends events :provider_event))))))
+
+(deftest reasoning-segments-use-original-content-positions
+  (let [events (events-for "openai"
+                 [{:type "response.reasoning_text.delta" :item_id "r" :content_index 2 :delta "two"}
+                  {:type "response.reasoning_text.delta" :item_id "r" :content_index 0 :delta "zero"}
+                  {:type "response.reasoning_text.done" :item_id "r" :content_index 0 :text "zero"}
+                  {:type "response.output_item.done"
+                   :item {:id "r" :type "reasoning" :content [{:type "reasoning_text" :text "zero"}
+                                                             {:type "other"}
+                                                             {:type "reasoning_text" :text "two"}]}}])]
+    (is (= ["zero" "two"] (mapv :reasoning (ends events :reasoning_end))))
+    (is (= 2 (count (set (map :text_id (ends events :reasoning_end))))))))
+
+(deftest openai-finish-response-tools-and-usage-remain-authoritative
+  (let [native {:id "response-id" :model "test" :status "completed"
+                :output [{:type "message" :id "i" :role "assistant" :content [{:type "output_text" :text "Answer"}]}
+                         {:type "function_call" :id "f" :call_id "c" :name "lookup" :arguments "{\"x\":1}"}]
+                :usage {:input_tokens 2 :output_tokens 3 :total_tokens 5}}
+        events (events-for "openai"
+                 [{:type "response.output_text.delta" :item_id "i" :delta "Answer"}
+                  {:type "response.output_text.done" :item_id "i" :text "Answer"}
+                  {:type "response.output_item.done" :item {:type "function_call" :id "f" :call_id "c" :name "lookup" :arguments "{\"x\":1}"}}
+                  {:type "response.completed" :response native}])
+        finish (last events)]
+    (is (= :finish (:type finish)))
+    (is (= "Answer" (get-in finish [:response :message :text])))
+    (is (= "Answer" (:text (first (ends events :text_end)))))
+    (is (= {"x" 1} (get-in finish [:response :tool_calls 0 :arguments])))
+    (is (= {"x" 1} (get-in (first (ends events :tool_call_end)) [:tool_call :arguments])))
+    (is (= 2 (get-in finish [:usage :input_tokens])))
+    (is (= 3 (get-in finish [:usage :output_tokens])))
+    (is (= 5 (get-in finish [:usage :total_tokens])))
+    (is (= (json/read-json (json/write-json native)) (get-in finish [:raw "response"])))))
+
+(deftest opaque-openai-reasoning-items-preserve-provider-events
+  (doseq [opaque [{:summary [{:type "summary_text" :text "provider summary"}]}
+                  {:encrypted_content "opaque-ciphertext"}
+                  {:summary [] :encrypted_content "opaque-ciphertext" :future_field "value"}]]
+    (let [chunk {:type "response.output_item.done" :item (merge {:id "r" :type "reasoning"} opaque)}
+          events (events-for "openai" [chunk])]
+      (is (= [:provider_event] (mapv :type events)))
+      (is (= (json/read-json (json/write-json chunk)) (:raw (first events)))))))

@@ -1687,6 +1687,47 @@
     (when-not seen? (swap! state update key conj id))
     (not seen?)))
 
+(defn- openai-segment-id [body kind]
+  (let [item (or (get body "item_id") (name kind))
+        index (or (get body "content_index") 0)]
+    ;; Length-prefix indexed identities so provider item IDs cannot collide.
+    (if (and (= index 0) (not (str/starts-with? item "segment:")))
+      item (str "segment:" (count item) ":" item ":" index))))
+
+(defn- openai-segment-events [state body kind action value]
+  (let [id (openai-segment-id body kind)
+        started (if (= kind :text) :text_started :reasoning_started)
+        ended (if (= kind :text) :text_ended :reasoning_ended)
+        start-type (if (= kind :text) :text_start :reasoning_start)
+        end-type (if (= kind :text) :text_end :reasoning_end)
+        delta-type (if (= kind :text) :text_delta :reasoning_delta)
+        delta-key (if (= kind :text) :delta :reasoning_delta)
+        start? (mark-stream-part! state started id)]
+    (when start?
+      (swap! state update :segment_order (fnil conj [])
+             {:kind kind :item_id (get body "item_id") :content_index (or (get body "content_index") 0)})
+      (when (and (= action :start) (string? value))
+        (swap! state assoc-in [:segments kind id] value)))
+    (vec
+      (concat
+        (when start? [{:type start-type :text_id id :raw body}])
+        (case action
+          :start []
+          :delta (do
+                   (swap! state update-in [:segments kind id] #(str (or % "") (or value "")))
+                   [(assoc {:type delta-type :text_id id :raw body} delta-key (or value ""))])
+          :end (when (mark-stream-part! state ended id)
+                 [(assoc {:type end-type :text_id id :raw body} kind
+                         (if (string? value) value (get-in @state [:segments kind id] "")))])
+          [])))))
+
+(defn- openai-part-events [state body action]
+  (let [part (or (get body "part") {})]
+    (case (get part "type")
+      "output_text" (openai-segment-events state body :text action (get part "text"))
+      "reasoning_text" (openai-segment-events state body :reasoning action (get part "text"))
+      [{:type :provider_event :raw body}])))
+
 (defn- openai-stream-events [request state event]
   (let [data (:data event)]
     (if (= data "[DONE]")
@@ -1708,81 +1749,22 @@
               [{:type :provider_event :raw body}]))
 
           "response.content_part.added"
-          (let [part (or (get body "part") {})
-                id (or (get body "item_id") "text")]
-            (case (get part "type")
-              "output_text"
-              (if (mark-stream-part! state :text_started id)
-                [{:type :text_start :text_id id :raw body}]
-                [])
-              "reasoning_text"
-              (if (mark-stream-part! state :reasoning_started id)
-                [{:type :reasoning_start :text_id id :raw body}]
-                [])
-              [{:type :provider_event :raw body}]))
+          (openai-part-events state body :start)
 
           "response.output_text.delta"
-          (let [id (or (get body "item_id") "text")
-                start? (mark-stream-part! state :text_started id)]
-            (vec
-              (concat
-                (when start? [{:type :text_start :text_id id :raw body}])
-                [{:type :text_delta
-                  :delta (or (get body "delta") "")
-                  :text_id id
-                  :raw body}])))
+          (openai-segment-events state body :text :delta (get body "delta"))
 
           "response.output_text.done"
-          (let [id (or (get body "item_id") "text")
-                start? (mark-stream-part! state :text_started id)
-                end? (mark-stream-part! state :text_ended id)]
-            (if end?
-              (vec (concat
-                     (when start? [{:type :text_start :text_id id :raw body}])
-                     [{:type :text_end :text_id id :raw body}]))
-              []))
+          (openai-segment-events state body :text :end (get body "text"))
 
           "response.content_part.done"
-          (let [part (or (get body "part") {})
-                id (or (get body "item_id") "text")]
-            (case (get part "type")
-              "output_text"
-              (let [start? (mark-stream-part! state :text_started id)
-                    end? (mark-stream-part! state :text_ended id)]
-                (if end?
-                  (vec (concat
-                         (when start? [{:type :text_start :text_id id :raw body}])
-                         [{:type :text_end :text_id id :raw body}]))
-                  []))
-              "reasoning_text"
-              (let [start? (mark-stream-part! state :reasoning_started id)
-                    end? (mark-stream-part! state :reasoning_ended id)]
-                (if end?
-                  (vec (concat
-                         (when start? [{:type :reasoning_start :text_id id :raw body}])
-                         [{:type :reasoning_end :text_id id :raw body}]))
-                  []))
-              [{:type :provider_event :raw body}]))
+          (openai-part-events state body :end)
 
           "response.reasoning_text.delta"
-          (let [id (or (get body "item_id") "reasoning")
-                start? (mark-stream-part! state :reasoning_started id)]
-            (vec
-              (concat
-                (when start? [{:type :reasoning_start :text_id id :raw body}])
-                [{:type :reasoning_delta
-                  :reasoning_delta (or (get body "delta") "")
-                  :text_id id :raw body}])))
+          (openai-segment-events state body :reasoning :delta (get body "delta"))
 
           "response.reasoning_text.done"
-          (let [id (or (get body "item_id") "reasoning")
-                start? (mark-stream-part! state :reasoning_started id)
-                end? (mark-stream-part! state :reasoning_ended id)]
-            (if end?
-              (vec (concat
-                     (when start? [{:type :reasoning_start :text_id id :raw body}])
-                     [{:type :reasoning_end :text_id id :raw body}]))
-              []))
+          (openai-segment-events state body :reasoning :end (get body "text"))
 
           "response.function_call_arguments.delta"
           (let [item-id (or (get body "item_id") "")
@@ -1798,12 +1780,28 @@
               [{:type :tool_call_end
                 :tool_call (first (normalize-openai-tool-calls [item]))
                 :raw body}]
-              "message"
-              (let [id (or (get item "id") "text")]
-                (if (and (contains? (:text_started @state) id)
-                         (mark-stream-part! state :text_ended id))
-                  [{:type :text_end :text_id id :raw body}]
-                  []))
+              ("message" "reasoning")
+              (if (and (= "reasoning" (get item "type"))
+                       (empty? (get item "content"))
+                       (not-any? #(= (get item "id") (:item_id %)) (:segment_order @state)))
+                ;; Summary/encrypted-only items remain opaque provider events.
+                ;; Known segments stay silent after their completion is deduplicated.
+                [{:type :provider_event :raw body}]
+                (vec (concat
+                     (mapcat
+                       (fn [[index part]]
+                         (map #(assoc % :raw body)
+                              (openai-part-events state
+                                (assoc body "item_id" (get item "id") "content_index" index "part" part)
+                                :end)))
+                       (map-indexed vector (or (get item "content") [])))
+                     (mapcat
+                       (fn [segment]
+                         (map #(assoc % :raw body)
+                              (openai-segment-events state
+                                (assoc body "item_id" (:item_id segment) "content_index" (:content_index segment))
+                                (:kind segment) :end nil)))
+                       (filter #(= (get item "id") (:item_id %)) (:segment_order @state))))))
               [{:type :provider_event :raw body}]))
 
           "response.completed"
@@ -1909,7 +1907,7 @@
     (vec
       (concat
         (when (:text_started snapshot)
-          [{:type :text_end :text_id "text" :raw raw}])
+          [{:type :text_end :text_id "text" :text (or (:text snapshot) "") :raw raw}])
         (when (:reasoning_started snapshot)
           [{:type :reasoning_end :text_id "reasoning"
             :reasoning (:reasoning snapshot) :raw raw}])
@@ -2079,7 +2077,7 @@
             block (or (get-in @state [:blocks index]) {})
             block-type (get block "type")]
         (case block-type
-          "text" {:type :text_end :text_id (str "text-" index) :raw body}
+          "text" {:type :text_end :text_id (str "text-" index) :text (or (get block "text") "") :raw body}
           "tool_use"
           (let [raw-args (or (:partial_json block) "")
                 args (if (str/blank? raw-args)
@@ -2092,7 +2090,8 @@
             (swap! state assoc-in [:blocks index "input"] args)
             {:type :tool_call_end :tool_call tool-call :raw body})
           ("thinking" "redacted_thinking")
-          {:type :reasoning_end :text_id (str "reasoning-" index) :raw body}
+          {:type :reasoning_end :text_id (str "reasoning-" index)
+           :reasoning (if (= block-type "thinking") (or (get block "thinking") "") "") :raw body}
           {:type :provider_event :raw body}))
 
       "message_delta"
@@ -2230,9 +2229,9 @@
           end-events (when finish-provider
                        (concat
                          (when (:text_started @state)
-                           [{:type :text_end :text_id "text" :raw body}])
+                           [{:type :text_end :text_id "text" :text (or (:text @state) "") :raw body}])
                          (when (:reasoning_started @state)
-                           [{:type :reasoning_end :text_id "reasoning" :raw body}])
+                           [{:type :reasoning_end :text_id "reasoning" :reasoning (or (:reasoning @state) "") :raw body}])
                          (let [response (gemini-stream-response request state body)]
                            [{:type :finish
                              :finish_reason (:finish_reason response)

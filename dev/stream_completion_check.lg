@@ -1,0 +1,74 @@
+(ns main
+  (:require [attractor.llm :as llm]
+            [json :as json]))
+
+;; Offline conformance probe for unified-LLM spec 3.14 typed completion.
+;; Small diagnostic companion to test/attractor/stream_completion_test.lg.
+(defn sse [frames]
+  (apply str (map (fn [frame]
+                    (str "data: " (json/write-json frame) "\n\n")) frames)))
+
+(def fixtures
+  {"anthropic"
+   [{:type "message_start" :message {:id "probe" :usage {}}}
+    {:type "content_block_start" :index 0
+     :content_block {:type "thinking" :thinking ""}}
+    {:type "content_block_delta" :index 0
+     :delta {:type "thinking_delta" :thinking "Think"}}
+    {:type "content_block_delta" :index 0
+     :delta {:type "thinking_delta" :thinking " more"}}
+    {:type "content_block_stop" :index 0}
+    {:type "content_block_start" :index 1
+     :content_block {:type "text" :text ""}}
+    {:type "content_block_delta" :index 1
+     :delta {:type "text_delta" :text "Hello"}}
+    {:type "content_block_delta" :index 1
+     :delta {:type "text_delta" :text " world"}}
+    {:type "content_block_stop" :index 1}
+    {:type "message_delta" :delta {:stop_reason "end_turn"}}
+    {:type "message_stop"}]
+   "gemini"
+   [{:candidates [{:content {:parts [{:text "Think" :thought true}]}}]}
+    {:candidates [{:content {:parts [{:text " more" :thought true}
+                                     {:text "Hello"}]}}]}
+    {:candidates [{:content {:parts [{:text " world"}]}
+                   :finishReason "STOP"}]}]
+   "openai"
+   [{:type "response.created" :response {:id "probe"}}
+    {:type "response.reasoning_text.delta" :item_id "r" :delta "Think"}
+    {:type "response.reasoning_text.delta" :item_id "r" :delta " more"}
+    {:type "response.reasoning_text.done" :item_id "r" :text "Think more"}
+    {:type "response.output_text.delta" :item_id "t" :delta "Hello"}
+    {:type "response.output_text.delta" :item_id "t" :delta " world"}
+    {:type "response.output_text.done" :item_id "t" :text "Hello world"}
+    {:type "response.completed"
+     :response {:id "probe" :status "completed"
+                :output [{:type "message" :id "t" :role "assistant"
+                          :content [{:type "output_text" :text "Hello world"}]}]}}]})
+
+(defn check-provider [provider]
+  (let [events (vec (llm/stream
+                     {:provider provider :model "offline-probe" :api_key "fixture"
+                      :messages [{:role :user :content "probe"}]
+                      :transport (fn [_] {:status 200 :body (sse (get fixtures provider))})}))
+        checks (mapv
+                 (fn [[kind delta-key completed-key expected]]
+                   (let [deltas (filter #(= (keyword (str (name kind) "_delta")) (:type %)) events)
+                         ends (filter #(= (keyword (str (name kind) "_end")) (:type %)) events)
+                         accumulated (apply str (map delta-key deltas))]
+                     {:kind kind :expected expected :accumulated accumulated
+                      :ends (mapv #(dissoc % :raw) ends)
+                      :pass (and (= expected accumulated) (= 1 (count ends))
+                                 (= expected (get (first ends) completed-key)))}))
+                 [[:text :delta :text "Hello world"]
+                  [:reasoning :reasoning_delta :reasoning "Think more"]])]
+    {:provider provider :finished (= :finish (:type (last events)))
+     :checks checks
+     :pass (and (= :finish (:type (last events))) (every? :pass checks))}))
+
+(defn -main [& _]
+  (let [results (mapv check-provider ["openai" "anthropic" "gemini"])]
+    (doseq [result results] (prn result))
+    (os/exit (if (every? :pass results) 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))
