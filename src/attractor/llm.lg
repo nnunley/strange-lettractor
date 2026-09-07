@@ -1896,6 +1896,7 @@
      :provider (or (:provider request) "openai-compatible")
      :message {:role :assistant :content parts :parts parts :text text}
      :tool_calls tool-calls
+     :reasoning (:reasoning snapshot)
      :usage (openai-compatible-usage (:usage snapshot))
      :finish_reason reason
      :warnings (adapter-warnings "openai-compatible" request)
@@ -1909,6 +1910,9 @@
       (concat
         (when (:text_started snapshot)
           [{:type :text_end :text_id "text" :raw raw}])
+        (when (:reasoning_started snapshot)
+          [{:type :reasoning_end :text_id "reasoning"
+            :reasoning (:reasoning snapshot) :raw raw}])
         (map (fn [index]
                {:type :tool_call_end
                 :tool_call (compatible-stream-tool-call
@@ -1943,6 +1947,9 @@
           (let [choice (first (or (get body "choices") []))
                 delta (or (get choice "delta") {})
                 content (get delta "content")
+                reasoning (get delta "reasoning_content")
+                first-reasoning? (and (string? reasoning)
+                                      (not (:reasoning_started @state)))
                 native-tools (or (get delta "tool_calls") [])
                 first-text? (and (some? content)
                                  (not (:text_started @state)))]
@@ -1953,6 +1960,9 @@
               (swap! state update :usage merge usage))
             (when-let [reason (get choice "finish_reason")]
               (swap! state assoc :finish_reason reason))
+            (when first-reasoning? (swap! state assoc :reasoning_started true))
+            (when (string? reasoning)
+              (swap! state update :reasoning append-string reasoning))
             (when first-text? (swap! state assoc :text_started true))
             (when (some? content)
               (swap! state update :text append-string content))
@@ -1962,6 +1972,11 @@
                   [{:type :stream_start
                     :warnings (adapter-warnings "openai-compatible" request)
                     :raw body}])
+                (when first-reasoning?
+                  [{:type :reasoning_start :text_id "reasoning" :raw body}])
+                (when (string? reasoning)
+                  [{:type :reasoning_delta :reasoning_delta reasoning
+                    :text_id "reasoning" :raw body}])
                 (when first-text?
                   [{:type :text_start :text_id "text" :raw body}])
                 (when (some? content)

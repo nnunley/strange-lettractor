@@ -3,6 +3,95 @@
             [json :as json]
             [attractor.llm :as llm]))
 
+(defn- stream-body [chunks]
+  (str (apply str (map #(str "data: " (json/write-json %) "\n\n") chunks))
+       "data: [DONE]\n\n"))
+
+(defn- delta-chunk [delta]
+  {:choices [{:delta delta}]})
+
+(defn- stream-with [chunks]
+  (vec (llm/openai-compatible-stream
+         {:provider "ollama" :model "qwen-test" :messages []
+          :transport (fn [_] {:status 200 :body (stream-body chunks)})})))
+
+(deftest streamed-reasoning-normalizes-strings-only
+  (doseq [delta [{} {:reasoning_content nil} {:reasoning_content 42}
+                 {:reasoning_content false} {:reasoning_content {}}]]
+    (let [events (stream-with [(delta-chunk delta)])]
+      (is (= [:stream_start :finish] (mapv :type events)))
+      (is (nil? (get-in (last events) [:response :reasoning])))))
+  (doseq [reasoning ["" "First reason.\nThen conclude. λ"]]
+    (let [events (stream-with [(delta-chunk {:reasoning_content reasoning})])]
+      (is (= [:stream_start :reasoning_start :reasoning_delta :reasoning_end :finish]
+             (mapv :type events)))
+      (is (= [reasoning] (mapv :reasoning_delta
+                              (filter #(= :reasoning_delta (:type %)) events))))
+      (is (= reasoning (get-in (last events) [:response :reasoning])))
+      (is (= reasoning (:reasoning (first (filter #(= :reasoning_end (:type %)) events)))))
+      (is (= "" (get-in (last events) [:response :message :text]))))))
+
+(deftest streamed-reasoning-interleaves-with-text-tools-and-final-usage
+  (let [chunks [(delta-chunk {:reasoning_content " Think\n"})
+                (delta-chunk {:content "An"})
+                (delta-chunk {:reasoning_content "" :tool_calls
+                              [{:index 0 :id "call-1" :type "function"
+                                :function {:name "lookup" :arguments "{\"q\":"}}]})
+                (delta-chunk {:reasoning_content nil})
+                (delta-chunk {:reasoning_content 42})
+                {:choices [{:delta {:reasoning_content "λ " :content "swer"
+                                    :tool_calls [{:index 0 :function {:arguments "\"x\"}"}}]}
+                            :finish_reason "tool_calls"}]}
+                {:choices [] :usage {:prompt_tokens 2 :completion_tokens 3 :total_tokens 5}}]
+        events (stream-with chunks)
+        reasoning-events (vec (filter #(= :reasoning_delta (:type %)) events))
+        finish (last events)
+        response (:response finish)]
+    (is (= [:stream_start :reasoning_start :reasoning_delta :text_start :text_delta
+            :reasoning_delta :tool_call_start :reasoning_delta :text_delta
+            :tool_call_delta :text_end :reasoning_end :tool_call_end :finish]
+           (mapv :type events)))
+    (is (= [" Think\n" "" "λ "] (mapv :reasoning_delta reasoning-events)))
+    (is (= ["reasoning" "reasoning" "reasoning"] (mapv :text_id reasoning-events)))
+    (is (= (mapv #(json/read-json (json/write-json (nth chunks %))) [0 2 5])
+           (mapv :raw reasoning-events)))
+    (is (= (:raw (first reasoning-events)) (:raw (nth events 1))))
+    (is (= (:raw finish) (:raw (first (filter #(= :reasoning_end (:type %)) events)))))
+    (is (= " Think\nλ " (:reasoning response)))
+    (is (= " Think\nλ " (:reasoning (first (filter #(= :reasoning_end (:type %)) events)))))
+    (is (= "Answer" (get-in response [:message :text])))
+    (is (= [:text :tool_call] (mapv :kind (get-in response [:message :content]))))
+    (is (= {"q" "x"} (get-in response [:tool_calls 0 :arguments])))
+    (is (= "{\"q\":\"x\"}" (get-in response [:tool_calls 0 :raw_arguments])))
+    (is (= :tool_calls (:finish_reason finish)))
+    (is (= {:input_tokens 2 :output_tokens 3 :total_tokens 5} (:usage finish)))))
+
+(deftest streamed-reasoning-stops-after-error
+  (let [events (stream-with [(delta-chunk {:reasoning_content "partial"})
+                            {:error {:message "failed"}}
+                            (delta-chunk {:reasoning_content "ignored" :content "ignored"})])]
+    (is (= [:stream_start :reasoning_start :reasoning_delta :error] (mapv :type events)))
+    (is (= ["partial"] (mapv :reasoning_delta
+                             (filter #(= :reasoning_delta (:type %)) events))))))
+
+(deftest streamed-reasoning-survives-configured-client-and-accumulation
+  (let [body (stream-body [(delta-chunk {:reasoning_content "Reason"})
+                          {:choices [{:delta {:content "Answer"} :finish_reason "stop"}]}])
+        client (llm/make-client
+                 {:default_provider "ollama"
+                  :providers {"ollama" (llm/make-provider-adapter "ollama"
+                                         {:transport (fn [_] {:status 200 :body body})})}})
+        events (vec (llm/client-stream client {:model "qwen-test" :messages []}))
+        accumulator (llm/make-stream-accumulator)
+        result (llm/stream "qwen-test" "question" {:client client :max_retries 0})
+        high-events (vec (:events result))]
+    (doseq [event events] (llm/stream-accumulator-process! accumulator event))
+    (is (= "Reason" (:reasoning (llm/stream-accumulator-response accumulator))))
+    (is (= "Reason" (:reasoning ((:response result)))))
+    (is (= ["Reason"] (mapv :reasoning_delta
+                            (filter #(= :reasoning_delta (:type %)) high-events))))
+    (is (= ["Answer"] (vec (:text_stream result))))))
+
 (defn- complete-with [message]
   (llm/openai-compatible-complete
    {:provider "ollama" :model "qwen-test" :messages []

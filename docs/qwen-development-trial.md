@@ -9,7 +9,9 @@ Task: preserve a string `reasoning_content` field as normalized response
 `:reasoning`, including the empty string; use nil for absent/non-string values.
 Keep answer content, tool calls, usage, and raw data unchanged. This also restores
 existing high-level generation/step reasoning propagation. Streaming reasoning
-normalization is separate, unfinished work.
+normalization was separate, unfinished work at the time of this trial. The later
+[deterministic streaming fix](qwen-streaming-reasoning.md) is separate evidence,
+not an additional autonomous Qwen development success.
 
 ## Outcome: assisted, not autonomous
 
