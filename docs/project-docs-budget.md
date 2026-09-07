@@ -26,6 +26,10 @@ once truncation occurs. Provider selection and root-first ordering are unchanged
   An earlier run while the test file was still being extended reported one
   failure; its detailed failure was not retained, so its cause is unverified.
   The final suite was rerun after edits stopped. `lgx build` also exited zero.
+- After integration onto main (`a38e37a`), the fresh suite passed 573 tests /
+  4,740 assertions with zero failures. The application build and its `help`
+  command exited zero. The CLI uses `help`; `--help` was rejected as an unknown
+  command during verification and is not being counted as a passing check.
 
 This closes the byte-budget defect, not the entire system-prompt requirement or
 the full Attractor implementation. No let-go runtime changes or model calls
