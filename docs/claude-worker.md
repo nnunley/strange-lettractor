@@ -44,6 +44,12 @@ Events render as `[claude <id>]` lines; `/cancel` with the worker focused
 requests cooperative cancellation; `/agents` lists running and finished
 workers. See `docs/console-requirements.md` (SCN-CONSOLE-CONTROL).
 
+Known strictness limit (2026-09-08): a long review run (34 turns) returned a
+valid successful `result`, after which the CLI emitted one more record; the
+connector reports `:claude-protocol` "record after its terminal result" and
+exits 1 although the result text is intact in the event stream. Follow-up:
+tolerate records after a valid terminal result (surface them, keep exit 0).
+
 ## Workflow and library use
 
 ```sh

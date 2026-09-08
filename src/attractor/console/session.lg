@@ -26,37 +26,65 @@
                  :run_defaults (or (:run_defaults opts) {})}
         client (request! console :client/attach {})]
     (atom (assoc console :client client :cursor (:cursor client)
-                 :focus {} :input {} :quit false :text_buffers {}))))
+                 ;; One focus at a time: {:kind :session|:run|:worker :id ...}.
+                 ;; :session remembers the agent session for unprefixed text
+                 ;; while a run or worker is focused.
+                 :focus nil :session nil :input {} :quit false :text_buffers {}
+                 :final_lines []))))
 
 (defn closed? [console] (:quit @console))
-(defn focus [console] (:focus @console))
+(defn focus
+  "The single focused object, {:kind :id}, or nil."
+  [console] (:focus @console))
+(defn selection
+  "Selection captured at submission: the agent session plus whichever run or
+   worker is focused."
+  [console]
+  (let [c @console f (:focus c)]
+    {:session_id (:session c)
+     :run_id (when (= :run (:kind f)) (:id f))
+     :worker_id (when (= :worker (:kind f)) (:id f))}))
+(declare drain!)
 
 (defn close!
-  "Detach this client. Hub-owned sessions, runs and workers keep running."
+  "Detach this client. Hub-owned sessions, runs and workers keep running.
+   Events published up to the detach are drained first and delivered by the
+   next drain! so nothing rendered late is lost."
   [console]
   (let [c @console]
     (when-not (:detached c)
-      (try (request! c :client/detach {:client_id (get-in c [:client :client_id])}) (catch Object _ nil))
-      (swap! console assoc :detached true :quit true))))
+      (let [late (try (:lines (drain! console)) (catch Object _ []))]
+        (try (request! c :client/detach {:client_id (get-in c [:client :client_id])}) (catch Object _ nil))
+        (swap! console assoc :detached true :quit true :final_lines late)))))
 
 ;; --- rendering --------------------------------------------------------------
+
+(def ^:private max-buffered-text 65536)
+(defn- buffer-text! [console key text]
+  ;; Bound per-key accumulation; a runaway response is truncated, not hoarded.
+  (swap! console update-in [:text_buffers key]
+         (fn [buffered] (let [joined (str (or buffered "") text)]
+                          (if (> (count joined) max-buffered-text) (subs joined 0 max-buffered-text) joined)))))
+(defn- take-buffer! [console key]
+  (let [buffered (get-in @console [:text_buffers key])]
+    (swap! console update :text_buffers dissoc key)
+    buffered))
+(defn- text-lines [tag text]
+  (if (str/blank? text) [] (mapv #(str tag " " %) (str/split text #"\n"))))
 
 (defn- agent-lines [console envelope]
   (let [tag (str "[agent " (short-id (:session_id envelope)) "]") event (:event envelope)
         sid (:session_id envelope)]
     (case (:type event)
       :session_start [(str tag " session started")]
-      :assistant_text_delta
-      (do (swap! console update-in [:text_buffers sid] (fnil str "") (:delta event)) [])
-      :assistant_text_end
-      (let [buffered (get-in @console [:text_buffers sid])]
-        (swap! console update :text_buffers dissoc sid)
-        (mapv #(str tag " " %) (str/split (or (:text event) buffered "") #"\n")))
+      :assistant_text_delta (do (buffer-text! console sid (:delta event)) [])
+      :assistant_text_end (let [buffered (take-buffer! console sid)]
+                            (text-lines tag (or (:text event) buffered)))
       :tool_call_start [(str tag " tool " (:tool_name event) " …")]
       :tool_call_end [(str tag " tool " (short-id (:call_id event)) (if (:error event) " failed" " done"))]
-      :error [(str tag " error: " (:error event))]
-      :processing_end [(str tag " turn complete")]
-      :session_end [(str tag " session ended")]
+      :error (do (take-buffer! console sid) [(str tag " error: " (:error event))])
+      :processing_end (into (text-lines tag (take-buffer! console sid)) [(str tag " turn complete")])
+      :session_end (do (take-buffer! console sid) [(str tag " session ended")])
       :warning [(str tag " warning: " (or (:message event) (pr-str event)))]
       [])))
 
@@ -85,11 +113,9 @@
 (defn- worker-lines [console envelope]
   (let [wid (:worker_id envelope) tag (str "[claude " (short-id wid) "]") ev (:event envelope)]
     (case (:type ev)
-      :text_delta (do (swap! console update-in [:text_buffers wid] (fnil str "") (:text ev)) [])
-      :completed (let [buffered (get-in @console [:text_buffers wid])]
-                   (swap! console update :text_buffers dissoc wid)
-                   (vec (concat (mapv #(str tag " " %) (str/split (or buffered "") #"\n"))
-                                [(str tag " completed")])))
+      :text_delta (do (buffer-text! console wid (:text ev)) [])
+      :completed (into (text-lines tag (take-buffer! console wid)) [(str tag " completed")])
+      :error (into (text-lines tag (take-buffer! console wid)) [(str tag " failed: " (get-in ev [:error :message]))])
       :protocol (let [type (get-in ev [:event "type"])]
                   (if (= "assistant" type)
                     (let [tools (keep #(get % "name") (get-in ev [:event "message" "content"]))]
@@ -110,10 +136,22 @@
   [console]
   (let [c @console]
     (if (:detached c)
-      {:lines []}
-      (let [{:keys [events cursor]} (hub/events-since (:hub c) (get-in c [:client :client_id]) (:cursor c))]
-        (swap! console assoc :cursor cursor)
-        {:lines (vec (mapcat #(render-envelope console %) events))}))))
+      (let [late (:final_lines c)]
+        (swap! console assoc :final_lines [])
+        {:lines (vec late)})
+      (try
+        (let [{:keys [events cursor]} (hub/events-since (:hub c) (get-in c [:client :client_id]) (:cursor c))]
+          (swap! console assoc :cursor cursor)
+          {:lines (vec (mapcat #(render-envelope console %) events))})
+        (catch Object e
+          (if (= :cursor-expired (:category (ex-data e)))
+            ;; Fell behind the bounded log: resync to its newest cursor and say so.
+            (let [{:keys [cursor events]} (hub/events-since (:hub c) (get-in c [:client :client_id])
+                                                            (dec (:seq (first (:events @(:log (:hub c)))))))]
+              (swap! console assoc :cursor cursor)
+              {:lines (into ["… older events dropped (client fell behind the hub log)"]
+                            (mapcat #(render-envelope console %) events))})
+            {:lines [(str "error: " (ex-message e))]}))))))
 
 ;; --- commands ---------------------------------------------------------------
 
@@ -123,72 +161,93 @@
    "  : form          evaluate let-go in the hub console namespace"
    "  :{ / :}         begin / submit a multiline evaluation"
    "  \\text           literal agent text"
-   "  /help /agents /new /focus <id> /run <file.dot> [--auto-approve]"
+   "  /help /agents /new /focus <id> /run <file.dot> --auto-approve"
    "  /claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
    "  /cancel         cancel the focused turn, run or worker"
-   "  /quit           detach; hub-owned work keeps running"])
+   "  /quit           detach this client (an in-process hub stops with the command)"])
+
+(defn- focus! [console kind id]
+  (swap! console (fn [c] (cond-> (assoc c :focus {:kind kind :id id})
+                           (= kind :session) (assoc :session id)))))
 
 (defn- ensure-session! [console]
-  (or (get-in @console [:focus :session_id])
+  (or (:session @console)
       (let [{:keys [session_id]} (request! @console :session/open {})]
-        (swap! console assoc-in [:focus :session_id] session_id)
+        (focus! console :session session_id)
         session_id)))
 
-(defn- parse-flags [args]
-  (loop [tokens (str/split (str/trim args) #"\s+") words [] flags {}]
+(def ^:private boolean-flags #{:auto-approve})
+(defn- parse-flags
+  "Words plus --flag values. Boolean flags never consume a value, and no flag
+   consumes a following token that is itself a flag; a value-less flag is
+   reported under :missing so callers can reject it."
+  [args]
+  (loop [tokens (remove str/blank? (str/split (str/trim args) #"\s+")) words [] flags {} missing []]
     (if (empty? tokens)
-      {:words (remove str/blank? words) :flags flags}
-      (let [t (first tokens)]
-        (if (and (str/starts-with? t "--") (second tokens))
-          (recur (drop 2 tokens) words (assoc flags (keyword (subs t 2)) (second tokens)))
-          (if (str/starts-with? t "--")
-            (recur (rest tokens) words (assoc flags (keyword (subs t 2)) true))
-            (recur (rest tokens) (conj words t) flags)))))))
+      {:words words :flags flags :missing missing}
+      (let [t (first tokens) value (second tokens)]
+        (cond
+          (not (str/starts-with? t "--")) (recur (rest tokens) (conj words t) flags missing)
+          (contains? boolean-flags (keyword (subs t 2))) (recur (rest tokens) words (assoc flags (keyword (subs t 2)) true) missing)
+          (and value (not (str/starts-with? value "--"))) (recur (drop 2 tokens) words (assoc flags (keyword (subs t 2)) value) missing)
+          :else (recur (rest tokens) words flags (conj missing t)))))))
 
 (defn- agents-lines [console]
   (let [c @console
         sessions (request! c :session/list {}) runs (request! c :workflow/list {}) workers (request! c :worker/list {})
-        f (:focus c) mark (fn [id key] (if (= id (get f key)) "* " "  "))]
+        f (:focus c) mark (fn [kind id] (if (= f {:kind kind :id id}) "* " "  "))]
     (vec (concat
-           (map #(str (mark (:session_id %) :session_id) "session " (short-id (:session_id %))
+           (map #(str (mark :session (:session_id %)) "session " (short-id (:session_id %))
                       (when (:busy %) " busy") (when (:closed %) " closed")) sessions)
-           (map #(str (mark (:run_id %) :run_id) "run " (short-id (:run_id %)) " " (:source_path %)
+           (map #(str (mark :run (:run_id %)) "run " (short-id (:run_id %)) " " (:source_path %)
                       (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) runs)
-           (map #(str (mark (:worker_id %) :worker_id) "claude " (short-id (:worker_id %))
+           (map #(str (mark :worker (:worker_id %)) "claude " (short-id (:worker_id %))
                       (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) workers)
            (when (and (empty? sessions) (empty? runs) (empty? workers)) ["nothing running"])))))
 
-(defn- focus! [console id]
+(defn- focus-by-id! [console id]
   (let [c @console
-        match (fn [key items] (first (filter #(or (= id (get % key)) (= id (short-id (get % key)))) items)))
-        session (match :session_id (request! c :session/list {}))
-        run (match :run_id (request! c :workflow/list {}))
-        worker (match :worker_id (request! c :worker/list {}))]
+        match (fn [key items] (filter #(or (= id (get % key)) (= id (short-id (get % key)))) items))
+        sessions (match :session_id (request! c :session/list {}))
+        runs (match :run_id (request! c :workflow/list {}))
+        workers (match :worker_id (request! c :worker/list {}))
+        candidates (concat (map (fn [x] [:session (:session_id x)]) sessions)
+                           (map (fn [x] [:run (:run_id x)]) runs)
+                           (map (fn [x] [:worker (:worker_id x)]) workers))
+        label {:session "session" :run "run" :worker "claude"}]
     (cond
-      session (do (swap! console assoc-in [:focus :session_id] (:session_id session)) [(str "focus: session " (short-id (:session_id session)))])
-      run (do (swap! console assoc-in [:focus :run_id] (:run_id run)) [(str "focus: run " (short-id (:run_id run)))])
-      worker (do (swap! console assoc-in [:focus :worker_id] (:worker_id worker)) [(str "focus: claude " (short-id (:worker_id worker)))])
-      :else [(str "no session, run or worker matches " id)])))
+      (empty? candidates) [(str "no session, run or worker matches " id)]
+      (next candidates) [(str "ambiguous: " (str/join ", " (map (fn [[k v]] (str (label k) " " (short-id v))) candidates)))]
+      :else (let [[kind full] (first candidates)]
+              (focus! console kind full)
+              [(str "focus: " (label kind) " " (short-id full))]))))
 
 (defn- run! [console args]
-  (let [{:keys [words flags]} (parse-flags args) path (first words) c @console]
+  (let [{:keys [words flags missing]} (parse-flags args) path (first words) c @console
+        defaults (:run_defaults c)
+        auto-approve? (boolean (or (:auto-approve flags) (:auto_approve defaults)))]
     (cond
-      (str/blank? path) ["usage: /run <file.dot> [--auto-approve]"]
+      (seq missing) [(str "flag needs a value: " (str/join ", " missing))]
+      (str/blank? path) ["usage: /run <file.dot> --auto-approve [--logs-root dir]"]
       (not (os/stat path)) [(str "no such file: " path)]
+      ;; Human gates would read the terminal out from under this frontend;
+      ;; until questions arrive as hub events, the console only runs
+      ;; auto-approved workflows.
+      (not auto-approve?) ["this console cannot answer human gates yet: add --auto-approve"]
       :else
-      (let [defaults (:run_defaults c)
-            logs-root (or (:logs-root flags) (when-let [f (:logs_root_fn defaults)] (f path))
+      (let [logs-root (or (:logs-root flags) (when-let [f (:logs_root_fn defaults)] (f path))
                           (str "attractor_runs/run_" (System/currentTimeMillis)))
             {:keys [run_id]} (request! c :workflow/run {:dot_source (io/slurp path) :source_path path
-                                                        :logs_root logs-root
-                                                        :auto_approve (boolean (or (:auto-approve flags) (:auto_approve defaults)))})]
-        (swap! console assoc-in [:focus :run_id] run_id)
+                                                        :logs_root logs-root :auto_approve true})]
+        (focus! console :run run_id)
         [(str "run " (short-id run_id) " started from " path " (logs: " logs-root ")")]))))
 
 (defn- claude! [console args]
-  (let [{:keys [words flags]} (parse-flags args) prompt (str/join " " words) c @console d (:worker_defaults c)]
-    (if (str/blank? prompt)
-      ["usage: /claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"]
+  (let [{:keys [words flags missing]} (parse-flags args) prompt (str/join " " words) c @console d (:worker_defaults c)]
+    (cond
+      (seq missing) [(str "flag needs a value: " (str/join ", " missing))]
+      (str/blank? prompt) ["usage: /claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"]
+      :else
       (let [fields (cond-> {:kind :claude :prompt prompt}
                      (or (:cwd flags) (:working_dir d)) (assoc :working_dir (or (:cwd flags) (:working_dir d)))
                      (or (:model flags) (:model d)) (assoc :model (or (:model flags) (:model d)))
@@ -198,36 +257,43 @@
                      (:timeout_ms d) (assoc :timeout_ms (:timeout_ms d))
                      (:scenario flags) (assoc :scenario (:scenario flags)))
             {:keys [worker_id]} (request! c :worker/run fields)]
-        (swap! console assoc-in [:focus :worker_id] worker_id)
+        (focus! console :worker worker_id)
         [(str "claude " (short-id worker_id) " started")]))))
 
 (defn- cancel! [console]
-  (let [c @console f (:focus c)]
-    (cond
-      (:worker_id f) (do (request! c :worker/cancel {:worker_id (:worker_id f)}) [(str "cancel requested: claude " (short-id (:worker_id f)))])
-      (:run_id f) (do (request! c :workflow/cancel {:run_id (:run_id f)}) [(str "cancel requested: run " (short-id (:run_id f)))])
-      (:session_id f) (do (request! c :session/cancel {:session_id (:session_id f)}) [(str "cancel requested: session " (short-id (:session_id f)))])
-      :else ["nothing focused to cancel"])))
+  (let [c @console {:keys [kind id]} (:focus c)]
+    (case kind
+      :worker (do (request! c :worker/cancel {:worker_id id}) [(str "cancel requested: claude " (short-id id))])
+      :run (do (request! c :workflow/cancel {:run_id id}) [(str "cancel requested: run " (short-id id))])
+      :session (do (request! c :session/cancel {:session_id id}) [(str "cancel requested: session " (short-id id))])
+      ["nothing focused to cancel"])))
 
 (defn busy?
   "True when the focused session has an unfinished turn or the focused run or
-   worker is still running. Frontends use it to route an interrupt."
+   worker is still running. Frontends use it to route an interrupt; a hub that
+   cannot answer counts as not busy so an idle interrupt can still quit."
   [console]
-  (let [c @console f (:focus c)
-        find (fn [key op] (when (get f key) (first (filter #(= (get f key) (get % key)) (request! c op {})))))
-        session (find :session_id :session/list) run (find :run_id :workflow/list) worker (find :worker_id :worker/list)]
-    (boolean (or (and session (:busy session))
-                 (and run (not (:done run)))
-                 (and worker (not (:done worker)))))))
+  (try
+    (let [c @console {:keys [kind id]} (:focus c)
+          find (fn [key op] (first (filter #(= id (get % key)) (request! c op {}))))]
+      (boolean
+        (case kind
+          :session (:busy (find :session_id :session/list))
+          :run (when-let [run (find :run_id :workflow/list)] (not (:done run)))
+          :worker (when-let [worker (find :worker_id :worker/list)] (not (:done worker)))
+          false)))
+    (catch Object _ false)))
 
 (defn- command! [console command args]
   (case command
     :help help-lines
     :agents (agents-lines console)
     :new (let [{:keys [session_id]} (request! @console :session/open {})]
-           (swap! console assoc-in [:focus :session_id] session_id)
+           (focus! console :session session_id)
            [(str "focus: session " (short-id session_id))])
-    :focus (if (str/blank? args) [(str "focus: " (pr-str (:focus @console)))] (focus! console (str/trim args)))
+    :focus (if (str/blank? args)
+             [(if-let [{:keys [kind id]} (:focus @console)] (str "focus: " (name kind) " " (short-id id)) "focus: none")]
+             (focus-by-id! console (str/trim args)))
     :run (run! console args)
     :claude (claude! console args)
     :cancel (cancel! console)
@@ -253,7 +319,7 @@
    Returns {:lines [...]} to render. Selection is captured at submission."
   [console event]
   (let [c @console
-        {:keys [state action]} (input/accept (:input c) event (:focus c))]
+        {:keys [state action]} (input/accept (:input c) event (selection console))]
     (swap! console assoc :input state)
     {:lines (cond
               action (try (dispatch! console action)

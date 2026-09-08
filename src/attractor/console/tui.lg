@@ -18,10 +18,9 @@
     (assoc state :transcript (if (pos? excess) (subvec all excess) all))))
 
 (defn- status-line [state]
-  (let [f (session/focus (:console state))
-        parts (remove nil? [(when (:session_id f) (str "session " (last (str/split (:session_id f) #"-"))))
-                            (when (:run_id f) (str "run " (last (str/split (:run_id f) #"-"))))
-                            (when (:worker_id f) (str "claude " (last (str/split (:worker_id f) #"-"))))
+  (let [{:keys [kind id]} (session/focus (:console state))
+        parts (remove nil? [(when kind (str ({:session "session" :run "run" :worker "claude"} kind) " "
+                                            (last (str/split id #"-"))))
                             (when (:buffering state) "multiline eval draft")])]
     (style/bold (str "attractor console" (when (seq parts) (str " — " (str/join " · " parts)))
                      "  (Ctrl-C: discard/cancel/quit)"))))

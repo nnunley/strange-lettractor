@@ -90,6 +90,26 @@ status line, echoed input, mock reply, evaluation, exit 0, and the line
 frontend quitting on EOF. Resize and exception-restoration cases are not yet
 covered natively.
 
+## Review of the console milestone
+
+An independent read-only review through `bin/attractor claude` reported 18
+findings. Fixed with regression tests: workflow/worker entries registered
+after launch (fast failures stayed "running"); three independent focus slots
+(now one focus plus a remembered agent session, so `/cancel` targets what
+`/focus` selected); `/run` without `--auto-approve` building a stdin-reading
+interviewer under the frontend (refused until questions arrive as hub events);
+eval namespace and `in-ns` shared across hubs in one process (per-hub
+namespaces, process-wide eval lock); unbounded text buffers (64 KiB cap,
+dropped on terminal events); `drain!` throwing on cursor expiry (resyncs and
+reports dropped events); Ctrl-C throwing when the hub cannot answer; the
+"final drain" after detach being a no-op; boolean flags consuming values;
+`/quit` help promising survival while the CLI stops its in-process hub (now
+warns and propagates a real exit code); console model resolution diverging
+from run/resume; `:eval_start` sequenced after a fast result; `#uuid` ids;
+bare lines for empty text; fixture-only `:scenario` accepted from any request.
+Recorded, not fixed: finished sessions/runs/workers are never pruned; reader
+futures stay parked after quit (masked by process exit in the CLI).
+
 ## SCN-CONSOLE-INPUT
 
 Status: implemented, focused/full/bundle verified; paired final audit clean.

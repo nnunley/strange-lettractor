@@ -7,6 +7,11 @@
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
   (try (f) (finally (reset! lock false))))
 (defn- fail! [category] (throw (ex-info (name category) {:category category})))
+(defn- fresh-id
+  ;; `str` of a UUID keeps the #uuid tag in this runtime (nooga/let-go#809);
+  ;; extract the canonical text so ids stay plain strings.
+  [prefix]
+  (str prefix "-" (re-find #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" (str (random-uuid)))))
 (defn- error-data [error]
   {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
@@ -34,8 +39,10 @@
 
 (defn- entry! [hub id]
   (or (get @(:sessions hub) id) (fail! :unknown-session)))
-(defn- launch! [f & [publisher]]
-  (let [completion (promise) publish (or publisher deliver)]
+(defn- launch! [f & [publisher completion]]
+  ;; Callers that must register an entry before the work can complete pass
+  ;; their own completion promise and register it first.
+  (let [completion (or completion (promise)) publish (or publisher deliver)]
     (try
       (core/future (publish completion (try {:value (f)} (catch Object e {:error (error-data e)}))))
       (catch Object e (publish completion {:error (error-data e)})))
@@ -58,21 +65,32 @@
           (reset! (:cancellation entry) completion)
           completion))))
 
-(def ^:private user-ns-name 'attractor.console.user)
+(def ^:private user-ns-counter (atom 0))
+(defn- user-ns-name
+  ;; The first hub in a process owns the documented `attractor.console.user`
+  ;; namespace; later hubs (tests, embedded use) get their own so helpers and
+  ;; definitions never leak between hubs.
+  []
+  (let [n (swap! user-ns-counter inc)]
+    (if (= 1 n) 'attractor.console.user (symbol (str "attractor.console.user" n)))))
+(def ^:private eval-lock (atom false))
 (defn- eval-in-user-ns! [hub code session-id run-id]
   ;; let-go's `*ns*` is process-global and `binding` does not restore it, so
-  ;; switch explicitly and restore in finally. Evaluations are serialized by
-  ;; the busy flag, so no other hub eval observes the switch.
-  (let [ns (:user_ns hub) saved (ns-name *ns*)]
+  ;; switch explicitly and restore in finally under one process-wide lock:
+  ;; the busy flag serializes evaluations within a hub, the lock across hubs.
+  (let [ns (:user_ns hub)]
     (intern ns '*session* session-id)
     (intern ns '*run* run-id)
-    (try
-      (in-ns user-ns-name)
-      (let [forms (read-string (str "[" code "\n]"))
-            holder (atom nil)
-            printed (with-out-str (reset! holder (reduce (fn [_ form] (eval form)) nil forms)))]
-        {:value @holder :printed printed})
-      (finally (in-ns saved)))))
+    (locked eval-lock
+      (fn []
+        (let [saved (ns-name *ns*)]
+          (try
+            (in-ns (ns-name ns))
+            (let [forms (read-string (str "[" code "\n]"))
+                  holder (atom nil)
+                  printed (with-out-str (reset! holder (reduce (fn [_ form] (eval form)) nil forms)))]
+              {:value @holder :printed printed})
+            (finally (in-ns saved))))))))
 
 (defn- finish-under-lock! [hub f]
   (locked (:event_lock hub) f))
@@ -89,8 +107,9 @@
       (when-not (string? code) (fail! :invalid-request))
       (when (:busy @(:eval hub)) (fail! :busy))
       (swap! (:eval hub) assoc :busy true)
-      (let [eval-id (str "eval-" (random-uuid))
+      (let [eval-id (fresh-id "eval")
             base {:source :eval :eval_id eval-id :session_id (:session_id request) :run_id (:run_id request)}
+            _ (append-envelope! hub (assoc base :event {:type :eval_start :code code}))
             completion
             (launch! (fn []
                        (try (eval-in-user-ns! hub code (:session_id request) (:run_id request))
@@ -107,18 +126,20 @@
                          (fn []
                            (swap! (:eval hub) assoc :busy false)
                            (deliver done result)))))]
-        (append-envelope! hub (assoc base :event {:type :eval_start :code code}))
         {:eval_id eval-id :completion completion}))
     :workflow/run
     (let [source (:dot_source request)]
       (when-not (string? source) (fail! :invalid-request))
       (when-not (:workflow_registry_fn hub) (fail! :workflows-unavailable))
-      (let [run-id (str "run-" (random-uuid)) cancelled (atom false)
+      (let [run-id (fresh-id "run") cancelled (atom false) completion (promise)
             base {:source :workflow :run_id run-id}
             emit (fn [event] (append-envelope! hub (assoc base :event event)))
             registry ((:workflow_registry_fn hub) request)
-            completion
-            (launch! (fn []
+            ;; Register before launching so a fast failure cannot publish
+            ;; :done ahead of the entry and be overwritten.
+            _ (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
+                                                    :source_path (:source_path request) :done false})]
+        (launch! (fn []
                        (let [outcome (pipeline/run source
                                        {:logs-root (:logs_root request) :source-path (:source_path request)
                                         :registry registry :on-event emit :cancelled? (fn [] @cancelled)})]
@@ -127,9 +148,8 @@
                        (finish-under-lock! hub
                          (fn []
                            (swap! (:workflows hub) assoc-in [run-id :done] true)
-                           (deliver done result)))))]
-        (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
-                                              :source_path (:source_path request) :done false})
+                           (deliver done result))))
+                 completion)
         {:run_id run-id :completion completion}))
     :workflow/cancel
     (let [entry (workflow-entry! hub (:run_id request))]
@@ -142,10 +162,12 @@
     (do
       (when-not (= :claude (:kind request)) (fail! :unknown-worker-kind))
       (when-not (string? (:prompt request)) (fail! :invalid-request))
-      (let [worker-id (str "worker-" (random-uuid)) cancelled (atom false)
+      (let [worker-id (fresh-id "worker") cancelled (atom false) completion (promise)
             base {:source :worker :kind :claude :worker_id worker-id}
+            ;; :scenario is a fixture-only argv extension; a request may only
+            ;; add it when the hub was started allowing it.
             command (cond-> (or (:worker_command hub) ["claude"])
-                      (:scenario request) (conj (:scenario request)))
+                      (and (:allow_worker_scenario hub) (:scenario request)) (conj (:scenario request)))
             options (cond-> {:prompt (:prompt request) :command command
                              :cancelled? (fn [] @cancelled)
                              :on_event (fn [event] (append-envelope! hub (assoc base :event event)))}
@@ -154,17 +176,17 @@
                       (:tools request) (assoc :tools (:tools request))
                       (:permission_mode request) (assoc :permission_mode (:permission_mode request))
                       (:timeout_ms request) (assoc :timeout_ms (:timeout_ms request)))
-            completion
-            (launch! (fn [] (claude/run! options))
+            _ (swap! (:workers hub) assoc worker-id {:worker_id worker-id :kind :claude :cancelled cancelled
+                                                     :completion completion :done false})]
+        (launch! (fn [] (claude/run! options))
                      (fn [done result]
                        (finish-under-lock! hub
                          (fn []
                            (swap! (:workers hub) assoc-in [worker-id :done] true)
                            (deliver done (if (and @cancelled (:error result))
                                            {:error {:category :cancelled :message "Worker cancelled"}}
-                                           result))))))]
-        (swap! (:workers hub) assoc worker-id {:worker_id worker-id :kind :claude :cancelled cancelled
-                                               :completion completion :done false})
+                                           result)))))
+                 completion)
         {:worker_id worker-id :completion completion}))
     :worker/cancel
     (let [entry (worker-entry! hub (:worker_id request))]
@@ -174,7 +196,7 @@
     (mapv (fn [[id e]] {:worker_id id :kind (:kind e) :done (:done e) :cancelled @(:cancelled e)})
           @(:workers hub))
     :session/open
-    (let [id (str "session-" (random-uuid))
+    (let [id (fresh-id "session")
           session (binding [agent/*event-origin* nil]
                     (agent/make-session
                       (assoc (:session_options hub) :id id :on_event #(append-event! hub id %))))
@@ -190,7 +212,7 @@
       (when (or @(:closed entry) (= :closed (:state @session))) (fail! :session-closed))
       (when (and (:turn entry) (not (realized? (:completion (:turn entry))))) (fail! :busy))
       (when-not (string? (:text request)) (fail! :invalid-request))
-      (let [turn-id (str "turn-" (random-uuid))
+      (let [turn-id (fresh-id "turn")
             completion (launch! (fn []
                                   (let [output (binding [agent/*event-origin* {:hub_turn_id turn-id}]
                                                  (agent/process-input! session (:text request)))]
@@ -212,7 +234,7 @@
       {:session_id (:session_id request) :completion (cancel-entry! hub entry)})
     :client/attach
     (locked (:event_lock hub)
-      (fn [] (let [id (str "client-" (random-uuid))]
+      (fn [] (let [id (fresh-id "client")]
                (swap! (:log hub) update :clients conj id)
                {:client_id id :cursor (:cursor @(:log hub))})))
     :client/detach
@@ -295,10 +317,11 @@
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts)
                :workflow_registry_fn (:workflow_registry_fn opts) :worker_command (:worker_command opts)
+               :allow_worker_scenario (boolean (:allow_worker_scenario opts))
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})
                :eval (atom {:busy false}) :workflows (atom {}) :workers (atom {})
-               :user_ns (create-ns user-ns-name)
+               :user_ns (create-ns (user-ns-name))
                :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}
           hub (init-user-ns! hub)]
       (try

@@ -16,7 +16,8 @@
                      :project_docs [] :complete_fn answer}
    :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
    :worker_command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
-                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]})
+                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]
+   :allow_worker_scenario true})
 (defn- req [h op fields]
   (deref (hub/request! h (merge {:id (str (random-uuid)) :op op} fields)) 5000 {:error {:category :test-timeout}}))
 (defn- stop [h] (when h (req h :hub/stop {})))
@@ -130,3 +131,39 @@
         (let [outcome (deref (:completion w) 5000 {:error {:category :test-timeout}})]
           (is (contains? #{:cancelled :claude-exit :claude-protocol} (get-in outcome [:error :category])) (pr-str outcome))))
       (finally (stop h) (os/sh "/bin/rm" "-rf" "--" dir)))))
+
+(deftest fast-failures-still-mark-entries-done
+  ;; A worker or workflow that fails before its entry is registered must not
+  ;; stay "running" forever.
+  (let [h (hub/start! (assoc (options) :worker_command ["/nonexistent/claude-binary"]))]
+    (try
+      (let [w (:value (req h :worker/run {:kind :claude :prompt "x" :timeout_ms 2000}))]
+        (is (contains? (deref (:completion w) 5000 {}) :error))
+        (is (true? (await-true #(:done (first (:value (req h :worker/list {})))) 2000))))
+      (let [r (:value (req h :workflow/run {:dot_source "digraph { not valid" :source_path nil :logs_root nil}))]
+        (is (contains? (deref (:completion r) 5000 {}) :error))
+        (is (true? (await-true #(:done (first (:value (req h :workflow/list {})))) 2000))))
+      (finally (stop h)))))
+
+(deftest eval-namespaces-are-per-hub-and-start-events-precede-results
+  (let [a (hub/start! (options)) b (hub/start! (options))]
+    (try
+      (let [client (:value (req a :client/attach {}))]
+        (eval! a {:code "(def only-in-a 1)"})
+        (is (= :eval-error (get-in (eval! b {:code "only-in-a"}) [:error :category])) "definitions do not leak across hubs")
+        (is (= "a" (get-in (eval! a {:code "(subs (str (:id (request! :session/open))) 0 0) \"a\"" }) [:value :value])))
+        (is (= 1 (count (:value (req a :session/list {})))) "helpers act on their own hub")
+        (is (= 0 (count (:value (req b :session/list {})))))
+        (let [evs (filter #(= :eval (:source %)) (events a client))
+              types (mapv #(get-in % [:event :type]) evs)]
+          (is (= [:eval_start :eval_result] (take 2 types)) (pr-str types))))
+      (finally (stop a) (stop b)))))
+
+(deftest worker-scenario-is-ignored-unless-enabled
+  (let [h (hub/start! (dissoc (options) :allow_worker_scenario))]
+    (try
+      (let [w (:value (req h :worker/run {:kind :claude :prompt "hello" :scenario "error" :timeout_ms 3000}))
+            result (deref (:completion w) 5000 {})]
+        ;; Without the scenario argument the fixture reads its default path.
+        (is (not= :claude-result (get-in result [:error :category])) (pr-str result)))
+      (finally (stop h)))))

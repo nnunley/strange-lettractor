@@ -111,16 +111,30 @@
           (some? model) (assoc :model_override model)
           (some? provider) (assoc :provider_override provider))))))
 
+(defn- live-llm-requested? [args]
+  ;; Same gate as run/resume: --mock forces mock; otherwise --llm or any
+  ;; configured provider credential selects a live model.
+  (and (not (some #{"--mock"} args))
+       (or (some #{"--llm"} args)
+           (some #(not (str/blank? (os/getenv %)))
+                 ["ANTHROPIC_API_KEY" "OPENAI_API_KEY" "GEMINI_API_KEY" "GOOGLE_API_KEY"
+                  "OLLAMA_API_KEY" "OLLAMA_BASE_URL"]))))
+
 (defn- console-session-options [args]
-  ;; Trusted startup configuration for hub-owned agent sessions. Model
-  ;; selection follows run/resume conventions: --mock forces the mock provider,
-  ;; otherwise --model/--provider or the default codergen model resolution.
-  (if (some #{"--mock"} args)
+  ;; Trusted startup configuration for hub-owned agent sessions, resolved the
+  ;; way run/resume resolve the codergen model.
+  (if-not (live-llm-requested? args)
     {:model "mock/default"}
     (let [override-model (find-arg-val args "--model")
           override-provider (find-arg-val args "--provider")
           parsed (llm/parse-model-spec (or override-model "claude-3-7-sonnet") override-provider)]
       {:model (str (:provider parsed) "/" (:model parsed))})))
+
+(defn- running-work [hub]
+  (let [ask (fn [op] (:value (deref (hub/request! hub {:id (str "console-" (name op)) :op op}) 2000 {})))]
+    (concat (map #(str "session " (:session_id %)) (filter :busy (ask :session/list)))
+            (map #(str "run " (:run_id %)) (remove :done (ask :workflow/list)))
+            (map #(str "claude worker " (:worker_id %)) (remove :done (ask :worker/list))))))
 
 (defn cmd-console [args]
   (let [session-options (console-session-options args)
@@ -139,15 +153,23 @@
                              (make-codergen-backend-from-args args)
                              {:fan-in-ranker (make-fan-in-ranker-from-args args)}))})
         console (session/open! hub {:worker_defaults worker-defaults
-                                    :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}})]
-    (try
-      (if (some #{"--tui"} args)
-        (tui/run! console {})
-        (line/run! console {}))
-      (finally
-        (session/close! console)
-        (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil)))
-    (os/exit 0)))
+                                    :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}})
+        outcome (try
+                  (if (some #{"--tui"} args)
+                    (tui/run! console {})
+                    (line/run! console {}))
+                  :ok
+                  (catch Object e
+                    (println (str "console failed: " (ex-message e)))
+                    :failed)
+                  (finally (session/close! console)))]
+    ;; The console process owns this in-process hub, so exiting stops it. Say
+    ;; so when that cancels work the client was told would keep running.
+    (let [running (running-work hub)]
+      (when (seq running)
+        (println (str "stopping the in-process hub cancels: " (str/join ", " running)))))
+    (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil)
+    (os/exit (if (= :ok outcome) 0 1))))
 
 (defn print-usage []
   (println "Attractor - Workflow Orchestration Engine for Multi-Stage LLM Pipelines")
@@ -162,7 +184,7 @@
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
   (println "  claude --prompt-file <file> [--cwd <dir>]            Stream an owned Claude Code worker as EDN")
-  (println "  console [--tui] [--mock] [--model <m>] [--provider <p>]  Interactive console: agent text, : eval, /run, /claude")
+  (println "  console [--tui] [--mock|--llm] [--model <m>] [--provider <p>]  Interactive console: agent text, : eval, /run, /claude")
   (println "    [--model <model>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--timeout-ms <ms>]   DOT run/resume also accept --worker claude and these worker options")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")

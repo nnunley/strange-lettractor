@@ -35,7 +35,7 @@
       (let [sent (line c "hello there")
             rendered (drain-until c #(str/includes? % "turn complete") 5000)]
         (is (has sent "→ agent"))
-        (is (string? (:session_id (console/focus c))))
+        (is (= :session (:kind (console/focus c))))
         (is (has rendered "session started"))
         (is (has rendered "echo: hello there"))
         (is (has rendered "turn complete"))
@@ -57,7 +57,7 @@
         (is (has rendered "multi"))
         (is (has rendered "[eval] => 40")))
       (line c "/new")
-      (let [sid (:session_id (console/focus c))]
+      (let [sid (:id (console/focus c))]
         (line c ": *session*")
         (let [rendered (drain-until c #(str/includes? % "=>") 5000)]
           (is (has rendered (str "=> \"" sid "\"")) (pr-str rendered))))
@@ -72,9 +72,11 @@
         c (console/open! h {:run_defaults {:logs_root_fn (fn [_] (str root "/logs"))}})]
     (try
       (is (has (line c "/run") "usage"))
-      (is (has (line c "/run /nonexistent.dot") "no such file"))
-      (is (has (line c (str "/run " path)) "started from"))
-      (is (string? (:run_id (console/focus c))))
+      (is (has (line c "/run /nonexistent.dot --auto-approve") "no such file"))
+      (is (has (line c (str "/run " path)) "cannot answer human gates") "stdin-reading gates are refused")
+      (is (has (line c (str "/run " path " --logs-root")) "flag needs a value"))
+      (is (has (line c (str "/run " path " --auto-approve --logs-root " root "/logs")) "started from"))
+      (is (= :run (:kind (console/focus c))))
       (let [rendered (drain-until c #(str/includes? % "completed in") 10000)]
         (is (has rendered "[run "))
         (is (has rendered "stage work")))
@@ -83,14 +85,37 @@
         (is (has rendered "[claude ") (pr-str rendered))
         (is (has rendered "héλ🙂")))
       (let [agents (line c "/agents")]
-        (is (has agents "* run"))
-        (is (has agents "* claude"))
+        (is (has agents "  run") "focus moved off the run")
+        (is (has agents "* claude") "exactly the worker is focused")
         (is (has agents "done")))
       (is (has (line c "/claude") "usage"))
+      (is (has (line c "/claude do it --cwd") "flag needs a value"))
       (is (has (line c "/focus nope") "no session, run or worker matches"))
       (is (has (line c "/cancel") "cancel requested: claude"))
-      (is (has (line c "\\/cancel") "→ agent") "escaped command is agent text")
+      (let [run-id (some (fn [l] (when (str/starts-with? l "  run ") (nth (str/split (str/trim l) #" +") 1))) (line c "/agents"))]
+        (is (has (line c (str "/focus " run-id)) "focus: run"))
+        (is (has (line c "/cancel") "cancel requested: run") "cancel targets the newly focused run, not the worker"))
+      (is (has (line c "\\/cancel") "→ agent") "escaped command is agent text, still to the remembered session")
       (finally (console/close! c) (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest late-events-survive-quit-and-cursor-expiry-resyncs
+  (let [h (hub/start! (assoc (hub-options) :event_capacity 8)) c (console/open! h)]
+    (try
+      (line c "hello")
+      (core/sleep 300)
+      ;; Everything the turn emitted is still undrained; quitting must not lose it.
+      (line c "/quit")
+      (is (has (:lines (console/drain! c)) "echo: hello") "final drain delivered after detach")
+      (is (= [] (:lines (console/drain! c))) "delivered once")
+      (finally (stop h))))
+  (let [h (hub/start! (assoc (hub-options) :event_capacity 4)) c (console/open! h)]
+    (try
+      (line c "first") (core/sleep 300) (line c "second") (core/sleep 300) (line c "third") (core/sleep 300)
+      (let [lines (:lines (console/drain! c))]
+        (is (has lines "older events dropped") (pr-str lines))
+        (is (has lines "turn complete")))
+      (is (vector? (:lines (console/drain! c))) "subsequent drains work again")
+      (finally (console/close! c) (stop h)))))
 
 (deftest interrupt-cancels-focus-only-outside-a-draft-and-quit-detaches-not-stops
   (let [h (hub/start! (hub-options)) c (console/open! h)]
