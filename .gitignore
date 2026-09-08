@@ -6,3 +6,7 @@ bin/
 .env
 !.env.sample
 .worktrees/
+
+# Keep project plans and specifications tracked despite global ignores.
+!docs/superpowers/
+!docs/superpowers/**
