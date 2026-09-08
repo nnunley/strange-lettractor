@@ -200,6 +200,17 @@ How it maps onto Attractor, which already has most of the pieces as data:
 | Loop | A DOT pipeline with pinned recovery, run by the hub, with human gates at the autonomy-class boundaries |
 | Meta loop / `Λ` | The iteration skills, review checklists and this design; evolving them is class three (human decision) until evidence says otherwise |
 
+Tool building is in scope for the paper's evolver: tools, skills and their
+descriptions are a harness category, and the evolution agent may edit "tool
+implementations" like any other component, judged only by the next score.
+The paper says nothing about how a new tool is specified, tested or bounded.
+For Attractor, tool changes are where capability widens, so they sit one
+autonomy class above prompt or orchestration edits: rewording or tightening
+an existing registry tool is class two (agent implements, independent
+review); adding a tool that grants new filesystem, shell or network reach is
+class three (human decision), because permissions are enforced outside the
+prompt and the evolver must not widen them by editing code.
+
 Design questions this adds to the list above: which harness components an
 iteration may edit per autonomy class; where the clean-state reset boundary
 is (worktree, logs root, hub state); how a two-tier score is derived from the
