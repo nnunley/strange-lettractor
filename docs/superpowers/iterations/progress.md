@@ -1,7 +1,16 @@
 # Progress
 
-**Phase:** prompt model-metadata fix verified
+**Phase:** explicit command-environment isolation verified
 **Next:** remaining environment/adapter contracts and hub integration; full Attractor conformance backlog remains open
+
+Caller environment names could replace the wrapper command, launch array or
+timeout. Child-only environment argv now fixes these explicit-assignment cases;
+filtering and process-group ownership are unchanged. RED 3 tests/10 pass/10 fail/0
+errors; native/bundle GREEN 3/20/0; full default suite 725/7012/0. Bounded actual
+Claude review approved, main implemented and verified. Fresh-path CLI build/help
+passes; an in-place build killed with137 was preserved and recovered by moving
+it aside and rebuilding. See `docs/command-env-isolation.md` for exact residuals
+and build observation; no runtime bug or full CAL-ENV-01 closure claimed.
 
 The section 6.3 model display-name and missing cutoff-field defects are fixed.
 Actual Claude implemented the bounded agent change through our connector, and a

@@ -319,7 +319,9 @@
     ;; An external setsid launcher can still be starting when the deadline fires,
     ;; leaving no group to signal and allowing the command to run after timeout.
     "set -m\n"
-    "command_env=()\n"
+    ;; Explicit assignments are argv for the child, never exports into this
+    ;; wrapper: valid caller names can otherwise overwrite its control state.
+    "command_env=(/usr/bin/env)\n"
     "case \"$env_policy\" in\n"
     "  filtered)\n"
     "    shopt -s nocasematch\n"
@@ -343,11 +345,7 @@
     "    ;;\n"
     "esac\n"
     "while [ \"$#\" -ge 2 ]; do\n"
-    "  if [ \"$env_policy\" = none ] || [ \"$env_policy\" = core ]; then\n"
-    "    command_env+=(\"$1=$2\")\n"
-    "  else\n"
-    "    export \"$1=$2\"\n"
-    "  fi\n"
+    "  command_env+=(\"$1=$2\")\n"
     "  shift 2\n"
     "done\n"
     "\"${command_env[@]}\" /bin/bash -p -c '\n"

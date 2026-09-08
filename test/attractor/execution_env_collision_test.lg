@@ -1,0 +1,33 @@
+(ns attractor.execution-env-collision-test
+  (:require [clojure.test :refer [deftest is]] [attractor.execution :as execution]))
+
+(deftest explicit-environment-cannot-replace-the-requested-command
+  (doseq [policy [:filtered :all :none :core]]
+    (let [environment (execution/make-local-environment {:env_policy policy})]
+      (try
+        (let [result ((:exec_command environment)
+                      "printf 'requested:%s' \"$command_text\"" 1000 nil
+                      {"command_text" "printf overridden"})]
+          (is (= 0 (:exit_code result)) (str policy))
+          (is (= "requested:printf overridden" (:stdout result)) (str policy)))
+        (finally ((:cleanup environment)))))))
+
+(deftest explicit-environment-cannot-replace-wrapper-launch-array
+  (doseq [policy [:filtered :all :none :core]]
+    (let [environment (execution/make-local-environment {:env_policy policy})]
+      (try
+        (let [result ((:exec_command environment)
+                      "printf '%s' \"$command_env\"" 1000 nil
+                      {"command_env" "visible-value"})]
+          (is (= 0 (:exit_code result)) (str policy))
+          (is (= "visible-value" (:stdout result)) (str policy)))
+        (finally ((:cleanup environment)))))))
+
+(deftest explicit-environment-cannot-extend-the-command-timeout
+  (doseq [policy [:filtered :all]]
+    (let [environment (execution/make-local-environment {:env_policy policy})]
+      (try
+        (let [result ((:exec_command environment) "/bin/sleep 0.4" 50 nil {"timeout_s" "999"})]
+          (is (true? (:timed_out result)) (str policy))
+          (is (= 124 (:exit_code result)) (str policy)))
+        (finally ((:cleanup environment)))))))
