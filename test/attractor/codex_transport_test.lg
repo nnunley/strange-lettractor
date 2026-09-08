@@ -1,0 +1,71 @@
+(ns attractor.codex-transport-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [os :as os]))
+
+(defn fixture-command [mode]
+  [(let [configured (os/getenv "LG_EXECUTABLE")]
+     (if (seq configured) configured (first os/args)))
+   "test/fixtures/codex_app_server.lg" mode])
+
+(defn process-alive? [pid]
+  ;; Signal zero only queries this exact PID; it never terminates the child.
+  (and (integer? pid) (pos? pid)
+       (nil? (.Run (os/exec "/bin/kill" "-0" (str pid))))))
+
+(deftest replies-arrive-before-stdin-closes-and-child-is-reaped
+  ;; Resolve inside the test so the initial RED is an assertion about the
+  ;; missing feature, and does not prevent discovery of unrelated tests.
+  (let [load-error (try (require 'attractor.codex.transport) nil
+                       (catch Object e (str e)))]
+    (is (nil? load-error) (str "Transport implementation must load: " load-error))
+    (when (nil? load-error)
+      (let [open! (ns-resolve 'attractor.codex.transport 'open!)
+            send! (ns-resolve 'attractor.codex.transport 'send!)
+            close! (ns-resolve 'attractor.codex.transport 'close!)
+            scope (core/scope-open)
+            messages (atom []) failures (atom []) pid (atom nil)
+            first-reply (promise) second-reply (promise)
+            closed (promise)
+            child (try (open! {:command (fixture-command "normal")
+                          :max-frame-bytes 1048576 :shutdown-ms 2000
+                          :on-message
+                          (fn [message]
+                            (swap! messages conj message)
+                            (when (= "fixture/progress" (get message "method"))
+                              (reset! pid (get-in message ["params" "pid"])))
+                            (cond
+                              (= 1 (get message "id")) (deliver first-reply message)
+                              (= 2 (get message "id")) (deliver second-reply message)))
+                          :on-failure #(swap! failures conj %)})
+                       (catch Object e
+                         (core/scope-close! scope 2000)
+                         (throw e)))]
+        (try
+          (send! child {"id" 1 "method" "initialize"
+                        "params" {"clientInfo" {"name" "transport-test" "version" "1"}}})
+          (let [reply (deref first-reply 3000 ::timeout)]
+            (is (= 1 (get reply "id")))
+            (is (= "fake" (get-in reply ["result" "userAgent"])))
+            (is (= "unix" (get-in reply ["result" "platformFamily"]))))
+          ;; A batch subprocess wrapper cannot satisfy this exchange: stdin
+          ;; must remain open after the first response to accept this request.
+          (send! child {"id" 2 "method" "fixture/echo" "params" {"value" "second"}})
+          (let [reply (deref second-reply 3000 ::timeout)]
+            (is (= 2 (get reply "id")))
+            (is (= {"value" "second"} (get-in reply ["result" "params"]))))
+          (is (= ["fixture/started" "fixture/progress"
+                  "fixture/started" "fixture/progress"]
+                 (mapv #(get % "method") (filter #(contains? % "method") @messages))))
+          (is (empty? @failures))
+          (is (process-alive? @pid) "Fixture is independently alive before close!")
+          (finally
+            ;; Native supervision owns the close worker; every wait is bounded.
+            (core/future (try (deliver closed (close! child))
+                              (catch Object e (deliver closed {:error (str e)}))))
+            (let [result (deref closed 3000 ::timeout)]
+              (is (= true (:closed? result)))
+              (is (= true (:reaped? result)))
+              (is (and (integer? @pid) (pos? @pid) (not (process-alive? @pid)))
+                  "The same fixture PID is absent after close!"))
+            (core/scope-close! scope 2000)))))))

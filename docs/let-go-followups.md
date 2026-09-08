@@ -171,3 +171,21 @@ runtime that output would leak to the hub process's stdout. Note also that
 `*ns*` is process-global and `binding` does not restore it, so the hub switches
 namespaces explicitly with `in-ns` and restores in `finally`; evaluations are
 serialized. After the upstream fix, rerun `dev/hub_console_ops_tests.lg`.
+
+## Codex subprocess interop: #813, #814, #815
+
+Findings from 2026-09-07 on the Codex app-server transport:
+
+- [#813: mutable byte-array interop](let-go-byte-array-interop.md): reflected
+  Go slice arguments are copied, so `.Read` does not mutate the caller's buffer.
+  Buffered `ReadByte` is a verified possible workaround for bounded framing.
+- [#814: boxed pointer field lookup](let-go-boxed-pointer-fields.md): lookup of
+  `exec.Cmd.Process` fails without pointer dereference. Keep exact-child forced
+  shutdown unverified until this or an equivalent owned-process path is tested.
+
+These are Go interop issues, not a reason to introduce JVM-shaped APIs. No
+runtime source changes accompany these findings.
+
+- [#815: JSON integer precision](let-go-json-integer-precision.md): float64
+  decoding rounds valid int64 values above 2^53. Preserve a large-ID regression
+  for Codex RPC; small locally generated IDs do not fix server-supplied IDs.

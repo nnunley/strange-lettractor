@@ -1,0 +1,85 @@
+(ns attractor.codex-framing-test
+  (:require [clojure.test :refer [deftest is]]))
+
+(defn failure-kind [f]
+  (try (f) nil (catch Object e (:kind (ex-data e)))))
+
+(deftest bounded-incremental-jsonl
+  (let [load-error (try (require 'attractor.codex.framing) nil
+                        (catch Object e (str e)))]
+    (is (nil? load-error) (str "Framing implementation must load: " load-error))
+    (when (nil? load-error)
+      (let [make-decoder (ns-resolve 'attractor.codex.framing 'make-decoder)
+            feed! (ns-resolve 'attractor.codex.framing 'feed!)
+            finish! (ns-resolve 'attractor.codex.framing 'finish!)
+            payload "{\"value\":\"é水😀\"}"
+            wire (vec (bytes (str payload "\n")))
+            expected [{:raw-json payload :message {"value" "é水😀"}}]]
+        (doseq [split (range (inc (count wire)))]
+          (let [decoder (make-decoder 100)]
+            (is (= expected (into (feed! decoder (take split wire))
+                                  (feed! decoder (drop split wire))))
+                (str "UTF-8 split at byte " split))
+            (is (nil? (finish! decoder)))))
+        (let [decoder (make-decoder 100)]
+          (is (= expected (reduce (fn [out b] (into out (feed! decoder [b]))) [] wire)))
+          (is (= [{:raw-json "{\"a\":1}\r" :message {"a" 1}}
+                  {:raw-json "{}" :message {}}
+                  {:raw-json "{\"b\":2}" :message {"b" 2}}]
+                 (feed! decoder (bytes "{\"a\":1}\r\n{}\n{\"b\":2}\n"))))
+          (is (= [] (feed! decoder [])))
+          (is (nil? (finish! decoder))))
+        (doseq [limit [nil 0 -1 1.5 "10"]]
+          (is (= :invalid-limit (failure-kind #(make-decoder limit)))))
+        (let [decoder (make-decoder (count (bytes payload)))]
+          (is (= [] (feed! decoder (bytes payload))))
+          (let [frames (feed! decoder [10])]
+            (is (= expected frames))
+            (is (= payload (:raw-json (first frames)))))
+          (is (nil? (finish! decoder))))
+        (let [raw "{\"id\":9007199254740993}"
+              decoder (make-decoder 100)
+              frame (first (feed! decoder (bytes (str raw "\n"))))]
+          ;; Native JSON loses precision here (#815). The public envelope keeps
+          ;; exact evidence available; RPC must not trust this parsed numeric ID.
+          (is (= raw (:raw-json frame)))
+          (is (= raw (:raw-json (read-string (pr-str frame))))))
+        (doseq [[limit input kind]
+                [[2 "{} " :frame-too-large]
+                 [2 "{} \n" :frame-too-large]
+                 [100 "\n" :invalid-json]
+                 [100 " \r\n" :invalid-json]
+                 [100 "{broken}\n" :invalid-json]
+                 [100 "{} {}\n" :invalid-json]
+                 [100 "[]\n" :non-object]
+                 [100 "null\n" :non-object]
+                 [100 "1\n" :non-object]]]
+          (let [decoder (make-decoder limit)]
+            (is (= kind (failure-kind #(feed! decoder (bytes input)))))
+            (is (= :decoder-failed (failure-kind #(feed! decoder (bytes "{}\n")))))
+            (is (= :decoder-failed (failure-kind #(finish! decoder))))))
+        (doseq [b [-1 256 1.5 nil "x"]]
+          (let [decoder (make-decoder 100)]
+            (is (= :invalid-byte (failure-kind #(feed! decoder [b]))))
+            (is (= :decoder-failed (failure-kind #(feed! decoder []))))))
+        (doseq [partial ["{" "{}" " "]]
+          (let [decoder (make-decoder 100)]
+            (feed! decoder (bytes partial))
+            (is (= :partial-frame (failure-kind #(finish! decoder))))
+            (is (= :decoder-failed (failure-kind #(finish! decoder))))))
+        (let [decoder (make-decoder 2)]
+          (feed! decoder [123])
+          (feed! decoder [125])
+          (is (= :frame-too-large (failure-kind #(feed! decoder [32])))))
+        ;; Errors make the entire feed fail, including earlier complete frames.
+        ;; The connection must close; callers must not retry the failed chunk.
+        (let [decoder (make-decoder 100)]
+          (is (= :invalid-json (failure-kind #(feed! decoder (bytes "{}\nno\n{}\n")))))
+          (is (= :decoder-failed (failure-kind #(feed! decoder [])))))
+        (doseq [invalid [[255] [128] [192 128] [226 130]
+                         [237 160 128] [244 144 128 128] [245 128 128 128]
+                         [224 128 128] [240 128 128 128] [194 32]]]
+          (let [decoder (make-decoder 100)
+                frame (concat (bytes "{\"x\":\"") invalid (bytes "\"}\n"))]
+            (is (= :invalid-utf8 (failure-kind #(feed! decoder frame))))
+            (is (= :decoder-failed (failure-kind #(finish! decoder))))))))))

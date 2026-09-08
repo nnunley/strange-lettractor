@@ -1,0 +1,91 @@
+(ns attractor.codex.framing
+  (:require [io :as io]
+            [json :as json]))
+
+(defn- protocol-error [kind message]
+  (ex-info message {:category :codex-protocol-error :kind kind}))
+
+(defn make-decoder
+  "Create an owned, single-reader JSONL decoder. The positive byte limit excludes
+   LF and includes any CR. Call feed! serially, then finish! on stream EOF."
+  [max-frame-bytes]
+  (when-not (and (integer? max-frame-bytes) (pos? max-frame-bytes))
+    (throw (protocol-error :invalid-limit "Frame byte limit must be a positive integer")))
+  (atom {:limit max-frame-bytes :pending [] :failed? false}))
+
+(defn- ensure-healthy! [decoder]
+  (when (:failed? @decoder)
+    (throw (protocol-error :decoder-failed "Decoder failed; close the connection"))))
+
+(defn- valid-utf8?
+  "Validate bytes before Go JSON can replace malformed UTF-8 with U+FFFD."
+  [data]
+  (loop [remaining (seq data) needed 0 low 128 high 191]
+    (if (nil? remaining)
+      (zero? needed)
+      (let [b (first remaining)]
+        (if (pos? needed)
+          (and (<= low b high)
+               (recur (next remaining) (dec needed) 128 191))
+          (cond
+            (<= b 127) (recur (next remaining) 0 128 191)
+            (<= 194 b 223) (recur (next remaining) 1 128 191)
+            (= b 224) (recur (next remaining) 2 160 191)
+            (<= 225 b 236) (recur (next remaining) 2 128 191)
+            (= b 237) (recur (next remaining) 2 128 159)
+            (<= 238 b 239) (recur (next remaining) 2 128 191)
+            (= b 240) (recur (next remaining) 3 144 191)
+            (<= 241 b 243) (recur (next remaining) 3 128 191)
+            (= b 244) (recur (next remaining) 3 128 143)
+            :else false))))))
+
+(defn- parse-frame [data]
+  (when-not (valid-utf8? data)
+    (throw (protocol-error :invalid-utf8 "Frame contains invalid UTF-8")))
+  (let [buffer (io/buffer)
+        _ (.Write buffer (byte-array data))
+        raw (io/buffer-str buffer)
+        message (try (json/read-json raw)
+                     (catch Object e
+                       (throw (protocol-error :invalid-json "Frame is not valid JSON"))))]
+    (when-not (map? message)
+      (throw (protocol-error :non-object "JSONL frame must be an object")))
+    {:raw-json raw :message message}))
+
+(defn feed!
+  "Consume unsigned byte values incrementally; return completed frame envelopes
+   {:raw-json exact-string :message parsed-object-with-string-keys}. Raw JSON
+   excludes LF but preserves CR and whitespace. Parsed numbers inherit native
+   json/read-json precision limits (#815); use the raw frame when numeric
+   identity matters. The parsed numeric IDs are not yet safe for RPC routing.
+
+   Any error fails the whole feed, including complete frames earlier in that
+   chunk, and permanently fails the decoder. Callers must close the connection,
+   never retry that chunk. Pending storage never exceeds the configured limit."
+  [decoder chunk]
+  (ensure-healthy! decoder)
+  (try
+    (loop [remaining (seq chunk) pending (:pending @decoder) frames []]
+      (if (nil? remaining)
+        (do (swap! decoder assoc :pending pending) frames)
+        (let [b (first remaining)]
+          (when-not (and (integer? b) (<= 0 b 255))
+            (throw (protocol-error :invalid-byte "Chunk values must be unsigned bytes")))
+          (if (= b 10)
+            (recur (next remaining) [] (conj frames (parse-frame pending)))
+            (do
+              (when (>= (count pending) (:limit @decoder))
+                (throw (protocol-error :frame-too-large "Frame exceeds byte limit")))
+              (recur (next remaining) (conj pending b) frames))))))
+    (catch Object e
+      (swap! decoder assoc :failed? true :pending [])
+      (throw e))))
+
+(defn finish!
+  "Accept EOF only at a frame boundary. Partial EOF permanently fails decoder."
+  [decoder]
+  (ensure-healthy! decoder)
+  (when (seq (:pending @decoder))
+    (swap! decoder assoc :failed? true :pending [])
+    (throw (protocol-error :partial-frame "EOF before JSONL frame delimiter")))
+  nil)
