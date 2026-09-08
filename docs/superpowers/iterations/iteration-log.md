@@ -280,3 +280,36 @@ The console is a client of a future RPC hub, not the owner of the framework.
 Stock nREPL gaps and existing upstream issues are in `docs/nrepl-hub-findings.md`.
 Hub/eval/TUI/worker integration and all outstanding StrongDM requirements remain
 open; no native-Go AOT or usable console command is claimed by this component.
+
+## Component checkpoint — LLM operation ownership (2026-09-08)
+
+**Completed:** 2026-09-08, shared LLM correctness component under standing
+transparent-fix authorization; does not close ITER-0010.
+**Stories delivered:** ULLM-CANCEL-01 ownership slice only; ULLM-ERROR-01 unchanged.
+**Tasks executed:** filed nooga/let-go#829 (lazy-seq realization context) with the
+pure reproducer; added local runtime `scope-cancelled?` (#830) and streamed
+`http/serve` bodies (#831); hardened the persistent operation owner with idle
+parent-cancellation proof; integrated generate, lazy stream reads and tool rounds
+into owned jobs and removed the unowned stream monitor; made tool dispatch eager
+so cancellation reaches tool workers; extended the let-go loopback fixture with
+held-body, held-JSON, paced SSE and tool-continuation scenarios.
+**Scenarios:** SCN-ULLM-CANCEL at the shared adapter seam and native OpenAI
+loopback seam; SCN-OWNER focused owner witnesses.
+
+Evidence: baseline 758/7146/0; owner focused 24/110/0; shared ownership regressions
+8 failures → 9/35/0 after review fixes; native ownership check 12 failures → 3/67/0 twice; discovery
+loopback 3/39/0; three impacted namespaces 107/803/0; full suite 791/7291/0,
+exit 0; focused outside-checkout bundle 33/145/0; CLI build/help pass; let-go
+`go vet`, `pkg/rt`, `pkg/vm`, `pkg/api`, `test/e2e`, the full jank Clojure
+suite (243 cases) and the native-entry gate pass on runtime `8c1e6ee4`. The `cancellation-during-error-read-wins-over-http-error` harness
+was simplified: it hooked the removed polling `deref`; every behavioral assertion
+is retained. Independent read-only review ran through the Attractor Claude
+connector; eight of eleven findings were accepted and fixed with regression
+tests, two were rejected with evidence, one recorded as a limitation (see
+`docs/llm-operation-ownership.md`). The review exposed nooga/let-go#832
+(`bound-fn*` detached calls from the caller's scope), fixed locally.
+
+Not claimed: adapter connect/request/read timeout distinctions, the remaining
+status/drop/retry matrix, server-observed disconnects, cancellation of work inside
+lazy-seq thunks (runtime #829), or interruption of callbacks that ignore the
+combined abort signal.

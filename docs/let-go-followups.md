@@ -86,9 +86,11 @@ After the runtime fix, rerun both `dev/http_scope_cancellation_check.lg` and
 `dev/http_llm_cancellation_check.lg` against fresh instances of the bounded
 `dev/http_cancellation_server.go` fixture. Require server-observed cancellation
 and zero live workers before fixture release, not just a caller-side error.
-Then address Attractor's `controlled-invoke` and stream-monitor ownership and
-extend coverage to held response bodies and streams. Adding an indefinite join
-before the HTTP request is cancellable would introduce an unbounded wait.
+Attractor's `controlled-invoke` and stream-monitor ownership were repaired on
+2026-09-08 (`src/attractor/operation_owner.lg`; evidence in
+[LLM operation ownership](llm-operation-ownership.md)), with held-body and
+stream coverage in `dev/llm_ownership_http_check.lg`. The owner joins provider
+work indefinitely, which is only safe because native HTTP is now cancellable.
 
 ## JSON string keys: #817
 
@@ -103,3 +105,57 @@ fixture keys to keywords before JSON encoding. After the configured binary is
 fixed, verify nested string-key roundtrips and escaped/Unicode keys, remove that
 fixture-only conversion, and rerun the terminal-error corpus and bundle. Do not
 apply keywordization as a general lossless workaround for arbitrary keys.
+
+## Lazy-seq realization context: #829
+
+At local checkpoint `7ea895f4502845248125b5fb2af01e5686048cde`, a `lazy-seq`
+thunk realized inside a `future` runs under `RootExecContext`, not the realizing
+goroutine's context: `LazySeq.sval` calls `fn.Invoke(nil)`, and `scope-open` on the
+main thread mutates the root context's scope field in place. Closing an unrelated
+sibling scope therefore cancels blocking natives (sleep, channel ops, scoped HTTP)
+inside a lazy seq owned by a different, still-live scope. Tracked in
+[nooga/let-go #829](https://github.com/nooga/let-go/issues/829).
+Reproducer: `dev/lazy_scope_isolation_check.lg` (exits 1 while the bug is present).
+
+Application impact: bounded discovery (`capacity/call!`) opens a child scope per
+probe, and that close interrupted lazy stream HTTP work in the native ownership
+check. Only diagnostic state polls in `dev/llm_ownership_http_check.lg` were
+switched to direct `http/request`; production discovery was NOT removed. After the
+runtime fix, rerun the reproducer (expect exit 0) and the native ownership check,
+then reassess whether stream consumers still need the owner coordinator to hold
+a stable scope between reads. Keep operation-lifetime ownership regardless: it is
+the Attractor design, not a workaround for this bug.
+
+## Scope cancellation predicate: #830
+
+Local runtime `8c1e6ee4` on the same workspace adds `scope-cancelled?`
+([nooga/let-go #830](https://github.com/nooga/let-go/issues/830)). Blocking
+natives return early and silently on cancellation, so a coordinator parked on
+`sleep` cannot otherwise tell waking from cancellation; the operation owner's
+`checked` uses the predicate to drain when its parent scope closes without any
+control signal (`parent-scope-close-drains-idle-coordinator-without-control-signal`).
+When upstream ships a predicate or makes `sleep` throw, switch to the released
+form and rerun the owner and ownership checks. Do not replace it with a timing
+heuristic: `System/nanoTime` is wall-clock here.
+
+## Streamed http/serve bodies: #831
+
+The same local runtime streams channel and lazy-seq response bodies with a flush
+per element ([nooga/let-go #831](https://github.com/nooga/let-go/issues/831)).
+`dev/context_discovery_server.lg` relies on it for `held-body`, `held-json`,
+`sse` and `tool` scenarios; the released runtime would buffer those bodies and
+the held scenarios would degrade into held headers. Handlers still cannot observe
+client disconnect, so native checks witness cleanup client-side (transport exit,
+body closed once, zero live workers) rather than server-side.
+
+## bound-fn* scope detachment: #832
+
+`bound-fn*` wrappers were context-free natives invoking through a fresh
+`ExecContext` whose nil scope normalises to the root scope, so work inside a
+bound fn escaped the caller's structured-concurrency scope
+([nooga/let-go #832](https://github.com/nooga/let-go/issues/832)). The local
+runtime makes the wrapper context-aware and inherits the invoking scope. The
+operation owner wraps every submitted job with `bound-fn*` so tool callbacks and
+custom clients see the caller's dynamic bindings; with the released runtime those
+jobs would silently become uncancellable. After the upstream fix, rerun
+`jobs-see-caller-bindings-and-remain-owned` and the shared/native ownership checks.
