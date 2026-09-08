@@ -1,7 +1,16 @@
 # Progress
 
-**Phase:** console-timeout discovery, ATTR-HUM-02 (ITER-0006)
-**Task:** record native input capability dependency; continue independent artifact work
+**Phase:** verified artifact store/layout, ATTR-ART-01 component (ITER-0006)
+**Task:** public checkpoint after clean paired three-tier audit
+
+**Current artifact slice:** isolated `.worktrees/artifact-contract` from `803ccb8`.
+Fresh full baseline passes 644 tests / 5,970 assertions. Paired scope reviews
+approve `docs/artifact-contract-plan.md`; paired spec/quality reviews also approve.
+Root run metadata now writes EDN while preserving legacy JSON. Original RED had
+17 failures; focused/bundled 3/64, impacted 138/920, full 647/6034 all pass, as do
+CLI build/help. Discovery/resume promises remain pending as ATTR-ART-02. Set-valued
+data exposed the separately filed reader defect #823 and remains a reader
+exception, not silently accepted or evaluated. Native-Go AOT is not claimed.
 
 **Current discovery:** public main `f9f7b30` contains the verified ownership fix.
 Fresh console-worktree baseline passes 644 tests / 5,970 assertions. A 50ms native

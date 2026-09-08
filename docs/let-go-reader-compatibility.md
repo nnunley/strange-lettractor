@@ -1,5 +1,11 @@
 # Clojure reader compatibility findings
 
+Additional set-literal data reading is tracked in [let-go #823](https://github.com/nooga/let-go/issues/823):
+the local reader returns a `hash-set` call rather than a set, so artifact
+round-trip validation rejects set-valued data. See `let-go-set-reader-gap.md`
+for the bounded let-go/JVM comparison and restoration criteria. No evaluation
+workaround is permitted.
+
 Observed 2026-09-06 using `/Users/ndn/development/let-go/lg` and the installed JVM `clojure`. These are runtime differences, separate from Strange Lettractor's overly restrictive mapping scanner. The user requires Clojure reader syntax (the superset of EDN), retaining `.edn` filenames.
 
 ## Reproduce

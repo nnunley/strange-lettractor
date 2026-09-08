@@ -1,5 +1,28 @@
 # Iteration Log
 
+## ITER-0006 component — Artifact store/layout and EDN run metadata
+
+**Verified:** 2026-09-07 from public `803ccb8`.
+
+New root run metadata uses `manifest.edn`; legacy JSON bytes, external stage
+`status.json`, and pinned `workflow/manifest.edn` remain unchanged. Public pipeline
+tests exercise handler artifact metadata/checkpoints, real loop restart plus a
+fresh run, and retrieval of earlier artifacts. Store contracts add exact 102,400/
+102,401-byte boundaries, no-base fallback, metadata, file-to-memory replacement,
+and failed-publication preservation of registration and bytes.
+
+Clean RED: 3 tests / 40 passing and 17 failing assertions. Final focused and
+standalone bundle: 3/64; impacted: 138/920; full baseline 644/5970 becomes 647/6034,
+all zero failures, exit 0. CLI build/help pass; native-Go AOT is not inferred.
+Paired scope, spec and quality reviews approve; final three-tier component audit
+is clean.
+
+This is the supported-value store/layout component of ATTR-ART-01 only. The
+previous stronger discovery/resume promise is retained as pending adopted
+ATTR-ART-02. Set-valued data exposed a separate local reader defect, filed as
+let-go #823 after JVM comparison; non-evaluating round-trip validation continues
+to reject it. Full reader and Attractor conformance remain incomplete.
+
 ## ITER-0008 component — Current-turn ownership (CAL-OWN-01)
 
 **Verified:** 2026-09-07, from public baseline `1bdc933`.

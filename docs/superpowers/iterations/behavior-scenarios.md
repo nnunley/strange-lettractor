@@ -161,6 +161,21 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - Then artifacts are discoverable from run state, correctly inline/file backed, and preserved across checkpoint resume
 - Seam: engine/artifact integration
 
+This stronger discovery/resume promise is retained as adopted project requirement
+ATTR-ART-02; it is not established by the store/layout scenario below.
+
+### SCN-ARTIFACT-STORE — Public store and run layout
+
+- Given a public pipeline whose custom handler uses the artifact store API
+- Then typed values are retrievable, metadata and byte-threshold backing agree,
+  root run metadata is EDN, and external stage status remains JSON
+- Exact threshold, no-base fallback, replacement and failed publication preserve
+  the specified store lifecycle; subsequent fresh/restarted runs leave prior
+  artifacts retrievable and their files intact
+- Seam: public pipeline/store integration plus store boundary/failure contracts
+- Status: supported-value component verified, 3 tests / 64 assertions, ATTR-ART-01;
+  set-valued artifacts remain deferred under let-go #823 / ATTR-READ-01
+
 ### SCN-FANIN-RANKING — Prompted and heuristic fan-in
 
 - Given real wait-all branches with ordered, scored outcomes and a configured unified client

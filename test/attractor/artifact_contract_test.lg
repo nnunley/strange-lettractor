@@ -1,0 +1,105 @@
+(ns attractor.artifact-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.edn :as edn]
+            [attractor.context :as c]
+            [attractor.handlers :as h]
+            [attractor.pipeline :as pipeline]
+            [io :as io] [os :as os] [json :as json]))
+
+;; SCN-ARTIFACT-STORE: not persistent inventory reconstruction.
+(defn- root []
+  (let [path (str (os/temp-dir) "/artifact-contract-" (random-uuid))]
+    (io/mkdir path)
+    path))
+(defn- payload [n] (apply str (repeat n "x")))
+
+(deftest exact-artifact-threshold-and-metadata
+  (let [dir (root) store (c/make-artifact-store dir)
+        small (payload 102400) large (payload 102401)
+        a (c/store-artifact! store "a" "Boundary" small)
+        b (c/store-artifact! store "b" "Above" large)
+        memory (c/make-artifact-store nil)
+        m (c/store-artifact! memory "m" "Memory" large)]
+    (is (= 102400 (:size_bytes a)))
+    (is (false? (:is_file_backed a)))
+    (is (not (io/file-exists? (str dir "/artifacts/a.edn"))))
+    (is (= 102401 (:size_bytes b)))
+    (is (true? (:is_file_backed b)))
+    (is (= #{:id :name :size_bytes :stored_at :is_file_backed} (set (keys b))))
+    (is (= "b" (:id b)))
+    (is (= "Above" (:name b)))
+    (is (and (string? (:stored_at b)) (pos? (count (:stored_at b)))))
+    (is (not (:is_file_backed m)))
+    (is (= large (c/retrieve-artifact memory "m")))
+    (is (= small (c/retrieve-artifact store "a")))
+    (is (= large (edn/read-string (io/slurp (str dir "/artifacts/b.edn")))))
+    (let [replacement {:typed [1 :two true nil] :nested {:a :b}}
+          info (c/store-artifact! store "b" "Replacement" replacement)]
+      (is (false? (:is_file_backed info)))
+      (is (not (io/file-exists? (str dir "/artifacts/b.edn"))))
+      (is (= replacement (c/retrieve-artifact store "b")))
+      (is (= 2 (count (c/list-artifacts store)))))))
+
+(deftest failed-publication-preserves-existing-artifact
+  (let [dir (root) store (c/make-artifact-store dir)
+        original (payload 102401)
+        info (c/store-artifact! store "stable" "Original" original)
+        path (str dir "/artifacts/stable.edn")
+        bytes (io/slurp path) entry (get-in @store [:artifacts "stable"])
+        shell os/sh
+        error (with-redefs [os/sh (fn [& args]
+                                   (if (= "mv" (first args))
+                                     {:exit 7 :err "publication denied"}
+                                     (apply shell args)))]
+                (try (c/store-artifact! store "stable" "New" (str original "y"))
+                     nil (catch Object e (ex-data e))))]
+    (is (= :artifact-write-failed (:category error)))
+    (is (= entry (get-in @store [:artifacts "stable"])))
+    (is (= [info] (c/list-artifacts store)))
+    (is (= bytes (io/slurp path)))
+    (is (= original (c/retrieve-artifact store "stable")))))
+
+(deftest public-pipeline-edn-layout-and-independent-restart-artifacts
+  (let [dir (root) fresh (root) seen (atom [])
+        legacy "{\"id\":\"legacy\",\"opaque\":true}\n"
+        registry (h/make-handler-registry)
+        _ (io/spit (str dir "/manifest.json") legacy)
+        _ (h/register-handler!
+            registry "artifact.probe"
+            (fn [node _ _ logs-root]
+              (let [store (c/make-artifact-store logs-root)
+                    value {:node (:id node) :typed [42 :ok true nil]
+                           :body (payload 102401)}
+                    info (c/store-artifact! store "result" "Typed result" value)]
+                (swap! seen conj {:root logs-root :store store :value value :info info
+                                 :node (:id node)})
+                {:status :success :artifacts [info]
+                 :context_updates {"artifact" info}})))
+        dot "digraph Artifact { graph [goal=\"Keep typed artifacts\"]; start [shape=Mdiamond]; first [type=artifact.probe]; second [type=artifact.probe]; exit [shape=Msquare]; start -> first; first -> second [loop_restart=true]; second -> exit; }"
+        result (pipeline/run dot {:logs-root dir :registry registry})
+        other (pipeline/run "digraph Fresh { start [shape=Mdiamond]; work [type=artifact.probe]; exit [shape=Msquare]; start -> work -> exit; }"
+                            {:logs-root fresh :registry registry})]
+    (is (= :success (:status result)))
+    (is (= :success (:status other)))
+    (is (= 3 (count @seen)))
+    (is (= 3 (count (set (map :root @seen)))))
+    (is (= legacy (io/slurp (str dir "/manifest.json"))))
+    (doseq [{:keys [root store value info node]} @seen]
+      (let [manifest-path (str root "/manifest.edn")
+            exists (io/file-exists? manifest-path)
+            manifest (when exists (edn/read-string (io/slurp manifest-path)))
+            checkpoint (c/load-checkpoint (str root "/checkpoint.edn"))
+            external (json/read-json (io/slurp (str root "/" node "/status.json")))]
+        (is exists)
+        (is (= #{:id :goal :start_time} (set (keys manifest))))
+        (is (= (if (= root fresh) "Fresh" "Artifact") (:id manifest)))
+        (is (string? (:start_time manifest)))
+        (when (not= root fresh) (is (= "Keep typed artifacts" (:goal manifest))))
+        (when (not= root dir) (is (not (io/file-exists? (str root "/manifest.json")))))
+        (is (= "success" (get external "outcome")))
+        (is (= info (get-in checkpoint [:node_outcomes node :context_updates "artifact"])))
+        (is (= [info] (get-in checkpoint [:node_outcomes node :artifacts])))
+        (is (= (count (.getBytes (pr-str value) "UTF-8")) (:size_bytes info)))
+        (is (= value (c/retrieve-artifact store "result")))
+        (is (= value (edn/read-string (io/slurp (str root "/artifacts/result.edn")))))
+        (is (true? (:is_file_backed info)))))))

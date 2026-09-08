@@ -411,7 +411,7 @@
     (let [manifest {:id (:id graph)
                     :goal (:goal graph)
                     :start_time (str (System/currentTimeMillis))}]
-      (io/spit (str root "/manifest.json") (json/write-json manifest)))
+      (io/spit (str root "/manifest.edn") (pr-str manifest)))
     root))
 
 ;; Write stage artifacts (Section 5.6)
