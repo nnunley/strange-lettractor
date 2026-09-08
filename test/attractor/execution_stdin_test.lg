@@ -1,0 +1,174 @@
+(ns attractor.execution-stdin-test
+  (:require [clojure.test :refer [deftest is]] [attractor.execution :as execution]
+            [clojure.string :as str] [io :as io] [os :as os]))
+
+(deftest stdin-byte-exact-and-compound-command
+  (let [env (execution/make-local-environment {:env_policy :none})
+        run (:exec_command_stdin env)]
+    (is (fn? run))
+    (when (fn? run)
+      (try
+        (doseq [input ["" "λ雪\n'\" $(touch forbidden) `printf bad`\n" (apply str (repeat 2200 (apply str (repeat 1024 "x"))))]]
+          (let [result (run "/bin/cat" 5000 nil nil input)]
+            (is (= 0 (:exit_code result)))
+            (is (= input (:stdout result)))))
+        (let [result (run "read -r first; printf '%s:' \"$first\"; /bin/cat" 1000 nil nil "one\ntwo\n")]
+          (is (= "one:two\n" (:stdout result))))
+        (finally ((:cleanup env)))))))
+
+(deftest optional-custom-capability-and-ordinary-exec-unchanged
+  (is (nil? (:exec_command_stdin (execution/make-environment {}))))
+  (let [env (execution/make-local-environment)]
+    (try (is (= "ok" (:stdout ((:exec_command env) "printf ok" 1000 nil nil))))
+         (finally ((:cleanup env))))))
+
+(defn capture-temp [operation]
+  (let [original os/sh paths (atom [])]
+    (with-redefs [os/sh (fn [& args]
+                         (let [result (apply original args)]
+                           (when (and (= "/usr/bin/mktemp" (first args)) (= 0 (:exit result)))
+                             (let [path (str/trim (:out result))]
+                               (swap! paths conj path)
+                               (is (= (if (= "-d" (second args)) "700" "600")
+                                      (str/trim (:out (if (= "darwin" (os/os-name))
+                                                       (original "/usr/bin/stat" "-f" "%Lp" path)
+                                                       (original "/usr/bin/stat" "-c" "%a" path))))))))
+                           result))]
+      (operation))
+    (is (= 2 (count @paths)))
+    (doseq [path @paths] (is (nil? (os/stat path))))))
+
+(deftest private-payload-cleanup-and-environment
+  (let [env (execution/make-local-environment {:env_policy :none})]
+    (try
+      (capture-temp
+        (fn []
+          (let [result ((:exec_command_stdin env)
+                        "printf '%s:' \"$HOOK_TEST\"; /bin/pwd; /bin/cat; exit 7"
+                        1000 "/" {"HOOK_TEST" "literal $()"} "payload")]
+            (is (= 7 (:exit_code result)))
+            (is (= "literal $():/\npayload" (:stdout result))))))
+      (capture-temp
+        (fn []
+          (is (try ((:exec_command_stdin env) "/bin/cat" 1000 nil {"INVALID-KEY" "bad"} "input")
+                   false (catch Object _ true)))))
+      (capture-temp
+        (fn []
+          (with-redefs [io/spit (fn [& _] (throw (ex-info "injected write failure" {})))]
+            (is (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input")
+                     false (catch Object _ true))))))
+      ((:cleanup env))
+      (capture-temp
+        (fn [] (is (= 130 (:exit_code ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input"))))))
+      (finally ((:cleanup env))))))
+
+(deftest stdin-timeout-and-cancellation-retain-owned-command-semantics
+  (let [env (execution/make-local-environment {:env_policy :none})]
+    (try
+      (capture-temp
+        (fn []
+          (let [result ((:exec_command_stdin env) "/bin/cat; /bin/sleep 2; printf late" 500 nil nil "partial")]
+            (is (= 124 (:exit_code result))) (is (:timed_out result))
+            (is (= "partial" (:stdout result))))))
+      (finally ((:cleanup env)))))
+  (let [env (execution/make-local-environment {:env_policy :none})
+        original os/sh paths (atom [])
+        root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d" (str (os/temp-dir) "/lettractor-stdin-test.XXXXXXXX"))))
+        marker (str root "/started") late (str root "/late")]
+    (with-redefs [os/sh (fn [& args]
+                         (let [result (apply original args)]
+                           (when (and (= "/usr/bin/mktemp" (first args)) (= 0 (:exit result)))
+                             (swap! paths conj (str/trim (:out result))))
+                           result))]
+      (let [worker (future ((:exec_command_stdin env)
+                            (str "/bin/cat; printf started > '" marker "'; (/bin/sleep 1; printf late > '" late "') & wait")
+                            5000 nil nil "partial"))]
+        (try
+          (loop [n 100]
+            (when (and (nil? (os/stat marker)) (pos? n)) (sleep 10) (recur (dec n))))
+          (is (some? (os/stat marker)))
+          ((:cleanup env))
+          (let [result (deref worker 4000 ::pending)]
+            (is (not= ::pending result)) (is (= 130 (:exit_code result)))
+            (is (:cancelled result)) (is (= "partial" (:stdout result))))
+          (sleep 1100)
+          (is (nil? (os/stat late)))
+          (doseq [path @paths] (is (nil? (os/stat path))))
+          (finally ((:cleanup env))
+                   (original "/bin/rm" "-f" "--" marker late)
+                   (original "/bin/rmdir" "--" root)))))))
+
+(deftest stdin-cleanup-failures-are-not-success
+  (let [env (execution/make-local-environment) original os/sh]
+    (try
+      (with-redefs [os/sh (fn [& args]
+                           (let [result (apply original args)]
+                             (if (= "/bin/rm" (first args)) (assoc result :exit 1 :err "injected cleanup failure") result)))]
+        (is (= :stdin-temp-cleanup
+               (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input") nil
+                    (catch Object e (:category (ex-data e))))))
+        (let [error (try ((:exec_command_stdin env) "printf output; printf diagnostic >&2; exit 7" 1000 nil nil "input") nil
+                         (catch Object e (ex-data e)))]
+          (is (= :stdin-temp-cleanup (:category error)))
+          (is (= 7 (get-in error [:command_result :exit_code])))
+          (is (= "output" (get-in error [:command_result :stdout])))
+          (is (str/includes? (get-in error [:command_result :stderr] "") "diagnostic")))
+        (let [error (try ((:exec_command_stdin env) "printf partial; /bin/sleep 2" 500 nil nil "input") nil
+                         (catch Object e (ex-data e)))]
+          (is (= 124 (get-in error [:command_result :exit_code])))
+          (is (true? (get-in error [:command_result :timed_out])))
+          (is (= "partial" (get-in error [:command_result :stdout]))))
+        (let [closed (execution/make-local-environment)]
+          ((:cleanup closed))
+          (let [error (try ((:exec_command_stdin closed) "/bin/cat" 1000 nil nil "input") nil
+                           (catch Object e (ex-data e)))]
+            (is (= 130 (get-in error [:command_result :exit_code])))
+            (is (true? (get-in error [:command_result :cancelled])))))
+        (let [error (try ((:exec_command_stdin env) "/bin/cat" 1000 nil {"BAD-KEY" "x"} "input") nil
+                         (catch Object e (ex-data e)))]
+          (is (= :invalid-environment-variable (:category error)))
+          (is (some? (:stdin_cleanup error))))
+        (with-redefs [io/spit (fn [& _] (throw (ex-info "write failed" {:category :test-write-error})))]
+          (let [error (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input") nil
+                           (catch Object e e))]
+            (is (= "write failed" (ex-message error)))
+            (is (= :test-write-error (:category (ex-data error))))
+            (is (some? (:stdin_cleanup (ex-data error)))))))
+      (is (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil {:not "string"}) false
+               (catch Object _ true)))
+      (finally ((:cleanup env))))))
+
+(deftest stdin-file-creation-failure-removes-private-directory
+  (let [original os/sh directory (atom nil) env (execution/make-local-environment)]
+    (try
+      (with-redefs [os/sh (fn [& args]
+                           (if (and (= "/usr/bin/mktemp" (first args)) (not= "-d" (second args)))
+                             {:exit 1 :out "" :err "injected file-create failure"}
+                             (let [result (apply original args)]
+                               (when (= "/usr/bin/mktemp" (first args)) (reset! directory (str/trim (:out result))))
+                               result)))]
+        (is (= :stdin-temp-create
+               (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input") nil
+                    (catch Object e (:category (ex-data e)))))))
+      (is (some? @directory)) (is (nil? (os/stat @directory)))
+      (finally ((:cleanup env))))))
+
+(deftest thrown-cleanup-still-attempts-directory-and-preserves-primary
+  (let [original os/sh removed-dir (atom false) directory (atom nil) env (execution/make-local-environment)]
+    (try
+      (with-redefs [os/sh (fn [& args]
+                           (let [result (apply original args)]
+                             (when (and (= "/usr/bin/mktemp" (first args)) (= "-d" (second args)))
+                               (reset! directory (str/trim (:out result))))
+                             (when (= "/bin/rmdir" (first args)) (reset! removed-dir true))
+                             (if (= "/bin/rm" (first args))
+                               (throw (ex-info "cleanup threw" {:category :secondary})) result)))
+                    io/spit (fn [& _] (throw (ex-info "primary write" {:category :primary})))]
+        (let [error (try ((:exec_command_stdin env) "/bin/cat" 1000 nil nil "input") nil
+                         (catch Object e e))]
+          (is (= :primary (:category (ex-data error))))
+          (is (= "primary write" (ex-message error)))
+          (is (some? (:stdin_cleanup (ex-data error))))
+          (is @removed-dir)))
+      (finally ((:cleanup env))
+               (when (and @directory (os/stat @directory)) (original "/bin/rmdir" "--" @directory))))))

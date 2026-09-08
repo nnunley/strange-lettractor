@@ -84,3 +84,18 @@ through four adapters. The standalone core bundle passes 5/177 from /tmp, build
 and CLI help pass, and paired independent spec/quality reviews approve.
 See `docs/session-error-contract.md` and its EDN evidence record for commands,
 scope and explicit native HTTP cancellation/SSE/live-provider/AOT residuals.
+
+## Component checkpoint — Hook stdin transport
+
+ATTR-HOOK-01 remains incomplete. SCN-TOOL-HOOKS-STDIN adds an optional local
+execution operation with private file-backed stdin, preserving existing owned
+command cancellation and four-argument callers. Payloads are not embedded in argv
+or evaluated by the shell. Cleanup reports failures, retains command results and
+primary error details, and attempts both owned removals.
+
+Evidence: baseline 609/5679/0; initial missing-capability RED 2 pass/1 fail;
+review regression RED 62 pass/7 fail; focused 7/74/0; impacted execution 36/185/0;
+final default 616/5753/0. Standalone bundle 7/74/0; CLI build/help pass. Paired
+scope/spec/quality reviews approve. See `docs/tool-hooks-plan.md` for commands,
+failure semantics and remaining agent/workflow integration. No native-Go AOT
+conformance or complete hooks behavior is claimed by this component.

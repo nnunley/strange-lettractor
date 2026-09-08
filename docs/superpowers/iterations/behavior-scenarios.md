@@ -206,6 +206,20 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - When pre succeeds, the tool runs and post observes its result; when pre fails, the tool is skipped; when post fails, the tool result is retained and failure evidence is emitted
 - Seam: coding-loop integration
 
+#### SCN-TOOL-HOOKS-STDIN — Native input transport component
+
+- Given a local execution environment and an input string, including empty input,
+  Unicode, shell-sensitive text and a multi-MiB result
+- When `:exec_command_stdin` runs a compound command, the entire command receives
+  the exact input through stdin while working-directory and environment overrides
+  retain existing semantics; no input bytes are shell-evaluated or embedded in argv
+- Then nonzero status remains observable, deadline/shutdown owns the command and
+  descendants, and the private temporary input is removed after completion,
+  failure or cancellation without deleting unrelated files
+- Seam: native execution-environment integration
+- Status: verified component, 7 tests / 74 assertions; this alone does not prove hooks
+  are wired through public workflows or complete SCN-TOOL-HOOKS
+
 ### SCN-CAL-CONTEXT-RECOVERY — Typed errors and reusable overflow sessions
 
 - Given typed complete/stream provider failures, including partial output and queued inputs

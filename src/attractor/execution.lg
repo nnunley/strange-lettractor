@@ -477,6 +477,44 @@
                     (fn [] (swap! active-commands dissoc command-id)))
                   (os/sh "rm" "-f" timeout-marker)
                   (os/sh "rm" "-f" cancel-marker))))))
+        exec-command-stdin
+        (fn [command timeout-ms requested-dir env-vars input]
+          (when-not (string? input)
+            (throw (ex-info "Command stdin must be a string" {:category :invalid-command-stdin})))
+          (let [created (os/sh "/usr/bin/mktemp" "-d" (str (os/temp-dir) "/lettractor-stdin.XXXXXXXX"))]
+            (when-not (= 0 (:exit created))
+              (throw (ex-info "Unable to create private stdin directory" {:category :stdin-temp-create :stderr (:err created)})))
+            (let [directory (str/trim (:out created))
+                  payload (atom nil)
+                  primary-error (atom nil)
+                  command-result (atom nil)
+                  remove-owned (fn [& args]
+                                 (try (apply os/sh args)
+                                      (catch Object error {:exit -1 :error (ex-message error)
+                                                           :data (ex-data error)})))]
+              (try
+                (let [file-result (os/sh "/usr/bin/mktemp" (str directory "/input.XXXXXXXX"))]
+                  (when-not (= 0 (:exit file-result))
+                    (throw (ex-info "Unable to create private stdin file" {:category :stdin-temp-create :stderr (:err file-result)})))
+                  (reset! payload (str/trim (:out file-result)))
+                  ;; mktemp creates the directory/file exclusively with 0700/0600.
+                  ;; spit opens the existing file without widening its permissions.
+                  (io/spit @payload input)
+                  (reset! command-result
+                    (exec-command
+                      (str "/bin/bash --noprofile --norc -p -c " (shell-quote command)
+                           " < " (shell-quote @payload))
+                      timeout-ms requested-dir env-vars)))
+                (catch Object error (reset! primary-error error) (throw error))
+                (finally
+                  (let [remove-result (when @payload (remove-owned "/bin/rm" "-f" "--" @payload))
+                        directory-result (remove-owned "/bin/rmdir" "--" directory)
+                        failures (vec (filter #(and % (not= 0 (:exit %))) [remove-result directory-result]))]
+                    (when (seq failures)
+                      (throw (ex-info (if @primary-error (ex-message @primary-error) "Unable to clean up command stdin")
+                                      (merge (if @primary-error (ex-data @primary-error) {:category :stdin-temp-cleanup})
+                                             (when @command-result {:command_result @command-result})
+                                             {:stdin_cleanup {:file @payload :directory directory :failures failures}}))))))))))
         cleanup
         (fn []
           (let [signal-errors (atom [])]
@@ -558,6 +596,7 @@
                requested-depth (max 1 (or depth 1))]
            (vec (list-directory-tree resolved "" requested-depth))))
        :exec_command exec-command
+       :exec_command_stdin exec-command-stdin
        :grep
        (fn [pattern path grep-options]
          (let [options (or grep-options {})

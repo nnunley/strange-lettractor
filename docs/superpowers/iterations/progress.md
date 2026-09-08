@@ -1,9 +1,21 @@
 # Progress
 
-**Phase:** resumed core conformance, CAL-ERROR-01 component (ITER-0008)
-**Task:** finish typed session-error/context-overflow behavior and native HTTP evidence
+**Phase:** implementing tool hooks, ATTR-HOOK-01 component (ITER-0007)
+**Task:** safe hook stdin transport verified; session/workflow integration next
 
-**Current checkpoint:** main is `699f26b`, including the independently reviewed
+**Current baseline:** public main `c373771` contains the reviewed session-error
+component. Fresh hook-worktree sentinel suite: 609 tests / 5,679 assertions / zero
+failures, exit 0. Paired scope review approved `docs/tool-hooks-plan.md` after
+clarifying per-call context snapshots, concurrent EDN logging and failure policy,
+and private-file stdin transport through the existing owned execution environment.
+Implementation is in `.worktrees/tool-hooks`; hooks are not yet complete.
+The stdin component passed paired spec and quality review after preserving returned
+command diagnostics and thrown primary errors when cleanup also fails. Focused
+7/74, impacted execution 36/185, full suite 616/5753, all zero failures; standalone
+bundle 7/74 and CLI build/help also pass. This is a transport component checkpoint,
+not ATTR-HOOK-01 completion or native-Go AOT conformance.
+
+**Previous session-error checkpoint:** main was `699f26b`, including the independently reviewed
 Qwen-authored quota-code fix. Fresh sentinel/default baseline: 604 tests / 5,502
 assertions / zero failures. The session-error worktree preserves its previously
 drafted patch and is now based on that main. Fresh baseline RED: 5 tests / 113

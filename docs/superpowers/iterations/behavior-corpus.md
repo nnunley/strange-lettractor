@@ -29,6 +29,7 @@ Commands are run from the repository root with the configured local compiler at 
 | SCN-CAL-TOOLS | coding-loop integration | impacted | `rg -q 'SCN-CAL-TOOLS' test/attractor/agent_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0007 |
 | SCN-CAL-SUBAGENTS | coding-loop integration | impacted | `rg -q 'SCN-CAL-SUBAGENTS' test/attractor/agent_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0007 |
 | SCN-TOOL-HOOKS | coding-loop integration | impacted | `rg -q 'SCN-TOOL-HOOKS' test/attractor/agent_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0007 |
+| SCN-TOOL-HOOKS-STDIN | native execution-environment integration | impacted | `/Users/ndn/development/let-go/lg -source-paths src:test dev/execution_stdin_tests.lg run` | verified transport component: 7/74/0; hooks wiring remains pending |
 | SCN-SSE-LIVE | HTTP integration | impacted | `rg -q 'SCN-SSE-LIVE' test/attractor/server_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0008 |
 | SCN-EVENT-FAMILIES | engine/server integration | impacted | `rg -q 'SCN-EVENT-FAMILIES' test/attractor/server_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0008 |
 | SCN-CAL-FAILURE-SHUTDOWN | coding-loop integration | impacted | `rg -q 'SCN-CAL-FAILURE-SHUTDOWN' test/attractor/server_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0008 |
