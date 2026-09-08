@@ -209,6 +209,17 @@
       (:session_id f) (do (request! c :session/cancel {:session_id (:session_id f)}) [(str "cancel requested: session " (short-id (:session_id f)))])
       :else ["nothing focused to cancel"])))
 
+(defn busy?
+  "True when the focused session has an unfinished turn or the focused run or
+   worker is still running. Frontends use it to route an interrupt."
+  [console]
+  (let [c @console f (:focus c)
+        find (fn [key op] (when (get f key) (first (filter #(= (get f key) (get % key)) (request! c op {})))))
+        session (find :session_id :session/list) run (find :run_id :workflow/list) worker (find :worker_id :worker/list)]
+    (boolean (or (and session (:busy session))
+                 (and run (not (:done run)))
+                 (and worker (not (:done worker)))))))
+
 (defn- command! [console command args]
   (case command
     :help help-lines

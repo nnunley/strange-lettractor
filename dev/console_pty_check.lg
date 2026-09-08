@@ -1,0 +1,44 @@
+(ns main
+  "Native terminal evidence for the console frontends. script(1) allocates a
+   pseudo-terminal and relays a paced stdin pipe, so the built CLI runs under a
+   real tty with the mock model. Run from the console worktree after lgx build."
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [os :as os] [io :as io]))
+
+(defn- temp-file [] (str/trim (:out (os/sh "/usr/bin/mktemp"))))
+(defn- drive [typescript args script]
+  ;; script is a shell fragment producing keystrokes with pauses.
+  (let [command (str "(" script ") | /usr/bin/script -q " typescript " ./bin/attractor console " args)]
+    (os/sh "/bin/sh" "-c" command)))
+(defn- has? [text s] (str/includes? text s))
+
+(deftest tui-under-a-pty-renders-answers-and-restores-the-terminal
+  (let [typescript (temp-file)
+        result (drive typescript "--tui --mock"
+                      "sleep 2; printf 'hello tui\\r'; sleep 2.5; printf ': (* 6 7)\\r'; sleep 1.5; printf '\\003'; sleep 1.5")
+        text (io/slurp typescript)]
+    (is (= 0 (:exit result)) (str (:err result)))
+    (is (has? text (str (char 27) "[?1049h")) "alternate screen entered")
+    (is (has? text (str (char 27) "[?1049l")) "alternate screen restored on quit")
+    (is (has? text "attractor console") "status line rendered")
+    (is (has? text "> hello tui") "typed line echoed into the transcript")
+    (is (has? text "Response to: hello tui") "mock agent reply rendered")
+    (is (has? text "[eval] => 42") "hub evaluation rendered")
+    (os/sh "/bin/rm" "-f" "--" typescript)))
+
+(deftest line-console-under-a-pty-quits-on-eof
+  (let [typescript (temp-file)
+        result (drive typescript "--mock" "sleep 1; printf 'hello line\\n'; sleep 2.5; printf ': (+ 1 1)\\n'; sleep 1.5")
+        text (io/slurp typescript)]
+    (is (= 0 (:exit result)) (str (:err result)))
+    (is (has? text "Response to: hello line"))
+    (is (has? text "[eval] => 2"))
+    (is (has? text "bye") "EOF quits cleanly")
+    (os/sh "/bin/rm" "-f" "--" typescript)))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+(when *command-line-args* (apply -main *command-line-args*))

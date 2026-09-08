@@ -16,6 +16,7 @@
             [attractor.hub :as hub]
             [attractor.console.session :as session]
             [attractor.console.line :as line]
+            [attractor.console.tui :as tui]
             [attractor.dotenv :as dotenv]))
 
 (defn- find-arg-val [args flag]
@@ -140,7 +141,9 @@
         console (session/open! hub {:worker_defaults worker-defaults
                                     :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}})]
     (try
-      (line/run! console {})
+      (if (some #{"--tui"} args)
+        (tui/run! console {})
+        (line/run! console {}))
       (finally
         (session/close! console)
         (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil)))
@@ -159,7 +162,7 @@
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
   (println "  claude --prompt-file <file> [--cwd <dir>]            Stream an owned Claude Code worker as EDN")
-  (println "  console [--mock] [--model <m>] [--provider <p>]      Interactive console: agent text, : eval, /run, /claude")
+  (println "  console [--tui] [--mock] [--model <m>] [--provider <p>]  Interactive console: agent text, : eval, /run, /claude")
   (println "    [--model <model>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--timeout-ms <ms>]   DOT run/resume also accept --worker claude and these worker options")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")

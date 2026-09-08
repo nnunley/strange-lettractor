@@ -1,6 +1,8 @@
 {:paths ["src"]
  :main "main.lg"
  :lg-version "1.12.2"
+ :deps {tiny-tui {:git/url "https://github.com/abogoyavlensky/tiny-tui"
+                  :git/sha "3d2aeaa68e4647187c10cbbcba7df881b81b9a6c"}}
  :targets {:bin {:out "bin/attractor"}}
 
  :contexts

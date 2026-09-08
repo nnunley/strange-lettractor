@@ -1,0 +1,64 @@
+(ns attractor.console-tui-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [clojure.string :as str]
+            [attractor.hub :as hub] [attractor.execution :as execution]
+            [attractor.profiles :as profiles]
+            [attractor.console.session :as session] [attractor.console.tui :as tui]))
+
+;; SCN-CONSOLE-TUI: the tiny-tui frontend drives the same dispatcher headlessly
+;; with scripted keys and a captured render; Ctrl-C routes by state.
+
+(defn- hub-options []
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                                                 :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs []
+                     :complete_fn (fn [request]
+                                    (let [text (:content (last (:messages request)))]
+                                      (when (= text "slow") (core/sleep 400))
+                                      {:message {:role :assistant :content (str "echo: " text)}}))}})
+(defn- keys-for [text] (concat (map str (seq text)) [:enter]))
+(defn- scripted-keys [groups]
+  ;; Each group is a vector of key messages followed by a pause so hub events
+  ;; can arrive; nil ends input.
+  (let [queue (atom (vec groups))]
+    (fn []
+      (loop []
+        (let [q @queue]
+          (cond
+            (empty? q) nil
+            (empty? (first q)) (do (swap! queue #(vec (rest %))) (core/sleep 200) (recur))
+            :else (let [k (first (first q))] (swap! queue #(vec (cons (rest (first %)) (rest %)))) k)))))))
+(defn- has? [lines s] (boolean (some #(str/includes? % s) lines)))
+
+(deftest headless-tui-routes-text-eval-and-ctrl-c-by-state
+  (let [h (hub/start! (hub-options)) c (session/open! h) frames (atom [])]
+    (try
+      (let [result (tui/run! c {:screen false :render-fn #(swap! frames conj %) :poll-ms 10
+                                :read-key (scripted-keys [(keys-for "hello") []
+                                                          (keys-for ": (+ 1 2)") []
+                                                          (keys-for ":{") (keys-for "(+ 1") [:ctrl-c] []
+                                                          (keys-for "/agents") []
+                                                          (keys-for "slow") [:ctrl-c] []
+                                                          [:ctrl-c]])})
+            transcript (:transcript result)]
+        (is (= :quit (:event result)) (pr-str (:event result)))
+        (is (has? transcript "> hello"))
+        (is (has? transcript "echo: hello"))
+        (is (has? transcript "[eval] => 3"))
+        (is (has? transcript "(draft discarded)"))
+        (is (has? transcript "* session"))
+        (is (has? transcript "cancel requested: session") "Ctrl-C during a busy focus cancels")
+        (is (has? transcript "bye"))
+        (is (session/closed? c))
+        (is (some #(str/includes? % "attractor console") @frames) "status line rendered")
+        (is (some #(str/includes? % "multiline eval draft") @frames) "draft state shown while buffering"))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+(deftest eof-ends-the-tui-and-detaches
+  (let [h (hub/start! (hub-options)) c (session/open! h)]
+    (try
+      (let [result (tui/run! c {:screen false :render-fn (fn [_] nil) :poll-ms 10 :read-key (scripted-keys [])})]
+        (is (nil? (:event result)))
+        (is (session/closed? c)))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))

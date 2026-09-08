@@ -1,0 +1,99 @@
+(ns attractor.console.tui
+  "Full-screen tiny-tui frontend over attractor.console.session. The stock
+   tiny-tui loop only wakes on keys and consumes Ctrl-C as exit, so this
+   adapter feeds run's :read-key-fn from a channel that merges keystrokes with
+   periodic hub-event ticks, and translates Ctrl-C into a console interrupt
+   that the dispatcher routes by state (discard draft, cancel focus, or quit
+   when idle)."
+  (:require [clojure.string :as str] [clojure.core :as core] [async :as async]
+            [tiny-tui.core :as tui] [tiny-tui.input :as tinput]
+            [tiny-tui.layout :as layout] [tiny-tui.style :as style] [tiny-tui.key :as key]
+            [attractor.console.session :as session]))
+
+(def ^:private max-transcript 2000)
+
+(defn- append-lines [state lines]
+  (let [all (into (:transcript state) lines)
+        excess (- (count all) max-transcript)]
+    (assoc state :transcript (if (pos? excess) (subvec all excess) all))))
+
+(defn- status-line [state]
+  (let [f (session/focus (:console state))
+        parts (remove nil? [(when (:session_id f) (str "session " (last (str/split (:session_id f) #"-"))))
+                            (when (:run_id f) (str "run " (last (str/split (:run_id f) #"-"))))
+                            (when (:worker_id f) (str "claude " (last (str/split (:worker_id f) #"-"))))
+                            (when (:buffering state) "multiline eval draft")])]
+    (style/bold (str "attractor console" (when (seq parts) (str " — " (str/join " · " parts)))
+                     "  (Ctrl-C: discard/cancel/quit)"))))
+
+(defn view [state]
+  (let [[width height] (or (:tui/size state) [80 24])
+        input-rows 3
+        rows (max 1 (- height input-rows 2))
+        transcript (:transcript state)
+        visible (if (> (count transcript) rows) (subvec transcript (- (count transcript) rows)) transcript)
+        clip (fn [line] (if (> (count line) width) (subs line 0 width) line))]
+    (layout/vstack
+      (status-line state)
+      (str/join "\n" (concat (map clip visible) (repeat (- rows (count visible)) "")))
+      ""
+      (tinput/view (:input state)))))
+
+(defn- submit! [state text]
+  (let [{:keys [lines buffering]} (session/handle! (:console state) {:type :line :text text})]
+    (-> state
+        (append-lines (cons (str (if (:buffering state) "…  " "> ") text) lines))
+        (assoc :buffering buffering
+               :input (tinput/create {:placeholder (if buffering ":} submits the draft" "message, : form, /help")})))))
+
+(defn- interrupt! [state]
+  (cond
+    (:buffering state)
+    (do (session/handle! (:console state) {:type :interrupt})
+        (-> state (append-lines ["(draft discarded)"]) (assoc :buffering false)))
+    (session/busy? (:console state))
+    (append-lines state (:lines (session/handle! (:console state) {:type :interrupt})))
+    ;; Nothing to discard or cancel: Ctrl-C when idle quits.
+    :else (do (session/close! (:console state)) (append-lines state ["bye"]))))
+
+(defn update [state msg]
+  (let [state (cond
+                (= msg ::tick) (append-lines state (:lines (session/drain! (:console state))))
+                (= msg ::interrupt) (interrupt! state)
+                (= msg :enter) (let [text (get-in state [:input :text])]
+                                 (if (str/blank? text) state (submit! state text)))
+                :else (assoc state :input (first (tinput/update (:input state) msg))))]
+    [state (when (session/closed? (:console state)) :quit)]))
+
+(defn- merged-key-reader
+  "Return a read-key-fn: a keystroke from the reader future when one is
+   pending, otherwise a ::tick after poll-ms so hub events keep flowing."
+  [read-key poll-ms]
+  (let [keys (async/chan)]
+    (core/future
+      (loop []
+        (let [k (read-key)]
+          (async/>!! keys (if (nil? k) ::eof k))
+          (when-not (nil? k) (recur)))))
+    (fn []
+      (let [[value _] (async/alts! [keys (async/timeout poll-ms)])]
+        (cond
+          (nil? value) ::tick
+          (= value ::eof) nil
+          (= value :ctrl-c) ::interrupt
+          :else value)))))
+
+(defn run!
+  "Run the full-screen console until it quits. Options: :read-key (defaults to
+   tiny-tui.key/read), :render-fn and :screen (tiny-tui testing hooks),
+   :poll-ms (default 50)."
+  [console & [opts]]
+  (let [help (:lines (session/handle! console {:type :line :text "/help"}))
+        init {:console console :transcript (vec help) :buffering false
+              :input (tinput/create {:placeholder "message, : form, /help"})}
+        read-key-fn (merged-key-reader (or (:read-key opts) key/read) (get opts :poll-ms 50))
+        [final event] (tui/run (cond-> {:init init :update update :view view :read-key-fn read-key-fn}
+                                 (contains? opts :screen) (assoc :screen (:screen opts))
+                                 (:render-fn opts) (assoc :render-fn (:render-fn opts))))]
+    (when-not (session/closed? console) (session/close! console))
+    {:transcript (:transcript final) :event event}))
