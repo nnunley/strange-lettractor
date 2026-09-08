@@ -1,0 +1,26 @@
+(ns main (:require [clojure.core :as core] [os :as os]))
+
+(defn check-case [lazy?]
+  (let [parent (core/scope-open) gate (promise) entered (promise)
+        job (core/future
+              (deref gate)
+              (try
+                (if lazy?
+                  (first (lazy-seq (deliver entered true) (core/sleep 1000) (list :done)))
+                  (do (deliver entered true) (core/sleep 1000) :done))
+                (catch Object _ :canceled)))
+        unrelated (core/scope-open)]
+    (try
+      (deliver gate true)
+      (when-not (true? (deref entered 1000 false))
+        (throw (ex-info "Worker did not enter" {})))
+      ;; job was spawned in parent BEFORE this unrelated child was opened.
+      (core/scope-close! unrelated 1000)
+      {:lazy lazy? :after_unrelated_close (deref job 50 :pending)}
+      (finally (core/scope-close! parent 1000)))))
+
+(defn -main [& _]
+  (let [results (mapv check-case [false true])]
+    (prn results)
+    (os/exit (if (every? #(= :pending (:after_unrelated_close %)) results) 0 1))))
+(when *command-line-args* (apply -main *command-line-args*))

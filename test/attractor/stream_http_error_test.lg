@@ -122,34 +122,21 @@
           status [401 429]]
     (let [controller (llm/make-abort-controller)
           reading (promise)
-          waiting (promise)
-          gated (atom [])
           closed (atom 0)
           attempts (atom 0)
           delays (atom [])
-          original-deref core/deref
           original-close io/close
           c (client provider (fn [_]
                                (swap! attempts inc)
                                {:status status :body (io/string-reader "")}))]
-      ;; Force the read failure to occur after controlled-invoke's pre-wait
-      ;; cancellation check, not before it. One-argument derefs are untouched.
-      (with-redefs [core/deref
-                    (fn [& args]
-                      (if (= 3 (count args))
-                        (do
-                          (swap! gated conj (original-deref reading 1000 false))
-                          (deliver waiting true)
-                          ;; Keep this observation open until the released read
-                          ;; settles, rather than letting a polling timeout hide
-                          ;; the completed-result race. Still bounded on failure.
-                          (original-deref (first args) 1000 (nth args 2)))
-                        (apply original-deref args)))
-                    io/close (fn [body] (swap! closed inc) (original-close body))
+      ;; The error-body read runs as a job owned by the operation coordinator,
+      ;; strictly after the caller's pre-invoke cancellation check. Aborting
+      ;; from inside that read races the resulting read failure against local
+      ;; control; the coordinator must elect the abort, not the HTTP error.
+      (with-redefs [io/close (fn [body] (swap! closed inc) (original-close body))
                     io/slurp
                     (fn [_]
                       (deliver reading true)
-                      (swap! gated conj (original-deref waiting 1000 false))
                       ((:abort controller))
                       (throw (ex-info "read interrupted by close" {})))]
         (let [error (caught #(vec (:events
@@ -157,9 +144,9 @@
                                       {:client c :max_retries 2
                                        :abort_signal (:signal controller)
                                        :retry_policy {:sleep_fn (fn [delay] (swap! delays conj delay))}}))))]
+          (is (= true (deref reading 0 false)))
           (is (= :abort (:category error)))
           (is (= false (:retryable error)))
           (is (= 1 @attempts))
-          (is (= [true true] @gated))
           (is (= 1 @closed))
           (is (= [] @delays)))))))

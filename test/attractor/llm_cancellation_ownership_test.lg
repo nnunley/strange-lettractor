@@ -1,0 +1,138 @@
+(ns attractor.llm-cancellation-ownership-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [attractor.llm :as llm]))
+
+;; SCN-ULLM-CANCEL: owned provider cleanup must precede caller completion.
+;; These deterministic adapters prove the shared wrapper seam; socket evidence
+;; remains a separate obligation and cannot be inferred from these witnesses.
+(defn await-quiescence [scope]
+  (let [deadline (+ (System/currentTimeMillis) 100)]
+    (loop []
+      (if (or (zero? (core/scope-live scope))
+              (>= (System/currentTimeMillis) deadline))
+        (core/scope-live scope)
+        (do (core/sleep 1) (recur))))))
+
+(defn check-held-provider [stream? timeout?]
+  (let [started (promise) cleaned (promise)
+        controller (llm/make-abort-controller)
+        hold (fn [_]
+               (deliver started true)
+               (try (core/sleep 5000)
+                    (finally (deliver cleaned true))))
+        adapter (llm/make-adapter "fixture" hold hold)
+        client (llm/make-client {:default_provider "fixture"
+                                 :providers {"fixture" adapter}})
+        scope (core/scope-open)
+        result (atom nil)
+        worker (core/future
+                 (reset! result
+                   (try
+                     (let [options (cond-> {:client client :max_retries 0}
+                                     timeout? (assoc :timeout {:per_step 0.2})
+                                     (not timeout?) (assoc :abort_signal (:signal controller)))]
+                       (if stream?
+                         (doall (:events (llm/stream "fixture" "hello" options)))
+                         (llm/generate "fixture" "hello" options))
+                       :unexpected-success)
+                     (catch Object error (:category (ex-data error))))))]
+    (try
+      (is (true? (deref started 1000 false)))
+      (when-not timeout? ((:abort controller)))
+      (is (not= ::pending (deref worker 1500 ::pending)))
+      (is (= (if timeout? :request-timeout :abort) @result))
+      (is (realized? cleaned) "Provider finally must finish before the caller returns")
+      (is (= 0 (await-quiescence scope)) "No provider or monitor remains after termination")
+      (finally
+        ((:abort controller))
+        (core/scope-close! scope 1000)))))
+
+(deftest generate-abort-joins-provider (check-held-provider false false))
+(deftest stream-abort-joins-opening-provider (check-held-provider true false))
+(deftest generate-step-timeout-joins-provider (check-held-provider false true))
+(deftest stream-step-timeout-joins-opening-provider (check-held-provider true true))
+
+(defn quiescent? [scope] (= 0 (await-quiescence scope)))
+
+(deftest unconsumed-stream-drains-when-parent-scope-closes
+  ;; No control configured, nothing consumed, no close: closing the caller's
+  ;; scope must still retire the coordinator and leave no live worker.
+  (let [adapter (llm/make-adapter "fixture" (fn [_] (throw (ex-info "unused" {}))) (fn [_] []))
+        client (llm/make-client {:default_provider "fixture" :providers {"fixture" adapter}})
+        scope (core/scope-open)
+        created (promise)]
+    (core/future (llm/stream "fixture" "hello" {:client client}) (deliver created true))
+    (is (true? (deref created 1000 false)))
+    (core/scope-close! scope 1000)
+    (is (quiescent? scope))))
+
+(deftest close-after-abort-does-not-throw
+  (let [started (promise) controller (llm/make-abort-controller)
+        hold (fn [_] (deliver started true) (core/sleep 5000))
+        adapter (llm/make-adapter "fixture" hold hold)
+        client (llm/make-client {:default_provider "fixture" :providers {"fixture" adapter}})
+        scope (core/scope-open)
+        result (llm/stream "fixture" "hello" {:client client :max_retries 0
+                                              :abort_signal (:signal controller)})
+        worker (core/future (try (doall (:events result)) :unexpected
+                                 (catch Object e (:category (ex-data e)))))]
+    (try
+      (is (true? (deref started 1000 false)))
+      ((:abort controller))
+      (is (= :abort (deref worker 1500 ::pending)))
+      (is (nil? ((:close result))) "close after a terminal abort is silent")
+      (is (nil? ((:close result))) "and idempotent")
+      (is (quiescent? scope))
+      (finally (core/scope-close! scope 1000)))))
+
+(deftest stale-close-registration-cannot-replace-successor
+  (let [attempts (atom 0) late-register (promise) closes (atom [])
+        stream-fn (fn [request]
+                    (let [n (swap! attempts inc)]
+                      (if (= 1 n)
+                        (do (deliver late-register (:register_stream_close request))
+                            (throw (ex-info "flaky open" {:retryable true})))
+                        (do ((:register_stream_close request) (fn [] (swap! closes conj :live)))
+                            [{:type :text_delta :delta "x"}]))))
+        adapter (llm/make-adapter "fixture" (fn [_] (throw (ex-info "unused" {}))) stream-fn)
+        client (llm/make-client {:default_provider "fixture" :providers {"fixture" adapter}})
+        result (llm/stream "fixture" "hello"
+                 {:client client :max_retries 1 :retry_policy {:sleep_fn (fn [_] nil)}})]
+    (is (= :text_delta (:type (first (:events result)))))
+    (is (= 2 @attempts))
+    ;; Attempt 1 publishes its close handle after attempt 2 already owns the body.
+    ((deref late-register 0 (fn [_] nil)) (fn [] (swap! closes conj :stale)))
+    ((:close result))
+    (is (= [:live] @closes) "the successor's live handle is the one closed")))
+
+(deftest tool-dispatch-is-eager-but-bounded
+  (let [active (atom 0) peak (atom 0)
+        tool {:name "t" :parameters {:type "object"}
+              :execute (fn [args]
+                         (swap! peak max (swap! active inc))
+                         (core/sleep 20)
+                         (swap! active dec)
+                         (get args "i"))}
+        calls (mapv (fn [i] {:id (str "c" i) :name "t" :arguments {"i" i}}) (range 40))
+        adapter (llm/make-adapter "fixture"
+                  (fn [request]
+                    (if (some #(= :tool (:role %)) (:messages request))
+                      {:provider "fixture" :message {:role :assistant :content "done"} :usage {} :finish_reason :stop}
+                      {:provider "fixture" :message {:role :assistant :content ""}
+                       :tool_calls calls :usage {} :finish_reason :tool_calls}))
+                  (fn [_] []))
+        client (llm/make-client {:default_provider "fixture" :providers {"fixture" adapter}})
+        result (llm/generate "fixture" "go" {:client client :tools [tool] :max_tool_rounds 1})]
+    (is (= (range 40) (map :content (:tool_results (first (:steps result))))) "order preserved")
+    (is (<= 2 @peak 32) (str "bounded overlap, peak " @peak))))
+
+(deftest invalid-options-do-not-leak-a-coordinator
+  (let [adapter (llm/make-adapter "fixture" (fn [_] (throw (ex-info "unused" {}))) (fn [_] []))
+        client (llm/make-client {:default_provider "fixture" :providers {"fixture" adapter}})
+        scope (core/scope-open)]
+    (try
+      (is (thrown? Object (llm/generate "fixture" "go" {:client client :max_tool_rounds "many"})))
+      (is (thrown? Object (llm/stream "fixture" "go" {:client client :max_tool_rounds "many"})))
+      (is (quiescent? scope) "no coordinator survives a failed construction")
+      (finally (core/scope-close! scope 1000)))))

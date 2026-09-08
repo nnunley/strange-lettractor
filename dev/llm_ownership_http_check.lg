@@ -1,0 +1,156 @@
+(ns main
+  (:require [attractor.llm :as llm] [attractor.http-fixture :as fixture]
+            [http :as http] [json :as json] [os :as os]
+            [clojure.test :refer [deftest is]] [clojure.core :as core]))
+
+(defn wait-for [f predicate milliseconds]
+  (let [deadline (+ (System/currentTimeMillis) milliseconds)]
+    (loop []
+      (let [value (f)]
+        (if (or (predicate value) (>= (System/currentTimeMillis) deadline))
+          value
+          (do (core/sleep 2) (recur)))))))
+
+(deftest native-header-stalls-join-before-public-terminal-return
+  (fixture/run-fixture
+    (fn [base]
+      (let [accepted (fn []
+                       (let [response (http/request {:url (str base "/state")})]
+                         (when (= 200 (:status response))
+                           (get (json/read-json (:body response)) "held_requests"))))]
+        (doseq [stream? [true false] mode [:abort :total :per-step]]
+          (let [before (accepted) cleaned (promise) controller (llm/make-abort-controller)
+                adapter (llm/make-provider-adapter
+                          "openai"
+                          {:api_key "fixture" :base_url (str base "/held/v1")
+                           ;; Instrument only the real native HTTP call's exit.
+                           :transport (fn [request]
+                                        (try (http/request request)
+                                             (finally (deliver cleaned true))))})
+                client (llm/make-client {:default_provider "openai" :providers {"openai" adapter}})
+                scope (core/scope-open)
+                options (merge {:client client :max_retries 0}
+                               (case mode
+                                 :abort {:abort_signal (:signal controller)}
+                                 :total {:timeout 0.3}
+                                 :per-step {:timeout {:per_step 0.3}}))
+                job (core/future
+                      (try
+                        (if stream?
+                          (doall (:events (llm/stream "fixture" "hello" options)))
+                          (llm/generate "fixture" "hello" options))
+                        :unexpected-success
+                        (catch Object error {:category (:category (ex-data error)) :message (str error)})))]
+            (try
+              (is (= (inc before) (wait-for accepted #(= (inc before) %) 1000))
+                  (str "Server received request: " stream? " " mode))
+              (when (= mode :abort) ((:abort controller)))
+              (let [result (deref job 1500 ::pending)]
+                (is (= (if (= mode :abort) :abort :request-timeout) (:category result))
+                    (pr-str result)))
+              (is (realized? cleaned) "Native HTTP must exit before the API returns")
+              (is (= 0 (wait-for #(core/scope-live scope) zero? 100)))
+              (finally
+                ((:abort controller))
+                (core/scope-close! scope 1000)
+                (is (realized? cleaned) "Test cleanup releases the socket even on RED")))))))))
+
+(defn fixture-client [base scenario transport]
+  (llm/make-client
+    {:default_provider "openai"
+     :providers {"openai" (llm/make-provider-adapter
+                            "openai" (cond-> {:api_key "fixture" :base_url (str base "/" scenario "/v1")}
+                                       transport (assoc :transport transport)))}}))
+
+(defn control-options [mode controller]
+  (case mode
+    :abort {:abort_signal (:signal controller)}
+    :total {:timeout 0.3}
+    :per-step {:timeout {:per_step 0.3}}))
+
+(deftest native-body-stalls-join-before-public-terminal-return
+  ;; Headers (and for streams, the first chunks) have arrived; the body then
+  ;; stalls. Termination must close the body, join the reader and drain the
+  ;; owned scope before the public call returns, preserving partial output.
+  (fixture/run-fixture
+    (fn [base]
+      (let [held (fn [] (get (json/read-json (:body (http/request {:url (str base "/state")}))) "held_requests"))
+            original-close io/close]
+        (doseq [stream? [true false] mode [:abort :total :per-step]]
+          (let [before (held) closed (atom 0) controller (llm/make-abort-controller)
+                client (fixture-client base (if stream? "held-body" "held-json") nil)
+                scope (core/scope-open)
+                options (merge {:client client :max_retries 0} (control-options mode controller))
+                partial (atom nil)
+                job (core/future
+                      (with-redefs [io/close (fn [body] (swap! closed inc) (original-close body))]
+                        (try
+                          (if stream?
+                            (let [result (llm/stream "fixture" "hello" options)]
+                              (try (doall (:events result))
+                                   (finally (reset! partial ((:partial_response result))))))
+                            (llm/generate "fixture" "hello" options))
+                          :unexpected-success
+                          (catch Object error {:category (:category (ex-data error)) :message (str error)}))))]
+            (try
+              (is (= (inc before) (wait-for held #(= (inc before) %) 1000))
+                  (str "Server started the held body: " stream? " " mode))
+              (when (= mode :abort)
+                (when stream? (wait-for #(get-in @partial [:message :text]) some? 500))
+                ((:abort controller)))
+              (let [result (deref job 1500 ::pending)]
+                (is (= (if (= mode :abort) :abort :request-timeout) (:category result))
+                    (pr-str [stream? mode result])))
+              (when stream?
+                (is (= 1 @closed) (str "Held stream body closed exactly once: " mode))
+                (is (= "held" (get-in @partial [:message :text])) (str "Partial output preserved: " mode)))
+              (is (= 0 (wait-for #(core/scope-live scope) zero? 100))
+                  (str "No worker survives termination: " stream? " " mode))
+              (finally
+                ((:abort controller))
+                (core/scope-close! scope 1000)))))))))
+
+(deftest native-normal-streams-complete-without-premature-close
+  ;; Multi-chunk and tool-continuation streams must read every chunk, close each
+  ;; body exactly once after it completes, and leave no owned worker behind.
+  (fixture/run-fixture
+    (fn [base]
+      (let [state (fn [] (json/read-json (:body (http/request {:url (str base "/state")}))))
+            original-close io/close]
+        (doseq [scenario ["sse" "tool"]]
+          (let [closed (atom 0) transports (atom 0)
+                client (fixture-client base scenario
+                                       (fn [request] (swap! transports inc) (http/request request)))
+                tools [{:name "echo" :parameters {:type "object"}
+                        :execute (fn [args] (str "echo:" (or (get args "value") (get args :value))))}]
+                scope (core/scope-open)
+                outcome (core/future
+                          (with-redefs [io/close (fn [body] (swap! closed inc) (original-close body))]
+                            (let [result (llm/stream "fixture" "hello"
+                                           {:client client :max_retries 0 :tools tools
+                                            :max_tool_rounds 2 :timeout {:per_step 2}})
+                                  events (doall (:events result))]
+                              {:types (mapv :type events)
+                               :text (get-in ((:response result)) [:message :text])
+                               :closed-after-events @closed})))
+                result (deref outcome 3000 ::pending)]
+            (try
+              (is (not= ::pending result) scenario)
+              (is (= :finish (last (:types result))) (str scenario " ends with finish: " (pr-str (:types result))))
+              (if (= scenario "tool")
+                (do (is (= 2 @transports) "Tool continuation opened a second native stream")
+                    (is (= 2 (get (state) "tool_requests")))
+                    (is (some #{:step_finish} (:types result)))
+                    (is (= 2 (:closed-after-events result)) "Each completed body closed exactly once"))
+                (do (is (= 1 @transports))
+                    (is (= 3 (count (filter #{:text_delta} (:types result)))) "Every chunk was read")
+                    (is (= 1 (:closed-after-events result)) "Completed body closed exactly once")))
+              (is (= 0 (wait-for #(core/scope-live scope) zero? 100)) (str "No worker survives completion: " scenario))
+              (finally (core/scope-close! scope 1000)))))))))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+(when *command-line-args* (apply -main *command-line-args*))

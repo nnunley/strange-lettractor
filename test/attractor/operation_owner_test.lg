@@ -1,0 +1,321 @@
+(ns attractor.operation-owner-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [attractor.operation-owner :as owner]))
+
+;; SCN-OWNER: a persistent coordinator owns one child scope per attempt and
+;; joins owned work before acknowledging any terminal transition.
+
+(defn- noop [] nil)
+
+(defn- await-true [f timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (f) true
+        (>= (System/currentTimeMillis) deadline) false
+        :else (do (core/sleep 1) (recur))))))
+
+(deftest repeated-invokes-share-attempt-scope
+  (let [calls (atom 0)
+        o (owner/start! {:check! noop :cleanup! noop})]
+    (is (= :a (owner/invoke! o (fn [] (swap! calls inc) :a))))
+    (is (= :b (owner/invoke! o (fn [] (swap! calls inc) :b))))
+    (is (= 2 @calls))
+    (owner/finish! o)
+    (is (owner/closed? o))))
+
+(deftest invoke-throws-original-exception
+  (let [original (ex-info "boom" {:category :provider})
+        o (owner/start! {:check! noop :cleanup! noop})]
+    (let [caught (try (owner/invoke! o (fn [] (throw original))) (catch Object e e))]
+      (is (identical? original caught)))
+    (owner/finish! o)))
+
+(deftest check-abort-cancels-and-joins-before-throw
+  (let [started (promise) cleaned (promise) aborted (atom false)
+        original (ex-info "aborted" {:category :abort})
+        job (fn []
+              (deliver started true)
+              (try (core/sleep 5000)
+                   (finally (deliver cleaned true))))
+        o (owner/start! {:check! (fn [] (when @aborted (throw original)))
+                          :cleanup! noop})
+        worker (core/future
+                 (try (owner/invoke! o job) :unexpected-success
+                      (catch Object e (:category (ex-data e)))))]
+    (is (true? (deref started 1000 false)))
+    (reset! aborted true)
+    (is (not= ::pending (deref worker 2000 ::pending)))
+    (is (= :abort @worker))
+    (is (true? (deref cleaned 10 false)) "cleanup must join before invoke throws")))
+
+(deftest close-request-cancels-running-job
+  (let [started (promise) cleaned (promise)
+        job (fn []
+              (deliver started true)
+              (try (core/sleep 5000) (finally (deliver cleaned true))))
+        o (owner/start! {:check! noop :cleanup! noop})
+        worker (core/future
+                 (try (owner/invoke! o job) :unexpected-success
+                      (catch Object e (:category (ex-data e)))))]
+    (is (true? (deref started 1000 false)))
+    (owner/close! o)
+    (is (owner/closed? o))
+    (is (true? (deref cleaned 10 false)))
+    (is (not= ::pending (deref worker 1000 ::pending)))))
+
+(deftest throwing-cleanup-surfaces-when-no-primary-error
+  (let [cleanup-error (ex-info "cleanup-broke" {:category :cleanup})
+        o (owner/start! {:check! noop :cleanup! (fn [] (throw cleanup-error))})]
+    (let [caught (try (owner/close! o) nil (catch Object e e))]
+      (is (identical? cleanup-error caught)))
+    (is (owner/closed? o))))
+
+(deftest primary-error-wins-over-cleanup-error
+  (let [started (promise) aborted (atom false)
+        original (ex-info "aborted" {:category :abort})
+        cleanup-error (ex-info "cleanup-broke" {:category :cleanup})
+        o (owner/start! {:check! (fn [] (when @aborted (throw original)))
+                          :cleanup! (fn [] (throw cleanup-error))})
+        worker (core/future
+                 (try (owner/invoke! o (fn [] (deliver started true) (core/sleep 5000)))
+                      :unexpected-success
+                      (catch Object e e)))]
+    (is (true? (deref started 1000 false)))
+    (reset! aborted true)
+    (let [outcome (deref worker 2000 ::pending)]
+      (is (identical? original outcome)))))
+
+(deftest finish-attempt-rolls-scope-only-after-cleanup
+  (let [cleanup-calls (atom 0)
+        o (owner/start! {:check! noop :cleanup! (fn [] (swap! cleanup-calls inc))})]
+    (is (= 1 (owner/invoke! o (fn [] 1))))
+    (owner/finish-attempt! o)
+    (is (= 1 @cleanup-calls))
+    (is (= 2 (owner/invoke! o (fn [] 2))))
+    (owner/finish! o)
+    (is (= 2 @cleanup-calls))))
+
+(deftest post-close-invoke-rejects
+  (let [o (owner/start! {:check! noop :cleanup! noop})]
+    (owner/finish! o)
+    (let [caught (try (owner/invoke! o (fn [] 1)) (catch Object e e))]
+      (is (= :operation-closed (:category (ex-data caught)))))))
+
+(deftest reentrant-invoke-on-same-owner-fails-explicitly
+  (let [o (owner/start! {:check! noop :cleanup! noop})
+        outcome (owner/invoke! o (fn []
+                                    (try (owner/invoke! o (fn [] :inner))
+                                         (catch Object e (:category (ex-data e))))))]
+    (is (= :operation-reentrant outcome))
+    (owner/finish! o)))
+
+(deftest different-owners-nest-normally
+  (let [o1 (owner/start! {:check! noop :cleanup! noop})
+        o2 (owner/start! {:check! noop :cleanup! noop})
+        outcome (owner/invoke! o1 (fn [] (owner/invoke! o2 (fn [] :inner))))]
+    (is (= :inner outcome))
+    (owner/finish! o1)
+    (owner/finish! o2)))
+
+(deftest close-from-owned-job-does-not-self-wait
+  (let [o (owner/start! {:check! noop :cleanup! noop})
+        outcome (try (owner/invoke! o (fn [] (owner/close! o) :job-returned))
+                  (catch Object e (:category (ex-data e))))]
+    (is (= :operation-closed outcome))
+    (is (await-true #(owner/closed? o) 1000))))
+
+(deftest close-from-owned-descendant-does-not-deadlock
+  (let [descendant-done (promise)
+        o (owner/start! {:check! noop :cleanup! noop})
+        outcome (try (owner/invoke! o
+                  (fn []
+                    (let [child (core/future (owner/close! o) (deliver descendant-done true))]
+                      (deref child 1000 ::pending))
+                    :job-returned)) (catch Object e (:category (ex-data e))))]
+    (is (= :operation-closed outcome))
+    (is (true? (deref descendant-done 1000 false)))
+    (is (await-true #(owner/closed? o) 1000))))
+
+(deftest close-from-cleanup-callback-does-not-self-wait
+  (let [cleanup-close-returned (promise) handle (atom nil)
+        o (owner/start! {:check! noop
+                          :cleanup! (fn []
+                                      (owner/close! @handle)
+                                      (deliver cleanup-close-returned true))})]
+    (reset! handle o)
+    (owner/finish! o)
+    (is (true? (deref cleanup-close-returned 10 false)))))
+
+(deftest idle-owner-polls-control-without-invokes
+  (let [checks (atom 0)
+        o (owner/start! {:check! (fn [] (swap! checks inc) nil) :cleanup! noop})]
+    (is (await-true #(pos? @checks) 1000))
+    (owner/finish! o)))
+
+(defn- capture [f] (try {:ok (f)} (catch Object e {:err e})))
+(defn- outcome [f] (core/future (capture f)))
+(defn- await [p] (deref p 1500 ::pending))
+
+(deftest terminal-acknowledgement-waits-for-held-cleanup
+  (let [entered (promise) release (promise)
+        o (owner/start! {:check! noop :cleanup! #(do (deliver entered true) (deref release 1500 false))})
+        closer (outcome #(owner/close! o))]
+    (try
+      (is (= true (await entered)))
+      (is (= ::pending (deref closer 30 ::pending)))
+      (let [again (outcome #(owner/close! o))
+            finish (outcome #(owner/finish! o))
+            attempt (outcome #(owner/finish-attempt! o))]
+        (is (= ::pending (deref again 30 ::pending)))
+        (deliver release true)
+        (is (= {:ok nil} (await closer)))
+        (is (= {:ok nil} (await again)))
+        (is (not= ::pending (await finish)))
+        (is (not= ::pending (await attempt))))
+      (finally (deliver release true)))))
+
+(deftest ready-result-loses-to-local-control
+  (let [abort (atom false) entered (promise) release (promise)
+        original (ex-info "abort" {:category :abort})
+        o (owner/start! {:check! #(when @abort (throw original))
+                         :cleanup! #(do (deliver entered true) (deref release 1500 false))})
+        call (outcome #(owner/invoke! o (fn [] (reset! abort true) :too-late)))]
+    (try
+      (is (= true (await entered)))
+      (is (= ::pending (deref call 30 ::pending)))
+      (deliver release true)
+      (is (identical? original (:err (await call))))
+      (finally (deliver release true)))))
+
+(deftest provider-error-drains-before-publication
+  (let [entered (promise) release (promise) cleaned (promise) started (promise)
+        original (ex-info "provider" {:category :provider})
+        o (owner/start! {:check! noop :cleanup! #(do (deliver entered true) (deref release 1500 false)
+                                                 (throw (ex-info "cleanup" {})))})
+        call (outcome #(owner/invoke! o (fn []
+                        (core/future (deliver started true)
+                          (try (core/sleep 3000) (finally (deliver cleaned true))))
+                        (deref started 1000 false)
+                        (throw original))))]
+    (try
+      (is (= true (await entered)))
+      (is (= ::pending (deref call 30 ::pending)))
+      (deliver release true)
+      (is (identical? original (:err (await call))))
+      (is (= true (await cleaned)))
+      (owner/finish-attempt! o)
+      (is (= :retry (owner/invoke! o (fn [] :retry))))
+      (capture #(owner/finish! o))
+      (finally (deliver release true)))))
+
+(deftest descendant-survives-reads-but-drains-before-retry
+  (let [started (promise) cleaned (promise) release (promise)
+        o (owner/start! {:check! noop :cleanup! noop})
+        sibling (core/future (deref release 3000 false) :sibling)]
+    (try
+      (owner/invoke! o (fn [] (core/future (deliver started true)
+                               (try (core/sleep 3000) (finally (deliver cleaned true)))) :first))
+      (is (= true (await started)))
+      (is (= :next (:ok (await (outcome #(owner/invoke! o (fn [] :next)))))))
+      (is (not (realized? cleaned)))
+      (owner/finish-attempt! o)
+      (is (= true (await cleaned)))
+      (is (= :retry (owner/invoke! o (fn [] :retry))))
+      (owner/finish! o)
+      (deliver release true)
+      (is (= :sibling (await sibling)))
+      (finally (deliver release true)))))
+
+(deftest terminal-waits-for-worker-finally-and-settles-queued-invokes
+  (doseq [reason [:close :abort :timeout]]
+    (let [started (promise) in-finally (promise) release (promise) cleaned (promise)
+          control (atom false) original (ex-info "control" {:category reason})
+          o (owner/start! {:check! #(when (and @control (not= reason :close)) (throw original))
+                           :cleanup! noop})
+          call (outcome #(owner/invoke! o (fn []
+                          (deliver started true)
+                          (try (core/sleep 3000)
+                            (finally (deliver in-finally true)
+                              (deref release 1500 false)
+                              (deliver cleaned true))))))]
+      (try
+        (is (= true (await started)))
+        (let [queued (outcome #(owner/invoke! o (fn [] :should-not-run)))
+              closing (when (= reason :close) (outcome #(owner/close! o)))]
+          (reset! control true)
+          (is (= true (await in-finally)))
+          (is (= ::pending (deref call 30 ::pending)))
+          (is (= ::pending (deref queued 30 ::pending)))
+          (when closing (is (= ::pending (deref closing 30 ::pending))))
+          (deliver release true)
+          (let [r (await call) q (await queued)]
+            (is (= true (await cleaned)))
+            (is (contains? r :err))
+            (is (contains? q :err))
+            (when (not= reason :close) (is (identical? original (:err r)))))
+          (when closing (is (= {:ok nil} (await closing)))))
+        (finally (deliver release true))))))
+
+(deftest idle-abort-drains-persistent-descendants
+  (let [started (promise) cleaned (promise) abort (atom false)
+        original (ex-info "idle abort" {:category :abort})
+        o (owner/start! {:check! #(when @abort (throw original)) :cleanup! noop})]
+    (owner/invoke! o (fn [] (core/future (deliver started true)
+                             (try (core/sleep 3000) (finally (deliver cleaned true)))) :ready))
+    (is (= true (await started)))
+    (reset! abort true)
+    (is (= true (await cleaned)))
+    (is (identical? original (:err (capture #(owner/close! o)))))
+    (is (= :operation-closed (:category (ex-data (:err (capture #(owner/invoke! o noop)))))))))
+
+(deftest parent-scope-close-drains-idle-coordinator-without-control-signal
+  ;; No check! ever throws and nobody calls close!: the only cancellation is the
+  ;; parent scope closing. The coordinator must exit and drain its child scope.
+  (let [parent (core/scope-open)
+        started (promise) cleaned (promise)
+        o (owner/start! {:check! noop :cleanup! noop})]
+    (owner/invoke! o (fn [] (core/future (deliver started true)
+                             (try (core/sleep 3000) (finally (deliver cleaned true)))) :ready))
+    (is (= true (await started)))
+    (core/scope-close! parent 1000)
+    (is (= true (await cleaned)))
+    (is (= 0 (core/scope-live parent)))
+    (is (= true (await-true #(owner/closed? o) 1500)))
+    (is (= :operation-closed (:category (ex-data (:err (capture #(owner/invoke! o noop)))))))))
+
+(deftest delivered-reply-beats-later-close
+  ;; Once a job has published its result, that value is owed to the caller
+  ;; even if the owner is closed before the waiter wakes up.
+  (dotimes [_ 20]
+    (let [o (owner/start! {:check! noop :cleanup! noop})
+          value (owner/invoke! o (fn [] :chunk))]
+      (owner/close! o)
+      (is (= :chunk value))))
+  (let [o (owner/start! {:check! noop :cleanup! noop})
+        release (promise)
+        worker (outcome #(owner/invoke! o (fn [] (deref release 1000 nil) :chunk)))]
+    (deliver release true)
+    (core/sleep 20)
+    (owner/close! o)
+    (is (= {:ok :chunk} (await worker)))))
+
+(def ^:dynamic *caller-binding* :root)
+
+(deftest jobs-see-caller-bindings-and-remain-owned
+  (let [o (owner/start! {:check! noop :cleanup! noop})
+        seen (binding [*caller-binding* :caller]
+               (owner/invoke! o (fn [] [*caller-binding*
+                                        (:category (ex-data (:err (capture #(owner/invoke! o noop)))))])))]
+    (is (= [:caller :operation-reentrant] seen))
+    (owner/finish! o)))
+
+(deftest terminal-cleanup-runs-even-after-attempt-drain
+  (let [cleanups (atom 0)
+        o (owner/start! {:check! noop :cleanup! (fn [] (swap! cleanups inc))})]
+    (owner/invoke! o (fn [] :ok))
+    (owner/finish-attempt! o)
+    (is (= 1 @cleanups))
+    (owner/close! o)
+    (is (= 2 @cleanups) "closing an owner with no open attempt still runs cleanup")))

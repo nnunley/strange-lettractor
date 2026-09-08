@@ -1,32 +1,8 @@
 (ns main
   (:require [attractor.context-discovery :as capacity] [attractor.execution :as execution]
+            [attractor.http-fixture :refer [run-fixture quote-shell]]
             [http :as http] [os :as os] [io :as io] [clojure.string :as str]
             [clojure.core :as core] [clojure.test :refer [deftest is]]))
-
-(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
-(defn run-fixture [f]
-  (let [runtime (os/getenv "LGX_LG")
-        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
-        port (+ 30000 (rand-int 20000)) token (str "capacity-" (rand-int 1000000000))
-        base (str "http://127.0.0.1:" port)
-        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
-                                                :max_command_timeout_ms 30000})
-        command (str (quote-shell runtime) " " (quote-shell (str (os/cwd) "/dev/context_discovery_server.lg"))
-                     " " port " " token)
-        worker (future ((:exec_command env) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
-    (try
-      (loop [remaining 100]
-        (let [response (capacity/call! #(http/request {:url (str base "/ready")}) {:timeout_ms 100})]
-          (cond
-            (= 200 (:status response))
-            (when-not (= token (:body response)) (throw (ex-info "Fixture port collision" {})))
-            (or (zero? remaining) (realized? worker)) (throw (ex-info "Fixture not ready" {}))
-            :else (do (core/sleep 20) (recur (dec remaining))))))
-      (f (str base "/" token))
-      (finally
-        ((:cleanup env))
-        (when (= ::pending (deref worker 3000 ::pending))
-          (throw (ex-info "Fixture process failed to join" {})))))))
 
 (deftest native-discovery-refresh-validation-and-cleanup
   (run-fixture

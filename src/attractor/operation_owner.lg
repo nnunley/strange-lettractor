@@ -1,0 +1,144 @@
+(ns attractor.operation-owner (:require [clojure.core :as core]))
+
+(def ^:dynamic *current-owner* nil)
+(defn- closed-error [] (ex-info "operation is closed" {:category :operation-closed}))
+(defn- reentrant-error [] (ex-info "reentrant operation invoke" {:category :operation-reentrant}))
+(defn- owned? [o] (identical? *current-owner* (:identity o)))
+(defn- cancelled-error []
+  (ex-info "operation scope was cancelled" {:category :operation-cancelled}))
+(defn- checked [o]
+  ;; Runs only on the coordinator, whose execution context carries the owned
+  ;; child scope (or, between attempts, the parent). Blocking natives return
+  ;; early and silently when that scope is cancelled, so cancellation of the
+  ;; parent must be observed explicitly or an idle coordinator would spin.
+  (if (core/scope-cancelled?)
+    (cancelled-error)
+    (try ((:check! o)) nil (catch Object e e))))
+(defn- unwrap [r] (if (contains? r :err) (throw (:err r)) (:ok r)))
+(defn- drain! [o & [terminal?]]
+  ;; Attempt drains act only on an open attempt. A terminal drain always runs
+  ;; cleanup so body-close attempts precede every terminal acknowledgement,
+  ;; even when the last attempt was already drained.
+  (let [scope (first (swap-vals! (:scope o) (fn [_] nil)))]
+    (when (or scope terminal?)
+      (let [err (try (binding [*current-owner* (:identity o)] ((:cleanup! o)))
+                     nil (catch Object e e))
+            join-err (when scope
+                       (try (core/scope-close! scope 0) nil (catch Object e e)))]
+        (or err join-err)))))
+
+(defn- terminal! [o primary]
+  ;; Only the coordinator performs this transition. Submissions and terminal
+  ;; election share one atom, so no command can be lost behind the drain.
+  (swap! (:state o) assoc :status :closing)
+  (let [cleanup-err (drain! o true)
+        err (or primary cleanup-err)
+        result (if err {:err err} {:ok nil})]
+    (swap! (:state o) assoc :status :closed :queue [])
+    (deliver (:done o) result)
+    result))
+
+(defn- take-command! [o]
+  (loop []
+    (let [s @(:state o)]
+      (when (seq (:queue s))
+        (if (compare-and-set! (:state o) s (assoc s :queue (vec (rest (:queue s)))))
+          (first (:queue s)) (recur))))))
+
+(defn- run-job! [o cmd]
+  (when-not @(:scope o) (reset! (:scope o) (core/scope-open)))
+  (let [result (promise)]
+    (core/future
+      (deliver result (try {:ok ((:fn cmd))} (catch Object e {:err e}))))
+    (loop []
+      (let [control (checked o)]
+        (cond
+          control (terminal! o control)
+          (:close? @(:state o)) (terminal! o nil)
+          (realized? result)
+          (let [r @result]
+            ;; Failed attempts drain before exposing their original error;
+            ;; they remain retryable until the caller finishes the operation.
+            (when (contains? r :err) (drain! o))
+            (if-let [err (checked o)]
+              (terminal! o err)
+              ;; A completed value is owed to its caller: a concurrent close
+              ;; request stops later work, not output that was already read.
+              (if (and (:close? @(:state o)) (contains? r :err))
+                (terminal! o nil)
+                (deliver (:reply cmd) r))))
+          :else (do (core/sleep 1) (recur)))))))
+
+(defn- coordinator! [o]
+  (try
+    (reset! (:scope o) (core/scope-open))
+    (loop []
+      (when (= :running (:status @(:state o)))
+        (let [err (checked o)]
+          (cond
+            err (terminal! o err)
+            (:close? @(:state o)) (terminal! o nil)
+            :else
+            (if-let [cmd (take-command! o)]
+              (case (:type cmd)
+                :invoke (run-job! o cmd)
+                :finish (terminal! o nil)
+                :attempt (let [err (drain! o)]
+                           (deliver (:reply cmd) (if err {:err err} {:ok nil}))))
+              ;; Idle between demanded jobs: control latency of a few
+              ;; milliseconds is enough for deadlines and aborts.
+              (core/sleep 5))))
+        (recur)))
+    (catch Object e (terminal! o e))))
+
+(defn start!
+  "Start a parent-scoped coordinator with check! and cleanup! callbacks.
+   Only the coordinator opens/closes child scopes; successful jobs retain them."
+  [opts]
+  (let [o {:identity (atom nil) :state (atom {:status :running :queue [] :close? false})
+           :scope (atom nil) :done (promise)
+           :check! (:check! opts) :cleanup! (:cleanup! opts)}]
+    (core/future (coordinator! o))
+    o))
+
+(defn- submit! [o type f]
+  (when (owned? o) (throw (reentrant-error)))
+  (let [reply (promise)
+        ;; The job runs under the coordinator's scope but with the caller's
+        ;; dynamic bindings, plus the owner identity so owned callbacks that
+        ;; close the operation never wait on themselves.
+        job (when f (binding [*current-owner* (:identity o)] (bound-fn* f)))]
+    (loop []
+      (let [s @(:state o)]
+        (if (= :running (:status s))
+          (when-not (compare-and-set! (:state o) s
+                     (update s :queue conj {:type type :fn job :reply reply})) (recur))
+          nil)))
+    (loop []
+      (cond
+        ;; A delivered reply wins over a terminal that lands in the same tick.
+        (realized? reply) (unwrap @reply)
+        (realized? (:done o))
+        (let [r @(:done o)]
+          (if (= :invoke type) (throw (or (:err r) (closed-error))) (unwrap r)))
+        ;; Timed deref blocks even when this caller's own scope is cancelled;
+        ;; sleep would return immediately and spin during a long drain.
+        :else (do (deref reply 1 nil) (recur))))))
+
+(defn invoke!
+  "Serialize demanded work. Failed jobs drain the attempt before throwing;
+   finish-attempt! and subsequent invoke! may then begin a retry."
+  [o f]
+  (when (= :closed (:status @(:state o))) (throw (closed-error)))
+  (submit! o :invoke f))
+(defn finish-attempt!
+  "Drain the current attempt. The next invoke lazily opens its successor."
+  [o] (submit! o :attempt nil))
+(defn finish! "Drain and finish the operation." [o] (submit! o :finish nil))
+(defn close!
+  "Request closure. External callers await drainage; owned callbacks must
+   return to let the coordinator join them, so they only request closure."
+  [o]
+  (swap! (:state o) assoc :close? true)
+  (when-not (owned? o) (unwrap @(:done o))))
+(defn closed? [o] (= :closed (:status @(:state o))))

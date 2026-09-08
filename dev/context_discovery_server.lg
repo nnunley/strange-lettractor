@@ -3,6 +3,51 @@
 
 (defn reply [body] {:status 200 :headers {"Content-Type" "application/json"}
                     :body (json/write-json body)})
+
+;; OpenAI Responses SSE fixtures. A lazy-seq body streams frame by frame, so a
+;; scenario can hold the connection open mid-body or pace chunks; the runtime
+;; flushes each element as it is realized.
+(defn frame [event body]
+  (str "event: " event "\ndata: " (json/write-json (assoc body :type event)) "\n\n"))
+(defn completed-frame [output]
+  (frame "response.completed"
+         {:response {:id "r" :status "completed" :model "fixture" :output output
+                     :usage {:input_tokens 1 :output_tokens 1}}}))
+(defn text-frames [deltas]
+  (concat
+    [(frame "response.output_item.added" {:item {:id "m" :type "message" :role "assistant" :content []}})]
+    (map (fn [delta] (frame "response.output_text.delta" {:item_id "m" :content_index 0 :delta delta})) deltas)
+    [(frame "response.output_text.done" {:item_id "m" :content_index 0 :text (apply str deltas)})]))
+(defn text-output [text]
+  [{:id "m" :type "message" :role "assistant" :content [{:type "output_text" :text text}]}])
+(defn paced [frames pause-ms]
+  (lazy-seq (when-let [remaining (seq frames)]
+              (cons (first remaining)
+                    (lazy-seq (when (next remaining) (sleep pause-ms)) (paced (rest remaining) pause-ms))))))
+(defn sse [body] {:status 200 :headers {"Content-Type" "text/event-stream"} :body body})
+(defn sse-scenario [scenario state]
+  (case scenario
+    ;; Headers and the first delta arrive, then the body is held open.
+    "held-body" (do (swap! state update :held_requests (fnil inc 0))
+                    (sse (lazy-seq (cons (frame "response.created" {})
+                                         (lazy-seq (concat (take 2 (text-frames ["held" "!"]))
+                                                           (lazy-seq (sleep 3000)
+                                                                     (list (completed-frame (text-output "held!"))))))))))
+    ;; Normal paced multi-chunk completion.
+    "sse" (sse (paced (concat [(frame "response.created" {})] (text-frames ["a" "b" "c"])
+                              [(completed-frame (text-output "abc"))]) 20))
+    ;; First request streams a tool call; the continuation streams text.
+    "tool" (let [n (get (swap! state update :tool_requests (fnil inc 0)) :tool_requests)]
+             (if (= 1 n)
+               (let [item {:id "fc" :type "function_call" :call_id "call-1" :name "echo" :arguments "{\"value\":\"x\"}"}]
+                 (sse (paced [(frame "response.created" {})
+                              (frame "response.output_item.added" {:item (assoc item :arguments "")})
+                              (frame "response.function_call_arguments.delta" {:item_id "fc" :delta "{\"value\":\"x\"}"})
+                              (frame "response.output_item.done" {:item item})
+                              (completed-frame [item])] 20)))
+               (sse (paced (concat [(frame "response.created" {})] (text-frames ["do" "ne"])
+                                   [(completed-frame (text-output "done"))]) 20))))
+    nil))
 (defn handler [token state]
   (fn [request]
     (let [[_ supplied scenario operation] (str/split (:path request) #"/")]
@@ -11,11 +56,24 @@
         (not= supplied token) {:status 404 :body "unknown fixture"}
         (= scenario "control")
         (do (reset! state (read-string (:body request))) {:status 200 :body "ok"})
+        (= scenario "state") (reply {:held_requests (or (:held_requests @state) 0)
+                                     :tool_requests (or (:tool_requests @state) 0)})
+        ;; Headers arrive, then the buffered JSON body is held open.
+        (and (= operation "v1") (= scenario "held-json"))
+        (do (swap! state update :held_requests (fnil inc 0))
+            {:status 200 :headers {"Content-Type" "application/json"}
+             :body (lazy-seq (sleep 3000)
+                             (list (json/write-json {:id "r" :status "completed" :model "fixture"
+                                                     :output (text-output "late") :usage {}})))})
         (= scenario "http-error") {:status 503 :body "fixture secret must not escape"}
         (= scenario "bad-json") {:status 200 :body "{"}
+        (and (= operation "v1") (contains? #{"held-body" "sse" "tool"} scenario))
+        (sse-scenario scenario state)
         (= operation "v1")
         (do
-          (when (= scenario "held") (sleep 3000))
+          (when (= scenario "held")
+            (swap! state update :held_requests (fnil inc 0))
+            (sleep 3000))
           (reply {:data [{:id (if (= scenario "mismatch") "other" (or (:model @state) "fixture"))
                          :owned_by (if (= scenario "unsupported") "other" "llamacpp")
                          :meta {:n_ctx_train 9999999}}]}))
