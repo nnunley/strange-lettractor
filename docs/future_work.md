@@ -52,49 +52,96 @@ The design session should settle:
 
 ## Self-improving harness (requested 2026-09-08)
 
-The user keeps a private note on a self-improving harness; this public entry
-records the request and the questions to settle, not the note's content. The
-premise: Attractor now drives external agents and its own native loop from a
-console over a hub, and the remaining specification work is meant to be done
-from inside that console. A self-improving harness closes the loop: the
-framework proposes, applies, verifies and records changes to itself under the
-same ownership, evidence and publication rules a human session follows.
+The premise: Attractor now drives external agents and its own native loop
+from a console over a hub, and the remaining specification work is meant to
+be done from inside that console. A self-improving harness closes the loop:
+the framework proposes, applies, verifies and records changes to itself under
+the same ownership, evidence and publication rules a human session follows.
+The user's private notes hold an operating-model essay (shared with them by a
+colleague) whose general principles shape this entry; the essay itself is not
+in the repository.
+
+Principles carried over from that essay:
+
+- **The unit of delegation is a work package**, not a role: intended outcome,
+  relevant sources and revisions, permitted scope, applicable contracts,
+  non-goals, acceptance evidence, resource limits and stop conditions.
+  "Improve the importer" is not a package; "add interpretation for this
+  construct, preserve these semantics, report these unsupported cases,
+  demonstrate against these fixtures" is.
+- **Separate creating an answer from establishing that it is right.** The
+  evaluator starts from the requirement, the contracts and independent
+  evidence, not from the implementer's explanation. Two agents agreeing is not
+  proof; for the highest-risk work ask what evidence would reveal that both
+  are wrong: a historical regression, a reference result approved by a domain
+  expert, a consumer-owned acceptance case, an invariant checked over
+  generated inputs.
+- **Autonomy attaches to a task class and a permission scope**, never to a
+  belief that a given agent is trustworthy. Three classes: bounded,
+  reversible, non-semantic work with strong checks (eligible for substantial
+  automation, including narrowly authorized merge paths); implementation
+  within established contracts (agent implementation and verification, human
+  review by risk and track record); changes to meaning, compatibility,
+  security boundaries or commitments (explicit human decision first).
+  Documentation-only does not mean low risk. Widen autonomy on evidence,
+  narrow it on failure.
+- **Enforce permissions outside the prompt.** Filesystem, network,
+  credential and publication rights are technical controls; external
+  documents, repository content and imported data are untrusted inputs, not
+  sources of authority.
+- **Keep an evaluation suite for the workflows themselves**: representative
+  past tasks, tricky constraints, expected escalations. Re-run it when
+  models, instructions, tools or permissions change; inspect the actual
+  cases, since one severe semantic failure outweighs a flattering average.
+- **A shared work ledger** where requests become decisions, with response
+  distinguished from commitment, work in progress limited by the capacity to
+  verify and integrate, and status assembled from evidence rather than
+  inferred from merged changes.
+- **A periodic cold-start test**: a fresh agent given only the recorded
+  materials must find the constraints, the evidence and the uncertainty. That
+  tests whether the operating model works without an undocumented human
+  dependency.
+- **Start with one complete workflow**, then automate its repeated parts,
+  rather than building a platform first. Every correction should improve
+  something durable: a bug improves the corpus, a review correction improves
+  the checks or the recorded guidance.
 
 The design session should settle:
 
-- **What "improve" means.** Candidate targets: conformance gaps in the
-  iteration roadmap, review findings, failing or flaky evidence, runtime
-  follow-ups in `let-go-followups.md`, and documentation drift. Decide which
-  are eligible for autonomous work and which stay human-directed.
+- **Eligible targets and their classes.** Roadmap gaps, review findings,
+  failing or flaky evidence, `let-go-followups.md` items and documentation
+  drift, each assigned to one of the three autonomy classes above.
 - **The loop as a workflow.** Express the cycle as a DOT pipeline the hub runs
-  (select target, plan, implement through `/agent` or a native session,
-  verify, review, publish or discard), so it uses pinned recovery,
-  checkpoints and human gates rather than a bespoke scheduler. Decide what a
-  single iteration is allowed to change (files, worktree, branch) and how
-  parallel iterations are isolated.
-- **Verification as the gate.** An iteration succeeds only on mechanical
-  evidence: the impacted scenarios, the full sentinel suite, a bundle outside
-  the checkout, and an independent review through a different agent than the
-  implementer. No claim of completion from test counts alone; the existing
-  behavior corpus and coverage ledger are the source of truth.
-- **Ownership and safety.** The harness runs under hub ownership with the
-  same cancellation and drainage guarantees as any agent job. Publication
-  stays explicit: verified checkpoints to `main`/`console`, never private
-  notes, never force pushes, and no permission escalation beyond what the
-  user configured for that agent. Reading transcripts, records or model output
-  never evaluates code.
-- **Memory and learning.** How an iteration records what it tried, what
-  failed and why, so later iterations do not repeat it: the iteration log,
-  brain notes, and let-go follow-ups already exist; decide what is written
-  automatically and in what form. Decide whether the harness may edit its own
-  prompts, skills and workflow definitions, and under what review.
-- **Budget and stopping.** Bounded model spend and wall-clock per iteration,
-  discovered model capacity rather than assumed, a stop condition the user
-  sets (goal, count, time), and an idle/quiet state that does not burn tokens.
+  (select target, package, implement through `/agent` or a native session,
+  verify, independent review, publish or discard), reusing pinned recovery,
+  checkpoints and human gates. Decide what one iteration may change (files,
+  worktree, branch) and how parallel iterations are isolated.
+- **Verification as the only gate.** Impacted scenarios, the full sentinel
+  suite, a bundle outside the checkout, and a review by a different agent
+  than the implementer; the behavior corpus and coverage ledger are the source
+  of truth, never test counts.
+- **Ownership and safety.** Hub ownership with the same cancellation and
+  drainage guarantees as any agent job; explicit publication of verified
+  checkpoints only; no private notes, no force pushes, no permission
+  escalation beyond the user's configuration for that agent; reading
+  transcripts, records or model output never evaluates code.
+- **Memory.** What an iteration records automatically (iteration log, brain
+  notes, follow-ups) so later iterations do not repeat it, and whether the
+  harness may edit its own prompts, skills and workflow definitions, and under
+  what review class.
+- **Budget and stopping.** Bounded spend and wall-clock per iteration,
+  discovered model capacity, a user-set stop condition (goal, count, time),
+  and a quiet idle state.
 - **Evidence.** One autonomous iteration that closes a real roadmap gap end to
-  end from the console, with its review and publication visible in the hub
-  event log, and one that correctly discards a change that failed
-  verification.
+  end from the console with its review and publication visible in the hub
+  event log; one that correctly discards a change that failed verification;
+  and one cold-start run.
+
+Follow-ups noted with the request: consider converting the operating-model
+essay into this project's natural-language spec form or an RFC so its rules
+become checkable, and read the two references it cites, a case study on a
+long-running agent harness for multi-context software development and
+arXiv 2604.21003, before the design session.
 
 Depends on user configuration (above) for budgets, agent defaults and
 publication targets, and on executable packets (below) if iterations are to
