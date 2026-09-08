@@ -107,8 +107,20 @@ reports dropped events); Ctrl-C throwing when the hub cannot answer; the
 warns and propagates a real exit code); console model resolution diverging
 from run/resume; `:eval_start` sequenced after a fast result; `#uuid` ids;
 bare lines for empty text; fixture-only `:scenario` accepted from any request.
-Recorded, not fixed: finished sessions/runs/workers are never pruned; reader
+Recorded, not fixed: finished sessions/runs/agent jobs are never pruned; reader
 futures stay parked after quit (masked by process exit in the CLI).
+
+## SCN-HUMAN-GATES (2026-09-08)
+
+Human gates no longer read stdin under the console. The hub publishes each
+`wait.human` question as a `:source :question` event with its options and
+`timeout_seconds`; the console renders `[run id] ? text` with `[key] label`
+lines and answers through `/answer <key or text>` (focused run first, or the
+only waiting run). `/list` marks runs "waiting for an answer"; `--auto-approve`
+now merely selects the first option. Evidence: `dev/hub_console_ops_tests.lg`
+12 tests / 68 assertions and `dev/console_session_tests.lg` 7 / 73. This
+closes the console's "cannot answer human gates" limitation and proves
+ATTR-HUM-02 at the hub seam; the standalone stdin interviewer is unchanged.
 
 ## SCN-CONSOLE-INPUT
 

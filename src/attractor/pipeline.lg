@@ -1,5 +1,5 @@
 (ns attractor.pipeline
-  (:require [attractor.engine :as engine]
+  (:require [attractor.ids :as ids] [attractor.engine :as engine]
             [attractor.capture :as capture]
             [attractor.context :as context]
             [attractor.parser :as parser]
@@ -328,11 +328,7 @@
             (if (seq changes) [(drift-diagnostic changes)] [])))))
 
 (defn- fresh-logs-root []
-  (let [printed (str (random-uuid))
-        uuid (or (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-                                  printed))
-                 printed)]
-    (str "attractor_runs/run_" (System/currentTimeMillis) "-" uuid)))
+  (str "attractor_runs/run_" (System/currentTimeMillis) "-" (ids/uuid-text)))
 
 (defn run
   "Prepare DOT source, reject validation errors, then execute the prepared graph.

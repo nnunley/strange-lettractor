@@ -1,5 +1,5 @@
 (ns attractor.context
-  (:require [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.string :as str]
             [clojure.edn :as edn]
             [clojure.core :as core]
             [json :as json]
@@ -332,7 +332,7 @@
                 (let [art-dir (str base-dir "/artifacts")
                       _ (io/mkdir art-dir)
                       file-path (str art-dir "/" id ".edn")
-                      temp-path (str file-path ".tmp-" (random-uuid))]
+                      temp-path (str file-path ".tmp-" (ids/uuid-text))]
                   (try
                     (io/spit temp-path serialized)
                     (move-artifact-file! temp-path file-path)

@@ -1,17 +1,14 @@
 (ns attractor.hub
-  (:require [clojure.core :as core] [async :as async] [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.core :as core] [async :as async] [clojure.string :as str]
             [attractor.agent :as agent] [attractor.pipeline :as pipeline]
+            [attractor.interviewer :as interviewer]
             [attractor.agents.registry :as registry]))
 
 (defn- locked [lock f]
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
   (try (f) (finally (reset! lock false))))
 (defn- fail! [category] (throw (ex-info (name category) {:category category})))
-(defn- fresh-id
-  ;; `str` of a UUID keeps the #uuid tag in this runtime (nooga/let-go#809);
-  ;; extract the canonical text so ids stay plain strings.
-  [prefix]
-  (str prefix "-" (re-find #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" (str (random-uuid)))))
+(defn- fresh-id [prefix] (ids/prefixed prefix))
 (defn- error-data [error]
   {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
@@ -95,6 +92,44 @@
 (defn- finish-under-lock! [hub f]
   (locked (:event_lock hub) f))
 
+(defn- question-entry! [hub id]
+  (or (get @(:questions hub) id) (fail! :unknown-question)))
+
+(defn- ask-through-hub!
+  "Publish a question as a hub event and wait for :question/answer, honoring
+   timeout_seconds with a deadline on the answer promise and releasing on run
+   cancellation. Never touches stdin."
+  [hub run-id cancelled? question]
+  (let [id (fresh-id "question") answer (promise)
+        deadline (when-let [seconds (:timeout_seconds question)]
+                   (+ (System/currentTimeMillis) (long (* 1000.0 (double seconds)))))]
+    (swap! (:questions hub) assoc id {:question_id id :run_id run-id :question question :answer answer})
+    (append-envelope! hub {:source :question :question_id id :run_id run-id
+                           :event {:type :question :question question}})
+    (let [result (loop []
+                   (let [value (deref answer 50 ::pending)]
+                     (cond
+                       (not= ::pending value) value
+                       (cancelled?) {:value :skipped :text "run cancelled"}
+                       (and deadline (>= (System/currentTimeMillis) deadline))
+                       (or (:default question) {:value :timeout})
+                       :else (recur))))]
+      (swap! (:questions hub) dissoc id)
+      (append-envelope! hub {:source :question :question_id id :run_id run-id
+                             :event {:type :answered :answer result}})
+      result)))
+
+(deftype HubInterviewer [hub runid cancelled]
+  ;; let-go's deftype rewrites field references in call forms but not inside
+  ;; map literals, so each method binds the fields it needs first.
+  interviewer/IInterviewer
+  (ask [_ question] (ask-through-hub! hub runid cancelled question))
+  (ask-multiple [this questions] (vec (map (fn [q] (interviewer/ask this q)) questions)))
+  (inform [_ message stage]
+    (let [h hub r runid]
+      (append-envelope! h {:source :question :run_id r
+                           :event {:type :inform :message message :stage stage}}))))
+
 (defn- workflow-entry! [hub id]
   (or (get @(:workflows hub) id) (fail! :unknown-run)))
 (defn- agent-entry! [hub id]
@@ -134,7 +169,10 @@
       (let [run-id (fresh-id "run") cancelled (atom false) completion (promise)
             base {:source :workflow :run_id run-id}
             emit (fn [event] (append-envelope! hub (assoc base :event event)))
-            registry ((:workflow_registry_fn hub) request)
+            ;; The registry factory receives a hub-backed interviewer bound to
+            ;; this run; it may still choose auto-approve.
+            registry ((:workflow_registry_fn hub)
+                      (assoc request :interviewer (->HubInterviewer hub run-id (fn [] @cancelled))))
             ;; Register before launching so a fast failure cannot publish
             ;; :done ahead of the entry and be overwritten.
             _ (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
@@ -155,6 +193,17 @@
     (let [entry (workflow-entry! hub (:run_id request))]
       (reset! (:cancelled entry) true)
       {:run_id (:run_id request) :completion (:completion entry)})
+    :question/list
+    (mapv (fn [[id e]] {:question_id id :run_id (:run_id e) :question (:question e)}) @(:questions hub))
+    :question/answer
+    (let [entry (question-entry! hub (:question_id request))
+          value (or (:value request) (:text request))]
+      (when-not (string? value) (fail! :invalid-request))
+      ;; Claim the question atomically so a second answer is rejected even
+      ;; before the waiting interviewer wakes up.
+      (swap! (:questions hub) dissoc (:question_id request))
+      (deliver (:answer entry) {:value value :text (or (:text request) value)})
+      {:question_id (:question_id request) :answered true})
     :workflow/list
     (mapv (fn [[id e]] {:run_id id :source_path (:source_path e) :done (:done e) :cancelled @(:cancelled e)})
           @(:workflows hub))
@@ -304,7 +353,7 @@
   (let [ns (:user_ns hub)]
     (intern ns 'hub hub)
     (intern ns 'request! (fn [op & [fields]]
-                           (deref (request! hub (merge {:id (str (random-uuid)) :op op} fields)))))
+                           (deref (request! hub (merge {:id (ids/uuid-text) :op op} fields)))))
     (intern ns 'events-since (fn [client-id cursor] (events-since hub client-id cursor)))
     (intern ns '*session* nil)
     (intern ns '*run* nil)
@@ -326,7 +375,7 @@
                :allow_agent_scenario (boolean (:allow_agent_scenario opts))
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})
-               :eval (atom {:busy false}) :workflows (atom {}) :agents (atom {})
+               :eval (atom {:busy false}) :workflows (atom {}) :agents (atom {}) :questions (atom {})
                :user_ns (create-ns (user-ns-name))
                :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}
           hub (init-user-ns! hub)]

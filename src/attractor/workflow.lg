@@ -1,5 +1,5 @@
 (ns attractor.workflow
-  (:require [clojure.core :as core]
+  (:require [attractor.ids :as ids] [clojure.core :as core]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
@@ -243,11 +243,7 @@
 (def publish-lock-wait-ms 500)
 (def publish-lock-poll-ms 5)
 
-(defn- uuid-text []
-  (let [printed (str (random-uuid))]
-    (or (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-                         printed))
-        printed)))
+(defn- uuid-text [] (ids/uuid-text))
 
 (defn- snapshot-error! [message data]
   (throw (ex-info message (merge {:category :workflow_snapshot_corrupt} data))))

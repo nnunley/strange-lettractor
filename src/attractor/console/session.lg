@@ -3,14 +3,14 @@
    the focus (selected session/run/agent job), the input reducer state and the
    rendering of hub event envelopes into lines. Line and TUI frontends feed
    it input events and print what it returns; they never touch the hub."
-  (:require [clojure.string :as str] [clojure.core :as core] [io :as io] [os :as os]
+  (:require [attractor.ids :as ids] [clojure.string :as str] [clojure.core :as core] [io :as io] [os :as os]
             [attractor.hub :as hub] [attractor.console.input :as input]
             [attractor.agents.registry :as registry]))
 
 (defn- fail! [message] (throw (ex-info message {:category :console})))
-(defn- short-id [id] (if (string? id) (last (str/split id #"-")) (str id)))
+(defn- short-id [id] (ids/short id))
 (defn- request! [console op fields]
-  (let [reply (deref (hub/request! (:hub console) (merge {:id (str (random-uuid)) :op op} fields))
+  (let [reply (deref (hub/request! (:hub console) (merge {:id (ids/uuid-text) :op op} fields))
                      (:request_timeout_ms console) {:error {:category :request-timeout}})]
     (if-let [error (:error reply)]
       (fail! (str (name op) " failed: " (name (or (:category error) :error))
@@ -126,9 +126,22 @@
                     []))
       [])))
 
+(defn- question-lines [envelope]
+  (let [tag (str "[run " (short-id (:run_id envelope)) "]") ev (:event envelope)]
+    (case (:type ev)
+      :question (let [q (:question ev)]
+                  (into [(str tag " ? " (:text q)
+                              (when (:timeout_seconds q) (str " (" (:timeout_seconds q) "s)")))]
+                        (concat (map #(str tag "   [" (:key %) "] " (:label %)) (:options q))
+                                [(str tag "   answer with /answer <key or text>")])))
+      :answered [(str tag " answered: " (let [a (:answer ev)] (if (keyword? (:value a)) (name (:value a)) (:value a))))]
+      :inform [(str tag " " (:stage ev) ": " (:message ev))]
+      [])))
+
 (defn render-envelope [console envelope]
   (case (:source envelope)
     :session (session-lines console envelope)
+    :question (question-lines envelope)
     :eval (eval-lines envelope)
     :workflow (workflow-lines envelope)
     :agent (agent-lines console envelope)
@@ -164,7 +177,8 @@
    "  : form          evaluate let-go in the hub console namespace"
    "  :{ / :}         begin / submit a multiline evaluation"
    "  \\text           literal agent text"
-   "  /help /list /new /focus <id> /run <file.dot> --auto-approve"
+   "  /help /list /new /focus <id> /run <file.dot> [--auto-approve]"
+   "  /answer <key or text>   answer the waiting human gate (focused run first)"
    "  /agent <name> <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
    "                        [--sandbox s] [--approval-policy p]   names: see /agent"
    "  /alias <name> <expansion>   define /<name> as a shortcut, e.g. /alias codex agent codex"
@@ -203,12 +217,14 @@
 (defn- list-lines [console]
   (let [c @console
         sessions (request! c :session/list {}) runs (request! c :workflow/list {}) jobs (request! c :agent/list {})
+        waiting (set (map :run_id (request! c :question/list {})))
         f (:focus c) mark (fn [kind id] (if (= f {:kind kind :id id}) "* " "  "))]
     (vec (concat
            (map #(str (mark :session (:session_id %)) "session " (short-id (:session_id %))
                       (when (:busy %) " busy") (when (:closed %) " closed")) sessions)
            (map #(str (mark :run (:run_id %)) "run " (short-id (:run_id %)) " " (:source_path %)
-                      (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) runs)
+                      (cond (:cancelled %) " cancelled" (:done %) " done"
+                            (contains? waiting (:run_id %)) " waiting for an answer" :else " running")) runs)
            (map #(str (mark :agent (:agent_id %)) (name (or (:agent %) :agent)) " " (short-id (:agent_id %))
                       (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) jobs)
            (when (and (empty? sessions) (empty? runs) (empty? jobs)) ["nothing running"])))))
@@ -235,17 +251,15 @@
         auto-approve? (boolean (or (:auto-approve flags) (:auto_approve defaults)))]
     (cond
       (seq missing) [(str "flag needs a value: " (str/join ", " missing))]
-      (str/blank? path) ["usage: /run <file.dot> --auto-approve [--logs-root dir]"]
+      (str/blank? path) ["usage: /run <file.dot> [--auto-approve] [--logs-root dir]"]
       (not (os/stat path)) [(str "no such file: " path)]
-      ;; Human gates would read the terminal out from under this frontend;
-      ;; until questions arrive as hub events, the console only runs
-      ;; auto-approved workflows.
-      (not auto-approve?) ["this console cannot answer human gates yet: add --auto-approve"]
       :else
+      ;; Human gates arrive as hub question events and are answered with
+      ;; /answer; --auto-approve selects the first option instead.
       (let [logs-root (or (:logs-root flags) (when-let [f (:logs_root_fn defaults)] (f path))
                           (str "attractor_runs/run_" (System/currentTimeMillis)))
             {:keys [run_id]} (request! c :workflow/run {:dot_source (io/slurp path) :source_path path
-                                                        :logs_root logs-root :auto_approve true})]
+                                                        :logs_root logs-root :auto_approve auto-approve?})]
         (focus! console :run run_id)
         [(str "run " (short-id run_id) " started from " path " (logs: " logs-root ")")]))))
 
@@ -290,6 +304,19 @@
       text)
     text))
 
+(defn- answer! [console text]
+  (let [c @console f (:focus c)
+        pending (request! c :question/list {})
+        focused (filter #(= (:id f) (:run_id %)) pending)
+        chosen (cond (seq focused) (first focused) (= 1 (count pending)) (first pending) :else nil)]
+    (cond
+      (str/blank? text) ["usage: /answer <key or text>"]
+      (empty? pending) ["no question is waiting"]
+      (nil? chosen) (into ["several runs are waiting; /focus one first:"]
+                          (map #(str "  run " (short-id (:run_id %)) " ? " (get-in % [:question :text])) pending))
+      :else (do (request! c :question/answer {:question_id (:question_id chosen) :value (str/trim text)})
+                [(str "answered run " (short-id (:run_id chosen)) ": " (str/trim text))]))))
+
 (defn- cancel! [console]
   (let [c @console {:keys [kind id]} (:focus c)]
     (case kind
@@ -325,6 +352,7 @@
              [(if-let [{:keys [kind id]} (:focus @console)] (str "focus: " (name kind) " " (short-id id)) "focus: none")]
              (focus-by-id! console (str/trim args)))
     :run (run! console args)
+    :answer (answer! console args)
     :agent (agent! console args)
     :alias (alias! console args)
     :cancel (cancel! console)

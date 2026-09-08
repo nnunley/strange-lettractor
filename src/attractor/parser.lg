@@ -166,6 +166,13 @@
         (re-matches #"^-?[0-9]*\.[0-9]+$" v) (parse-double v)
         :else v))))
 
+;; Integer-typed attributes (spec §2.5/§2.6) keep their type even when the DOT
+;; author quotes the value, which the spec's own examples do.
+(defn- typed-integer [v]
+  (if (and (string? v) (re-matches #"^-?[0-9]+$" v)) (parse-long v) v))
+(defn- typed-boolean [v]
+  (cond (= v "true") true (= v "false") false :else v))
+
 ;; Parse an attribute block starting at token idx: [ key=val, key2=val2 ... ]
 ;; Returns [attrs next-idx]
 (defn- parse-attr-block-tokens [tokens start-idx]
@@ -383,7 +390,7 @@
                                                            :shape (or (:shape defaults) "box")
                                                            :type (or (:type defaults) "")
                                                            :prompt ""
-                                                           :max_retries (:max_retries defaults)
+                                                           :max_retries (typed-integer (:max_retries defaults))
                                                            :goal_gate false
                                                            :retry_target ""
                                                            :fallback_retry_target ""
@@ -438,8 +445,8 @@
                           :shape (or (:shape merged-attrs) (:shape existing-node) "box")
                           :type (or (:type merged-attrs) (:type existing-node) "")
                           :prompt (or (:prompt merged-attrs) (:prompt existing-node) "")
-                          :max_retries (or (:max_retries merged-attrs) (:max_retries existing-node))
-                          :goal_gate (boolean (or (:goal_gate merged-attrs) false))
+                          :max_retries (typed-integer (or (:max_retries merged-attrs) (:max_retries existing-node)))
+                          :goal_gate (boolean (typed-boolean (or (:goal_gate merged-attrs) false)))
                           :retry_target (or (:retry_target merged-attrs) "")
                           :fallback_retry_target (or (:fallback_retry_target merged-attrs) "")
                           :fidelity (:fidelity merged-attrs)
@@ -527,7 +534,7 @@
              :goal (or (:goal ga) "")
              :label (or (:label ga) "")
              :model_stylesheet (or (:model_stylesheet ga) "")
-             :default_max_retries (or default-max-retries 0)
+             :default_max_retries (typed-integer (or default-max-retries 0))
              :default_fidelity (or (:default_fidelity ga) "")
              :retry_target (or (:retry_target ga) "")
              :fallback_retry_target (or (:fallback_retry_target ga) "")

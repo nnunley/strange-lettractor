@@ -1,5 +1,5 @@
 (ns attractor.agents.claude
-  (:require [attractor.execution :as execution] [clojure.core :as core]
+  (:require [attractor.ids :as ids] [attractor.execution :as execution] [clojure.core :as core]
             [clojure.string :as str] [io :as io] [os :as os] [json :as json]))
 
 (defn- fail! [category message] (throw (ex-info message {:category category :source :claude})))
@@ -26,7 +26,7 @@
   (let [opts (merge {:command ["claude"] :tools ["Read"] :permission_mode "plan"
                     :timeout_ms 120000 :working_dir (os/cwd)} options)
         _ (validate! opts)
-        job-id (str (random-uuid)) session-id (atom nil) terminal (atom nil)
+        job-id (ids/uuid-text) session-id (atom nil) terminal (atom nil)
         callback (or (:on_event opts) (fn [_] nil)) cancelled? (or (:cancelled? opts) (fn [] false))
         directory (str/trim (checked-sh "/usr/bin/mktemp" "-d"))
         files (atom []) reader (atom nil) completion (promise)

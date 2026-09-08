@@ -1,5 +1,5 @@
 (ns attractor.llm
-  (:require [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.string :as str]
             [clojure.core :as core]
             [json :as json]
             [os :as os]
@@ -1521,7 +1521,7 @@
 (defn normalize-gemini-tool-calls [parts]
   (mapv (fn [part]
           (let [call (get part "functionCall")]
-            {:id (or (get call "id") (str "call_" (random-uuid)))
+            {:id (or (get call "id") (str "call_" (ids/uuid-text)))
              :name (or (get call "name") "")
              :arguments (or (get call "args") {})}))
         (filter (fn [part] (some? (get part "functionCall"))) (or parts []))))
@@ -1582,7 +1582,7 @@
       (cond
         (some? (get part "functionCall"))
         (let [native (get part "functionCall")
-              call {:id (or (get native "id") (str "call_" (random-uuid)))
+              call {:id (or (get native "id") (str "call_" (ids/uuid-text)))
                     :name (or (get native "name") "")
                     :arguments (or (get native "args") {})}]
           [(conj parts {:kind :tool_call :tool_call call})
@@ -2316,7 +2316,7 @@
         provider-calls (filter (fn [part] (some? (get part "functionCall"))) parts)
         calls (mapv (fn [part]
                       (let [call (get part "functionCall")]
-                        {:id (or (get call "id") (str "call_" (random-uuid)))
+                        {:id (or (get call "id") (str "call_" (ids/uuid-text)))
                          :name (or (get call "name") "")
                          :arguments (or (get call "args") {})}))
                     provider-calls)

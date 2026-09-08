@@ -167,10 +167,12 @@
         hub (hub/start! {:session_options session-options
                          :workflow_registry_fn
                          (fn [request]
+                           ;; Human gates are hub questions answered from the
+                           ;; console; the stdin interviewer is never used here.
                            (handlers/make-handler-registry
                              (if (:auto_approve request)
                                (interviewer/make-auto-approve-interviewer)
-                               (interviewer/make-console-interviewer))
+                               (:interviewer request))
                              (make-codergen-backend-from-args args)
                              {:fan-in-ranker (make-fan-in-ranker-from-args args)}))})
         aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")

@@ -1,5 +1,7 @@
 (ns attractor.parser-test
   (:require [clojure.test :refer [deftest is testing run-tests]]
+            [clojure.string :as str]
+            [attractor.ids]
             [attractor.parser :as p]))
 
 (deftest test-linear-dot-parsing
@@ -112,3 +114,19 @@ digraph Chaining {
                  }")]
     (is (true? (:auto_status (p/find-node graph "inherited"))))
     (is (false? (:auto_status (p/find-node graph "disabled"))))))
+
+(deftest quoted-integer-and-boolean-attributes-keep-their-spec-types
+  ;; §2.5/§2.6 type max_retries and default_max_retries as Integer and
+  ;; goal_gate as Boolean; the spec's examples quote attribute values.
+  (let [g (p/parse-dot "digraph Q { graph [default_max_retries=\"3\"] start [shape=Mdiamond] work [prompt=\"w\", max_retries=\"2\", goal_gate=\"true\"] exit [shape=Msquare] start -> work -> exit }")
+        work (get-in g [:nodes "work"])]
+    (is (= 3 (:default_max_retries g)))
+    (is (= 2 (:max_retries work)))
+    (is (true? (:goal_gate work)))))
+
+(deftest identifiers-never-carry-the-uuid-reader-tag
+  (let [text (attractor.ids/uuid-text) run (attractor.ids/prefixed "run")]
+    (is (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" text))
+    (is (re-matches #"run-[0-9a-f-]{36}" run))
+    (is (= 12 (count (attractor.ids/short run))))
+    (is (not (str/includes? (str text run) "#uuid")))))

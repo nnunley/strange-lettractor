@@ -173,3 +173,81 @@
         ;; Without the scenario argument the fixture reads its default path.
         (is (not= :claude-result (get-in result [:error :category])) (pr-str result)))
       (finally (stop h)))))
+
+;; ATTR-HUM-02 at the hub seam: human gates are questions published as hub
+;; events and answered through a hub request, so no interviewer blocks stdin
+;; and timeout_seconds is honored by a deadline on the answer promise.
+(def ^:private gate-dot
+  (str "digraph G { graph [goal=\"gate\"] start [shape=Mdiamond] "
+       "gate [shape=hexagon, label=\"Ship it?\"%s] "
+       "ship [shape=box, prompt=\"ship\"] hold [shape=box, prompt=\"hold\"] exit [shape=Msquare] "
+       "start -> gate gate -> ship [label=\"Ship\"] gate -> hold [label=\"Hold\"] ship -> exit hold -> exit }"))
+(defn- gate-options []
+  (assoc (options) :workflow_registry_fn
+         (fn [request] (handlers/make-handler-registry (:interviewer request) nil {}))))
+(defn- started-nodes [evs]
+  (set (keep #(when (= :stage.started (get-in % [:event :type])) (get-in % [:event :node_id])) evs)))
+(def ^:private gate-runs (atom 0))
+(defn- run-gate! [h root attrs]
+  ;; Each run gets its own root: pinned publication rejects a different
+  ;; workflow in an existing run root.
+  (let [n (swap! gate-runs inc) path (str root "/gate-" n ".dot")]
+    (io/spit path (format gate-dot attrs))
+    (:value (req h :workflow/run {:dot_source (io/slurp path) :source_path path :logs_root (str root "/logs-" n)}))))
+
+(deftest human-gate-questions-are-hub-events-answered-by-request
+  (let [h (hub/start! (gate-options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [client (:value (req h :client/attach {})) run (run-gate! h root "")]
+        (is (true? (await-true #(seq (:value (req h :question/list {}))) 3000)))
+        (let [[q] (:value (req h :question/list {}))
+              evs (events h client)
+              question-event (first (filter #(= :question (:source %)) evs))]
+          (is (= (:run_id run) (:run_id q)))
+          (is (= "Ship it?" (get-in q [:question :text])))
+          (is (= ["S" "H"] (mapv :key (get-in q [:question :options]))))
+          (is (= (:question_id q) (:question_id question-event)))
+          (is (= :unknown-question (get-in (req h :question/answer {:question_id "nope" :value "H"}) [:error :category])))
+          (is (nil? (:error (req h :question/answer {:question_id (:question_id q) :value "H"}))))
+          (is (= :unknown-question (get-in (req h :question/answer {:question_id (:question_id q) :value "S"}) [:error :category]))
+              "an answered question cannot be answered again"))
+        (let [outcome (deref (:completion run) 10000 {:error {:category :test-timeout}})
+              evs (events h client)]
+          (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
+          (is (contains? (started-nodes evs) "hold"))
+          (is (not (contains? (started-nodes evs) "ship")))
+          (is (some #(and (= :question (:source %)) (= :answered (get-in % [:event :type]))
+                          (= "H" (get-in % [:event :answer :value]))) evs))
+          (is (empty? (:value (req h :question/list {}))))))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest human-gate-timeout-uses-default-choice-without-blocking
+  (let [h (hub/start! (gate-options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [client (:value (req h :client/attach {}))
+            started (System/currentTimeMillis)
+            run (run-gate! h root ", human.timeout_seconds=\"0.2\", human.default_choice=\"hold\"")
+            outcome (deref (:completion run) 10000 {:error {:category :test-timeout}})
+            evs (events h client)]
+        (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
+        (is (< (- (System/currentTimeMillis) started) 5000))
+        (is (contains? (started-nodes evs) "hold"))
+        (is (some #(and (= :question (:source %)) (= :timeout (get-in % [:event :answer :value]))) evs)))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest human-gate-timeout-without-default-retries-and-cancel-releases-the-wait
+  (let [h (hub/start! (gate-options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [run (run-gate! h root ", human.timeout_seconds=\"0.2\", max_retries=\"0\"")
+            outcome (deref (:completion run) 10000 {:error {:category :test-timeout}})]
+        (is (not= :success (get-in outcome [:value :status])) (pr-str outcome))
+        (is (not= :test-timeout (get-in outcome [:error :category]))))
+      (let [run (run-gate! h root "")]
+        (is (true? (await-true #(seq (:value (req h :question/list {}))) 3000)))
+        (let [started (System/currentTimeMillis)]
+          (req h :workflow/cancel {:run_id (:run_id run)})
+          (let [outcome (deref (:completion run) 5000 {:error {:category :test-timeout}})]
+            (is (not= :test-timeout (get-in outcome [:error :category])) "cancel releases a waiting gate")
+            (is (< (- (System/currentTimeMillis) started) 3000))
+            (is (empty? (:value (req h :question/list {})))))))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))

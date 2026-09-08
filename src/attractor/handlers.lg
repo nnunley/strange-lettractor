@@ -224,10 +224,16 @@
       (if (empty? choices)
         {:status :fail :failure_reason "No outgoing edges for human gate"}
         (let [opts (map (fn [c] {:key (:key c) :label (:label c)}) choices)
-              question {:text (or (:label node) "Select an option:")
-                        :type :multiple_choice
-                        :options opts
-                        :stage (:id node)}
+              ;; human.timeout_seconds is a project extension: §6.2 defines the
+              ;; question field, §4.6 never populates it for wait.human nodes.
+              timeout-seconds (let [raw (get-in node [:attrs :human.timeout_seconds])]
+                                (when-not (str/blank? (str raw))
+                                  (try (Double/parseDouble (str raw)) (catch Object _ nil))))
+              question (cond-> {:text (or (:label node) "Select an option:")
+                                :type :multiple_choice
+                                :options opts
+                                :stage (:id node)}
+                         timeout-seconds (assoc :timeout_seconds timeout-seconds))
               answer (interviewer/ask interviewer question)]
 
           (cond

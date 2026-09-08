@@ -1,5 +1,5 @@
 (ns attractor.agent
-  (:require [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
@@ -451,7 +451,7 @@
             (discover-project-docs environment (:id profile)))
           snapshot (environment-snapshot environment profile)
           session
-          (atom {:id (or (:id options) (str "agent-" (random-uuid)))
+          (atom {:id (or (:id options) (ids/prefixed "agent"))
                  :model (:model profile)
                  :provider_profile profile
                  :context_capacity_fallback (:context_window_fallback profile)
@@ -1265,7 +1265,7 @@
                           parent-profile
                           (profiles/create-profile (:id parent-profile)
                                                    requested-model))
-          child-id (str "agent-" (random-uuid))
+          child-id (ids/prefixed "agent")
           child
           (make-session
             {:id child-id

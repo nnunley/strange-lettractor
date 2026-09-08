@@ -3,7 +3,7 @@
    deltas, identified events. Approval and permission requests from the server
    are refused with a JSON-RPC error; this agent never grants authority on the
    user's behalf. Completion requires a completed turn."
-  (:require [clojure.string :as str] [clojure.core :as core] [os :as os]
+  (:require [attractor.ids :as ids] [clojure.string :as str] [clojure.core :as core] [os :as os]
             [attractor.codex.transport :as transport]))
 
 (defn- fail! [category message & [data]]
@@ -26,7 +26,7 @@
   (let [opts (merge {:command ["codex" "app-server" "--stdio"] :sandbox "read-only" :approval_policy "never"
                      :timeout_ms 120000 :working_dir (os/cwd)} options)
         _ (validate! opts)
-        job-id (str (random-uuid))
+        job-id (ids/uuid-text)
         callback (or (:on_event opts) (fn [_] nil)) cancelled? (or (:cancelled? opts) (fn [] false))
         next-id (atom 0) replies (atom {}) text (atom "") turn (atom nil) thread (atom nil)
         done (promise) failure (atom nil)

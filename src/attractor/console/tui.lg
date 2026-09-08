@@ -5,7 +5,7 @@
    periodic hub-event ticks, and translates Ctrl-C into a console interrupt
    that the dispatcher routes by state (discard draft, cancel focus, or quit
    when idle)."
-  (:require [clojure.string :as str] [clojure.core :as core] [async :as async]
+  (:require [attractor.ids :as ids] [clojure.string :as str] [clojure.core :as core] [async :as async]
             [tiny-tui.core :as tui] [tiny-tui.input :as tinput]
             [tiny-tui.layout :as layout] [tiny-tui.style :as style] [tiny-tui.key :as key]
             [attractor.console.session :as session]))
@@ -20,7 +20,7 @@
 (defn- status-line [state]
   (let [{:keys [kind id]} (session/focus (:console state))
         parts (remove nil? [(when kind (str ({:session "session" :run "run" :agent "agent"} kind) " "
-                                            (last (str/split id #"-"))))
+                                            (ids/short id)))
                             (when (:buffering state) "multiline eval draft")])]
     (style/bold (str "attractor console" (when (seq parts) (str " — " (str/join " · " parts)))
                      "  (Ctrl-C: discard/cancel/quit)"))))

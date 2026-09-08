@@ -76,7 +76,7 @@
     (try
       (is (has (line c "/run") "usage"))
       (is (has (line c "/run /nonexistent.dot --auto-approve") "no such file"))
-      (is (has (line c (str "/run " path)) "cannot answer human gates") "stdin-reading gates are refused")
+      (is (has (line c (str "/run " path)) "started from") "human gates are hub questions now")
       (is (has (line c (str "/run " path " --logs-root")) "flag needs a value"))
       (is (has (line c (str "/run " path " --auto-approve --logs-root " root "/logs")) "started from"))
       (is (= :run (:kind (console/focus c))))
@@ -84,7 +84,7 @@
         (is (has rendered "[run "))
         (is (has rendered "stage work")))
       (is (has (line c "/agent claude hello --scenario success") "claude "))
-      (let [rendered (drain-until c #(str/includes? % "completed") 5000)]
+      (let [rendered (drain-until c #(and (str/includes? % "[claude") (str/includes? % "completed")) 5000)]
         (is (has rendered "[claude ") (pr-str rendered))
         (is (has rendered "héλ🙂")))
       (let [agents (line c "/list")]
@@ -152,3 +152,30 @@
       (is (has (drain-until c #(str/includes? % "completed") 8000) "[claude "))
       (is (has (line c "\\/cx literal") "→ agent") "escape still wins over aliases")
       (finally (console/close! c) (stop h)))))
+
+(def ^:private gate-dot
+  "digraph G { graph [goal=\"gate\"] start [shape=Mdiamond] gate [shape=hexagon, label=\"Ship it?\"] ship [shape=box, prompt=\"ship\"] hold [shape=box, prompt=\"hold\"] exit [shape=Msquare] start -> gate gate -> ship [label=\"Ship\"] gate -> hold [label=\"Hold\"] ship -> exit hold -> exit }")
+
+(deftest human-gates-are-answered-from-the-console
+  (let [h (hub/start! (assoc (hub-options) :workflow_registry_fn
+                             (fn [request] (handlers/make-handler-registry
+                                             (if (:auto_approve request) (interviewer/make-auto-approve-interviewer) (:interviewer request))
+                                             nil {}))))
+        root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) path (str root "/gate.dot") _ (io/spit path gate-dot)
+        c (console/open! h {:run_defaults {:logs_root_fn (fn [_] (str root "/logs"))}})]
+    (try
+      (is (has (line c "/answer H") "no question is waiting"))
+      (is (has (line c (str "/run " path)) "started from") "no --auto-approve needed")
+      (let [rendered (drain-until c #(str/includes? % "/answer") 5000)]
+        (is (has rendered "? Ship it?") (pr-str rendered))
+        (is (has rendered "[S] Ship"))
+        (is (has rendered "[H] Hold"))
+        (is (has rendered "/answer <key or text>")))
+      (is (has (line c "/list") "waiting for an answer"))
+      (is (has (line c "/answer H") "answered"))
+      (let [rendered (drain-until c #(str/includes? % "completed in") 10000)]
+        (is (has rendered "answered: H"))
+        (is (has rendered "stage hold"))
+        (is (not (has rendered "stage ship"))))
+      (is (has (line c "/answer H") "no question is waiting"))
+      (finally (console/close! c) (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))

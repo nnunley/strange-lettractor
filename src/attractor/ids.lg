@@ -1,0 +1,23 @@
+(ns attractor.ids
+  "Identifier text. In this let-go runtime `str` of a UUID keeps the `#uuid`
+   reader tag (nooga/let-go#809), which must never reach a file name, run
+   directory, wire id or log line. Every id in the project comes through here.")
+
+(def ^:private canonical #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+(defn uuid-text
+  "Canonical 36-character UUID text, never the tagged reader form."
+  []
+  (let [printed (str (random-uuid))]
+    (or (re-find canonical printed) printed)))
+
+(defn prefixed
+  "<prefix>-<uuid> for run, session, turn and job identifiers."
+  [prefix]
+  (str prefix "-" (uuid-text)))
+
+(defn short
+  "Last 12 hex characters of a prefixed or canonical id, for display."
+  [id]
+  (let [text (str id)]
+    (or (last (re-seq #"[0-9a-f]{12}" text)) text)))

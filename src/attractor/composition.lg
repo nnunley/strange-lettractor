@@ -1,5 +1,5 @@
 (ns attractor.composition
-  (:require [clojure.edn :as edn]
+  (:require [attractor.ids :as ids] [clojure.edn :as edn]
             [clojure.string :as str]
             [attractor.context :as context]
             [attractor.workflow :as workflow]
@@ -138,7 +138,7 @@
 (defn- child-root [logs-root node-id]
   (let [node-dir (checked-node-directory logs-root node-id)
         uuid (second (re-find #"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-                             (str (random-uuid))))
+                             (ids/uuid-text)))
         children-dir (str node-dir "/children")
         child (str children-dir "/" uuid)]
     (when (and (io/file-exists? children-dir)

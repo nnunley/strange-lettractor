@@ -1,5 +1,5 @@
 (ns attractor.engine
-  (:require [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
@@ -1107,7 +1107,7 @@
 
 (defn- allocate-restart-root [root-base allocated-roots]
   (loop []
-    (let [candidate (str root-base "_restart_" (random-uuid))]
+    (let [candidate (str root-base "_restart_" (ids/uuid-text))]
       (if (or (contains? @allocated-roots candidate)
               (some? (os/stat candidate)))
         (recur)
