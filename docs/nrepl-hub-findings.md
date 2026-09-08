@@ -44,3 +44,7 @@ Existing upstream breadcrumbs (verified open):
 
 No duplicate issues filed. These proposals primarily discuss Go embedding;
 our product remains let-go and needs a language-level extension surface.
+
+The stock `net` namespace also lacks listen/accept; details and the reviewed
+upstream request are in `hub-listener-runtime-request.md`. Neither the existing
+HTTP server nor stock nREPL is a proved streaming hub substitute.
