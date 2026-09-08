@@ -1,7 +1,16 @@
 # Progress
 
-**Phase:** verified current-turn ownership, CAL-OWN-01 component (ITER-0008)
-**Task:** public checkpoint after clean paired three-tier audit
+**Phase:** console-timeout discovery, ATTR-HUM-02 (ITER-0006)
+**Task:** record native input capability dependency; continue independent artifact work
+
+**Current discovery:** public main `f9f7b30` contains the verified ownership fix.
+Fresh console-worktree baseline passes 644 tests / 5,970 assertions. A 50ms native
+console question remained blocked until explicit release at 7,782ms. Terminal key
+polling is not a transparent replacement for the bound buffered line reader.
+Upstream enhancement [let-go#822](https://github.com/nooga/let-go/issues/822) requests
+EOF-aware deadline/cancellation-capable line input. No runtime edits or abandoned
+readers. `docs/console-timeout-plan.md` records the evidence and return criteria;
+ATTR-HUM-02 remains incomplete, while independent requirements can proceed.
 
 **Current repair:** isolated in `.worktrees/turn-ownership` from public `1bdc933`.
 Fresh baseline passes 639 tests / 5,885 assertions. The permanent gated regression
