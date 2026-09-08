@@ -137,11 +137,79 @@ The design session should settle:
   event log; one that correctly discards a change that failed verification;
   and one cold-start run.
 
+### Reference: "The Last Harness You'll Ever Build" (arXiv 2604.21003)
+
+Seong, Yin, Zhang, Shi (Sylph.AI), technical report, v3 dated 2026-05-01.
+Read in full on 2026-09-08. It is a framework paper: two algorithms and a
+meta-learning correspondence, with no experiments ("we plan to follow up with
+empirical results"). What it defines:
+
+- **Harness.** Following "agent = model + harness": every piece of code,
+  configuration and execution logic that is not the model. Categories: system
+  and task prompts; tools, skills and their descriptions; bundled
+  infrastructure (filesystem, sandboxes, browsers, observability); orchestration
+  logic (subagents, handoffs, model routing, continuation loops); hooks and
+  middleware (compaction, lint checks, verification loops); model
+  configuration and routing.
+- **Task.** `t = (I, S)`: instructions plus a checklist of verifiable success
+  criteria the evaluator judges.
+- **Harness Evolution Loop (Algorithm 1).** For `K` iterations: rebuild the
+  worker from the previous harness, reset the environment to a clean state,
+  execute the task to produce a trace, have the Evaluator produce
+  `(report, score)`, record `IMPROVED` or `REGRESSED` against the best score,
+  append `(harness, report, score, verdict)` to a history, then have the
+  Evolution Agent produce the next harness **from the best one so far** given
+  the full history. Return the best harness, its score, and the history.
+- **Evaluator `V`.** A separate, adversarial reviewer with four functions:
+  state verification (cross-reference the worker's claimed observations with
+  ground-truth environment state to catch hallucinated or misread state);
+  per-criterion pass/fail; performance auditing (model time versus tool
+  time); and two-tier scoring (pass/fail first, execution time as
+  tiebreaker), which decides improvement versus regression.
+- **Evolution Agent `E`.** Aggregates the history so failed strategies are not
+  repeated, classifies failures into recurring patterns (wrong tool usage,
+  reasoning loops, misread state, latency), and edits the harness to address
+  root causes.
+- **Meta-Evolution Loop (Algorithm 2).** The blueprint
+  `Λ = (worker, initial harness, V, E)` has the same structure as a harness,
+  so a meta agent evolves it across training tasks, judged by mean best score;
+  it may change the evaluator prompt, the evolution prompt, what telemetry the
+  worker surfaces, what flows between agents, the scoring design, and loop
+  hyperparameters (iterations, parallelism, revert thresholds, stopping).
+  Generalization is measured on held-out tasks by convergence speed, final
+  pass rate, and variance.
+
+What it does and does not protect against: the only guards named are the
+evaluator's ground-truth state check and the held-out task set. Because the
+meta loop also rewrites the evaluator, the evaluator and evolver can co-adapt;
+the paper does not address that, which is exactly the essay's "what evidence
+would reveal both agents are wrong" question. Treat its evaluator as
+necessary, not sufficient, and keep human-approved reference results and
+consumer-owned acceptance cases outside the loop's reach.
+
+How it maps onto Attractor, which already has most of the pieces as data:
+
+| Paper | Attractor |
+|---|---|
+| Harness components | DOT graphs and `model_stylesheet`, provider profiles and tool registry, execution environment, tool hooks, agent defaults (future user configuration) |
+| Task `(I, S)` | A behavior scenario with its corpus command; `S` is the mechanical evidence, never a test count |
+| Worker `W_H.execute(t)` → trace | A hub `run` of a DOT pipeline, an `/agent` job, or a native session; the trace is the hub event log plus stage logs |
+| Evaluator `V` | An independent review through `bin/attractor agent` with a different agent than the implementer, plus the corpus as ground truth; state verification is the project's existing rule to witness cleanup mechanically rather than trust flags |
+| History | Iteration log, hub event log, brain notes |
+| Evolution `E` | An `/agent` job whose permitted scope is the harness data above, never the corpus or reference results |
+| Loop | A DOT pipeline with pinned recovery, run by the hub, with human gates at the autonomy-class boundaries |
+| Meta loop / `Λ` | The iteration skills, review checklists and this design; evolving them is class three (human decision) until evidence says otherwise |
+
+Design questions this adds to the list above: which harness components an
+iteration may edit per autonomy class; where the clean-state reset boundary
+is (worktree, logs root, hub state); how a two-tier score is derived from the
+corpus and ledger; what "evolve from the best harness" means when the best is
+a published checkpoint; and how held-out scenarios are kept from the evolver.
+
 Follow-ups noted with the request: consider converting the operating-model
 essay into this project's natural-language spec form or an RFC so its rules
-become checkable, and read the two references it cites, a case study on a
-long-running agent harness for multi-context software development and
-arXiv 2604.21003, before the design session.
+become checkable, and read the other reference it cites, a case study on a
+long-running agent harness for multi-context software development.
 
 Depends on user configuration (above) for budgets, agent defaults and
 publication targets, and on executable packets (below) if iterations are to
