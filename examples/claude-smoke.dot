@@ -1,0 +1,7 @@
+digraph ClaudeSmoke {
+    graph [goal="Exercise the owned Claude worker through Attractor"]
+    start [shape=Mdiamond]
+    inspect [shape=box, prompt="Read only the LICENSE file in the working directory and return its SPDX identifier. Do not modify files or read anything else."]
+    exit [shape=Msquare]
+    start -> inspect -> exit
+}

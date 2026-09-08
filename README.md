@@ -21,6 +21,17 @@ lgx run-pipeline examples/hello.dot
 
 See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and CLI usage.
 
+## Claude Code workers
+
+Dispatch Claude through the let-go framework with a prompt file:
+
+```sh
+bin/attractor claude --prompt-file examples/claude-smoke.md --cwd .
+```
+
+This streams identified EDN events and defaults to read-only tools. DOT runs can
+select the same connector with `--worker claude`. See [worker usage and permissions](docs/claude-worker.md).
+
 ## Workflow lifecycle
 
 Use `attractor.pipeline/prepare` to parse, transform, and validate DOT source

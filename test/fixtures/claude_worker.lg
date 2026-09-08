@@ -1,0 +1,30 @@
+(ns main (:require [clojure.core :as core] [json :as json] [os :as os] [io :as io]))
+(defn emit [record] (core/write! *out* (str (json/write-json record) "\n")))
+(defn -main [scenario & _]
+  (let [prompt (loop [s ""] (if-let [chunk (core/read-bytes *in* 4096)] (recur (str s chunk)) s))]
+    (emit {:type "system" :subtype "init" :session_id "fixture-session"})
+    (case scenario
+      "malformed" (core/write! *out* "not-json\n")
+      "missing" nil
+      "truncated" (core/write! *out* "{\"type\":")
+      "oversize" (core/write! *out* (apply str (repeat 1048577 "x")))
+      "stderr" (do (core/write! *err* "fixture authentication failed") (os/exit 9))
+      "gated" (do (emit {:type "stream_event" :event {:type "content_block_delta" :delta {:type "text_delta" :text "ready"}}})
+                    (loop [] (when-not (os/stat prompt) (core/sleep 10) (recur)))
+                    (emit {:type "result" :is_error false :result "released" :session_id "fixture-session"}))
+      "late" (do (emit {:type "stream_event" :event {:type "content_block_delta" :delta {:type "text_delta" :text "ready"}}})
+                   (core/sleep 900) (io/spit prompt "late") (core/sleep 20000))
+      "hang" (do (emit {:type "stream_event" :event {:type "content_block_delta" :delta {:type "text_delta" :text "ready"}}}) (core/sleep 20000))
+      "error" (emit {:type "result" :is_error true :result "fixture error" :session_id "fixture-session"})
+      "nonzero" (do (emit {:type "result" :is_error false :result prompt :session_id "fixture-session"}) (os/exit 7))
+      (do
+        (core/write! *out* "{\"type\":\"stream_event\",\"event\":")
+        (core/sleep 20)
+        (core/write! *out* "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"héλ")
+        (core/write! *out* (byte-array [240 159]))
+        (core/sleep 20)
+        (core/write! *out* (byte-array [153 130]))
+        (core/write! *out* "\"}}}\n")
+        (emit {:type "assistant" :message {:content [{:type "tool_use" :id "tool1" :name "Read" :input {:file_path "sample"}}]}})
+        (emit {:type "result" :is_error false :result prompt :session_id "fixture-session"})))))
+(apply -main *command-line-args*)

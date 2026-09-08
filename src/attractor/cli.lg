@@ -11,6 +11,8 @@
             [attractor.llm :as llm]
             [attractor.fan-in-llm :as fanin-llm]
             [attractor.agent :as agent]
+            [attractor.workers.claude :as claude]
+            [attractor.workers.claude-backend :as claude-backend]
             [attractor.dotenv :as dotenv]))
 
 (defn- find-arg-val [args flag]
@@ -20,7 +22,56 @@
       (= (first rem) flag) (second rem)
       :else (recur (rest rem)))))
 
+(defn- claude-options [args]
+  (let [mode (or (find-arg-val args "--permission-mode") "plan")
+        tools (or (find-arg-val args "--tools") "Read")
+        raw-timeout (find-arg-val args "--timeout-ms")
+        timeout (if raw-timeout (parse-long raw-timeout) 120000)]
+    (when-not (contains? #{"plan" "acceptEdits" "dontAsk"} mode)
+      (throw (ex-info "Unsupported Claude permission mode" {:category :configuration_error})))
+    (when-not (and (integer? timeout) (pos? timeout))
+      (throw (ex-info "--timeout-ms must be a positive integer" {:category :configuration_error})))
+    {:working_dir (or (find-arg-val args "--cwd") (os/cwd))
+     :model (find-arg-val args "--model")
+     :tools (if (str/blank? tools) [] (mapv str/trim (str/split tools #",")))
+     :permission_mode mode :timeout_ms timeout
+     :on_event (fn [event] (prn event))}))
+
+(defn cmd-claude [args]
+  (let [exit-code
+        (try
+          (loop [remaining args]
+            (when (seq remaining)
+              (when-not (and (contains? #{"--prompt-file" "--cwd" "--model" "--tools"
+                                         "--timeout-ms" "--permission-mode" "--env-file"}
+                                       (first remaining))
+                             (some? (second remaining)))
+                (throw (ex-info "Expected named option and value; use --prompt-file <file>"
+                                {:category :configuration_error})))
+              (recur (drop 2 remaining))))
+          (let [opts (claude-options args) path (find-arg-val args "--prompt-file")]
+            (when (str/blank? path)
+              (throw (ex-info "--prompt-file is required" {:category :configuration_error})))
+            (claude/run! (assoc opts :prompt (io/slurp path)))
+            0)
+          (catch Object error
+            (prn {:source :claude :type :error
+                  :error (merge (select-keys (ex-data error) [:stderr :exit_code])
+                                {:category (or (:category (ex-data error)) :worker-error)
+                                 :message (ex-message error)})})
+            1))]
+    (os/exit exit-code)))
+
 (defn- make-codergen-backend-from-args [args]
+  (when (and (some #{"--worker"} args) (str/blank? (find-arg-val args "--worker")))
+    (throw (ex-info "--worker requires a name" {:category :configuration_error})))
+  (if-let [worker (find-arg-val args "--worker")]
+    (do
+      (when-not (= "claude" worker)
+        (throw (ex-info "Unknown external worker" {:category :configuration_error :worker worker})))
+      (when (some #{"--mock"} args)
+        (throw (ex-info "--worker claude cannot be combined with --mock" {:category :configuration_error})))
+      (claude-backend/make-backend (claude-options args)))
   (let [force-mock? (some #{"--mock"} args)
         has-keys? (or (not (str/blank? (os/getenv "ANTHROPIC_API_KEY")))
                       (not (str/blank? (os/getenv "OPENAI_API_KEY")))
@@ -41,7 +92,7 @@
                           raw-model (or override-provider (:llm_provider node)))]
              {:model (str (:provider parsed) "/" (:model parsed))
               :reasoning_effort (:reasoning_effort node)}))})
-      nil)))
+      nil))))
 
 (defn- make-fan-in-ranker-from-args [args]
   (if (some #{"--mock"} args)
@@ -68,6 +119,9 @@
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
+  (println "  claude --prompt-file <file> [--cwd <dir>]            Stream an owned Claude Code worker as EDN")
+  (println "    [--model <model>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
+  (println "    [--timeout-ms <ms>]   DOT run/resume also accept --worker claude and these worker options")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -279,6 +333,7 @@
       "clean" (cmd-clean rest-args)
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)
+      "claude" (cmd-claude rest-args)
       "help" (print-usage)
       nil (print-usage)
       (do

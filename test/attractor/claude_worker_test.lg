@@ -1,0 +1,87 @@
+(ns attractor.claude-worker-test
+  (:require [clojure.test :refer [deftest is]] [attractor.workers.claude :as worker]
+            [attractor.execution :as execution]
+            [os :as os] [io :as io] [clojure.string :as str] [clojure.core :as core]))
+(defn opts [scenario]
+  {:prompt "literal ' \" $(touch NEVER)\nλ🙂\n" :working_dir (os/cwd)
+   :command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+             (str (os/cwd) "/test/fixtures/claude_worker.lg") scenario]
+   :timeout_ms 3000})
+(defn attempt [options]
+  (try (worker/run! options) (catch Exception e {:error (ex-data e) :message (str e)})))
+(deftest portable-fixture-runtime-selection
+  (doseq [[override expected] [[nil "lg"] ["" "lg"] ["  " "lg"] ["/custom/let-go/lg" "/custom/let-go/lg"]]]
+    (with-redefs [os/getenv (fn [key] (when (= key "LGX_LG") override))]
+      (is (= expected (first (:command (opts "success"))))))))
+(deftest native-prompt-and-protocol
+  (let [events (atom []) options (assoc (opts "success") :on_event #(swap! events conj %)) result (attempt options)]
+    (is (= (:prompt options) (:text result)))
+    (is (= 0 (:exit_code result)))
+    (is (= "fixture-session" (:session_id result)))
+    (is (string? (:worker_id result)))
+    (is (= ["héλ🙂"] (mapv :text (filter #(= :text_delta (:type %)) @events))))
+    (is (every? #(= :claude (:source %)) @events))
+    (is (some #(= "assistant" (get-in % [:event "type"])) @events))))
+(deftest native-terminal-failures
+  (doseq [[scenario category] [["malformed" :claude-protocol] ["missing" :claude-protocol]
+                              ["error" :claude-result] ["nonzero" :claude-exit]
+                              ["truncated" :claude-protocol] ["oversize" :claude-output-limit]]]
+    (is (= category (get-in (attempt (opts scenario)) [:error :category])))))
+(defn temp-dir [] (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))))
+(defn remove-temp [dir paths]
+  (doseq [p paths] (when (os/stat p) (os/sh "/bin/rm" "--" p)))
+  (os/sh "/bin/rmdir" "--" dir))
+(deftest streams-before-process-exit
+  (let [dir (temp-dir) gate (str dir "/release") ready (promise)
+        job (future (attempt (assoc (opts "gated") :prompt gate
+                       :on_event #(when (= :text_delta (:type %)) (deliver ready %)))))]
+    (try
+      (is (= "ready" (:text (deref ready 2000 {}))))
+      (is (not (realized? job)))
+      (io/spit gate "release")
+      (is (= "released" (:text (deref job 4000 {}))))
+      (finally (io/spit gate "release") (deref job 5000 nil) (remove-temp dir [gate])))))
+(deftest cancellation-and-callback-failure-join-process
+  (doseq [mode [:cancel :callback :timeout]]
+    (let [dir (temp-dir) marker (str dir "/late") ready (promise) cancelled (atom false)
+          job (future (attempt (assoc (opts "late") :prompt marker :timeout_ms (if (= mode :timeout) 250 3000)
+                    :cancelled? #(deref cancelled)
+                    :on_event #(when (= :text_delta (:type %))
+                                 (deliver ready true)
+                                 (when (= mode :callback) (throw (ex-info "listener" {})))))))]
+      (try
+        (is (true? (deref ready 2000 false)))
+        (when (= mode :cancel) (reset! cancelled true))
+        (is (= (case mode :cancel :cancelled :callback :claude-callback :timeout :timeout)
+               (get-in (deref job 5000 {}) [:error :category])))
+        (is (realized? job))
+        (core/sleep 1000)
+        (is (nil? (os/stat marker)))
+        (finally (reset! cancelled true) (deref job 5000 nil) (remove-temp dir [marker]))))))
+(deftest explicit-options-and-bounded-exit-diagnostic
+  (doseq [change [{:permission_mode "bypassPermissions"} {:prompt nil} {:command []} {:timeout_ms 0}]]
+    (is (= :invalid-request (get-in (attempt (merge (opts "success") change)) [:error :category]))))
+  (let [result (attempt (opts "stderr"))]
+    (is (= :claude-exit (get-in result [:error :category])))
+    (is (str/includes? (or (get-in result [:error :stderr]) "") "fixture authentication failed"))))
+(deftest drains-bytes-written-between-eof-and-process-completion
+  (let [dir (temp-dir) gate (str dir "/release") ready (atom false) gated (atom false)
+        finished (promise) original-read core/read-bytes original-env execution/make-local-environment]
+    (try
+      (with-redefs [execution/make-local-environment
+                    (fn [options]
+                      (let [environment (original-env options) execute (:exec_command_stdin environment)]
+                        (assoc environment :exec_command_stdin
+                          (fn [& args] (let [result (apply execute args)] (deliver finished true) result)))))
+                    core/read-bytes
+                    (fn [handle n]
+                      (let [chunk (original-read handle n)]
+                        (when (and (nil? chunk) @ready (compare-and-set! gated false true))
+                          (io/spit gate "release")
+                          (deref finished 3000 nil))
+                        chunk))]
+        (let [result (attempt (assoc (opts "gated") :prompt gate
+                              :on_event #(when (= :text_delta (:type %)) (reset! ready true))))]
+          (is @gated)
+          (is (= "released" (:text result)))))
+      (finally (io/spit gate "release") (remove-temp dir [gate])))))
