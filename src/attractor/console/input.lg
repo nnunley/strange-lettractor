@@ -1,6 +1,6 @@
 (ns attractor.console.input (:require [clojure.string :as str]))
 
-(def ^:private commands #{:help :agents :focus :run :cancel :quit})
+(def ^:private commands #{:help :agents :new :focus :run :claude :cancel :quit})
 
 (defn- result [state action selection]
   {:state state :action (when action (assoc action :selection selection))})

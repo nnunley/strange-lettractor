@@ -1,0 +1,108 @@
+(ns attractor.console-session-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [clojure.string :as str] [os :as os] [io :as io]
+            [attractor.hub :as hub] [attractor.execution :as execution]
+            [attractor.profiles :as profiles] [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.console.session :as console]))
+
+;; SCN-CONSOLE-CONTROL: one dispatcher routes agent text, evaluation, workflow
+;; and worker commands to the hub and renders identified events for any frontend.
+
+(defn- answer [request] {:message {:role :assistant :content (str "echo: " (:content (last (:messages request))))}})
+(defn- hub-options []
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                                                 :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs [] :complete_fn answer}
+   :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
+   :worker_command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]})
+(defn- stop [h] (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))
+(defn- line [c text] (:lines (console/handle! c {:type :line :text text})))
+(defn- drain-until [c pred ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop [acc []]
+      (let [acc (into acc (:lines (console/drain! c)))]
+        (if (or (some pred acc) (> (System/currentTimeMillis) deadline))
+          acc
+          (do (core/sleep 10) (recur acc)))))))
+(defn- has [lines s] (boolean (some #(str/includes? % s) lines)))
+
+(deftest agent-text-opens-a-session-and-renders-identified-turn
+  (let [h (hub/start! (hub-options)) c (console/open! h)]
+    (try
+      (let [sent (line c "hello there")
+            rendered (drain-until c #(str/includes? % "turn complete") 5000)]
+        (is (has sent "→ agent"))
+        (is (string? (:session_id (console/focus c))))
+        (is (has rendered "session started"))
+        (is (has rendered "echo: hello there"))
+        (is (has rendered "turn complete"))
+        (is (every? #(str/starts-with? % "[agent ") rendered) (pr-str rendered)))
+      (finally (console/close! c) (stop h)))))
+
+(deftest eval-routes-render-values-errors-and-bind-focus
+  (let [h (hub/start! (hub-options)) c (console/open! h)]
+    (try
+      (is (has (line c ": (def x 20)") "→ eval"))
+      (is (has (drain-until c #(str/includes? % "=>") 5000) "[eval] => #'"))
+      (line c ": (undefined-fn x)")
+      (is (has (drain-until c #(str/includes? % "error") 5000) "[eval] error"))
+      (line c ":{")
+      (is (:buffering (console/handle! c {:type :line :text "(println \"multi\")"})))
+      (line c "(* x 2)")
+      (is (has (line c ":}") "→ eval"))
+      (let [rendered (drain-until c #(str/includes? % "=> 40") 5000)]
+        (is (has rendered "multi"))
+        (is (has rendered "[eval] => 40")))
+      (line c "/new")
+      (let [sid (:session_id (console/focus c))]
+        (line c ": *session*")
+        (let [rendered (drain-until c #(str/includes? % "=>") 5000)]
+          (is (has rendered (str "=> \"" sid "\"")) (pr-str rendered))))
+      (is (has (line c ":not-a-form") "→ agent") "keyword without space is agent text")
+      (finally (console/close! c) (stop h)))))
+
+(def ^:private dot "digraph T { graph [goal=\"console\"] start [shape=Mdiamond] work [shape=box, label=\"Work\", prompt=\"do $goal\"] exit [shape=Msquare] start -> work -> exit }")
+
+(deftest workflow-and-worker-commands-run-focus-and-cancel
+  (let [h (hub/start! (hub-options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))
+        path (str root "/t.dot") _ (io/spit path dot)
+        c (console/open! h {:run_defaults {:logs_root_fn (fn [_] (str root "/logs"))}})]
+    (try
+      (is (has (line c "/run") "usage"))
+      (is (has (line c "/run /nonexistent.dot") "no such file"))
+      (is (has (line c (str "/run " path)) "started from"))
+      (is (string? (:run_id (console/focus c))))
+      (let [rendered (drain-until c #(str/includes? % "completed in") 10000)]
+        (is (has rendered "[run "))
+        (is (has rendered "stage work")))
+      (is (has (line c "/claude hello --scenario success") "claude "))
+      (let [rendered (drain-until c #(str/includes? % "completed") 5000)]
+        (is (has rendered "[claude ") (pr-str rendered))
+        (is (has rendered "héλ🙂")))
+      (let [agents (line c "/agents")]
+        (is (has agents "* run"))
+        (is (has agents "* claude"))
+        (is (has agents "done")))
+      (is (has (line c "/claude") "usage"))
+      (is (has (line c "/focus nope") "no session, run or worker matches"))
+      (is (has (line c "/cancel") "cancel requested: claude"))
+      (is (has (line c "\\/cancel") "→ agent") "escaped command is agent text")
+      (finally (console/close! c) (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest interrupt-cancels-focus-only-outside-a-draft-and-quit-detaches-not-stops
+  (let [h (hub/start! (hub-options)) c (console/open! h)]
+    (try
+      (is (= ["nothing focused to cancel"] (:lines (console/handle! c {:type :interrupt}))))
+      (line c ":{")
+      (is (= [] (:lines (console/handle! c {:type :interrupt}))) "interrupt discards the draft silently")
+      (is (not (:buffering (console/handle! c {:type :line :text "(+ 1 1)"}))) "draft was discarded")
+      (is (has (drain-until c #(str/includes? % "→") 200) "") )
+      (is (has (line c "/help") "Console input:"))
+      (is (has (line c "/quit") "bye"))
+      (is (console/closed? c))
+      (is (= :alive (get-in (deref (hub/request! h {:id "x" :op :session/list}) 1000 {:error {:category :missing}}) [:error :category] :alive))
+          "hub is still alive after client quit")
+      (finally (stop h)))))

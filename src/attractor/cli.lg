@@ -13,6 +13,9 @@
             [attractor.agent :as agent]
             [attractor.workers.claude :as claude]
             [attractor.workers.claude-backend :as claude-backend]
+            [attractor.hub :as hub]
+            [attractor.console.session :as session]
+            [attractor.console.line :as line]
             [attractor.dotenv :as dotenv]))
 
 (defn- find-arg-val [args flag]
@@ -107,6 +110,42 @@
           (some? model) (assoc :model_override model)
           (some? provider) (assoc :provider_override provider))))))
 
+(defn- console-session-options [args]
+  ;; Trusted startup configuration for hub-owned agent sessions. Model
+  ;; selection follows run/resume conventions: --mock forces the mock provider,
+  ;; otherwise --model/--provider or the default codergen model resolution.
+  (if (some #{"--mock"} args)
+    {:model "mock/default"}
+    (let [override-model (find-arg-val args "--model")
+          override-provider (find-arg-val args "--provider")
+          parsed (llm/parse-model-spec (or override-model "claude-3-7-sonnet") override-provider)]
+      {:model (str (:provider parsed) "/" (:model parsed))})))
+
+(defn cmd-console [args]
+  (let [session-options (console-session-options args)
+        worker-defaults (cond-> {:working_dir (or (find-arg-val args "--worker-cwd") (os/cwd))}
+                          (find-arg-val args "--worker-model") (assoc :model (find-arg-val args "--worker-model"))
+                          (find-arg-val args "--worker-tools") (assoc :tools (str/split (find-arg-val args "--worker-tools") #","))
+                          (find-arg-val args "--worker-permission-mode") (assoc :permission_mode (find-arg-val args "--worker-permission-mode"))
+                          (find-arg-val args "--worker-timeout-ms") (assoc :timeout_ms (parse-long (find-arg-val args "--worker-timeout-ms"))))
+        hub (hub/start! {:session_options session-options
+                         :workflow_registry_fn
+                         (fn [request]
+                           (handlers/make-handler-registry
+                             (if (:auto_approve request)
+                               (interviewer/make-auto-approve-interviewer)
+                               (interviewer/make-console-interviewer))
+                             (make-codergen-backend-from-args args)
+                             {:fan-in-ranker (make-fan-in-ranker-from-args args)}))})
+        console (session/open! hub {:worker_defaults worker-defaults
+                                    :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}})]
+    (try
+      (line/run! console {})
+      (finally
+        (session/close! console)
+        (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil)))
+    (os/exit 0)))
+
 (defn print-usage []
   (println "Attractor - Workflow Orchestration Engine for Multi-Stage LLM Pipelines")
   (println "")
@@ -120,6 +159,7 @@
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
   (println "  claude --prompt-file <file> [--cwd <dir>]            Stream an owned Claude Code worker as EDN")
+  (println "  console [--mock] [--model <m>] [--provider <p>]      Interactive console: agent text, : eval, /run, /claude")
   (println "    [--model <model>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--timeout-ms <ms>]   DOT run/resume also accept --worker claude and these worker options")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
@@ -334,6 +374,7 @@
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)
       "claude" (cmd-claude rest-args)
+      "console" (cmd-console rest-args)
       "help" (print-usage)
       nil (print-usage)
       (do

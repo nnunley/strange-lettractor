@@ -1,0 +1,49 @@
+(ns attractor.console.line
+  "Streaming line frontend over attractor.console.session. One reader future
+   owns stdin; the loop interleaves submitted lines with drained hub events.
+   Works on any stream, so transcript tests drive it with scripted input."
+  (:require [clojure.string :as str] [clojure.core :as core] [async :as async] [io :as io]
+            [attractor.console.session :as session]))
+
+(defn- emit! [out lines]
+  (doseq [line lines] (out line)))
+
+(defn run!
+  "Drive a console until it quits. Options:
+     :read-line  fn returning the next line or nil at EOF (default core/read-line)
+     :out        fn receiving one rendered line (default println)
+     :prompt     prompt string (default \"> \")
+     :show-prompt fn receiving the prompt (default: print without newline)
+     :poll-ms    event polling interval while idle (default 50)"
+  [console & [opts]]
+  (let [read-line* (or (:read-line opts) (fn [] (core/read-line)))
+        out (or (:out opts) println)
+        prompt (get opts :prompt "> ")
+        show-prompt (or (:show-prompt opts) (fn [p] (core/print p) (io/flush *out*)))
+        poll-ms (get opts :poll-ms 50)
+        lines (async/chan)
+        reader (core/future
+                 (try
+                   (loop []
+                     (let [text (read-line* )]
+                       (if (nil? text)
+                         (async/>!! lines {:type :eof})
+                         (do (async/>!! lines {:type :line :text text}) (recur)))))
+                   (catch Object e (async/>!! lines {:type :eof :error (str e)}))))]
+    (emit! out (:lines (session/handle! console {:type :line :text "/help"})))
+    (show-prompt prompt)
+    (loop []
+      (when-not (session/closed? console)
+        (if-let [event (async/poll! lines)]
+          (let [{:keys [lines buffering]} (session/handle! console event)]
+            (emit! out lines)
+            (when-not (session/closed? console)
+              (show-prompt (if buffering "…  " prompt))))
+          (let [{:keys [lines]} (session/drain! console)]
+            (emit! out lines)
+            (core/sleep poll-ms)))
+        (recur)))
+    ;; Final drain so late events from the last request are not lost.
+    (emit! out (:lines (session/drain! console)))
+    (deref reader 100 nil)
+    nil))

@@ -1,0 +1,50 @@
+(ns attractor.console-line-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [clojure.string :as str] [os :as os]
+            [attractor.hub :as hub] [attractor.execution :as execution]
+            [attractor.profiles :as profiles]
+            [attractor.console.session :as session] [attractor.console.line :as line]))
+
+;; SCN-CONSOLE-LINE: the streaming line frontend over the shared dispatcher,
+;; driven by a scripted stream in place of stdin.
+
+(defn- hub-options []
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                                                 :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs []
+                     :complete_fn (fn [request] {:message {:role :assistant :content (str "echo: " (:content (last (:messages request))))}})}})
+
+(defn- has? [lines s] (boolean (some #(str/includes? % s) lines)))
+
+(defn- scripted [lines]
+  ;; Hand out lines one at a time, pausing briefly so the loop can drain events
+  ;; between them the way an interactive user would.
+  (let [remaining (atom lines)]
+    (fn [] (core/sleep 150) (let [l (first @remaining)] (swap! remaining rest) l))))
+
+(deftest transcript-interleaves-prompts-input-and-events
+  (let [h (hub/start! (hub-options)) c (session/open! h) out (atom [])]
+    (try
+      (line/run! c {:read-line (scripted ["hi" ": (+ 1 2)" ":{" "(def y 5)" "(* y 2)" ":}" "/quit"])
+                    :out #(swap! out conj %) :show-prompt #(swap! out conj %) :prompt "> " :poll-ms 10})
+      (let [transcript @out]
+        (is (has? transcript "Console input:"))
+        (is (has? transcript "→ agent"))
+        (is (has? transcript "echo: hi"))
+        (is (has? transcript "turn complete"))
+        (is (has? transcript "[eval] => 3"))
+        (is (has? transcript "[eval] => 10"))
+        (is (has? transcript "…  ") "multiline draft shows a continuation prompt")
+        (is (has? transcript "bye"))
+        (is (session/closed? c))
+        (is (= "> " (last (filter #(= "> " %) transcript)))))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+(deftest eof-quits-cleanly
+  (let [h (hub/start! (hub-options)) c (session/open! h) out (atom [])]
+    (try
+      (line/run! c {:read-line (scripted []) :out #(swap! out conj %) :show-prompt #(swap! out conj %) :poll-ms 10})
+      (is (session/closed? c))
+      (is (has? @out "bye"))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
