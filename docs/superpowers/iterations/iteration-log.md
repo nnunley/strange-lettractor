@@ -313,3 +313,25 @@ Not claimed: adapter connect/request/read timeout distinctions, the remaining
 status/drop/retry matrix, server-observed disconnects, cancellation of work inside
 lazy-seq thunks (runtime #829), or interruption of callbacks that ignore the
 combined abort signal.
+
+## Component checkpoint — Console milestone (2026-09-08)
+
+**Completed:** 2026-09-08, user goal "implement enough of the Attractor
+specification to finish the remainder in a strange-lettractor UI".
+**Stories delivered:** CONSOLE-EVAL-01, CONSOLE-CONTROL-01, CONSOLE-TUI-01;
+CONSOLE-HUB-01, CONSOLE-INPUT-02 and CONSOLE-WORKER-01 advanced to partial.
+**Tasks executed:** hub-owned eval/workflow/worker operations; shared console
+dispatcher; line frontend and `attractor console`; tiny-tui frontend and
+`--tui`; let-go PTY evidence through script(1); local runtime `eval` context
+fix (nooga/let-go#833); independent review through the connector with 16 of
+18 findings fixed under test.
+
+Evidence: focused hub ops 9/43, hub sessions 20/149, console session 5/49,
+line 2/12, TUI headless 2/13, PTY 2/11; full suite 809/7408/0; console bundle
+outside checkout 18/117/0; CLI build/help pass; let-go vet, rt/vm/api/compiler,
+jank suite and e2e pass on runtime `aeb44ef4`. Live: one Qwen turn through
+`attractor console` against llama.cpp.
+
+Not claimed: separate-process RPC/nREPL transport, reconnect/replay, Codex
+worker, human gates answered from the console, native resize/exception
+coverage, a bounded live implementer trial, pruning of finished entries.

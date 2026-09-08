@@ -128,7 +128,7 @@ the Attractor design, not a workaround for this bug.
 
 ## Scope cancellation predicate: #830
 
-Local runtime `8c1e6ee4` on the same workspace adds `scope-cancelled?`
+Local runtime `aeb44ef4` on the same workspace adds `scope-cancelled?`
 ([nooga/let-go #830](https://github.com/nooga/let-go/issues/830)). Blocking
 natives return early and silently on cancellation, so a coordinator parked on
 `sleep` cannot otherwise tell waking from cancellation; the operation owner's

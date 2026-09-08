@@ -63,7 +63,7 @@ and the proposal to bound the drain with an `:operation-unjoined` error, which
 contradicts the approved design's indefinite-join requirement and is recorded
 below as a residual limitation instead.
 
-## Evidence (2026-09-08, runtime `8c1e6ee4` on `bdd8268c`)
+## Evidence (2026-09-08, runtime `aeb44ef4` on `bdd8268c`)
 
 - Owner witnesses `test/attractor/operation_owner_test.lg`: 24 tests / 110
   assertions, including idle parent-scope cancellation without a control
