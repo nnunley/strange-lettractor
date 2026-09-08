@@ -1,0 +1,56 @@
+(ns attractor.fail-retry-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.engine :as e] [attractor.context :as c]))
+
+;; SCN-FAIL-RETRY-CONTRACT COMPLETE
+;; ATTR-ENG-04 decision: the normative text wins over the §11.5 checklist.
+;; §3.5 returns a FAIL outcome immediately, §5.2 calls FAIL "failed permanently"
+;; and routes it through fail edges or retry_target (§3.7), and RETRY exists to
+;; request re-execution. So: a returned FAIL never re-executes the node no
+;; matter max_retries; RETRY re-executes up to the limit; a thrown exception
+;; re-executes while should_retry accepts it. The checklist's "retried on RETRY
+;; or FAIL" is read as covering thrown failures, not returned FAIL outcomes.
+
+(defn- run-with [handler node]
+  (e/execute-with-retry handler node (c/make-context) {} "" (fn [_] nil)
+                        {:sleep-fn (fn [_] nil)}))
+
+(deftest returned-fail-is-terminal-regardless-of-max-retries
+  (let [attempts (atom 0)
+        outcome (run-with (fn [_ _ _ _] (swap! attempts inc) {:status :fail :failure_reason "permanent"})
+                          {:id "n" :max_retries 3})]
+    (is (= 1 @attempts) "FAIL is not re-executed")
+    (is (= :fail (:status outcome)))
+    (is (= "permanent" (:failure_reason outcome)) "the handler's outcome is returned as-is")))
+
+(deftest returned-retry-re-executes-up-to-the-limit
+  (let [attempts (atom 0)
+        outcome (run-with (fn [_ _ _ _] (swap! attempts inc)
+                            (if (< @attempts 3) {:status :retry :failure_reason "again"} {:status :success}))
+                          {:id "n" :max_retries 3})]
+    (is (= 3 @attempts))
+    (is (= :success (:status outcome))))
+  (let [attempts (atom 0)
+        outcome (run-with (fn [_ _ _ _] (swap! attempts inc) {:status :retry :failure_reason "again"})
+                          {:id "n" :max_retries 2})]
+    (is (= 3 @attempts) "max_retries additional attempts beyond the first")
+    (is (= :fail (:status outcome)))
+    (is (= "again" (:failure_reason outcome)) "the last RETRY reason is kept; the engine's generic text only fills a blank")))
+
+(deftest thrown-retryable-failures-re-execute-but-fail-outcomes-do-not
+  (let [attempts (atom 0)
+        outcome (run-with (fn [_ _ _ _] (swap! attempts inc)
+                            (if (< @attempts 2)
+                              (throw (ex-info "transient" {:category :network_error :retryable true}))
+                              {:status :success}))
+                          {:id "n" :max_retries 3})]
+    (is (= 2 @attempts))
+    (is (= :success (:status outcome))))
+  (let [attempts (atom 0)
+        outcome (run-with (fn [_ _ _ _] (swap! attempts inc)
+                            (if (= 1 @attempts)
+                              (throw (ex-info "transient" {:category :network_error :retryable true}))
+                              {:status :fail :failure_reason "gave up"}))
+                          {:id "n" :max_retries 5})]
+    (is (= 2 @attempts) "a FAIL after a retried exception still ends the node")
+    (is (= "gave up" (:failure_reason outcome)))))
