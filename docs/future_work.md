@@ -50,6 +50,56 @@ The design session should settle:
   only a file and no flags, and `attractor config` output matching the values
   actually used by a run.
 
+## Self-improving harness (requested 2026-09-08)
+
+The user keeps a private note on a self-improving harness; this public entry
+records the request and the questions to settle, not the note's content. The
+premise: Attractor now drives external agents and its own native loop from a
+console over a hub, and the remaining specification work is meant to be done
+from inside that console. A self-improving harness closes the loop: the
+framework proposes, applies, verifies and records changes to itself under the
+same ownership, evidence and publication rules a human session follows.
+
+The design session should settle:
+
+- **What "improve" means.** Candidate targets: conformance gaps in the
+  iteration roadmap, review findings, failing or flaky evidence, runtime
+  follow-ups in `let-go-followups.md`, and documentation drift. Decide which
+  are eligible for autonomous work and which stay human-directed.
+- **The loop as a workflow.** Express the cycle as a DOT pipeline the hub runs
+  (select target, plan, implement through `/agent` or a native session,
+  verify, review, publish or discard), so it uses pinned recovery,
+  checkpoints and human gates rather than a bespoke scheduler. Decide what a
+  single iteration is allowed to change (files, worktree, branch) and how
+  parallel iterations are isolated.
+- **Verification as the gate.** An iteration succeeds only on mechanical
+  evidence: the impacted scenarios, the full sentinel suite, a bundle outside
+  the checkout, and an independent review through a different agent than the
+  implementer. No claim of completion from test counts alone; the existing
+  behavior corpus and coverage ledger are the source of truth.
+- **Ownership and safety.** The harness runs under hub ownership with the
+  same cancellation and drainage guarantees as any agent job. Publication
+  stays explicit: verified checkpoints to `main`/`console`, never private
+  notes, never force pushes, and no permission escalation beyond what the
+  user configured for that agent. Reading transcripts, records or model output
+  never evaluates code.
+- **Memory and learning.** How an iteration records what it tried, what
+  failed and why, so later iterations do not repeat it: the iteration log,
+  brain notes, and let-go follow-ups already exist; decide what is written
+  automatically and in what form. Decide whether the harness may edit its own
+  prompts, skills and workflow definitions, and under what review.
+- **Budget and stopping.** Bounded model spend and wall-clock per iteration,
+  discovered model capacity rather than assumed, a stop condition the user
+  sets (goal, count, time), and an idle/quiet state that does not burn tokens.
+- **Evidence.** One autonomous iteration that closes a real roadmap gap end to
+  end from the console, with its review and publication visible in the hub
+  event log, and one that correctly discards a change that failed
+  verification.
+
+Depends on user configuration (above) for budgets, agent defaults and
+publication targets, and on executable packets (below) if iterations are to
+be shared or replayed.
+
 ## Executable packets and skill packages (requested 2026-09-06)
 
 Recorded in `superpowers/iterations/roadmap.md` under "Future design:
