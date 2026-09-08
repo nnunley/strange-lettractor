@@ -1,6 +1,0 @@
-(ns attractor.workers.claude-backend
-  "Compatibility shim: the Claude-specific backend is now
-   attractor.workers.backend/make-backend with framework :claude."
-  (:require [attractor.workers.backend :as backend]))
-
-(defn make-backend [opts] (backend/make-backend :claude opts))

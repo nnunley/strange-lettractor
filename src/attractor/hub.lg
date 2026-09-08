@@ -1,7 +1,7 @@
 (ns attractor.hub
   (:require [clojure.core :as core] [async :as async] [clojure.string :as str]
             [attractor.agent :as agent] [attractor.pipeline :as pipeline]
-            [attractor.workers.registry :as registry]))
+            [attractor.agents.registry :as registry]))
 
 (defn- locked [lock f]
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
@@ -16,7 +16,7 @@
   {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
 (defn- append-envelope! [hub envelope]
-  ;; Every source (agent, eval, workflow, worker) shares one bounded log and
+  ;; Every source (session, eval, workflow, agent) shares one bounded log and
   ;; one sequence so a client sees interleaved events in emission order.
   (locked (:event_lock hub)
     (fn []
@@ -25,7 +25,7 @@
             excess (- (count events) (:event_capacity hub))]
         (reset! (:log hub) (assoc log :cursor seq :events (if (pos? excess) (subvec events excess) events)))))))
 (defn- append-event! [hub id event]
-  (append-envelope! hub {:source :agent :session_id id
+  (append-envelope! hub {:source :session :session_id id
                          :turn_id (:hub_turn_id (:origin event)) :event event}))
 
 (defn events-since [hub client-id cursor]
@@ -97,8 +97,8 @@
 
 (defn- workflow-entry! [hub id]
   (or (get @(:workflows hub) id) (fail! :unknown-run)))
-(defn- worker-entry! [hub id]
-  (or (get @(:workers hub) id) (fail! :unknown-worker)))
+(defn- agent-entry! [hub id]
+  (or (get @(:agents hub) id) (fail! :unknown-agent-job)))
 
 (defn- operation! [hub request]
   (case (:op request)
@@ -158,17 +158,17 @@
     :workflow/list
     (mapv (fn [[id e]] {:run_id id :source_path (:source_path e) :done (:done e) :cancelled @(:cancelled e)})
           @(:workflows hub))
-    :worker/run
-    (let [framework (try (registry/resolve-framework (:framework request)) (catch Object _ (fail! :unknown-framework)))]
+    :agent/run
+    (let [agent (try (registry/resolve-agent (:agent request)) (catch Object _ (fail! :unknown-agent)))]
       (when-not (string? (:prompt request)) (fail! :invalid-request))
-      (let [worker-id (fresh-id "worker") cancelled (atom false) completion (promise)
-            base {:source :worker :framework framework :worker_id worker-id}
-            ;; Commands are trusted startup configuration per framework. :scenario is
+      (let [job-id (fresh-id "agent") cancelled (atom false) completion (promise)
+            base {:source :agent :agent agent :agent_id job-id}
+            ;; Commands are trusted startup configuration per agent. :scenario is
             ;; a fixture-only argv extension a request may only add when the hub
             ;; was started allowing it.
-            configured (get (:worker_commands hub) framework)
+            configured (get (:agent_commands hub) agent)
             command (cond-> configured
-                      (and configured (:allow_worker_scenario hub) (:scenario request)) (conj (:scenario request)))
+                      (and configured (:allow_agent_scenario hub) (:scenario request)) (conj (:scenario request)))
             options (cond-> {:prompt (:prompt request) :cancelled? (fn [] @cancelled)
                              :on_event (fn [event] (append-envelope! hub (assoc base :event event)))}
                       command (assoc :command command)
@@ -179,25 +179,25 @@
                       (:sandbox request) (assoc :sandbox (:sandbox request))
                       (:approval_policy request) (assoc :approval_policy (:approval_policy request))
                       (:timeout_ms request) (assoc :timeout_ms (:timeout_ms request)))
-            _ (swap! (:workers hub) assoc worker-id {:worker_id worker-id :framework framework :cancelled cancelled
-                                                     :completion completion :done false})]
-        (launch! (fn [] (registry/run! framework options))
+            _ (swap! (:agents hub) assoc job-id {:agent_id job-id :agent agent :cancelled cancelled
+                                                 :completion completion :done false})]
+        (launch! (fn [] (registry/run! agent options))
                      (fn [done result]
                        (finish-under-lock! hub
                          (fn []
-                           (swap! (:workers hub) assoc-in [worker-id :done] true)
+                           (swap! (:agents hub) assoc-in [job-id :done] true)
                            (deliver done (if (and @cancelled (:error result))
-                                           {:error {:category :cancelled :message "Worker cancelled"}}
+                                           {:error {:category :cancelled :message "Agent job cancelled"}}
                                            result)))))
                  completion)
-        {:worker_id worker-id :completion completion}))
-    :worker/cancel
-    (let [entry (worker-entry! hub (:worker_id request))]
+        {:agent_id job-id :completion completion}))
+    :agent/cancel
+    (let [entry (agent-entry! hub (:agent_id request))]
       (reset! (:cancelled entry) true)
-      {:worker_id (:worker_id request) :completion (:completion entry)})
-    :worker/list
-    (mapv (fn [[id e]] {:worker_id id :framework (:framework e) :done (:done e) :cancelled @(:cancelled e)})
-          @(:workers hub))
+      {:agent_id (:agent_id request) :completion (:completion entry)})
+    :agent/list
+    (mapv (fn [[id e]] {:agent_id id :agent (:agent e) :done (:done e) :cancelled @(:cancelled e)})
+          @(:agents hub))
     :session/open
     (let [id (fresh-id "session")
           session (binding [agent/*event-origin* nil]
@@ -256,10 +256,10 @@
   (loop [] (when-let [packet (async/poll! (:mailbox hub))]
              (reply! packet {:error {:category :stopped}}) (recur)))
   (let [entries (vals @(:sessions hub))]
-    ;; Hub-owned workflows and workers stop cooperatively, then the scope
+    ;; Hub-owned workflows and agent jobs stop cooperatively, then the scope
     ;; close below cancels and joins whatever they spawned.
     (doseq [e (vals @(:workflows hub))] (reset! (:cancelled e) true))
-    (doseq [e (vals @(:workers hub))] (reset! (:cancelled e) true))
+    (doseq [e (vals @(:agents hub))] (reset! (:cancelled e) true))
     (doseq [entry entries] (cancel-entry! hub entry))
     ;; Allocation of abort futures is not proof they ran. Observe actual abort
     ;; entry or a tagged failure before cancellation/drain of their native scope.
@@ -320,13 +320,13 @@
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts)
                :workflow_registry_fn (:workflow_registry_fn opts)
-               ;; {:claude [argv...] :codex [argv...]}; a framework without an entry
+               ;; {:claude [argv...] :codex [argv...]}; an agent without an entry
                ;; uses its connector's default command.
-               :worker_commands (or (:worker_commands opts) {})
-               :allow_worker_scenario (boolean (:allow_worker_scenario opts))
+               :agent_commands (or (:agent_commands opts) {})
+               :allow_agent_scenario (boolean (:allow_agent_scenario opts))
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})
-               :eval (atom {:busy false}) :workflows (atom {}) :workers (atom {})
+               :eval (atom {:busy false}) :workflows (atom {}) :agents (atom {})
                :user_ns (create-ns (user-ns-name))
                :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}
           hub (init-user-ns! hub)]

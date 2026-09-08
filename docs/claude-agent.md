@@ -1,4 +1,4 @@
-# Claude Code worker
+# Claude Code agent
 
 Strange Lettractor launches Claude Code as an owned external agent. Claude runs
 its own tool loop; this is separate from the Anthropic unified-LLM adapter.
@@ -9,10 +9,10 @@ Build with your local let-go, then use a prompt file:
 
 ```sh
 lgx build
-bin/attractor agent --framework claude --prompt-file examples/claude-smoke.md --cwd . --model sonnet
+bin/attractor agent claude --prompt-file examples/claude-smoke.md --cwd . --model sonnet
 ```
 
-Output is a stream of EDN event maps identifying the worker and Claude session.
+Output is a stream of EDN event maps identifying the job and Claude session.
 Claude's JSON-lines protocol stays inside the connector. Token deltas are distinct
 from complete assistant/result records; consumers must not concatenate all three.
 See Claude's [programmatic streaming protocol](https://code.claude.com/docs/en/headless)
@@ -24,26 +24,25 @@ longer tasks.
 Default access is `--tools Read --permission-mode plan`. To authorize editing:
 
 ```sh
-bin/attractor agent --framework claude --prompt-file task.md --cwd . --tools Read,Edit,Write --permission-mode acceptEdits
+bin/attractor agent claude --prompt-file task.md --cwd . --tools Read,Edit,Write --permission-mode acceptEdits
 ```
 
 This is explicit tool authority, not a sandbox. There is no permission-bypass flag.
 Permissions needing interaction are denied, not silently approved. Claude's safe
-mode disables customization/hooks/MCP for these workers; normal CLI authentication
+mode disables customization/hooks/MCP for these jobs; normal CLI authentication
 is retained. Authenticate using Claude's own CLI; the connector does not copy
 credentials or choose a replacement provider. CLI availability does not prove
 subscription billing or remaining quota.
 
 ## Console use
 
-`attractor console` dispatches the same connector as a hub-owned worker:
-`/agent --framework claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]`
-(`/alias claude agent --framework claude` if you want the short form).
-Worker defaults come from `--worker-cwd`, `--worker-model`, `--worker-tools`,
-`--worker-permission-mode` and `--worker-timeout-ms` on the console command.
-Events render as `[claude <id>]` lines; `/cancel` with the worker focused
-requests cooperative cancellation; `/agents` lists running and finished
-workers. See `docs/console-requirements.md` (SCN-CONSOLE-CONTROL).
+`attractor console` dispatches the same connector as a hub-owned agent job:
+`/agent claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]`
+(`/alias claude agent claude` if you want the short form). Job defaults come
+from `--agent-cwd`, `--agent-model`, `--agent-tools`, `--agent-permission-mode`
+and `--agent-timeout-ms` on the console command. Events render as
+`[claude <id>]` lines; `/cancel` with the job focused requests cooperative
+cancellation; `/list` shows running and finished jobs. See `docs/console-requirements.md` (SCN-CONSOLE-CONTROL).
 
 Known strictness limit (2026-09-08): a long review run (34 turns) returned a
 valid successful `result`, after which the CLI emitted one more record; the
@@ -54,17 +53,17 @@ tolerate records after a valid terminal result (surface them, keep exit 0).
 ## Workflow and library use
 
 ```sh
-bin/attractor run examples/claude-smoke.dot --worker claude --model sonnet --auto-approve --cwd .
+bin/attractor run examples/claude-smoke.dot --agent claude --model sonnet --auto-approve --cwd .
 ```
 
-`run` and `resume` accept `--worker claude` plus the same worker options. This
+`run` and `resume` accept `--agent claude` plus the same options. This
 explicit selection never falls back to mock or an API-key model adapter.
 `--mock` cannot be combined with it. `--auto-approve` concerns workflow human
 gates; it does not grant Claude additional tool permissions.
 
-The library entry points are `attractor.workers.claude/run!`,
-`attractor.workers.registry/run!` (by framework) and
-`attractor.workers.backend/make-backend` (any framework as a codergen backend). Options include `:prompt`,
+The library entry points are `attractor.agents.claude/run!`,
+`attractor.agents.registry/run!` (by agent name) and
+`attractor.agents.backend/make-backend` (any agent as a codergen backend). Options include `:prompt`,
 `:working_dir`, `:model`, `:tools`, `:permission_mode`, `:timeout_ms`,
 `:cancelled?`, and `:on_event`. `run!` returns the final text/result or throws a
 tagged failure only after its owned command has been joined.
@@ -90,7 +89,7 @@ authenticated Claude trial:
 
 ```sh
 export LGX_LG="$HOME/development/let-go/lg"
-"$LGX_LG" -source-paths src:test dev/claude_worker_tests.lg run
+"$LGX_LG" -source-paths src:test dev/claude_agent_tests.lg run
 "$LGX_LG" -source-paths src:test dev/claude_cli_tests.lg run
 ```
 

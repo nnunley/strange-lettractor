@@ -38,7 +38,7 @@
                                 :read-key (scripted-keys [(keys-for "hello") []
                                                           (keys-for ": (+ 1 2)") []
                                                           (keys-for ":{") (keys-for "(+ 1") [:ctrl-c] []
-                                                          (keys-for "/agents") []
+                                                          (keys-for "/list") []
                                                           (keys-for "slow") [:ctrl-c] []
                                                           [:ctrl-c]])})
             transcript (:transcript result)]

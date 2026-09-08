@@ -1,5 +1,5 @@
-(ns attractor.claude-worker-test
-  (:require [clojure.test :refer [deftest is]] [attractor.workers.claude :as worker]
+(ns attractor.claude-agent-test
+  (:require [clojure.test :refer [deftest is]] [attractor.agents.claude :as worker]
             [attractor.execution :as execution]
             [os :as os] [io :as io] [clojure.string :as str] [clojure.core :as core]))
 (defn opts [scenario]
@@ -18,7 +18,7 @@
     (is (= (:prompt options) (:text result)))
     (is (= 0 (:exit_code result)))
     (is (= "fixture-session" (:session_id result)))
-    (is (string? (:worker_id result)))
+    (is (string? (:job_id result)))
     (is (= ["héλ🙂"] (mapv :text (filter #(= :text_delta (:type %)) @events))))
     (is (every? #(= :claude (:source %)) @events))
     (is (some #(= "assistant" (get-in % [:event "type"])) @events))))

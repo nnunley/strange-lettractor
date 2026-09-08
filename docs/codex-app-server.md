@@ -1,9 +1,9 @@
 # Codex app-server integration
 
-Status (2026-09-08): transport, one-turn worker and framework registration are
+Status (2026-09-08): transport, one-turn agent and registry entry are
 implemented and tested against the let-go fake child, and one live turn ran
-against the installed `codex-cli 0.153.4`: `bin/attractor agent --framework
-codex` with a read-only sandbox returned "codex connected" (37 protocol
+against the installed `codex-cli 0.153.4`: `bin/attractor agent codex`
+with a read-only sandbox returned "codex connected" (37 protocol
 records, 3 text deltas, one completed event, exit 0). This backend uses
 Attractor's existing orchestration rather than a shared cross-provider
 conversation or a second workflow engine.
@@ -15,22 +15,22 @@ conversation or a second workflow engine.
   writing, stdout/stderr are files read incrementally through the bounded
   framing decoder. This avoids the byte-array (#813) and boxed pointer (#814)
   interop limits without a Go change. Server requests (approvals, permissions,
-  tool calls) are answered with a JSON-RPC error: the worker never grants
+  tool calls) are answered with a JSON-RPC error: the agent never grants
   authority on the user's behalf. Close gives the child `:shutdown-ms`, then
   TERM and KILL by exact PID; `close!` is idempotent.
-- `attractor.workers.codex/run!`: initialize → initialized → `thread/start`
+- `attractor.agents.codex/run!`: initialize → initialized → `thread/start`
   (`cwd`, `approvalPolicy`, `sandbox` as the kebab-case `SandboxMode`, optional
   `model`) → `turn/start` with one text input; streams `item/agentMessage/delta`
   as `:text_delta` events and completes on `turn/completed`. `turn/interrupt`
   is sent on cancellation. Options: `--sandbox read-only|workspace-write|
   danger-full-access`, `--approval-policy never|on-request|untrusted`.
-- Selected as `--framework codex` (`bin/attractor agent`), `--worker codex`
-  (DOT runs) or `/agent --framework codex` (console).
+- Selected as `bin/attractor agent codex`, `--agent codex` (DOT runs) or
+  `/agent codex` (console).
 
 Evidence: `dev/codex_transport_tests.lg` 4 tests / 41 assertions (duplex
 exchange, split/coalesced/delayed frames, malformed/partial-EOF/stderr-flood
 failures reported once, ignore-EOF child killed by exact PID);
-`dev/codex_worker_tests.lg` 3 / 15 (completed turn with deltas, failed turn,
+`dev/codex_agent_tests.lg` 3 / 15 (completed turn with deltas, failed turn,
 refused approval, invalid options, interrupt on cancel). The live server's
 rejection of an object-shaped `sandbox` during development is what fixed the
 wire format (`SandboxMode` strings, not `SandboxPolicy` objects).

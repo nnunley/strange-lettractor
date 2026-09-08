@@ -24,9 +24,9 @@ Prerequisites:
   stock release runs most of the suite, but the console's evaluation capture
   and held-stream cancellation depend on those fixes; see
   [let-go follow-ups](docs/let-go-followups.md).
-- Optional agentic frameworks on `PATH`: [Claude Code](https://code.claude.com)
-  (`claude`) and [Codex](https://github.com/openai/codex) (`codex`, app-server
-  protocol). Optional: a llama.cpp or Ollama-compatible endpoint for live models.
+- Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
+  (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
+  llama.cpp or Ollama-compatible endpoint for live models.
 
 Every command below reads the runtime from `LGX_LG`; the `lg` on your `PATH`
 may be older, so always set it:
@@ -43,9 +43,11 @@ Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
 
 ### Console
 
-The console is the interactive front door: agent conversation, let-go
-evaluation, workflow runs and external workers in one place, over an
-in-process hub.
+The console is the interactive front door: conversation with the native
+agent, let-go evaluation, workflow runs and external agent jobs in one place,
+over an in-process hub. Two things are named everywhere: a **model**, addressed
+as `provider/name`, and an **agent**, anything that runs a tool loop against a
+model (`native` is Attractor's own; `claude` and `codex` are external).
 
 ```sh
 bin/attractor console --mock          # line console, mock model
@@ -60,14 +62,14 @@ Inside the console:
 
 | Input | Effect |
 |---|---|
-| `text` | message the focused agent session |
+| `text` | message the native agent session |
 | `: (form)` | evaluate let-go in the hub namespace (`hub`, `request!`, `*session*`, `*run*` are bound) |
 | `:{` … `:}` | multiline evaluation |
 | `\text` | literal agent text |
 | `/run file.dot --auto-approve` | launch a workflow and stream its events |
-| `/agent --framework claude\|codex <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p] [--sandbox s] [--approval-policy p]` | dispatch an owned agentic-framework worker |
-| `/alias claude agent --framework claude` | define an explicit shortcut (`/claude …`); none exist by default. `--alias name=expansion` at startup does the same |
-| `/agents`, `/focus <id>`, `/new`, `/cancel`, `/quit` | list, select, open, cancel, leave |
+| `/agent claude\|codex <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p] [--sandbox s] [--approval-policy p]` | start an external agent job |
+| `/alias codex agent codex` | define an explicit shortcut (`/codex …`); none exist by default. `--alias name=expansion` at startup does the same |
+| `/list`, `/focus <id>`, `/new`, `/cancel`, `/quit` | list sessions/runs/jobs, select, open a session, cancel, leave |
 
 In the TUI, Ctrl-C discards a multiline draft, cancels busy focused work, or
 quits when idle. Human-gated workflows need `--auto-approve` for now. See
@@ -78,8 +80,8 @@ quits when idle. Human-gated workflows need `--auto-approve` for now. See
 ```sh
 bin/attractor validate examples/hello.dot
 bin/attractor run examples/hello.dot --auto-approve      # mock model unless keys/--llm
-bin/attractor run examples/hello.dot --worker claude     # an agentic framework as the codergen worker
-bin/attractor run examples/hello.dot --worker codex --sandbox workspace-write
+bin/attractor run examples/hello.dot --agent claude      # an external agent as the codergen backend
+bin/attractor run examples/hello.dot --agent codex --sandbox workspace-write
 lgx run-pipeline examples/hello.dot                      # the same through lgx
 ```
 
@@ -87,23 +89,22 @@ See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and C
 See [deployment context discovery](docs/context-capacity.md) for live capacity,
 explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 
-## Agentic framework workers
+## External agents
 
-Three things are configured separately: the **provider** (the network model
-client: OpenAI, Anthropic, Gemini, Ollama, llama.cpp), the **model** name, and
-the **agentic framework** (a streaming wrapper around an external coding agent
-that runs its own tool loop). Frameworks are selected explicitly with
-`--framework`; nothing is assumed when it is absent.
+An agent is anything that runs its own tool loop against a model. Attractor's
+native loop is one; Claude Code and Codex are external agents wrapped as
+streaming connectors. Agents are named explicitly; nothing is assumed when the
+name is absent.
 
 ```sh
-bin/attractor agent --framework claude --prompt-file examples/claude-smoke.md --cwd .
-bin/attractor agent --framework codex  --prompt-file examples/claude-smoke.md --cwd . --sandbox read-only
+bin/attractor agent claude --prompt-file examples/claude-smoke.md --cwd .
+bin/attractor agent codex  --prompt-file examples/claude-smoke.md --cwd . --sandbox read-only
 ```
 
 Both stream identified EDN events and default to read-only access. DOT runs
-select a framework with `--worker <framework>`; the console with
-`/agent --framework <framework>`. See [Claude Code worker](docs/claude-worker.md)
-and [Codex app-server worker](docs/codex-app-server.md).
+select an agent with `--agent <name>`; the console with `/agent <name>`. See
+[Claude Code agent](docs/claude-agent.md) and
+[Codex app-server agent](docs/codex-app-server.md).
 
 ## Workflow lifecycle
 

@@ -6,9 +6,9 @@
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.pipeline :as pipeline]
-            [attractor.workers.backend :as backend]
-            [attractor.workers.claude :as claude]
-            [attractor.workers.codex :as codex]))
+            [attractor.agents.backend :as backend]
+            [attractor.agents.claude :as claude]
+            [attractor.agents.codex :as codex]))
 
 (deftest agent-command-reads-prompt-file-and-streams-worker-events
   (let [path (str (os/temp-dir) "/claude-cli-" (random-uuid) ".txt")
@@ -19,9 +19,9 @@
             (with-redefs [os/exit #(swap! exits conj %)
                           claude/run! (fn [opts]
                                         (swap! calls conj opts)
-                                        ((:on_event opts) {:source :claude :worker_id "worker-1" :type :text_delta :text "hello"})
-                                        {:worker_id "worker-1" :text "hello" :exit_code 0})]
-              (with-out-str (cli/-main "agent" "--framework" "claude" "--prompt-file" path "--cwd" "/repo")))]
+                                        ((:on_event opts) {:source :claude :agent_id "worker-1" :type :text_delta :text "hello"})
+                                        {:agent_id "worker-1" :text "hello" :exit_code 0})]
+              (with-out-str (cli/-main "agent" "claude" "--prompt-file" path "--cwd" "/repo")))]
         (is (= [0] @exits))
         (is (= 1 (count @calls)))
         (is (= "Inspect literal $() and : (forms)\n" (:prompt (first @calls))))
@@ -33,10 +33,10 @@
       (finally (os/sh "/bin/rm" "-f" "--" path)))))
 
 (deftest agent-command-rejects-invalid-options-without-launch
-  (doseq [args [["--framework" "claude" "--prompt-file"] ["--framework" "claude" "--prompt" "oops"]
-                ["--framework" "claude" "--prompt-file" "/missing" "--permission-mode" "bypassPermissions"]
+  (doseq [args [["claude" "--prompt-file"] ["claude" "--prompt" "oops"]
+                ["claude" "--prompt-file" "/missing" "--permission-mode" "bypassPermissions"]
                 ["--prompt-file" "/missing"]
-                ["--framework" "gemini" "--prompt-file" "/missing"]]]
+                ["gemini" "--prompt-file" "/missing"]]]
     (let [calls (atom 0) exits (atom [])]
       (with-redefs [os/exit #(swap! exits conj %)
                     claude/run! (fn [_] (swap! calls inc))]
@@ -44,7 +44,7 @@
       (is (= [1] @exits))
       (is (zero? @calls)))))
 
-(deftest dot-run-explicitly-selects-claude-worker
+(deftest dot-run-explicitly-selects-claude-agent
   (let [dir (str (os/temp-dir) "/claude-dot-" (random-uuid))
         path (str dir "/workflow.dot") calls (atom []) exits (atom [])]
     (io/mkdir dir)
@@ -55,7 +55,7 @@
                                  (let [node {:id "work" :type "codergen" :prompt "Inspect" :cancelled? (fn [] false)}
                                        handler (handlers/resolve-handler (:registry opts) node)]
                                    (handler node (context/make-context) {} dir)))]
-      (with-out-str (cli/cmd-run [path "--worker" "claude" "--auto-approve" "--cwd" dir])))
+      (with-out-str (cli/cmd-run [path "--agent" "claude" "--auto-approve" "--cwd" dir])))
     (is (= [0] @exits))
     (is (= 1 (count @calls)))
     (is (= "Inspect" (:prompt (first @calls))))
@@ -63,12 +63,12 @@
     (is (fn? (:cancelled? (first @calls))))
     (is (= "Claude result" (io/slurp (str dir "/work/response.md"))))))
 
-(deftest worker-backend-preserves-cancellation-and-rejects-unsupported-contracts
+(deftest agent-backend-preserves-cancellation-and-rejects-unsupported-contracts
   (let [calls (atom []) events (atom []) cancelled (atom false)
         run (backend/make-backend :claude {:on_event #(swap! events conj %)})]
     (with-redefs [claude/run! (fn [opts]
                                (swap! calls conj opts)
-                               ((:on_event opts) {:type :text_delta :worker_id "w" :text "ok"})
+                               ((:on_event opts) {:type :text_delta :agent_id "w" :text "ok"})
                                {:text "ok"})]
       (is (= "ok" (run {:id "node" :cancelled? #(deref cancelled)} "prompt" nil)))
       (is (= "node" (:node_id (first @events))))
@@ -82,28 +82,28 @@
                     (catch Object error (:category (ex-data error))))))))
     (is (= 1 (count @calls)))))
 
-(deftest worker-error-is-a-nonzero-cli-exit
+(deftest agent-error-is-a-nonzero-cli-exit
   (let [path (str (os/temp-dir) "/claude-error-" (random-uuid)) exits (atom [])]
     (try
       (io/spit path "prompt")
       (let [output (with-redefs [os/exit #(swap! exits conj %)
                                 claude/run! (fn [_] (throw (ex-info "Not authenticated" {:category :worker-error :stderr "diagnostic detail"})))]
-                     (with-out-str (cli/-main "agent" "--framework" "claude" "--prompt-file" path)))]
+                     (with-out-str (cli/-main "agent" "claude" "--prompt-file" path)))]
         (is (= [1] @exits))
         (is (str/includes? output "Not authenticated"))
         (is (str/includes? output "diagnostic detail")))
       (finally (os/sh "/bin/rm" "-f" "--" path)))))
 
-(deftest missing-worker-name-never-falls-back-to-simulation
+(deftest missing-agent-name-never-falls-back-to-simulation
   (let [calls (atom 0)]
     (with-redefs [pipeline/run (fn [& _] (swap! calls inc) {:status :success})
                   os/exit (fn [_] nil)]
       (is (= :configuration_error
-             (try (with-out-str (cli/cmd-run ["examples/hello.dot" "--worker"])) nil
+             (try (with-out-str (cli/cmd-run ["examples/hello.dot" "--agent"])) nil
                   (catch Object error (:category (ex-data error)))))))
     (is (zero? @calls))))
 
-(deftest dot-run-selects-codex-framework-through-the-same-backend
+(deftest dot-run-selects-codex-through-the-same-backend
   (let [dir (str (os/temp-dir) "/codex-dot-" (random-uuid))
         path (str dir "/workflow.dot") calls (atom []) exits (atom [])]
     (io/mkdir dir)
@@ -114,7 +114,7 @@
                                  (let [node {:id "work" :type "codergen" :prompt "Inspect" :cancelled? (fn [] false)}
                                        handler (handlers/resolve-handler (:registry opts) node)]
                                    (handler node (context/make-context) {} dir)))]
-      (with-out-str (cli/cmd-run [path "--worker" "codex" "--auto-approve" "--cwd" dir "--sandbox" "workspace-write"])))
+      (with-out-str (cli/cmd-run [path "--agent" "codex" "--auto-approve" "--cwd" dir "--sandbox" "workspace-write"])))
     (is (= [0] @exits))
     (is (= "workspace-write" (:sandbox (first @calls))))
     (is (= "Codex result" (io/slurp (str dir "/work/response.md"))))))

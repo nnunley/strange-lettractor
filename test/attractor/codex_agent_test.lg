@@ -1,8 +1,8 @@
-(ns attractor.codex-worker-test
+(ns attractor.codex-agent-test
   (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
-            [attractor.workers.codex :as worker]))
+            [attractor.agents.codex :as worker]))
 
-;; SCN-CODEX-WORKER: one owned app-server turn against the let-go fake child.
+;; SCN-CODEX-AGENT: one owned app-server turn against the let-go fake child.
 (defn- command [mode]
   [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
    (str (os/cwd) "/test/fixtures/codex_app_server.lg") mode])

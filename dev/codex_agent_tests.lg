@@ -1,4 +1,4 @@
-(ns main (:require [attractor.claude-worker-test] [os :as os]))
+(ns main (:require [attractor.codex-agent-test] [os :as os]))
 (defn -main [& _]
   (let [output (with-out-str (clojure.test/run-tests))]
     (prn clojure.test/*report-counters*)

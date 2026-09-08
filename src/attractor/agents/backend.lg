@@ -1,23 +1,23 @@
-(ns attractor.workers.backend
-  "Adapt any registered agentic framework to the codergen backend contract.
+(ns attractor.agents.backend
+  "Adapt any registered external agent to the codergen backend contract.
    These one-shot connectors do not implement full-fidelity session reuse or
    intercept the agent's internal tool calls for Attractor tool hooks."
   (:require [clojure.string :as str]
-            [attractor.workers.registry :as registry]))
+            [attractor.agents.registry :as registry]))
 
 (defn make-backend
-  [framework opts]
-  (let [framework (registry/resolve-framework framework)]
+  [agent opts]
+  (let [agent (registry/resolve-agent agent)]
     (fn [node prompt _context]
       (when (= "full" (:resolved_fidelity node))
-        (throw (ex-info (str (name framework) " worker does not yet support full-fidelity sessions")
+        (throw (ex-info (str (name agent) " does not yet support full-fidelity sessions")
                         {:category :configuration_error :retryable false})))
       (when (some #(not (str/blank? %))
                   (vals (select-keys (:attractor.tool-hooks/invocation node) [:pre :post])))
-        (throw (ex-info (str "Attractor tool hooks cannot intercept " (name framework) "'s tools")
+        (throw (ex-info (str "Attractor tool hooks cannot intercept " (name agent) "'s tools")
                         {:category :configuration_error :retryable false})))
       (:text
-        (registry/run! framework
+        (registry/run! agent
           (assoc opts :prompt prompt
                  :model (or (:model opts) (:llm_model node))
                  :cancelled? (fn [] (boolean (or (when-let [cancelled? (:cancelled? node)] (cancelled?))

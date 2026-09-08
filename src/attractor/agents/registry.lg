@@ -1,0 +1,37 @@
+(ns attractor.agents.registry
+  "External agents: anything that runs its own tool loop against a model
+   (Claude Code, Codex), as distinct from a model, which is addressed as
+   provider/name. Every agent exposes the same contract: (run! options) with
+   :prompt, :working_dir, :model, :timeout_ms, :on_event, :cancelled? plus
+   agent-specific options, returning {:text ...} or throwing a tagged error.
+   Nothing here assumes a default agent; callers name one."
+  (:require [clojure.string :as str]
+            [attractor.agents.claude :as claude]
+            [attractor.agents.codex :as codex]))
+
+(def agents
+  ;; Wrappers resolve the connector var per call so redefinitions (tests,
+  ;; instrumentation) take effect.
+  {:claude {:run! (fn [options] (claude/run! options))
+            :description "Claude Code CLI (stream-json); options: --tools, --permission-mode"
+            :options #{:tools :permission_mode}}
+   :codex {:run! (fn [options] (codex/run! options))
+           :description "Codex app-server (JSON-RPC over stdio); options: --sandbox, --approval-policy"
+           :options #{:sandbox :approval_policy}}})
+
+(defn agent-names [] (sort (map name (keys agents))))
+
+(defn resolve-agent
+  "Return the agent keyword for a string or keyword, or throw a configuration
+   error naming the available agents."
+  [value]
+  (let [k (cond (keyword? value) value (string? value) (keyword value) :else nil)]
+    (if (contains? agents k)
+      k
+      (throw (ex-info (str "Unknown agent " (pr-str value) "; available: " (str/join ", " (agent-names)))
+                      {:category :configuration_error :agent value :available (agent-names)})))))
+
+(defn run!
+  "Run one job of the named agent."
+  [agent options]
+  ((:run! (get agents (resolve-agent agent))) options))

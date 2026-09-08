@@ -29,7 +29,7 @@
     (is (= {:state {} :action expected} (line {} text)))))
 
 (deftest command-names-arguments-and-unknowns
-  (doseq [command [:help :agents :focus :run :cancel :quit]]
+  (doseq [command [:help :list :new :focus :run :agent :alias :cancel :quit]]
     (is (= {:state {} :action {:type :command :command command :args "" :selection selection}}
            (line {} (str "/" (name command)))))
     (is (= {:state {} :action {:type :command :command command :args "agent 雪  " :selection selection}}

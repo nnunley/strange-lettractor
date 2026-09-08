@@ -11,7 +11,7 @@ unless concrete evidence below says otherwise. No conformance story is removed.
 | CONSOLE-INPUT-02 | One owned input source, concurrent stream redraw, cancellation, EOF and terminal restoration | Partial: native PTY covers Ctrl-C, EOF and restoration (SCN-CONSOLE-TUI); resize and exception paths pending |
 | CONSOLE-WORKER-01 | Qwen invoked through Attractor; bounded live implementer trial and mechanical acceptance | Partial: live Qwen conversation turn through the console hub (SCN-CONSOLE-LINE); bounded implementer trial pending |
 | CONSOLE-WORKER-02 | Owned Claude Code subprocess, streaming events, explicit permissions, failure/cancel/exit; no silent fallback | Let-go protocol fixture plus separately recorded live framework trial |
-| CONSOLE-WORKER-03 | Codex app-server orchestration and interleaved identified worker events | Verified: transport 4/41 and worker 3/15 against the let-go fake child, `/agent --framework codex` through the hub (SCN-CONSOLE-CONTROL), one live turn via `bin/attractor agent --framework codex` |
+| CONSOLE-WORKER-03 | Codex app-server orchestration and interleaved identified worker events | Verified: transport 4/41 and worker 3/15 against the let-go fake child, `/agent codex` through the hub (SCN-CONSOLE-CONTROL), one live turn via `bin/attractor agent codex` |
 | CONSOLE-TUI-01 | tiny-tui full-screen presentation using same dispatcher as line console | Verified: SCN-CONSOLE-TUI headless plus native PTY |
 | CONSOLE-HUB-01 | RPC hub owns framework sessions, workers and evaluation; console is a client; disconnect does not implicitly cancel work | Partial: in-process hub owns sessions, evaluation, workflows and workers and client detach leaves work running (SCN-HUB-CONSOLE-OPS, SCN-CONSOLE-CONTROL); separate-process RPC and reconnect/replay pending |
 
@@ -56,8 +56,8 @@ Story: CONSOLE-EVAL-01, CONSOLE-HUB-01 (in-process operations component).
 namespace with interned `hub`, `request!`, `events-since`, `*session*`,
 `*run*`; one evaluation at a time, busy rejected, printed output captured,
 errors rendered), `:workflow/run|cancel|list` (hub-owned pipeline runs with
-cooperative cancellation) and `:worker/run|cancel|list` (owned external
-coding-agent workers through the existing connector). Every source shares the
+cooperative cancellation) and `:agent/run|cancel|list` (owned external
+agent jobs through the registered connectors). Every source shares the
 bounded event log. Evidence 2026-09-08: `dev/hub_console_ops_tests.lg` 6 tests /
 33 assertions with the fixture provider, a mock DOT workflow and the let-go
 worker fixture, including busy, cancel-leaves-hub-alive and failure paths.

@@ -1,4 +1,4 @@
-(ns attractor.workers.claude
+(ns attractor.agents.claude
   (:require [attractor.execution :as execution] [clojure.core :as core]
             [clojure.string :as str] [io :as io] [os :as os] [json :as json]))
 
@@ -6,7 +6,7 @@
 (defn- quote-arg [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
 (defn- checked-sh [& args]
   (let [r (apply os/sh args)]
-    (when-not (= 0 (:exit r)) (fail! :claude-io "Claude worker temporary-file operation failed"))
+    (when-not (= 0 (:exit r)) (fail! :claude-io "Claude agent temporary-file operation failed"))
     (:out r)))
 (defn- validate! [opts]
   (when-not (and (string? (:prompt opts)) (string? (:working_dir opts))
@@ -17,7 +17,7 @@
                 (contains? #{"plan" "acceptEdits" "dontAsk"} (:permission_mode opts))
                 (integer? (:timeout_ms opts)) (pos? (:timeout_ms opts))
                 (or (nil? (:model opts)) (and (string? (:model opts)) (not (str/blank? (:model opts))))))
-    (fail! :invalid-request "Invalid Claude worker options")))
+    (fail! :invalid-request "Invalid Claude agent options")))
 
 (defn run!
   "Run Claude Code's tool loop. Prompt is private stdin; callbacks receive identified
@@ -26,7 +26,7 @@
   (let [opts (merge {:command ["claude"] :tools ["Read"] :permission_mode "plan"
                     :timeout_ms 120000 :working_dir (os/cwd)} options)
         _ (validate! opts)
-        worker-id (str (random-uuid)) session-id (atom nil) terminal (atom nil)
+        job-id (str (random-uuid)) session-id (atom nil) terminal (atom nil)
         callback (or (:on_event opts) (fn [_] nil)) cancelled? (or (:cancelled? opts) (fn [] false))
         directory (str/trim (checked-sh "/usr/bin/mktemp" "-d"))
         files (atom []) reader (atom nil) completion (promise)
@@ -34,9 +34,9 @@
                      :max_command_timeout_ms (:timeout_ms opts) :env_policy :all})
         started (atom false)
         emit! (fn [type record text]
-                (try (callback (cond-> {:source :claude :worker_id worker-id :session_id @session-id
+                (try (callback (cond-> {:source :claude :job_id job-id :session_id @session-id
                                          :type type :event record} text (assoc :text text)))
-                     (catch Object e (fail! :claude-callback "Claude worker event callback failed"))))
+                     (catch Object e (fail! :claude-callback "Claude agent event callback failed"))))
         record! (fn [line]
                   (when (> (count (bytes line)) 1048576) (fail! :claude-output-limit "Claude record exceeds 1 MiB"))
                   (let [record (try (json/read-json line) (catch Object e (fail! :claude-protocol "Malformed Claude JSON record")))
@@ -71,13 +71,13 @@
             command (str (str/join " " (map quote-arg argv)) " > " (quote-arg stdout) " 2> " (quote-arg stderr))
             deadline (+ (System/currentTimeMillis) (:timeout_ms opts))]
         (reset! reader (io/open stdout :read))
-        (when (cancelled?) (fail! :cancelled "Claude worker cancelled"))
+        (when (cancelled?) (fail! :cancelled "Claude agent cancelled"))
         (future (try (deliver completion {:value ((:exec_command_stdin environment) command (:timeout_ms opts) nil nil (:prompt opts))})
                      (catch Object e (deliver completion {:error e}))))
         (reset! started true)
         (loop [pending "" total 0]
-          (when (cancelled?) (fail! :cancelled "Claude worker cancelled"))
-          (when (> (System/currentTimeMillis) deadline) (fail! :timeout "Claude worker timed out"))
+          (when (cancelled?) (fail! :cancelled "Claude agent cancelled"))
+          (when (> (System/currentTimeMillis) deadline) (fail! :timeout "Claude agent timed out"))
           (when (> (or (:size (os/stat stderr)) 0) 16777216) (fail! :claude-output-limit "Claude stderr exceeds 16 MiB"))
           ;; Observe process completion BEFORE reading EOF: otherwise the child
           ;; can append its last record between EOF and completion observation.
@@ -91,8 +91,8 @@
             (if completed-before-read
               (let [done @completion result (:value done)]
                 (when (:error done) (throw (:error done)))
-                (when (:cancelled result) (fail! :cancelled "Claude worker cancelled"))
-                (when (:timed_out result) (fail! :timeout "Claude worker timed out"))
+                (when (:cancelled result) (fail! :cancelled "Claude agent cancelled"))
+                (when (:timed_out result) (fail! :timeout "Claude agent timed out"))
                 (when-not (= 0 (:exit_code result))
                   (let [error-reader (io/open stderr :read)
                         diagnostic (try (or (core/read-bytes error-reader 4096) "") (finally (io/close! error-reader)))]
@@ -101,7 +101,7 @@
                 (when-not (str/blank? pending) (fail! :claude-protocol "Truncated Claude JSON record"))
                 (when-not @terminal (fail! :claude-protocol "Claude exited without a terminal result"))
                 (emit! :completed @terminal nil)
-                {:worker_id worker-id :session_id @session-id :text (get @terminal "result") :result @terminal :exit_code 0})
+                {:job_id job-id :session_id @session-id :text (get @terminal "result") :result @terminal :exit_code 0})
               (do (core/sleep 10) (recur pending total)))))))
       (finally
         ;; cleanup signals the owned process group. The explicit completion join

@@ -31,7 +31,7 @@
           (is (= ["first" "second"] (mapv :content (filter #(= :user (:role %)) (:messages (second @requests))))))
           (let [events (:events (hub/events-since h (:client_id client) (:cursor client)))]
             (is (seq events))
-            (is (every? #(= :agent (:source %)) events))
+            (is (every? #(= :session (:source %)) events))
             (is (every? #(= id (:session_id %)) events))
             (is (= 1 (count (filter #(= :session_start (get-in % [:event :type])) events))))
             (is (= 2 (count (filter #(= :processing_end (get-in % [:event :type])) events))))))

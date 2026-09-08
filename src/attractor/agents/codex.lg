@@ -1,7 +1,7 @@
-(ns attractor.workers.codex
-  "Owned Codex app-server worker: one thread, one turn, streamed agent message
+(ns attractor.agents.codex
+  "Owned Codex app-server agent: one thread, one turn, streamed agent message
    deltas, identified events. Approval and permission requests from the server
-   are refused with a JSON-RPC error; this worker never grants authority on the
+   are refused with a JSON-RPC error; this agent never grants authority on the
    user's behalf. Completion requires a completed turn."
   (:require [clojure.string :as str] [clojure.core :as core] [os :as os]
             [attractor.codex.transport :as transport]))
@@ -10,9 +10,9 @@
   (throw (ex-info message (merge {:category category :source :codex} data))))
 
 (defn- validate! [opts]
-  (when-not (and (string? (:prompt opts)) (not (str/blank? (:prompt opts)))) (fail! :invalid-request "Codex worker needs a prompt"))
-  (when-not (and (vector? (:command opts)) (seq (:command opts))) (fail! :invalid-request "Codex worker needs a command"))
-  (when-not (and (integer? (:timeout_ms opts)) (pos? (:timeout_ms opts))) (fail! :invalid-request "Codex worker needs a positive timeout"))
+  (when-not (and (string? (:prompt opts)) (not (str/blank? (:prompt opts)))) (fail! :invalid-request "Codex agent needs a prompt"))
+  (when-not (and (vector? (:command opts)) (seq (:command opts))) (fail! :invalid-request "Codex agent needs a command"))
+  (when-not (and (integer? (:timeout_ms opts)) (pos? (:timeout_ms opts))) (fail! :invalid-request "Codex agent needs a positive timeout"))
   (when-not (contains? #{"read-only" "workspace-write" "danger-full-access"} (:sandbox opts))
     (fail! :invalid-request "Codex sandbox must be read-only, workspace-write or danger-full-access")))
 
@@ -21,17 +21,17 @@
    the live app-server's thread/start takes the kebab-case sandbox mode),
    :approval_policy (\"never\" default), :timeout_ms (120000), :command
    ([\"codex\" \"app-server\" \"--stdio\"]), :on_event, :cancelled?.
-   Returns {:worker_id :thread_id :turn_id :text :status} or throws."
+   Returns {:job_id :thread_id :turn_id :text :status} or throws."
   [options]
   (let [opts (merge {:command ["codex" "app-server" "--stdio"] :sandbox "read-only" :approval_policy "never"
                      :timeout_ms 120000 :working_dir (os/cwd)} options)
         _ (validate! opts)
-        worker-id (str (random-uuid))
+        job-id (str (random-uuid))
         callback (or (:on_event opts) (fn [_] nil)) cancelled? (or (:cancelled? opts) (fn [] false))
         next-id (atom 0) replies (atom {}) text (atom "") turn (atom nil) thread (atom nil)
         done (promise) failure (atom nil)
         emit! (fn [type record & [delta]]
-                (callback (cond-> {:source :codex :worker_id worker-id :thread_id @thread :turn_id @turn :type type :event record}
+                (callback (cond-> {:source :codex :job_id job-id :thread_id @thread :turn_id @turn :type type :event record}
                             delta (assoc :text delta))))
         t (atom nil)
         request! (fn [method params]
@@ -53,7 +53,7 @@
                        ;; Server request: refuse, never grant.
                        (and (contains? message "id") (contains? message "method"))
                        (transport/send! @t {"id" (get message "id")
-                                            "error" {"code" -32000 "message" (str "refused by attractor worker: " (get message "method"))}})
+                                            "error" {"code" -32000 "message" (str "refused by attractor agent: " (get message "method"))}})
                        ;; Notifications.
                        :else
                        (case (get message "method")
@@ -84,13 +84,13 @@
                                                        "params" {"threadId" @thread "turnId" @turn}})
                                   (catch Object _ nil))
                              (deref done 2000 nil)
-                             (fail! :cancelled "Codex worker cancelled"))
-            (> (System/currentTimeMillis) deadline) (fail! :timeout "Codex worker timed out")
+                             (fail! :cancelled "Codex agent cancelled"))
+            (> (System/currentTimeMillis) deadline) (fail! :timeout "Codex agent timed out")
             :else (do (core/sleep 10) (recur)))))
       (let [{:keys [status error]} @done]
         (case status
           "completed" (do (emit! :completed {"status" status "text" @text})
-                          {:worker_id worker-id :thread_id @thread :turn_id @turn :text @text :status status})
+                          {:job_id job-id :thread_id @thread :turn_id @turn :text @text :status status})
           "interrupted" (fail! :cancelled "Codex turn interrupted")
           "transport-failed" (fail! :codex-protocol (str "Codex transport failed: " (get error "message")))
           (fail! :codex-result (str "Codex turn " status ": " (get error "message")) {:status status :error error})))
