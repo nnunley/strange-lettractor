@@ -1,0 +1,20 @@
+(ns main
+  (:require [attractor.subagent-lifecycle-test]
+            [attractor.agent-test]
+            [attractor.agent-loop-contract-test]
+            [attractor.turn-ownership-test]
+            [attractor.session-error-contract-test]
+            [attractor.engine-test]
+            [attractor.execution-test]
+            [attractor.execution-env-test]
+            [attractor.tool-hooks-test]
+            [attractor.tool-hook-workflow-test]
+            [os :as os]))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

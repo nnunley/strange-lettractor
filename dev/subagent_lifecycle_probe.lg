@@ -1,0 +1,112 @@
+(ns main
+  (:require [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]
+            [os :as os]))
+
+(defn probe-cancellation []
+  (let [entered (promise)
+        release (promise)
+        provider-returned (atom false)
+        environment (execution/make-environment
+                      {:working_directory (fn [] "/virtual/subagent-probe")
+                       :file_exists (fn [_] false)
+                       :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+        parent (agent/make-session
+                 {:provider_profile (profiles/make-profile
+                                      {:id "probe" :model "probe"
+                                       :supports_streaming false})
+                  :execution_env environment :project_docs []
+                  :complete_fn (fn [_]
+                                 (deliver entered true)
+                                 (deref release 5000 :release-timeout)
+                                 (reset! provider-returned true)
+                                 {:message {:role :assistant :content "late output"}
+                                  :tool_calls []})})]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! parent {:task "inspect"}))]
+        (when-not (= true (deref entered 5000 false))
+          (throw (ex-info "Probe never entered provider" {})))
+        (let [closed (agent/close-subagent! parent id)
+              after-close (get-in @parent [:subagents id :status])
+              returned-before-provider (not @provider-returned)]
+          (deliver release true)
+          (let [result (deref (get-in @parent [:subagents id :future]) 5000 :wait-timeout)]
+            (prn {:close-result closed
+                  :status-after-close after-close
+                  :close-returned-before-provider returned-before-provider
+                  :wait-result result
+                  :final-handle-status (get-in @parent [:subagents id :status])
+                  :child-state (:state @(get-in @parent [:subagents id :session]))}))))
+      (finally
+        (deliver release true)
+        (agent/close-session! parent)))))
+
+(defn probe-closed-parent []
+  (let [calls (atom 0)
+        environment (execution/make-environment
+                      {:working_directory (fn [] "/virtual/subagent-probe")
+                       :file_exists (fn [_] false)
+                       :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+        parent (agent/make-session
+                 {:provider_profile (profiles/make-profile
+                                      {:id "probe" :model "probe"
+                                       :supports_streaming false})
+                  :execution_env environment :project_docs []
+                  :complete_fn (fn [_]
+                                 (swap! calls inc)
+                                 {:message {:role :assistant :content "orphan output"}
+                                  :tool_calls []})})]
+    (agent/close-session! parent)
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! parent {:task "after shutdown"}))
+            child (get-in @parent [:subagents id :session])]
+        (try
+          (let [result (deref (get-in @parent [:subagents id :future]) 5000 :timeout)]
+            (prn {:probe :closed-parent
+                :wait-result result
+                :parent-state (:state @parent)
+                :child-state (:state @child)
+                :provider-calls @calls}))
+          (finally (agent/close-subagent! parent id))))
+      (catch Object e (prn {:probe :closed-parent :rejected (ex-data e)})))))
+
+(defn probe-completion-send []
+  (let [parent-ref (atom nil)
+        sent (atom false)
+        ack (atom nil)
+        environment (execution/make-environment
+                      {:working_directory (fn [] "/virtual/subagent-probe")
+                       :file_exists (fn [_] false)
+                       :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+        parent (agent/make-session
+                 {:provider_profile (profiles/make-profile
+                                      {:id "probe" :model "probe"
+                                       :supports_streaming false})
+                  :execution_env environment :project_docs []
+                  :on_event (fn [event]
+                              (when (and (= :subagent_event (:type event))
+                                         (= :processing_end (get-in event [:event :type]))
+                                         (compare-and-set! sent false true))
+                                (reset! ack (agent/send-subagent-input!
+                                              @parent-ref (:agent_id event) "second"))))
+                  :complete_fn (fn [request]
+                                 {:message {:role :assistant
+                                            :content (:content (last (:messages request)))}
+                                  :tool_calls []})})]
+    (reset! parent-ref parent)
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! parent {:task "first"}))
+            result (deref (get-in @parent [:subagents id :future]) 5000 :timeout)
+            child (get-in @parent [:subagents id :session])]
+        (prn {:probe :completion-send :ack @ack :wait-result result
+              :remaining-queue (:followup-queue @child)
+              :child-state (:state @child)}))
+      (finally (agent/close-session! parent)))))
+
+(defn -main [& _]
+  (probe-cancellation)
+  (probe-closed-parent)
+  (probe-completion-send))
+
+(when *command-line-args* (apply -main *command-line-args*))

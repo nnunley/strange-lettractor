@@ -1,0 +1,39 @@
+{:component :subagent-lifecycle
+ :story "CAL-SUBAGENT-01"
+ :scenario "SCN-CAL-SUBAGENTS"
+ :status :verified-component
+ :base "39338c4956fabebf709db7eefef657d35481b1b1"
+ :runtime "/Users/ndn/development/let-go/lg"
+ :baseline {:tests 667 :assertions 6507 :failures 0 :exit 0}
+ :discovery
+ [{:case :close-late-success
+   :observed {:after-close :closed :after-worker :completed :success true}}
+  {:case :spawn-after-parent-close
+   :observed {:parent-state :closed :child-state :idle :provider-calls 1
+              :success true}}
+  {:case :send-at-completion-callback
+   :observed {:queued true :child-state :idle :remaining-queue ["second"]
+              :output "first"}}]
+ :red {:five-cases {:tests 5 :pass 23 :fail 15 :error 0
+                    :runner-exit 0
+                    :note "Diagnostic run-test-var exits zero despite failed counters; not passing evidence."}
+       :callback-close {:exit 2 :failure :native-deadlock
+                        :cause "Nested parent forwarding loses child delivery ancestry; close waits on its own child event drainer."}}
+ :scope-review {:reviewers 2 :verdict :approved}
+ :focused {:tests 12 :assertions 106 :failures 0 :exit 0
+           :command "/Users/ndn/development/let-go/lg -source-paths src:test dev/subagent_lifecycle_tests.lg run"}
+ :impacted {:tests 166 :assertions 1044 :failures 0 :exit 0
+            :command "/Users/ndn/development/let-go/lg -source-paths src:test dev/subagent_lifecycle_impacted_tests.lg run"}
+ :sentinel {:tests 679 :assertions 6613 :failures 0 :exit 0
+            :command "PATH=/Users/ndn/development/let-go:$PATH lgx test"}
+ :bundle {:tests 12 :assertions 106 :failures 0 :exit 0
+          :command "lg -source-paths src:test -b <output>/tests dev/subagent_lifecycle_tests.lg; cd <output>; ./tests run"}
+ :cli-build {:build-exit 0 :help-exit 0}
+ :spec-review {:reviewers [:codex :claude-code] :verdict :approved}
+ :quality-review {:reviewers [:codex :claude-code] :verdict :approved}
+ :component-audit {:reviewers [:codex :claude-code] :verdict :clean}
+ :completion-semantics "Run promise publication after model/loop work and synchronous callbacks; not an OS-thread join. Close does not resolve a held provider's completion."
+ :residuals [:full-subagent-conformance :model-profile-override-fidelity
+             :working-directory-validation :live-provider-evidence
+             :uninterruptible-provider-cancellation :full-event-shutdown
+             :native-go-aot-parity]}

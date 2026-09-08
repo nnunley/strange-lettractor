@@ -358,6 +358,28 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Then histories remain independent, bounds are enforced, results propagate, and cancellation closes descendants
 - Seam: coding-loop integration
 
+#### Lifecycle ownership component (verified)
+
+- Close during active provider work is terminal even after late success/error;
+  repeated close and rejected sends cannot resurrect the child. Closing an
+  already completed child preserves its historical result.
+- Spawn/shutdown and send/close have atomic admission outcomes: admitted work
+  is owned and cancelled, or late work rejects. Test both controlled orderings.
+- A send acknowledged during `processing_end` is consumed exactly once, and
+  concurrent sends cannot start competing loops or replace wait ownership.
+- Public wait captures its admitted run, including accepted queued messages;
+  waits after later acknowledged runs see those runs. Closing from a child
+  callback cannot self-join; blocked provider work must actually return before
+  its completion wait resolves.
+- Command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/subagent_lifecycle_tests.lg run`.
+  Focused and external-directory bundle: 12 tests / 106 assertions; impacted
+  166/1044, full default suite 679/6613, zero failures; CLI build/help pass.
+  Paired spec and quality reviews approve; paired final audit is clean.
+  Existing history, limits,
+  scoped native process cancellation and root ownership contracts are impacted.
+  Broader profile/model/working-directory fidelity and live §7 evidence remain
+  separate requirements. See `docs/subagent-lifecycle-plan.md`.
+
 ### SCN-CAL-ENV — Execution environment result contract
 
 - Given successful, failing, and cancelled local commands

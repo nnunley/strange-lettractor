@@ -1,7 +1,28 @@
 # Progress
 
-**Phase:** verified read_file component, CAL-TOOLS-01 (ITER-0007)
-**Task:** verified checkpoint after clean paired three-tier audit
+**Phase:** subagent lifecycle verified checkpoint, CAL-SUBAGENT-01 (ITER-0007)
+**Task:** paired final audit clean; ready to commit and push
+
+**Current subagent slice:** `.worktrees/subagent-lifecycle`, base `39338c4`.
+Baseline full suite: 667 tests / 6507 assertions / zero failures. Native bounded
+public-API probes confirm closed children are republished as successful completed
+runs, fully closed parents accept new child work, and completion-callback sends
+are acknowledged but stranded. See
+`docs/subagent-lifecycle-plan.md` for terminal-state, admission, send handoff and
+wait-ownership proof obligations. Paired scope review approved after adding exact
+wait ownership and deterministic competing-admission evidence. Implementation
+is underway. Five permanent cases report 23 passing and 15 failing assertions,
+zero test errors on the unfixed code; the diagnostic per-var runner exits zero
+even when its counters fail, so those exits are not pass evidence. The callback
+case additionally reproduces a native deadlock (terminal exit 2): nested event
+forwarding loses the child delivery ancestry and close waits on its own drainer.
+Final focused and external-directory bundle: 12 tests / 106 assertions, zero
+failures. Impacted: 166/1044; full default suite: 679/6613, zero failures; CLI
+build/help pass. Paired spec review approves after fixing overlapping-close
+cancellation and a turn-count evaluation-order regression and strengthening
+public wait/pre-launch spawn barriers. Paired quality review approves; final
+component audit is clean. No full §7 or native-Go AOT completion claimed.
+Private notes remain untouched; full §7 and the implementation goal remain open.
 
 **Current read_file slice:** `.worktrees/read-file-contract`, public base
 `892db06`. Fresh full baseline completed with 653 tests / 6,068 assertions /

@@ -1,0 +1,343 @@
+(ns attractor.subagent-lifecycle-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; SCN-CAL-SUBAGENTS: public lifecycle APIs with bounded provider/event gates.
+(defn- parent [complete & [options]]
+  (agent/make-session
+    (merge {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+            :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                              :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+            :project_docs [] :complete_fn complete} options)))
+(defn- response [text] {:message {:role :assistant :content text} :tool_calls []})
+(defn- wait-task [p id] (core/future (agent/wait-subagent! p id)))
+(defn- error-of [f] (try (f) nil (catch Object e (:category (ex-data e)))))
+(defn- join-children [p]
+  (doseq [[_ handle] (:subagents @p)]
+    (when (:future handle) (deref (:future handle) 4000 nil))))
+
+(def ^:dynamic *admission-actor* nil)
+
+(deftest close-is-terminal-and-wait-still-awaits-worker
+  (doseq [throws? [false true]]
+    (let [entered (promise) release (promise)
+          p (parent (fn [_] (deliver entered true) (deref release 3000 nil)
+                      (if throws? (throw (ex-info "late failure" {:category :late})) (response "late"))))]
+      (try
+        (let [id (:agent_id (agent/spawn-subagent! p {:task "first"}))
+              _ (is (= true (deref entered 3000 false)))
+              waiting (wait-task p id)]
+          (is (= :closed (:status (agent/close-subagent! p id))))
+          (is (= :closed (:status (agent/close-subagent! p id))))
+          (is (= :pending (deref waiting 20 :pending)))
+          (is (some? (error-of #(agent/send-subagent-input! p id "rejected"))))
+          (deliver release true)
+          (let [result (deref waiting 3000 :timeout)]
+            (is (false? (:success result)))
+            (is (= :closed (get-in @p [:subagents id :status])))
+            (is (= :closed (:state @(get-in @p [:subagents id :session]))))))
+        (finally (deliver release true) (agent/close-session! p) (join-children p))))))
+
+(deftest completed-history-and-later-wait-snapshots
+  (let [p (parent (fn [request] (response (:content (last (:messages request))))))]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "first"}))
+            first-result (deref (wait-task p id) 3000 :timeout)
+            old-future (get-in @p [:subagents id :future])]
+        (is (= "first" (:output first-result)))
+        (is (= 1 (:turns_used first-result)))
+        (is (= :running (:status (agent/send-subagent-input! p id "second"))))
+        (is (= "second" (:output (deref (wait-task p id) 3000 :timeout))))
+        (is (= first-result (deref old-future 3000 :timeout)))
+        (agent/close-subagent! p id)
+        (is (= "second" (:output (deref (wait-task p id) 3000 :timeout)))))
+      (finally (agent/close-session! p) (join-children p)))))
+
+(deftest repeated-parent-close-signals-child-before-first-close-resumes
+  (let [entered (promise) provider-release (promise) abort-entered (promise) abort-release (promise)
+        p (parent (fn [_] (deliver entered true) (deref provider-release 3000 nil) (response "late")))
+        id (:agent_id (agent/spawn-subagent! p {:task "work"}))
+        child (get-in @p [:subagents id :session])
+        original-abort agent/abort-session! gated (atom false)]
+    (try
+      (is (= true (deref entered 3000 false)))
+      (with-redefs [agent/abort-session!
+                    (fn [session & args]
+                      (when (and (identical? child session) (compare-and-set! gated false true))
+                        (deliver abort-entered true) (deref abort-release 3000 nil))
+                      (apply original-abort session args))]
+        (let [closing (core/future (agent/close-subagent! p id))]
+          (try
+            (is (= true (deref abort-entered 3000 false)))
+            (agent/close-session! p)
+            (is (= :closed (:state @child)))
+            (is (true? (:abort_signaled @child)))
+            (is (true? (:cleanup_done @p)))
+            (deliver abort-release true)
+            (is (= :closed (:status (deref closing 3000 {}))))
+            (finally (deliver abort-release true) (deref closing 3000 nil)))))
+      (finally (deliver abort-release true) (deliver provider-release true)
+               (agent/close-session! p) (join-children p)))))
+
+(deftest public-wait-keeps-snapshot-when-another-run-is-admitted
+  (let [entered (promise) release (promise) newer-entered (promise) newer-release (promise)
+        captured (promise) release-wait (promise)
+        p (parent (fn [request]
+                    (let [text (:content (last (:messages request)))]
+                      (if (= text "first")
+                        (do (deliver entered true) (deref release 3000 nil))
+                        (do (deliver newer-entered true) (deref newer-release 3000 nil)))
+                      (response text))))
+        id (:agent_id (agent/spawn-subagent! p {:task "first"}))
+        old (get-in @p [:subagents id :future]) original-deref core/deref]
+    (try
+      (is (= true (deref entered 3000 false)))
+      (with-redefs [core/deref (fn [value & args]
+                                (when (and (= *admission-actor* :wait) (identical? value old) (empty? args))
+                                  (deliver captured true) (original-deref release-wait 3000 nil))
+                                (apply original-deref value args))]
+        (let [waiting (core/future (binding [*admission-actor* :wait] (agent/wait-subagent! p id)))]
+          (try
+            (is (= true (deref captured 3000 false)))
+            (deliver release true)
+            (is (= "first" (:output (deref old 3000 :timeout))))
+            (is (= :running (:status (agent/send-subagent-input! p id "second"))))
+            (is (= true (deref newer-entered 3000 false)))
+            (deliver release-wait true)
+            (is (= "first" (:output (deref waiting 3000 :timeout))))
+            (let [new-wait (wait-task p id)]
+              (is (= :pending (deref new-wait 20 :pending)))
+              (deliver newer-release true)
+              (is (= "second" (:output (deref new-wait 3000 :timeout)))))
+            (finally (deliver release-wait true) (deliver release true) (deliver newer-release true)
+                     (deref waiting 3000 nil)))))
+      (finally (deliver release true) (deliver newer-release true) (deliver release-wait true)
+               (agent/close-session! p) (join-children p)))))
+
+(deftest registered-spawn-is-owned-before-worker-launch
+  (let [at-launch (promise) release-launch (promise) calls (atom 0)
+        p (parent (fn [_] (swap! calls inc) (response "orphan")))
+        original-future core/future*]
+    (try
+      (with-redefs [core/future* (fn [f]
+                                  (when (= *admission-actor* :spawn)
+                                    (deliver at-launch true) (deref release-launch 3000 nil))
+                                  (original-future f))]
+        (let [spawning (core/future (binding [*admission-actor* :spawn]
+                                     (agent/spawn-subagent! p {:task "registered"})))]
+          (try
+            (is (= true (deref at-launch 3000 false)))
+            (let [id (first (keys (:subagents @p)))
+                  handle (get-in @p [:subagents id])
+                  waiting (wait-task p id)]
+              (is (= :running (:status handle)))
+              (is (some? (:future handle)))
+              (is (= :pending (deref waiting 20 :pending)))
+              (agent/close-session! p)
+              (is (= :closed (:state @(:session handle))))
+              (is (= :pending (deref waiting 20 :pending)))
+              (deliver release-launch true)
+              (is (= id (:agent_id (deref spawning 3000 {}))))
+              (is (false? (:success (deref waiting 3000 :timeout))))
+              (is (= 0 @calls)))
+            (finally (deliver release-launch true) (deref spawning 3000 nil)))))
+      (finally (deliver release-launch true) (agent/close-session! p) (join-children p)))))
+
+(deftest concurrent-idle-sends-share-one-published-completion
+  (let [entered (promise) release (promise) calls (atom []) active (atom 0) peak (atom 0)
+        p (parent (fn [request]
+                    (let [text (:content (last (:messages request)))]
+                      (swap! calls conj text)
+                      (swap! peak max (swap! active inc))
+                      (try
+                        (when (not= text "seed") (deliver entered true) (deref release 3000 nil))
+                        (response text)
+                        (finally (swap! active dec))))))]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "seed"}))
+            _ (is (= "seed" (:output (deref (wait-task p id) 3000 :timeout))))
+            original (get-in @p [:subagents id :future])
+            sends (mapv (fn [n] (core/future (agent/send-subagent-input! p id (str n)))) (range 6))
+            acks (mapv #(deref % 3000 :timeout) sends)]
+        (is (= true (deref entered 3000 false)))
+        (is (= 6 (count (filter #(= :running (:status %)) acks))))
+        (is (= 5 (count (filter :queued acks))))
+        (is (not (identical? original (get-in @p [:subagents id :future]))))
+        (let [waiting (wait-task p id)]
+          (is (= :pending (deref waiting 20 :pending)))
+          (deliver release true)
+          (is (true? (:success (deref waiting 3000 :timeout)))))
+        (is (= 1 @peak))
+        (is (= 7 (count @calls)))
+        (is (= #{"seed" "0" "1" "2" "3" "4" "5"} (set @calls))))
+      (finally (deliver release true) (agent/close-session! p) (join-children p)))))
+
+(deftest send-and-close-have-controlled-admission-order
+  (doseq [send-wins? [false true]]
+    (let [send-at-lock (promise) release-send (promise) close-at-lock (promise)
+          provider-release (promise) calls (atom [])
+          p (parent (fn [request]
+                      (let [text (:content (last (:messages request)))]
+                        (swap! calls conj text)
+                        (when (= text "new") (deref provider-release 3000 nil))
+                        (response text))))
+          id (:agent_id (agent/spawn-subagent! p {:task "seed"}))
+          _ (is (= "seed" (:output (deref (wait-task p id) 3000 :timeout))))
+          lock (:lifecycle_lock @p) original-cas core/compare-and-set!
+          gated (atom false)]
+      (try
+        (with-redefs [core/compare-and-set!
+                      (fn [a old new]
+                        (if (and (identical? a lock) (= old false) (= new true))
+                          (do
+                            (when (= *admission-actor* :close) (deliver close-at-lock true))
+                            (if (and (= *admission-actor* :send) (original-cas gated false true))
+                              (if send-wins?
+                                (let [won (original-cas a old new)]
+                                  (deliver send-at-lock won) (deref release-send 3000 nil) won)
+                                (do (deliver send-at-lock true) (deref release-send 3000 nil)
+                                    (original-cas a old new)))
+                              (original-cas a old new)))
+                          (original-cas a old new)))]
+          (let [sender (core/future
+                         (binding [*admission-actor* :send]
+                           (try (agent/send-subagent-input! p id "new")
+                                (catch Object e {:error (:category (ex-data e))}))))]
+            (try
+              (is (= true (deref send-at-lock 3000 false)))
+              (let [closer (core/future (binding [*admission-actor* :close] (agent/close-subagent! p id)))]
+                (try
+                  (is (= true (deref close-at-lock 3000 false)))
+                  (when-not send-wins? (is (= :closed (:status (deref closer 3000 {})))))
+                  (deliver release-send true)
+                  (let [ack (deref sender 3000 {})]
+                    (is (= (if send-wins? :running :session-closed)
+                           (if send-wins? (:status ack) (:error ack)))))
+                  (is (= :closed (:status (deref closer 3000 {}))))
+                  (deliver provider-release true)
+                  (let [result (deref (wait-task p id) 3000 :timeout)]
+                    (is (= (not send-wins?) (:success result))))
+                  (is (= :closed (get-in @p [:subagents id :status])))
+                  (when-not send-wins? (is (= ["seed"] @calls)))
+                  (finally (deliver release-send true) (deliver provider-release true) (deref closer 3000 nil))))
+              (finally (deliver release-send true) (deref sender 3000 nil)))))
+        (finally (deliver release-send true) (deliver provider-release true)
+                 (agent/close-session! p) (join-children p))))))
+
+(deftest parent-shutdown-still-closes-child-that-publishes-during-cleanup
+  (let [provider-entered (promise) provider-release (promise)
+        cleanup-entered (promise) cleanup-release (promise)
+        p (parent (fn [_] (deliver provider-entered true) (deref provider-release 3000 nil) (response "late"))
+                  {:execution_env (execution/make-environment
+                    {:file_exists (fn [_] false) :inspect_command (fn [_] {:exit_code 1 :stdout ""})
+                     :cleanup (fn [] (deliver cleanup-entered true) (deref cleanup-release 3000 nil))})})
+        id (:agent_id (agent/spawn-subagent! p {:task "work"}))]
+    (try
+      (is (= true (deref provider-entered 3000 false)))
+      (let [closing (core/future (agent/close-session! p))]
+        (try
+          (is (= true (deref cleanup-entered 3000 false)))
+          (deliver provider-release true)
+          (is (false? (:success (deref (wait-task p id) 3000 :timeout))))
+          (deliver cleanup-release true)
+          (is (not= :timeout (deref closing 3000 :timeout)))
+          (is (= :closed (:state @(get-in @p [:subagents id :session]))))
+          (finally (deliver provider-release true) (deliver cleanup-release true) (deref closing 3000 nil))))
+      (finally (deliver provider-release true) (deliver cleanup-release true)
+               (agent/close-session! p) (join-children p)))))
+
+(deftest completion-callback-send-belongs-to-captured-run
+  (let [entered (promise) release (promise) second-entered (promise) second-release (promise)
+        calls (atom []) gated (atom false)
+        p (parent (fn [request]
+                    (let [text (:content (last (:messages request)))]
+                      (swap! calls conj text)
+                      (when (= text "second") (deliver second-entered true) (deref second-release 3000 nil))
+                      (response text)))
+                  {:on_event (fn [event]
+                     (when (and (= :subagent_event (:type event))
+                                (= :processing_end (get-in event [:event :type]))
+                                (compare-and-set! gated false true))
+                       (deliver entered true) (deref release 3000 nil)))})]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "first"}))
+            _ (is (= true (deref entered 3000 false)))
+            captured (get-in @p [:subagents id :future])
+            waiting (wait-task p id)]
+        (is (true? (:queued (agent/send-subagent-input! p id "second"))))
+        (is (identical? captured (get-in @p [:subagents id :future])))
+        (deliver release true)
+        (is (= true (deref second-entered 500 false)))
+        (is (= :pending (deref waiting 20 :pending)))
+        (deliver second-release true)
+        (is (= "second" (:output (deref waiting 3000 :timeout))))
+        (is (= ["first" "second"] @calls)))
+      (finally (deliver release true) (deliver second-release true)
+               (agent/close-session! p) (join-children p)))))
+
+(deftest parent-close-wins-during-child-construction
+  (let [constructing (promise) release (promise) calls (atom 0)
+        base (execution/make-environment {:file_exists (fn [_] false)
+                :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+        p (parent (fn [_] (swap! calls inc) (response "orphan"))
+                  {:execution_env (assoc base :with_working_directory
+                    (fn [_] (deliver constructing true) (deref release 3000 nil) base))})
+        spawning (core/future (error-of #(agent/spawn-subagent! p {:task "work" :working_dir "child"})))]
+    (try
+      (is (= true (deref constructing 3000 false)))
+      (agent/close-session! p)
+      (deliver release true)
+      (is (= :session-closed (deref spawning 3000 :timeout)))
+      (is (= 0 @calls))
+      (is (= {} (:subagents @p)))
+      (finally (deliver release true) (deref spawning 3000 nil)
+               (doseq [[id _] (:subagents @p)] (agent/close-subagent! p id))
+               (join-children p)))))
+
+(deftest admitted-spawn-and-send-are-cancelled-by-parent-close
+  (let [entered (promise) release (promise) calls (atom 0)
+        p (parent (fn [_] (swap! calls inc) (deliver entered true) (deref release 3000 nil) (response "late")))]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "first"}))]
+        (is (= true (deref entered 3000 false)))
+        (is (true? (:queued (agent/send-subagent-input! p id "accepted"))))
+        (agent/close-session! p)
+        (is (some? (error-of #(agent/send-subagent-input! p id "rejected"))))
+        (is (= :session-closed (error-of #(agent/spawn-subagent! p {:task "rejected"}))))
+        (deliver release true)
+        (is (false? (:success (deref (wait-task p id) 3000 :timeout))))
+        (is (= 1 @calls)))
+      (finally (deliver release true) (agent/close-session! p) (join-children p)))))
+
+(deftest concurrent-sends-and-callback-close-do-not-compete-or-selfjoin
+  (let [entered (promise) release (promise) calls (atom [])
+        p (parent (fn [request]
+                    (let [text (:content (last (:messages request)))]
+                      (swap! calls conj text)
+                      (when (= text "first") (deliver entered true) (deref release 3000 nil))
+                      (response text))))]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "first"}))
+            _ (is (= true (deref entered 3000 false)))
+            sends (mapv (fn [n] (core/future (agent/send-subagent-input! p id (str n)))) (range 6))]
+        (doseq [send sends] (is (true? (:queued (deref send 3000 {})))))
+        (deliver release true)
+        (is (true? (:success (deref (wait-task p id) 3000 :timeout))))
+        (is (= 7 (count @calls)))
+        (is (= #{"first" "0" "1" "2" "3" "4" "5"} (set @calls))))
+      (finally (deliver release true) (agent/close-session! p) (join-children p))))
+  (let [ref (atom nil) closed (promise)
+        p (parent (fn [_] (response "done"))
+                  {:on_event (fn [event]
+                    (when (and (= :subagent_event (:type event))
+                               (= :processing_end (get-in event [:event :type])))
+                      (agent/close-subagent! @ref (:agent_id event))
+                      (deliver closed true)))})]
+    (reset! ref p)
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! p {:task "close me"}))]
+        (is (= true (deref closed 3000 false)))
+        (is (false? (:success (deref (wait-task p id) 3000 :timeout))))
+        (is (= :closed (get-in @p [:subagents id :status]))))
+      (finally (agent/close-session! p) (join-children p)))))

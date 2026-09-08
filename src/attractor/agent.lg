@@ -140,9 +140,11 @@
         (reset! lock false)))))
 
 (def ^:dynamic *delivering-session-id* nil)
+(def ^:dynamic *delivering-session-ids* #{})
 
 (defn- deliver-event! [session stamped listener]
-  (binding [*delivering-session-id* (:id @session)]
+  (binding [*delivering-session-id* (:id @session)
+            *delivering-session-ids* (conj *delivering-session-ids* (:id @session))]
     (let [stored-listener (:event_fn @session)]
       (when stored-listener
         (try
@@ -218,7 +220,7 @@
                 value))))]
     (when stamped (drain-event-deliveries! session))
     (when (and stamped
-               (not= *delivering-session-id* (:id @session)))
+               (not (contains? *delivering-session-ids* (:id @session))))
       @delivered)
     stamped))
 
@@ -1056,32 +1058,78 @@
   (count (filter (fn [turn] (= :assistant (:type turn)))
                  (:history @session))))
 
-(defn- start-subagent-run! [parent agent-id input]
-  (let [child (get-in @parent [:subagents agent-id :session])]
-    (when (nil? child)
+(defn- subagent-handle! [parent agent-id]
+  (let [handle (get-in @parent [:subagents agent-id])]
+    (when (nil? handle)
       (throw (ex-info (str "Unknown subagent: " agent-id)
                       {:category :unknown-subagent :agent_id agent-id})))
-    (swap! parent update-in [:subagents agent-id]
-           assoc :status :running :result nil)
-    (let [task
-          (core/future
-            (try
-              (let [output (process-input! child input)
-                    result {:output output :success true
-                            :turns_used (subagent-turn-count child)}]
-                (swap! parent update-in [:subagents agent-id]
-                       assoc :status :completed :result result)
-                result)
-              (catch Object e
-                (let [result {:output (str e) :success false
-                              :turns_used (subagent-turn-count child)}]
-                  (swap! parent update-in [:subagents agent-id]
-                         assoc :status :failed :result result)
-                  result))))]
-      (swap! parent assoc-in [:subagents agent-id :future] task)
-      {:agent_id agent-id :status :running})))
+    handle))
+
+(defn- parent-open! [parent]
+  (when (= :closed (:state @parent))
+    (throw (ex-info "Cannot admit a subagent after parent shutdown"
+                    {:category :session-closed :session_id (:id @parent)}))))
+
+;; All subagent admission/queue/result/completion publication uses the PARENT
+;; lifecycle lock. No child lock is acquired while holding it. Child processing,
+;; cancellation, environments and event listeners run outside that lock.
+;; :future is a prepublished run-completion promise: queued sends belong to it,
+;; and close never resolves it before its worker exits. Completion and the next
+;; send's admission share this lock, so neither can strand an accepted message.
+(defn- admit-subagent-run! [parent agent-id input]
+  (parent-open! parent)
+  (let [handle (subagent-handle! parent agent-id)]
+    (when (or (= :closed (:status handle)) (= :closed (:state @(:session handle))))
+      (throw (ex-info "Cannot send to a closed subagent" {:category :session-closed :agent_id agent-id})))
+    (if (= :running (:status handle))
+      (do (swap! parent update-in [:subagents agent-id :pending] conj input)
+          {:agent_id agent-id :status :running :queued true})
+      (let [completion (promise)]
+        (swap! parent update-in [:subagents agent-id]
+               assoc :status :running :result nil :pending [] :future completion)
+        {:agent_id agent-id :status :running :completion completion :child (:session handle) :input input}))))
+
+(defn- launch-subagent-run! [parent admission]
+  (when-let [completion (:completion admission)]
+    (let [agent-id (:agent_id admission) child (:child admission)]
+      (core/future
+        (loop [input (:input admission)]
+          (let [result (try
+                         (let [output (process-input! child input)]
+                           {:output output :success true
+                            :turns_used (subagent-turn-count child)})
+                         (catch Object e {:output (str e) :success false
+                                          :turns_used (subagent-turn-count child)}))
+                decision
+                (with-session-lock parent
+                  (fn []
+                    (let [handle (subagent-handle! parent agent-id)
+                          closed? (or (= :closed (:status handle))
+                                      (= :closed (:state @parent))
+                                      (:abort_signaled @child))]
+                      (if (and (not closed?) (:success result) (seq (:pending handle)))
+                        (let [next-input (first (:pending handle))]
+                          (swap! parent update-in [:subagents agent-id] assoc :pending (vec (rest (:pending handle))))
+                          {:next next-input})
+                        (let [final-result (if closed?
+                                             {:output "Subagent cancelled" :success false
+                                              :turns_used (subagent-turn-count child)} result)]
+                          (swap! parent update-in [:subagents agent-id]
+                                 assoc :pending [] :result final-result
+                                 :status (if closed? :closed (if (:success result) :completed :failed)))
+                          ;; Promise delivery is nonblocking and invokes no user
+                          ;; callbacks; publish it with terminal state atomically.
+                          (deliver completion final-result)
+                          {:done final-result})))))]
+            (if (contains? decision :next) (recur (:next decision)) (:done decision)))))))
+  (dissoc admission :completion :child :input))
+
+(defn- start-subagent-run! [parent agent-id input]
+  (launch-subagent-run! parent
+    (with-session-lock parent #(admit-subagent-run! parent agent-id input))))
 
 (defn spawn-subagent! [parent arguments]
+  (with-session-lock parent #(parent-open! parent))
   (let [depth (:subagent_depth @parent)
         max-depth (or (get-in @parent [:config :max_subagent_depth]) 1)]
     (when (>= depth max-depth)
@@ -1130,38 +1178,40 @@
                              :agent_id child-id
                              :event event}))})
           agent-id (:id @child)]
-      (swap! parent assoc-in [:subagents agent-id]
-             {:id agent-id :session child :status :starting
-              :future nil :result nil})
-      (start-subagent-run! parent agent-id task))))
+      (let [admission
+            (try
+              (with-session-lock parent
+                (fn []
+                  (parent-open! parent)
+                  (swap! parent assoc-in [:subagents agent-id]
+                         {:id agent-id :session child :status :starting :future nil :result nil})
+                  (admit-subagent-run! parent agent-id task)))
+              (catch Object e
+                ;; A child constructed outside the lock but not registered is
+                ;; ours to close; parent cleanup could not have observed it.
+                (close-session! child)
+                (throw e)))]
+        (launch-subagent-run! parent admission)))))
 
 (defn send-subagent-input! [parent agent-id message]
-  (let [handle (get-in @parent [:subagents agent-id])]
-    (when (nil? handle)
-      (throw (ex-info (str "Unknown subagent: " agent-id)
-                      {:category :unknown-subagent :agent_id agent-id})))
-    (if (= :running (:status handle))
-      (do
-        (follow-up-session! (:session handle) message)
-        {:agent_id agent-id :status :running :queued true})
-      (start-subagent-run! parent agent-id message))))
+  (start-subagent-run! parent agent-id message))
 
 (defn wait-subagent! [parent agent-id]
-  (let [handle (get-in @parent [:subagents agent-id])]
-    (when (nil? handle)
-      (throw (ex-info (str "Unknown subagent: " agent-id)
-                      {:category :unknown-subagent :agent_id agent-id})))
+  (let [handle (with-session-lock parent #(subagent-handle! parent agent-id))]
     (if-let [task (:future handle)]
       @task
       (:result handle))))
 
 (defn close-subagent! [parent agent-id]
-  (let [handle (get-in @parent [:subagents agent-id])]
-    (when (nil? handle)
-      (throw (ex-info (str "Unknown subagent: " agent-id)
-                      {:category :unknown-subagent :agent_id agent-id})))
+  (let [handle (with-session-lock parent
+                 (fn []
+                   (let [handle (subagent-handle! parent agent-id)]
+                     (swap! parent update-in [:subagents agent-id] assoc :status :closed :pending [])
+                     handle)))]
+    ;; A published close intent is not cancellation delivery. Every closer
+    ;; signals the child through the idempotent session abort path; otherwise a
+    ;; suspended first closer could let parent shutdown return before signalling.
     (abort-session! (:session handle))
-    (swap! parent update-in [:subagents agent-id] assoc :status :closed)
     {:agent_id agent-id :status :closed}))
 
 (defn- subagent-tool [name description properties required executor]

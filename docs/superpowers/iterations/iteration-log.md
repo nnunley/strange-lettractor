@@ -238,3 +238,24 @@ ITER-0007 and the full goal remain incomplete. Audit discovered a separately
 verified preexisting stale-turn cancellation race at the completion callback
 handoff; CAL-OWN-01 / SCN-CAL-TURN-OWNERSHIP records the pending regression/fix in
 ITER-0008. No native-Go AOT conformance is inferred from these bundle/build checks.
+
+## Component checkpoint — Subagent lifecycle ownership (2026-09-08)
+
+**Completed:** 2026-09-08, scoped component; paired final audit clean.
+**Stories delivered:** CAL-SUBAGENT-01 ownership component only; story stays partial.
+**Tasks executed:** reproduce close/admission/handoff races; implement parent-owned
+run admission and completion queues; preserve terminal cancellation; guard nested
+event delivery against self-join; repair overlapping-close and turn-count defects.
+**Scenarios:** SCN-CAL-SUBAGENTS lifecycle ownership component.
+**Summary:** Wait captures a prepublished run promise, accepted messages drain
+through that run, shutdown cannot orphan admitted children, and late completion
+cannot resurrect cancelled handles. Actual Codex and Claude Code reviewers
+approve spec compliance and code quality. Native controlled barriers exercise
+both admission orderings and old/new public waiter selection.
+
+Evidence: baseline 667/6507; focused/bundle 12/106; impacted 166/1044; default full
+suite 679/6613, zero failures and terminal exit 0. CLI build/help pass. The first
+impacted run correctly caught a turn-count ordering regression; it was repaired,
+not waived. See `docs/subagent-lifecycle-evidence.edn` for commands and scope.
+Profile/model/directory fidelity, remaining depth/live proof, general event
+shutdown and native-Go AOT parity remain open. No console/TUI code is included.
