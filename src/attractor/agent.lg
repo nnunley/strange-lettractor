@@ -428,6 +428,7 @@
                  :project_docs project-docs
                  :environment_snapshot snapshot
                  :state :idle
+                 :current_turn_owner nil
                  :abort_signaled false
                  :llm_abort_controller (llm/make-abort-controller)
                  :active_stream_close nil
@@ -555,10 +556,21 @@
 (defn abort-session! [session & [on-event]]
   (with-session-lock
     session
-    (fn [] (swap! session assoc :abort_signaled true :state :closed)))
+    (fn []
+      (when-let [owner (:current_turn_owner @session)] (reset! owner :cancelled))
+      (swap! session assoc :abort_signaled true :state :closed)))
   (when-let [abort (get-in @session [:llm_abort_controller :abort])]
     (abort))
   (close-session! session on-event))
+
+(defn- claim-turn-close! [session owner]
+  ;; Ownership and admission are checked under the same lock. Once closed is
+  ;; claimed, cleanup may run outside the lock without admitting a successor.
+  (with-session-lock session
+    (fn []
+      (when (identical? owner (:current_turn_owner @session))
+        (swap! session assoc :state :closed)
+        true))))
 
 (defn- session-stopped? [session]
   (or (:abort_signaled @session)
@@ -832,6 +844,7 @@
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn- process-input-cycle! [session prompt on-event followup? & [invocation]]
   (let [event-fn (fn [event] (emit-event! session event on-event))
+        owner (or (:owner invocation) (:admission invocation) (atom :owned))
         config (:config @session)
         profile (:provider_profile @session)
         environment (:execution_env @session)
@@ -861,10 +874,11 @@
                        (contains? #{:idle :awaiting_input}
                                   (:state @session)))
                      (not @(:session_end_emitted @session)))
-            (when invocation
+            (when (and (not followup?) (:admission invocation))
               (when-not (compare-and-set! (:admission invocation) :pending :owned)
                 (throw (ex-info "Agent turn cancelled before admission" {:category :cancelled :retryable false})))
               (reset! (:tool_hook_context @session) (:hooks invocation)))
+            (when-not followup? (swap! session assoc :current_turn_owner owner))
             (swap! session
                    (fn [state]
                      (-> state
@@ -1012,7 +1026,7 @@
           :stopped result
           :followup
           (try
-            (process-input-cycle! session (:input decision) on-event true)
+            (process-input-cycle! session (:input decision) on-event true {:owner owner})
             (catch Object e
               (if (and (session-stopped? session)
                        (= :session-closed (:category (ex-data e))))
@@ -1192,13 +1206,13 @@
   [session prompt cancelled? hooks admission]
   (if-not cancelled?
     (let [result (process-input-cycle! session prompt nil false {:hooks hooks :admission admission})]
-      (when (:abort_signaled @session) (throw (cancelled-turn-error session)))
+      (when (= :cancelled @admission) (throw (cancelled-turn-error session)))
       result)
     (let [pending (Object.)
           task (core/future
                  (try
                    (let [result (process-input-cycle! session prompt nil false {:hooks hooks :admission admission})]
-                     (when (:abort_signaled @session) (throw (cancelled-turn-error session)))
+                     (when (= :cancelled @admission) (throw (cancelled-turn-error session)))
                      {:value result})
                    (catch Object error {:error error})))]
       (loop []
@@ -1215,7 +1229,8 @@
               ;; the session's normal environment/subagent cleanup. Join the
               ;; turn before reporting cancellation to the engine.
               (compare-and-set! admission :pending :cancelled)
-              (when (= :owned @admission) (abort-session! session))
+              (when (and (= :owned @admission) (claim-turn-close! session admission))
+                (abort-session! session))
               @task
               (throw (cancelled-turn-error session)))
 
@@ -1252,8 +1267,12 @@
             (try
               (run-agent-turn-with-cancellation! session prompt cancelled? hooks admission)
               (catch Object e
-                (when (or (= :owned @admission) (nil? existing))
-                  (when-not (= :closed (:state @session)) (close-session! session))
+                ;; A newly created but never admitted session is owned only
+                ;; while its current owner remains nil. If a successor used the
+                ;; published session, neither nil nor this stale token matches.
+                (when (claim-turn-close! session
+                        (if (and (nil? existing) (not (identical? admission (:current_turn_owner @session)))) nil admission))
+                  (close-session! session)
                 ;; A cancelled/failed older turn can finish after a retry has
                 ;; installed a replacement. Only evict the entry it owns.
                 (swap! threads
@@ -1269,4 +1288,6 @@
               (run-agent-turn-with-cancellation! session prompt cancelled?
                 (merge (:tool_hooks static-options) (:tool_hooks dynamic-options) (:attractor.tool-hooks/invocation node)) admission)
               (finally
-                (close-session! session)))))))))
+                (when (claim-turn-close! session
+                        (if (identical? admission (:current_turn_owner @session)) admission nil))
+                  (close-session! session))))))))))

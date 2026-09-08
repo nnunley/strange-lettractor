@@ -1,0 +1,227 @@
+;; SCN-CAL-TURN-OWNERSHIP: stale invocations cannot mutate their successors.
+(ns attractor.turn-ownership-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.agent :as agent] [attractor.execution :as execution]))
+
+(defn caught [operation]
+  (try {:value (operation)} (catch Object error {:error (ex-data error)})))
+
+(deftest stale-completed-turn-cancellation-cannot-abort-its-successor
+ (doseq [direct? [false true]]
+  (let [threads (atom {}) cancellation (atom false)
+        callback-entered (promise) callback-release (promise)
+        provider-entered (promise) provider-release (promise)
+        cancellation-processed (promise) promise-type (type (promise))
+        first-end (atom true) cleanups (atom 0)
+        original-deref core/deref
+        backend (agent/make-agent-codergen-backend
+                  {:project_docs []
+                   :execution_env (execution/make-environment {:cleanup #(swap! cleanups inc)})
+                   :complete_fn (fn [request]
+                                  (when (= "second" (:content (last (:messages request))))
+                                    (deliver provider-entered true)
+                                    (deref provider-release 5000 false))
+                                  {:message {:role :assistant :content "done"}})
+                   :on_event (fn [event]
+                               (when (and (= :processing_end (:type event))
+                                          (compare-and-set! first-end true false))
+                                 (deliver callback-entered true)
+                                 (deref callback-release 5000 false)))})
+        node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared"
+              :fidelity_threads threads}]
+    ;; Observe the monitor blocking after its cancellation decision: either the
+    ;; owned task join, or (in the buggy version) session-end delivery during abort.
+    ;; Test gates use timed deref, so neither can trigger this observation.
+    (with-redefs [core/deref
+                  (fn [& arguments]
+                    (when (and (= 1 (count arguments)) (original-deref cancellation)
+                               (= promise-type (type (first arguments))))
+                      (deliver cancellation-processed true))
+                    (apply original-deref arguments))]
+      (let [first-worker (future (caught #(backend (assoc node :cancelled? (fn [] @cancellation)
+                                                         :attractor.tool-hooks/invocation {:node_id "A"}) "first" nil)))
+            second-worker (atom nil)]
+        (try
+          (is (= true (deref callback-entered 2000 false)))
+          (let [session (get-in @threads ["shared" :session])
+                controller (:llm_abort_controller @session)]
+            (is (= :idle (:state @session)))
+            (when direct? (reset! (:tool_hook_context @session) {:node_id "B-direct"}))
+            (reset! second-worker (future (caught #(if direct? (agent/process-input! session "second")
+                                                     (backend (assoc node :attractor.tool-hooks/invocation {:node_id "B"}) "second" nil)))))
+            (is (= true (deref provider-entered 2000 false)))
+            (is (= :processing (:state @session)))
+            (let [b-history (:history @session) b-hooks @(:tool_hook_context @session)]
+            (is (= (if direct? "B-direct" "B") (:node_id b-hooks)))
+            (reset! cancellation true)
+            (is (= true (deref cancellation-processed 2000 false)))
+            (is (= :processing (:state @session)))
+            (is (false? (:abort_signaled @session)))
+            (is (false? ((get-in controller [:signal :aborted?]))))
+            (is (= 0 @cleanups))
+            (is (identical? session (get-in @threads ["shared" :session])))
+            (is (= b-history (:history @session)))
+            (is (= b-hooks @(:tool_hook_context @session)))
+            (deliver callback-release true)
+            (let [first-result (deref first-worker 2000 ::pending)]
+              (is (= :cancelled (get-in first-result [:error :category]))))
+            ;; Failure cleanup/cache eviction must also be fenced after A joins.
+            (is (identical? session (get-in @threads ["shared" :session])))
+            (is (= :processing (:state @session)))
+            (is (= b-history (:history @session)))
+            (is (= b-hooks @(:tool_hook_context @session))))
+            (deliver provider-release true)
+            (is (= {:value "done"} (deref @second-worker 2000 ::pending))))
+          (finally
+            (deliver callback-release true)
+            (deliver provider-release true)
+            (deref first-worker 2000 ::pending)
+            (when @second-worker (deref @second-worker 2000 ::pending))
+            (doseq [[_ entry] @threads] ((:close entry))))))))))
+
+(deftest stale-context-error-cleanup-cannot-close-successor
+  (let [threads (atom {}) entered (promise) release (promise) second-entered (promise) second-release (promise)
+        first? (atom true) cleanups (atom 0)
+        backend (agent/make-agent-codergen-backend
+                  {:project_docs [] :execution_env (execution/make-environment {:cleanup #(swap! cleanups inc)})
+                   :complete_fn (fn [request]
+                                  (if (= "first" (:content (last (:messages request))))
+                                    (throw (ex-info "context overflow" {:category :context-length :retryable false}))
+                                    (do (deliver second-entered true) (deref second-release 5000 false)
+                                        {:message {:role :assistant :content "done"}})))
+                   :on_event (fn [event]
+                               (when (and (= :processing_end (:type event)) (compare-and-set! first? true false))
+                                 (deliver entered true) (deref release 5000 false)))})
+        node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}
+        a (future (caught #(backend (assoc node :attractor.tool-hooks/invocation {:node_id "A"}) "first" nil))) b (atom nil)]
+    (try
+      (is (= true (deref entered 2000 false)))
+      (let [session (get-in @threads ["shared" :session])]
+        (reset! b (future (caught #(backend (assoc node :attractor.tool-hooks/invocation {:node_id "B"}) "second" nil))))
+        (is (= true (deref second-entered 2000 false)))
+        (let [b-history (:history @session) b-hooks @(:tool_hook_context @session)]
+        (is (= "B" (:node_id b-hooks)))
+        (deliver release true)
+        (is (= :context-length (get-in (deref a 2000 {}) [:error :category])))
+        (is (= :processing (:state @session))) (is (= 0 @cleanups))
+        (is (identical? session (get-in @threads ["shared" :session])))
+        (is (= b-history (:history @session)))
+        (is (= b-hooks @(:tool_hook_context @session))))
+        (deliver second-release true)
+        (is (= {:value "done"} (deref @b 2000 {}))))
+      (finally (deliver release true) (deliver second-release true)
+               (deref a 2000 nil) (when @b (deref @b 2000 nil))
+               (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest predecessor-success-does-not-inherit-successor-abort
+  (let [threads (atom {}) entered (promise) release (promise) second-entered (promise) second-release (promise)
+        abort-claimed (promise) first? (atom true)
+        backend (agent/make-agent-codergen-backend
+                  {:project_docs [] :execution_env (execution/make-environment {})
+                   :complete_fn (fn [request]
+                                  (when (= "second" (:content (last (:messages request))))
+                                    (deliver second-entered true) (deref second-release 5000 false))
+                                  {:message {:role :assistant :content "done"}})
+                   :on_event (fn [event]
+                               (when (and (= :processing_end (:type event)) (compare-and-set! first? true false))
+                                 (deliver entered true) (deref release 5000 false)))})
+        node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}
+        a (future (caught #(backend node "first" nil))) b (atom nil) abort-worker (atom nil)]
+    (try
+      (is (= true (deref entered 2000 false)))
+      (let [session (get-in @threads ["shared" :session]) original-abort (get-in @session [:llm_abort_controller :abort])]
+        (swap! session assoc-in [:llm_abort_controller :abort]
+               (fn [] (original-abort) (deliver abort-claimed true)))
+        (reset! b (future (caught #(backend node "second" nil))))
+        (is (= true (deref second-entered 2000 false)))
+        (reset! abort-worker (future (agent/abort-session! session)))
+        (is (= true (deref abort-claimed 2000 false)))
+        (deliver release true)
+        (is (= {:value "done"} (deref a 2000 {}))))
+      (finally (deliver release true) (deliver second-release true)
+               (deref a 2000 nil) (when @b (deref @b 2000 nil))
+               (when @abort-worker (deref @abort-worker 2000 nil))
+               (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest queued-followup-retains-owner-and-current-owner-cancellation-cleans-up
+  (let [threads (atom {}) first-entered (promise) first-release (promise)
+        queued-entered (promise) queued-release (promise) cleaned (promise)
+        cancel (atom false) owners (atom [])
+        backend (agent/make-agent-codergen-backend
+                  {:project_docs [] :execution_env (execution/make-environment {:cleanup #(deliver cleaned true)})
+                   :complete_fn (fn [request]
+                                  (let [session (get-in @threads ["shared" :session])]
+                                    (swap! owners conj (:current_turn_owner @session)))
+                                  (if (= "first" (:content (last (:messages request))))
+                                    (do (deliver first-entered true) (deref first-release 5000 false))
+                                    (do (deliver queued-entered true) (deref queued-release 5000 false)))
+                                  {:message {:role :assistant :content "done"}})})
+        node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads
+              :cancelled? (fn [] @cancel)}
+        worker (future (caught #(backend node "first" nil)))]
+    (try
+      (is (= true (deref first-entered 2000 false)))
+      (let [session (get-in @threads ["shared" :session])]
+        (agent/follow-up-session! session "queued")
+        (deliver first-release true)
+        (is (= true (deref queued-entered 2000 false)))
+        (is (= 2 (count @owners))) (is (some? (first @owners)))
+        (is (identical? (first @owners) (second @owners)))
+        (reset! cancel true)
+        (is (= true (deref cleaned 2000 false)))
+        (is (= :closed (:state @session)))
+        (is (:abort_signaled @session))
+        (deliver queued-release true)
+        (is (= :cancelled (get-in (deref worker 2000 {}) [:error :category])))
+        (is (nil? (get @threads "shared"))))
+      (finally (deliver first-release true) (deliver queued-release true)
+               (deref worker 2000 nil) (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest unadmitted-creator-cannot-clean-up-a-session-adopted-by-another-turn
+  (doseq [adopter? [true false]]
+    (let [threads (atom {}) published (promise) creator-release (promise)
+          provider-entered (promise) provider-release (promise) cleanups (atom 0)
+          backend (agent/make-agent-codergen-backend
+                    {:project_docs [] :execution_env (execution/make-environment {:cleanup #(swap! cleanups inc)})
+                     :complete_fn (fn [_]
+                                    (deliver provider-entered true)
+                                    (deref provider-release 5000 false)
+                                    {:message {:role :assistant :content "done"}})})
+          node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}
+          creator (future (caught #(backend
+                           (assoc node :attractor.tool-hooks/invocation {:node_id "creator"}
+                             :cancelled? (fn [] (deliver published true) (deref creator-release 5000 false) true))
+                           "creator" nil)))
+          adopter (atom nil)]
+      (try
+        (is (= true (deref published 2000 false)))
+        (let [session (get-in @threads ["shared" :session])]
+          (is (some? session)) (is (= :idle (:state @session)))
+          (is (nil? (:current_turn_owner @session)))
+          (when adopter?
+            (reset! adopter (future (caught #(backend (assoc node :attractor.tool-hooks/invocation {:node_id "adopter"}) "adopter" nil))))
+            (is (= true (deref provider-entered 2000 false))))
+          (let [history (:history @session) hooks @(:tool_hook_context @session)]
+            (deliver creator-release true)
+            (let [result (deref creator 2000 {})]
+              (is (contains? (if adopter? #{:session-busy :cancelled} #{:cancelled})
+                             (get-in result [:error :category]))))
+            (if adopter?
+              (do
+                (is (= :processing (:state @session)))
+                (is (false? (:abort_signaled @session)))
+                (is (false? ((get-in @session [:llm_abort_controller :signal :aborted?]))))
+                (is (= 0 @cleanups))
+                (is (= history (:history @session)))
+                (is (= hooks @(:tool_hook_context @session)))
+                (is (= "adopter" (:node_id hooks)))
+                (is (identical? session (get-in @threads ["shared" :session])))
+                (deliver provider-release true)
+                (is (= {:value "done"} (deref @adopter 2000 {}))))
+              (do
+                (is (= :closed (:state @session)))
+                (is (= 1 @cleanups))
+                (is (nil? (get @threads "shared")))))))
+        (finally (deliver creator-release true) (deliver provider-release true)
+                 (deref creator 2000 nil) (when @adopter (deref @adopter 2000 nil))
+                 (doseq [[_ entry] @threads] ((:close entry))))))))

@@ -1,11 +1,24 @@
-# Pending: stale-turn cancellation across completion callbacks
+# Resolved component: stale-turn cancellation across completion callbacks
 
 This is a verified Attractor lifecycle bug, not a new let-go issue or a hook
-regression. Track as CAL-OWN-01 / SCN-CAL-TURN-OWNERSHIP. It remains unfixed.
+regression. Track as CAL-OWN-01 / SCN-CAL-TURN-OWNERSHIP. The repair assigns
+current ownership on every root admission and atomically claims closure before
+backend cleanup. Queued follow-ups retain ownership; stale callers cannot close
+or evict a successor. Explicit public session abort/close remains session-wide.
+
+Permanent evidence: `test/attractor/turn_ownership_test.lg`, run with
+`/Users/ndn/development/let-go/lg -source-paths src:test dev/turn_ownership_tests.lg run`.
+Five tests / 85 assertions pass, including stale cancellation/error, direct
+successors, reverse successor-abort isolation, follow-up cancellation cleanup,
+and adoption of a newly published but unadmitted session. Impacted tests pass
+198/1405; full suite passes 644/5970; standalone bundle and CLI build/help pass.
+See `turn-ownership-evidence.edn`. Broader shutdown conformance remains open.
+
+## Historical reproduction
 
 Two bounded diagnostic processes reproduced the same interference against the
 hook candidate and pre-hook public checkpoint `f38af57`; both exited zero and
-released their workers. No persistent regression has been added yet.
+released their workers. This preceded the permanent regression and repair.
 
 Reproduction:
 
@@ -32,9 +45,7 @@ token as owned and calls session-wide abort. A's authority needs to be fenced by
 the session's **current** invocation, including failure cleanup and cache eviction.
 The new hook admission guard protects rejected/pending callers, not this handoff.
 
-Next work: add the gated regression mechanically, then ensure canceling or failing
-A cannot close B, abort B's controller, or evict B's cache entry. Preserve supported
-completion-callback reentry and follow-up semantics; do not simply forbid existing
-behavior without reviewing the session contract. Source obligations: coding-agent
+The repair preserves completion-callback reentry and follow-up semantics rather
+than forbidding the handoff. Source obligations: coding-agent
 specification §2.3, §2.8 and graceful shutdown. Broader CAL-LOOP-01/CAL-ERROR-01
 remain incomplete even while the default suite is green.

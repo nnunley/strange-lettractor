@@ -1,5 +1,28 @@
 # Iteration Log
 
+## ITER-0008 component — Current-turn ownership (CAL-OWN-01)
+
+**Verified:** 2026-09-07, from public baseline `1bdc933`.
+
+Every admitted root input now establishes current ownership; queued follow-ups
+retain it. Backend cancellation/failure atomically claims closure under the
+lifecycle lock before performing cleanup outside it. Stale callers cannot close
+or evict a successor, and completed callers do not inherit a successor's abort.
+Direct input, public session-wide shutdown, and completion-callback reentry remain.
+
+Permanent original RED: 1 test / 7 passing and 7 failing assertions. Final focused
+and standalone bundled regression: 5 tests / 85 assertions. Fresh impacted suite:
+198/1405. Full default baseline 639/5885 becomes 644/5970; all candidate results
+have zero failures and exit 0. CLI build/help pass; native-Go AOT conformance is
+not inferred. Paired scope/spec/quality reviews approve; review added the missing
+fresh-publication/adoption and unused-session cleanup controls. Reusable evidence
+and commands are in `docs/turn-ownership-evidence.edn`.
+Paired final three-tier component audit is clean.
+
+This completes the ownership component, not ITER-0008 or the Attractor goal.
+Broader ordered shutdown, server streaming/events, and the remaining roadmap stay
+open. No local let-go changes were needed; this was an Attractor lifecycle defect.
+
 ## ITER-0000 — Walking skeleton and deadline safety
 
 **Completed:** 2026-09-04

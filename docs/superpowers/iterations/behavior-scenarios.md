@@ -221,11 +221,14 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 - Given cached turn A paused in its processing-end callback after becoming idle
   and turn B admitted into that session with its provider gated
-- When A is cancelled or its cleanup fails, B's session, abort controller and
+- When A is cancelled or reports a context-overflow error, B's session, abort controller and
   cache entry remain owned by B and usable until B's own completion
 - Seam: session/backend concurrency integration with deterministic gates
-- Status: verified existing bug; permanent harness and fix pending CAL-OWN-01
-- See `docs/turn-ownership-gap.md` for the bounded reproduction and baseline
+- Also cover direct B admission, queued follow-up ownership, current-owner cleanup,
+  completed A remaining successful after B abort, and unadmitted creator A losing
+  cleanup authority when B adopts its published session (with no-adopter control)
+- Status: complete CAL-OWN-01 component, 5 tests / 85 assertions; not full shutdown
+- See `docs/turn-ownership-evidence.edn` for reusable commands and baseline
 
 ### SCN-TOOL-HOOKS-STDIN — Native input transport component
 

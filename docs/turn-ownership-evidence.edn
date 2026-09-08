@@ -1,0 +1,27 @@
+{:requirement "CAL-OWN-01"
+ :scenario "SCN-CAL-TURN-OWNERSHIP"
+ :scope :component
+ :base_commit "1bdc93301ee7b364fe9d2a782eaf92fa3726fc95"
+ :compiler "/Users/ndn/development/let-go/lg"
+ :baseline {:tests 639 :assertions 5885 :failures 0 :exit 0}
+ :red {:tests 1 :passed 7 :failures 7 :exit 1
+       :scope "Original permanent stale-cancellation regression before repair"}
+ :focused {:tests 5 :assertions 85 :failures 0 :exit 0
+           :command "/Users/ndn/development/let-go/lg -source-paths src:test dev/turn_ownership_tests.lg run"}
+ :impacted {:tests 198 :assertions 1405 :failures 0 :exit 0
+            :namespaces [attractor.agent-test attractor.agent-loop-contract-test
+                         attractor.session-error-contract-test attractor.tool-hooks-test
+                         attractor.tool-hook-workflow-test attractor.engine-test
+                         attractor.status-contract-test attractor.workflow-recovery-contract-test]}
+ :default_suite {:tests 644 :assertions 5970 :failures 0 :exit 0
+                 :command "env PATH=/Users/ndn/development/let-go:/opt/homebrew/bin:/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin /Users/ndn/.local/share/mise/installs/github-abogoyavlensky-lgx/0.1.0-rc2/lgx test"}
+ :standalone_bundle {:tests 5 :assertions 85 :failures 0 :exit 0
+                     :build_command "/Users/ndn/development/let-go/lg -source-paths src:test -b /tmp/lettractor-ownership-evidence.ooGD2Co7/ownership-tests dev/turn_ownership_tests.lg"
+                     :working_directory "/tmp/lettractor-ownership-evidence.ooGD2Co7"
+                     :command "./ownership-tests run"}
+ :cli_build {:exit 0 :help_exit 0 :native_go_aot_conformance false}
+ :reviews {:paired_scope :approved :paired_spec :approved :paired_quality :approved
+           :paired_three_tier_component_audit :clean}
+ :residuals ["Broader CAL-ERROR-01/ITER-0008 ordered shutdown and server conformance"
+             "Native-Go AOT conformance remains unproved"
+             "Remaining Attractor requirements and deferred reader compatibility"]}

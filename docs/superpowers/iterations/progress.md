@@ -1,7 +1,17 @@
 # Progress
 
-**Phase:** verified tool hooks, ATTR-HOOK-01 component (ITER-0007)
-**Task:** final evidence audit and public checkpoint
+**Phase:** verified current-turn ownership, CAL-OWN-01 component (ITER-0008)
+**Task:** public checkpoint after clean paired three-tier audit
+
+**Current repair:** isolated in `.worktrees/turn-ownership` from public `1bdc933`.
+Fresh baseline passes 639 tests / 5,885 assertions. The permanent gated regression
+reproduced stale cancellation before the repair; the final candidate passes
+5 tests / 85 assertions. Current ownership is assigned at every root admission,
+retained through queued follow-ups, and checked atomically before backend cleanup.
+Paired spec and quality reviews approve. Impacted tests pass 198/1405, final
+default suite passes 644/5970, standalone bundle passes 5/85, and CLI build/help
+pass. All exits are zero. Paired component audit is clean; broader shutdown,
+ITER-0008 and the full goal remain incomplete. Native-Go AOT is not claimed.
 
 **Hook completion checkpoint:** the standalone core and public workflow integration
 pass paired spec and quality review. Focused/bundled evidence is 23 tests / 132
@@ -9,10 +19,10 @@ assertions; impacted agent/engine/status/recovery is 203/1579; final full suite 
 639/5885, all zero failures. CLI build/help pass. This completes ATTR-HOOK-01,
 not ITER-0007 or the full goal. Native-Go AOT conformance is not claimed.
 
-**Next verified gap:** CAL-OWN-01 tracks stale-turn cancellation after the session
+**Historical gap, now repaired above:** CAL-OWN-01 tracks stale-turn cancellation after the session
 becomes idle but before its completion callback returns. A gated reproduction on
 both `f38af57` and the hook candidate shows cancellation of A closing newly admitted
-B. See `docs/turn-ownership-gap.md`; permanent regression/fix are pending. This is
+B. See `docs/turn-ownership-gap.md`; permanent regression/fix are now verified. This is
 Attractor lifecycle work, not a new let-go bug or a hooks regression.
 
 **Historical hook baseline:** public main `c373771` contained the reviewed session-error
