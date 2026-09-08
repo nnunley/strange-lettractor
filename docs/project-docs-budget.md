@@ -31,6 +31,20 @@ once truncation occurs. Provider selection and root-first ordering are unchanged
   command exited zero. The CLI uses `help`; `--help` was rejected as an unknown
   command during verification and is not being counted as a passing check.
 
+## Backlog reconciliation (2026-09-08)
+
+The requirement table and roadmap still called this budget work pending despite
+the committed implementation and evidence above. Rechecked source and all six
+contract tests against the snapshot's section 6.5; reran natively and from a
+standalone bundle outside the checkout: 6 tests / 30 assertions / zero failures
+or errors in each, exit 0. The persistent focused runner is now:
+
+`/Users/ndn/development/let-go/lg -source-paths src:test dev/project_docs_tests.lg run`
+
+Only the evidence index and runner changed; no production behavior or test
+assertions changed in this reconciliation. Complete environment/git metadata and
+provider-base system prompt evidence still needs its own closure audit.
+
 This closes the byte-budget defect, not the entire system-prompt requirement or
 the full Attractor implementation. No let-go runtime changes or model calls
 were required.

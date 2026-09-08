@@ -3,6 +3,14 @@
 **Phase:** hub agent-ownership component verified
 **Next:** RPC transport and hub-side eval/workflow/worker integration; full Attractor conformance backlog remains open
 
+Hub worker integration scope is awaiting user approval; discovery is recorded in
+`docs/hub-worker-findings.md`. Independent conformance reconciliation found the
+32 KiB project-instruction budget was already implemented in `a38e37a` but remained
+listed as pending. Fresh native and outside-checkout bundle runs each pass 6 tests /
+30 assertions, zero failures/errors. Added a persistent focused runner and corrected
+the requirement/scenario/roadmap evidence indexes. No production changes; full
+prompt metadata/base-layer proof and the broader iteration remain open.
+
 Final hub evidence: focused native and outside-checkout bundle20/149/0, existing
 affected lifecycle166/1044/0, full default suite719/6926/0, build/help pass. Live
 Qwen through hub/agent/unified streaming returned `hub connected` with7 events and
