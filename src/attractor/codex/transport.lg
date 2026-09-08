@@ -1,0 +1,127 @@
+(ns attractor.codex.transport
+  "Owned duplex JSONL child for the Codex app-server protocol. The child is
+   launched by a shell that keeps its PID and exit status in files; stdin is a
+   FIFO this process holds open for writing, stdout/stderr are files read
+   incrementally. That sidesteps let-go's byte-array interop (#813) and boxed
+   pointer field (#814) limits without a Go change. One reader future feeds the
+   bounded framing decoder and hands complete frames to :on-message; any
+   protocol failure is reported once through :on-failure and the transport is
+   then only good for close!."
+  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json]
+            [attractor.codex.framing :as framing]))
+
+(def ^:private max-stderr-bytes 65536)
+(defn- fail! [kind message & [data]]
+  (throw (ex-info message (merge {:category :codex-transport :kind kind} data))))
+(defn- sh! [& args]
+  (let [r (apply os/sh args)]
+    (when-not (= 0 (:exit r)) (fail! :shell (str "command failed: " (str/join " " args)) {:stderr (:err r)}))
+    (:out r)))
+(defn- quote-arg [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn- read-file-trim [path] (when (os/stat path) (str/trim (io/slurp path))))
+
+(defn- json-safe
+  ;; The JSON writer expects keyword object keys at every depth (#817).
+  [value]
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(keyword (name k)) (json-safe v)]) value))
+    (sequential? value) (mapv json-safe value)
+    :else value))
+
+(defn- report-failure! [transport error]
+  (when (compare-and-set! (:failed transport) nil error)
+    (try ((:on-failure transport) error) (catch Object _ nil))))
+
+(defn- reader-loop! [transport]
+  (let [{:keys [decoder on-message stdout stderr exit-file]} transport
+        reader (io/open stdout :read)]
+    (try
+      (loop []
+        (when-not @(:closing transport)
+          (let [exited-before-read (some? (os/stat exit-file))]
+            (when (> (or (:size (os/stat stderr)) 0) max-stderr-bytes)
+              (fail! :stderr-overflow "Child stderr exceeded 64 KiB"))
+            (if-let [chunk (core/read-bytes reader 4096)]
+              (do
+                (doseq [frame (framing/feed! decoder (seq (bytes chunk)))]
+                  (try (on-message (:message frame))
+                       (catch Object e (fail! :callback "on-message callback failed" {:cause (str e)}))))
+                (recur))
+              (if exited-before-read
+                (do (framing/finish! decoder)
+                    (reset! (:eof transport) true))
+                (do (core/sleep 5) (recur)))))))
+      (catch Object e (report-failure! transport e))
+      (finally (io/close! reader)))))
+
+(defn open!
+  "Start the child. Options: :command vector (argv), :on-message, :on-failure,
+   :max-frame-bytes (default 1048576), :shutdown-ms (default 2000)."
+  [options]
+  (let [command (:command options)]
+    (when-not (and (vector? command) (seq command) (every? string? command))
+      (fail! :invalid-command "Command must be a non-empty vector of strings"))
+    (let [dir (str/trim (sh! "/usr/bin/mktemp" "-d"))
+          in (str dir "/in") stdout (str dir "/out") stderr (str dir "/err")
+          pid-file (str dir "/pid") exit-file (str dir "/exit")
+          _ (sh! "/usr/bin/mkfifo" in)
+          script (str (str/join " " (map quote-arg command))
+                      " < " (quote-arg in) " > " (quote-arg stdout) " 2> " (quote-arg stderr)
+                      " & echo $! > " (quote-arg pid-file) "; wait $!; echo $? > " (quote-arg exit-file))
+          shell (core/future (os/sh "/bin/sh" "-c" script))
+          ;; Opening the FIFO for writing blocks until the shell has opened it
+          ;; for the child's stdin: the two rendezvous here.
+          writer (io/open in :write)
+          transport {:dir dir :stdin writer :stdout stdout :stderr stderr :pid-file pid-file :exit-file exit-file
+                     :shell shell :on-message (or (:on-message options) (fn [_] nil))
+                     :on-failure (or (:on-failure options) (fn [_] nil))
+                     :decoder (framing/make-decoder (or (:max-frame-bytes options) 1048576))
+                     :shutdown-ms (or (:shutdown-ms options) 2000)
+                     :failed (atom nil) :closing (atom false) :eof (atom false) :closed (atom nil)}]
+      (assoc transport :reader (core/future (reader-loop! transport))))))
+
+(defn pid [transport] (some-> (read-file-trim (:pid-file transport)) parse-long))
+(defn failed? [transport] (some? @(:failed transport)))
+
+(defn send!
+  "Write one JSON-RPC message as a JSONL frame. Throws after failure or close."
+  [transport message]
+  (when-let [error @(:failed transport)] (fail! :failed "Transport failed" {:cause (str error)}))
+  (when @(:closing transport) (fail! :closed "Transport is closed"))
+  (when-not (map? message) (fail! :invalid-message "Message must be a map"))
+  (let [line (str (json/write-json (json-safe message)) "\n")]
+    (io/write! (:stdin transport) line)
+    (io/flush (:stdin transport))
+    nil))
+
+(defn- await-exit [transport ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond
+        (os/stat (:exit-file transport)) true
+        (> (System/currentTimeMillis) deadline) false
+        :else (do (core/sleep 10) (recur))))))
+
+(defn close!
+  "Close stdin, give the child :shutdown-ms to exit, then TERM and KILL its
+   exact PID. Joins the shell and reader, removes the temporary files, and
+   returns {:closed? true :reaped? bool :exit_code n|nil}."
+  [transport]
+  (or @(:closed transport)
+      (do
+        (reset! (:closing transport) true)
+        (try (io/close! (:stdin transport)) (catch Object _ nil))
+        (let [ms (:shutdown-ms transport)
+              child-pid (pid transport)
+              exited (or (await-exit transport ms)
+                         (do (when child-pid (os/sh "/bin/kill" "-TERM" (str child-pid)))
+                             (await-exit transport ms))
+                         (do (when child-pid (os/sh "/bin/kill" "-KILL" (str child-pid)))
+                             (await-exit transport ms)))
+              _ (deref (:shell transport) (+ ms 1000) nil)
+              _ (deref (:reader transport) (+ ms 1000) nil)
+              exit-code (some-> (read-file-trim (:exit-file transport)) parse-long)
+              result {:closed? true :reaped? (boolean exited) :exit_code exit-code}]
+          (os/sh "/bin/rm" "-rf" "--" (:dir transport))
+          (reset! (:closed transport) result)
+          result))))

@@ -4,7 +4,8 @@
    rendering of hub event envelopes into lines. Line and TUI frontends feed
    it input events and print what it returns; they never touch the hub."
   (:require [clojure.string :as str] [clojure.core :as core] [io :as io] [os :as os]
-            [attractor.hub :as hub] [attractor.console.input :as input]))
+            [attractor.hub :as hub] [attractor.console.input :as input]
+            [attractor.workers.registry :as registry]))
 
 (defn- fail! [message] (throw (ex-info message {:category :console})))
 (defn- short-id [id] (if (string? id) (last (str/split id #"-")) (str id)))
@@ -18,12 +19,14 @@
 
 (defn open!
   "Attach to a running hub. Options: :request_timeout_ms, :worker_defaults
-   (cwd/model/tools/permission_mode/timeout_ms for /claude), :run_defaults
-   (:logs_root_fn, :auto_approve)."
+   (cwd/model/tools/permission_mode/sandbox/approval_policy/timeout_ms for
+   /agent), :run_defaults (:logs_root_fn, :auto_approve), :aliases
+   ({\"claude\" \"agent --framework claude\"}: explicit slash shortcuts, none by default)."
   [hub & [opts]]
   (let [console {:hub hub :request_timeout_ms (get opts :request_timeout_ms 5000)
                  :worker_defaults (or (:worker_defaults opts) {})
-                 :run_defaults (or (:run_defaults opts) {})}
+                 :run_defaults (or (:run_defaults opts) {})
+                 :aliases (or (:aliases opts) {})}
         client (request! console :client/attach {})]
     (atom (assoc console :client client :cursor (:cursor client)
                  ;; One focus at a time: {:kind :session|:run|:worker :id ...}.
@@ -111,7 +114,7 @@
       [])))
 
 (defn- worker-lines [console envelope]
-  (let [wid (:worker_id envelope) tag (str "[claude " (short-id wid) "]") ev (:event envelope)]
+  (let [wid (:worker_id envelope) tag (str "[" (name (or (:framework envelope) :agent)) " " (short-id wid) "]") ev (:event envelope)]
     (case (:type ev)
       :text_delta (do (buffer-text! console wid (:text ev)) [])
       :completed (into (text-lines tag (take-buffer! console wid)) [(str tag " completed")])
@@ -162,7 +165,9 @@
    "  :{ / :}         begin / submit a multiline evaluation"
    "  \\text           literal agent text"
    "  /help /agents /new /focus <id> /run <file.dot> --auto-approve"
-   "  /claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
+   "  /agent --framework <f> <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
+   "                       [--sandbox s] [--approval-policy p]   frameworks: see /agent"
+   "  /alias <name> <expansion>   define /<name> as a shortcut, e.g. /alias claude agent --framework claude"
    "  /cancel         cancel the focused turn, run or worker"
    "  /quit           detach this client (an in-process hub stops with the command)"])
 
@@ -177,6 +182,9 @@
         session_id)))
 
 (def ^:private boolean-flags #{:auto-approve})
+(def ^:private agent-flag-keys
+  {:cwd :working_dir :model :model :tools :tools :permission-mode :permission_mode
+   :sandbox :sandbox :approval-policy :approval_policy :timeout-ms :timeout_ms})
 (defn- parse-flags
   "Words plus --flag values. Boolean flags never consume a value, and no flag
    consumes a following token that is itself a flag; a value-less flag is
@@ -201,7 +209,7 @@
                       (when (:busy %) " busy") (when (:closed %) " closed")) sessions)
            (map #(str (mark :run (:run_id %)) "run " (short-id (:run_id %)) " " (:source_path %)
                       (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) runs)
-           (map #(str (mark :worker (:worker_id %)) "claude " (short-id (:worker_id %))
+           (map #(str (mark :worker (:worker_id %)) (name (or (:framework %) :agent)) " " (short-id (:worker_id %))
                       (cond (:cancelled %) " cancelled" (:done %) " done" :else " running")) workers)
            (when (and (empty? sessions) (empty? runs) (empty? workers)) ["nothing running"])))))
 
@@ -214,7 +222,7 @@
         candidates (concat (map (fn [x] [:session (:session_id x)]) sessions)
                            (map (fn [x] [:run (:run_id x)]) runs)
                            (map (fn [x] [:worker (:worker_id x)]) workers))
-        label {:session "session" :run "run" :worker "claude"}]
+        label {:session "session" :run "run" :worker "agent"}]
     (cond
       (empty? candidates) [(str "no session, run or worker matches " id)]
       (next candidates) [(str "ambiguous: " (str/join ", " (map (fn [[k v]] (str (label k) " " (short-id v))) candidates)))]
@@ -242,28 +250,50 @@
         (focus! console :run run_id)
         [(str "run " (short-id run_id) " started from " path " (logs: " logs-root ")")]))))
 
-(defn- claude! [console args]
-  (let [{:keys [words flags missing]} (parse-flags args) prompt (str/join " " words) c @console d (:worker_defaults c)]
+(defn- agent! [console args]
+  (let [{:keys [words flags missing]} (parse-flags args) prompt (str/join " " words) c @console d (:worker_defaults c)
+        frameworks (str/join ", " (registry/framework-names))]
     (cond
       (seq missing) [(str "flag needs a value: " (str/join ", " missing))]
-      (str/blank? prompt) ["usage: /claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"]
+      (nil? (:framework flags)) [(str "usage: /agent --framework <" frameworks "> <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p] [--sandbox s] [--approval-policy p]")]
+      (not (contains? (set (registry/framework-names)) (:framework flags))) [(str "unknown agent framework " (:framework flags) "; available: " frameworks)]
+      (str/blank? prompt) ["usage: /agent --framework <framework> <prompt>"]
       :else
-      (let [fields (cond-> {:kind :claude :prompt prompt}
-                     (or (:cwd flags) (:working_dir d)) (assoc :working_dir (or (:cwd flags) (:working_dir d)))
-                     (or (:model flags) (:model d)) (assoc :model (or (:model flags) (:model d)))
-                     (or (:tools flags) (:tools d)) (assoc :tools (if-let [t (:tools flags)] (str/split t #",") (:tools d)))
-                     (or (:permission-mode flags) (:permission_mode d))
-                     (assoc :permission_mode (or (:permission-mode flags) (:permission_mode d)))
-                     (:timeout_ms d) (assoc :timeout_ms (:timeout_ms d))
+      (let [framework (keyword (:framework flags))
+            merged (reduce (fn [m [flag key]]
+                             (if-let [v (or (get flags flag) (get d key))] (assoc m key v) m))
+                           {} agent-flag-keys)
+            fields (cond-> (assoc merged :framework framework :prompt prompt)
+                     (string? (:tools merged)) (assoc :tools (str/split (:tools merged) #","))
+                     (string? (:timeout_ms merged)) (assoc :timeout_ms (parse-long (:timeout_ms merged)))
                      (:scenario flags) (assoc :scenario (:scenario flags)))
             {:keys [worker_id]} (request! c :worker/run fields)]
         (focus! console :worker worker_id)
-        [(str "claude " (short-id worker_id) " started")]))))
+        [(str (name framework) " " (short-id worker_id) " started")]))))
+
+(defn- alias! [console args]
+  (let [[_ name expansion] (re-matches #"\s*([^\s/]+)\s+(.+)" (or args ""))]
+    (cond
+      (str/blank? args) (let [aliases (:aliases @console)]
+                          (if (empty? aliases) ["no aliases defined"]
+                              (mapv (fn [[k v]] (str "/" k " -> /" v)) (sort aliases))))
+      (nil? name) ["usage: /alias <name> <expansion>, e.g. /alias claude agent --framework claude"]
+      (input/command? name) [(str "/" name " is a built-in command")]
+      :else (do (swap! console assoc-in [:aliases name] (str/replace expansion #"^/" ""))
+                [(str "/" name " -> /" (str/replace expansion #"^/" ""))]))))
+
+(defn- expand-alias [console text]
+  ;; /name rest -> /expansion rest, only for explicitly defined aliases.
+  (if-let [[_ name rest] (re-matches #"/([^\s/]+)(?:\s+(.*))?" text)]
+    (if-let [expansion (get (:aliases @console) name)]
+      (str "/" expansion (when rest (str " " rest)))
+      text)
+    text))
 
 (defn- cancel! [console]
   (let [c @console {:keys [kind id]} (:focus c)]
     (case kind
-      :worker (do (request! c :worker/cancel {:worker_id id}) [(str "cancel requested: claude " (short-id id))])
+      :worker (do (request! c :worker/cancel {:worker_id id}) [(str "cancel requested: agent " (short-id id))])
       :run (do (request! c :workflow/cancel {:run_id id}) [(str "cancel requested: run " (short-id id))])
       :session (do (request! c :session/cancel {:session_id id}) [(str "cancel requested: session " (short-id id))])
       ["nothing focused to cancel"])))
@@ -295,7 +325,8 @@
              [(if-let [{:keys [kind id]} (:focus @console)] (str "focus: " (name kind) " " (short-id id)) "focus: none")]
              (focus-by-id! console (str/trim args)))
     :run (run! console args)
-    :claude (claude! console args)
+    :agent (agent! console args)
+    :alias (alias! console args)
     :cancel (cancel! console)
     :quit (do (close! console) ["bye"])
     [(str "unknown command /" (name command))]))
@@ -319,6 +350,9 @@
    Returns {:lines [...]} to render. Selection is captured at submission."
   [console event]
   (let [c @console
+        event (if (and (= :line (:type event)) (string? (:text event)) (not (contains? (:input c) :buffer)))
+                (assoc event :text (expand-alias console (:text event)))
+                event)
         {:keys [state action]} (input/accept (:input c) event (selection console))]
     (swap! console assoc :input state)
     {:lines (cond

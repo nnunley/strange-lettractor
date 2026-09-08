@@ -11,8 +11,8 @@
             [attractor.llm :as llm]
             [attractor.fan-in-llm :as fanin-llm]
             [attractor.agent :as agent]
-            [attractor.workers.claude :as claude]
-            [attractor.workers.claude-backend :as claude-backend]
+            [attractor.workers.registry :as registry]
+            [attractor.workers.backend :as backend]
             [attractor.hub :as hub]
             [attractor.console.session :as session]
             [attractor.console.line :as line]
@@ -26,40 +26,56 @@
       (= (first rem) flag) (second rem)
       :else (recur (rest rem)))))
 
-(defn- claude-options [args]
-  (let [mode (or (find-arg-val args "--permission-mode") "plan")
+(def ^:private agent-option-flags
+  #{"--framework" "--prompt-file" "--cwd" "--model" "--tools" "--timeout-ms" "--permission-mode"
+    "--sandbox" "--approval-policy" "--env-file"})
+
+(defn- agent-options
+  "Options for one external agent worker. --framework selects the agentic
+   framework (claude, codex); nothing is assumed when it is absent."
+  [args]
+  (let [framework (registry/resolve-framework (or (find-arg-val args "--framework")
+                                                  (throw (ex-info (str "--framework is required; available: "
+                                                                       (str/join ", " (registry/framework-names)))
+                                                        {:category :configuration_error}))))
+        mode (or (find-arg-val args "--permission-mode") "plan")
         tools (or (find-arg-val args "--tools") "Read")
+        sandbox (or (find-arg-val args "--sandbox") "read-only")
+        approval (or (find-arg-val args "--approval-policy") "never")
         raw-timeout (find-arg-val args "--timeout-ms")
         timeout (if raw-timeout (parse-long raw-timeout) 120000)]
     (when-not (contains? #{"plan" "acceptEdits" "dontAsk"} mode)
-      (throw (ex-info "Unsupported Claude permission mode" {:category :configuration_error})))
+      (throw (ex-info "Unsupported permission mode" {:category :configuration_error})))
+    (when-not (contains? #{"read-only" "workspace-write" "danger-full-access"} sandbox)
+      (throw (ex-info "Unsupported sandbox" {:category :configuration_error})))
+    (when-not (contains? #{"never" "on-request" "untrusted"} approval)
+      (throw (ex-info "Unsupported approval policy" {:category :configuration_error})))
     (when-not (and (integer? timeout) (pos? timeout))
       (throw (ex-info "--timeout-ms must be a positive integer" {:category :configuration_error})))
-    {:working_dir (or (find-arg-val args "--cwd") (os/cwd))
+    {:framework framework
+     :working_dir (or (find-arg-val args "--cwd") (os/cwd))
      :model (find-arg-val args "--model")
      :tools (if (str/blank? tools) [] (mapv str/trim (str/split tools #",")))
-     :permission_mode mode :timeout_ms timeout
+     :permission_mode mode :sandbox sandbox :approval_policy approval :timeout_ms timeout
      :on_event (fn [event] (prn event))}))
 
-(defn cmd-claude [args]
+(defn cmd-agent [args]
   (let [exit-code
         (try
           (loop [remaining args]
             (when (seq remaining)
-              (when-not (and (contains? #{"--prompt-file" "--cwd" "--model" "--tools"
-                                         "--timeout-ms" "--permission-mode" "--env-file"}
-                                       (first remaining))
+              (when-not (and (contains? agent-option-flags (first remaining))
                              (some? (second remaining)))
-                (throw (ex-info "Expected named option and value; use --prompt-file <file>"
+                (throw (ex-info "Expected named option and value; use --framework <framework> --prompt-file <file>"
                                 {:category :configuration_error})))
               (recur (drop 2 remaining))))
-          (let [opts (claude-options args) path (find-arg-val args "--prompt-file")]
+          (let [opts (agent-options args) path (find-arg-val args "--prompt-file")]
             (when (str/blank? path)
               (throw (ex-info "--prompt-file is required" {:category :configuration_error})))
-            (claude/run! (assoc opts :prompt (io/slurp path)))
+            (registry/run! (:framework opts) (assoc (dissoc opts :framework) :prompt (io/slurp path)))
             0)
           (catch Object error
-            (prn {:source :claude :type :error
+            (prn {:source :agent :type :error
                   :error (merge (select-keys (ex-data error) [:stderr :exit_code])
                                 {:category (or (:category (ex-data error)) :worker-error)
                                  :message (ex-message error)})})
@@ -70,12 +86,10 @@
   (when (and (some #{"--worker"} args) (str/blank? (find-arg-val args "--worker")))
     (throw (ex-info "--worker requires a name" {:category :configuration_error})))
   (if-let [worker (find-arg-val args "--worker")]
-    (do
-      (when-not (= "claude" worker)
-        (throw (ex-info "Unknown external worker" {:category :configuration_error :worker worker})))
+    (let [framework (registry/resolve-framework worker)]
       (when (some #{"--mock"} args)
-        (throw (ex-info "--worker claude cannot be combined with --mock" {:category :configuration_error})))
-      (claude-backend/make-backend (claude-options args)))
+        (throw (ex-info "--worker cannot be combined with --mock" {:category :configuration_error})))
+      (backend/make-backend framework (dissoc (agent-options (concat ["--framework" worker] args)) :framework)))
   (let [force-mock? (some #{"--mock"} args)
         has-keys? (or (not (str/blank? (os/getenv "ANTHROPIC_API_KEY")))
                       (not (str/blank? (os/getenv "OPENAI_API_KEY")))
@@ -152,8 +166,13 @@
                                (interviewer/make-console-interviewer))
                              (make-codergen-backend-from-args args)
                              {:fan-in-ranker (make-fan-in-ranker-from-args args)}))})
+        aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")
+                                                     (let [[name expansion] (str/split (str value) #"=" 2)]
+                                                       (when (and (seq name) (seq expansion)) [name expansion]))))
+                               (partition 2 1 args)))
         console (session/open! hub {:worker_defaults worker-defaults
-                                    :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}})
+                                    :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}
+                                    :aliases aliases})
         outcome (try
                   (if (some #{"--tui"} args)
                     (tui/run! console {})
@@ -183,10 +202,12 @@
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
   (println "  serve [--port <port>]                               Start HTTP management server")
   (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
-  (println "  claude --prompt-file <file> [--cwd <dir>]            Stream an owned Claude Code worker as EDN")
-  (println "  console [--tui] [--mock|--llm] [--model <m>] [--provider <p>]  Interactive console: agent text, : eval, /run, /claude")
-  (println "    [--model <model>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
-  (println "    [--timeout-ms <ms>]   DOT run/resume also accept --worker claude and these worker options")
+  (println (str "  agent --framework <" (str/join "|" (registry/framework-names)) "> --prompt-file <file>  Run one agentic-framework worker, EDN events"))
+  (println "    [--cwd <dir>] [--model <m>] [--timeout-ms <ms>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
+  (println "    [--sandbox read-only|workspace-write|danger-full-access] [--approval-policy never|on-request|untrusted]")
+  (println "    DOT run/resume accept --worker <framework> with the same options")
+  (println "  console [--tui] [--mock|--llm] [--model <m>] [--provider <p>] [--alias name=expansion]")
+  (println "                                                      Interactive console: agent text, : eval, /run, /agent --framework")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -398,7 +419,7 @@
       "clean" (cmd-clean rest-args)
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)
-      "claude" (cmd-claude rest-args)
+      "agent" (cmd-agent rest-args)
       "console" (cmd-console rest-args)
       "help" (print-usage)
       nil (print-usage)

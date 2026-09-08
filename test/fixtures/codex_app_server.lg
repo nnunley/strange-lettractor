@@ -34,8 +34,46 @@
                   "platformFamily" "unix" "platformOs" "macos" "userAgent" "fake"}
                  {"method" method "params" (get request "params")})}]))
 
+(defn agent-frames
+  ;; A minimal app-server conversation: initialize, thread/start, turn/start
+  ;; with streamed agent message deltas and a completed turn. "agent-fail"
+  ;; completes the turn with a failed status; "agent-approval" first asks the
+  ;; client to approve a command and fails the turn if that request is refused.
+  [request]
+  (let [id (get request "id") method (get request "method") params (get request "params")]
+    (case method
+      "initialize" [{"id" id "result" {"codexHome" "/tmp/fake" "platformFamily" "unix" "platformOs" "macos" "userAgent" "fake"}}]
+      "thread/start" [{"id" id "result" {"thread" {"id" "thread-1" "cwd" (get params "cwd")}
+                                         "cwd" (get params "cwd") "model" (or (get params "model") "fake-model")
+                                         "modelProvider" "fake" "approvalPolicy" (get params "approvalPolicy")
+                                         "approvalsReviewer" "user" "sandbox" (get params "sandbox")}}]
+      "turn/start" (let [text (get-in params ["input" 0 "text"])
+                         opened [{"id" id "result" {"turn" {"id" "turn-1" "status" "inProgress"}}}
+                                 {"method" "turn/started" "params" {"threadId" "thread-1" "turn" {"id" "turn-1" "status" "inProgress"}}}]]
+                     (case mode
+                       ;; Ask for approval and wait for the client's answer before continuing.
+                       "agent-approval" (conj opened {"id" 900 "method" "item/commandExecution/requestApproval"
+                                                      "params" {"threadId" "thread-1" "turnId" "turn-1" "itemId" "cmd-1" "command" "rm -rf /"}})
+                       ;; Never finish on its own; only turn/interrupt ends it.
+                       "agent-hang" opened
+                     (concat
+                       opened
+                       [{"method" "item/agentMessage/delta" "params" {"threadId" "thread-1" "turnId" "turn-1" "itemId" "msg-1" "delta" "echo: "}}
+                        {"method" "item/agentMessage/delta" "params" {"threadId" "thread-1" "turnId" "turn-1" "itemId" "msg-1" "delta" text}}
+                        {"method" "item/completed" "params" {"threadId" "thread-1" "turnId" "turn-1" "completedAtMs" 1
+                                                             "item" {"type" "agentMessage" "id" "msg-1" "text" (str "echo: " text)}}}
+                        {"method" "turn/completed"
+                         "params" {"threadId" "thread-1"
+                                   "turn" (if (= mode "agent-fail")
+                                            {"id" "turn-1" "status" "failed" "error" {"message" "fixture turn failure"}}
+                                            {"id" "turn-1" "status" "completed"})}}])))
+      "turn/interrupt" [{"id" id "result" {}}
+                        {"method" "turn/completed" "params" {"threadId" "thread-1" "turn" {"id" "turn-1" "status" "interrupted"}}}]
+      [{"id" id "error" {"code" -32601 "message" (str "unknown method " method)}}])))
+
 (defn respond! [request]
-  (let [lines (mapv #(str (json/write-json (json-safe %)) "\n") (frames request))]
+  (let [agent? (contains? #{"agent" "agent-fail" "agent-approval" "agent-hang"} mode)
+        lines (mapv #(str (json/write-json (json-safe %)) "\n") (if agent? (agent-frames request) (frames request)))]
     (cond
       (= mode "malformed") (emit! "{not-json}\n")
       (= mode "partial-eof") (do (emit! "{\"id\":") (os/exit 0))
@@ -60,8 +98,14 @@
     (do
       (when (seq line)
         (let [request (json/read-json line)]
-          ;; Notifications have no response.
-          (when (contains? request "id") (respond! request))))
+          ;; Notifications have no response; a client's reply to a server
+          ;; request (id, no method) is acknowledged by continuing the turn.
+          (cond
+            (and (contains? request "id") (contains? request "method")) (respond! request)
+            (and (contains? request "id") (contains? request "error"))
+            (emit! (str (json/write-json (json-safe {"method" "turn/completed"
+                                                     "params" {"threadId" "thread-1" "turn" {"id" "turn-1" "status" "failed" "error" {"message" "approval refused"}}}})) "\n"))
+            :else nil)))
       (recur))
     (if (= mode "ignore-eof")
       (loop [] (sleep 1000) (recur))

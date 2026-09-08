@@ -16,8 +16,11 @@
                                                                  :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
                      :project_docs [] :complete_fn answer}
    :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
-   :worker_command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
-                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]})
+   :worker_commands {:claude [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                              (str (os/cwd) "/test/fixtures/claude_worker.lg")]
+                     :codex [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                             (str (os/cwd) "/test/fixtures/codex_app_server.lg")]}
+   :allow_worker_scenario true})
 (defn- stop [h] (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))
 (defn- line [c text] (:lines (console/handle! c {:type :line :text text})))
 (defn- drain-until [c pred ms]
@@ -80,7 +83,7 @@
       (let [rendered (drain-until c #(str/includes? % "completed in") 10000)]
         (is (has rendered "[run "))
         (is (has rendered "stage work")))
-      (is (has (line c "/claude hello --scenario success") "claude "))
+      (is (has (line c "/agent --framework claude hello --scenario success") "claude "))
       (let [rendered (drain-until c #(str/includes? % "completed") 5000)]
         (is (has rendered "[claude ") (pr-str rendered))
         (is (has rendered "héλ🙂")))
@@ -88,10 +91,10 @@
         (is (has agents "  run") "focus moved off the run")
         (is (has agents "* claude") "exactly the worker is focused")
         (is (has agents "done")))
-      (is (has (line c "/claude") "usage"))
-      (is (has (line c "/claude do it --cwd") "flag needs a value"))
+      (is (has (line c "/agent") "usage"))
+      (is (has (line c "/agent --framework claude do it --cwd") "flag needs a value"))
       (is (has (line c "/focus nope") "no session, run or worker matches"))
-      (is (has (line c "/cancel") "cancel requested: claude"))
+      (is (has (line c "/cancel") "cancel requested: agent"))
       (let [run-id (some (fn [l] (when (str/starts-with? l "  run ") (nth (str/split (str/trim l) #" +") 1))) (line c "/agents"))]
         (is (has (line c (str "/focus " run-id)) "focus: run"))
         (is (has (line c "/cancel") "cancel requested: run") "cancel targets the newly focused run, not the worker"))
@@ -131,3 +134,21 @@
       (is (= :alive (get-in (deref (hub/request! h {:id "x" :op :session/list}) 1000 {:error {:category :missing}}) [:error :category] :alive))
           "hub is still alive after client quit")
       (finally (stop h)))))
+
+(deftest agent-frameworks-and-aliases-are-explicit
+  (let [h (hub/start! (hub-options)) c (console/open! h {:aliases {"cx" "agent --framework codex"}})]
+    (try
+      (is (has (line c "/agent hi") "usage: /agent --framework"))
+      (is (has (line c "/agent --framework gemini hi") "unknown agent framework"))
+      (is (has (line c "/claude hi") "Unknown console command") "no built-in /claude")
+      (is (has (line c "/cx hello --scenario agent") "codex ") "startup alias expands")
+      (let [rendered (drain-until c #(str/includes? % "completed") 8000)]
+        (is (has rendered "[codex ") (pr-str rendered))
+        (is (has rendered "echo: hello")))
+      (is (has (line c "/alias claude agent --framework claude") "/claude -> /agent --framework claude"))
+      (is (has (line c "/alias") "/cx -> /agent --framework codex"))
+      (is (has (line c "/alias run agent") "built-in"))
+      (is (has (line c "/claude hello --scenario success") "claude ") "defined alias expands")
+      (is (has (drain-until c #(str/includes? % "completed") 8000) "[claude "))
+      (is (has (line c "\\/cx literal") "→ agent") "escape still wins over aliases")
+      (finally (console/close! c) (stop h)))))

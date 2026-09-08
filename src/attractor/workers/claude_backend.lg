@@ -1,26 +1,6 @@
 (ns attractor.workers.claude-backend
-  (:require [clojure.string :as str]
-            [attractor.workers.claude :as claude]))
+  "Compatibility shim: the Claude-specific backend is now
+   attractor.workers.backend/make-backend with framework :claude."
+  (:require [attractor.workers.backend :as backend]))
 
-(defn make-backend
-  "Adapt an owned Claude Code worker to the codergen backend contract.
-   This one-shot connector does not implement full-fidelity session reuse or
-   intercept Claude's internal tool calls for Attractor tool hooks."
-  [opts]
-  (fn [node prompt _context]
-    (when (= "full" (:resolved_fidelity node))
-      (throw (ex-info "Claude worker does not yet support full-fidelity sessions"
-                      {:category :configuration_error :retryable false})))
-    (when (some #(not (str/blank? %))
-                (vals (select-keys (:attractor.tool-hooks/invocation node) [:pre :post])))
-      (throw (ex-info "Attractor tool hooks cannot intercept Claude Code's tools"
-                      {:category :configuration_error :retryable false})))
-    (:text
-      (claude/run!
-        (assoc opts :prompt prompt
-               :model (or (:model opts) (:llm_model node))
-               :cancelled? (fn [] (boolean (or (when-let [cancelled? (:cancelled? node)] (cancelled?))
-                                              (when-let [cancelled? (:cancelled? opts)] (cancelled?)))))
-               :on_event (fn [event]
-                           (when-let [listener (:on_event opts)]
-                             (listener (assoc event :node_id (:id node))))))))))
+(defn make-backend [opts] (backend/make-backend :claude opts))

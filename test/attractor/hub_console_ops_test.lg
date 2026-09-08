@@ -15,8 +15,10 @@
                                                                  :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
                      :project_docs [] :complete_fn answer}
    :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
-   :worker_command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
-                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]
+   :worker_commands {:claude [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                              (str (os/cwd) "/test/fixtures/claude_worker.lg")]
+                     :codex [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                             (str (os/cwd) "/test/fixtures/codex_app_server.lg")]}
    :allow_worker_scenario true})
 (defn- req [h op fields]
   (deref (hub/request! h (merge {:id (str (random-uuid)) :op op} fields)) 5000 {:error {:category :test-timeout}}))
@@ -106,7 +108,7 @@
   (let [h (hub/start! (options))]
     (try
       (let [client (:value (req h :client/attach {}))
-            ok (:value (req h :worker/run {:kind :claude :prompt "hello" :scenario "success" :timeout_ms 3000}))
+            ok (:value (req h :worker/run {:framework :claude :prompt "hello" :scenario "success" :timeout_ms 3000}))
             result (deref (:completion ok) 5000 {:error {:category :test-timeout}})]
         (is (string? (:worker_id ok)))
         (is (= "hello" (get-in result [:value :text])) (pr-str result))
@@ -114,18 +116,22 @@
           (is (every? #(= (:worker_id ok) (:worker_id %)) evs))
           (is (= ["héλ🙂"] (mapv #(get-in % [:event :text]) (filter #(= :text_delta (get-in % [:event :type])) evs)))
               (pr-str (mapv #(select-keys (:event %) [:type :text]) evs))))
-        (let [bad (:value (req h :worker/run {:kind :claude :prompt "x" :scenario "error" :timeout_ms 3000}))
+        (let [bad (:value (req h :worker/run {:framework :claude :prompt "x" :scenario "error" :timeout_ms 3000}))
               failure (deref (:completion bad) 5000 {:error {:category :test-timeout}})]
           (is (= :claude-result (get-in failure [:error :category])) (pr-str failure)))
-        (is (= :unknown-worker-kind (get-in (req h :worker/run {:kind :codex :prompt "x"}) [:error :category])))
-        (is (= 2 (count (:value (req h :worker/list {}))))))
+        (is (= :unknown-framework (get-in (req h :worker/run {:framework :gemini :prompt "x"}) [:error :category])))
+        (let [codex (:value (req h :worker/run {:framework :codex :prompt "via hub" :scenario "agent" :timeout_ms 5000}))
+              result (deref (:completion codex) 8000 {:error {:category :test-timeout}})]
+          (is (= "echo: via hub" (get-in result [:value :text])) (pr-str result))
+          (is (every? #(= :codex (:framework %)) (filter #(= (:worker_id codex) (:worker_id %)) (events h client)))))
+        (is (= 3 (count (:value (req h :worker/list {}))))))
       (finally (stop h)))))
 
 (deftest worker-cancel-terminates-the-process
   (let [h (hub/start! (options)) dir (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) gate (str dir "/release")]
     (try
       (let [client (:value (req h :client/attach {}))
-            w (:value (req h :worker/run {:kind :claude :prompt gate :scenario "gated" :timeout_ms 10000}))]
+            w (:value (req h :worker/run {:framework :claude :prompt gate :scenario "gated" :timeout_ms 10000}))]
         (is (true? (await-true #(some (fn [e] (= :text_delta (get-in e [:event :type]))) (events h client)) 3000)))
         (is (nil? (:error (req h :worker/cancel {:worker_id (:worker_id w)}))))
         (let [outcome (deref (:completion w) 5000 {:error {:category :test-timeout}})]
@@ -135,9 +141,9 @@
 (deftest fast-failures-still-mark-entries-done
   ;; A worker or workflow that fails before its entry is registered must not
   ;; stay "running" forever.
-  (let [h (hub/start! (assoc (options) :worker_command ["/nonexistent/claude-binary"]))]
+  (let [h (hub/start! (assoc (options) :worker_commands {:claude ["/nonexistent/claude-binary"]}))]
     (try
-      (let [w (:value (req h :worker/run {:kind :claude :prompt "x" :timeout_ms 2000}))]
+      (let [w (:value (req h :worker/run {:framework :claude :prompt "x" :timeout_ms 2000}))]
         (is (contains? (deref (:completion w) 5000 {}) :error))
         (is (true? (await-true #(:done (first (:value (req h :worker/list {})))) 2000))))
       (let [r (:value (req h :workflow/run {:dot_source "digraph { not valid" :source_path nil :logs_root nil}))]
@@ -162,7 +168,7 @@
 (deftest worker-scenario-is-ignored-unless-enabled
   (let [h (hub/start! (dissoc (options) :allow_worker_scenario))]
     (try
-      (let [w (:value (req h :worker/run {:kind :claude :prompt "hello" :scenario "error" :timeout_ms 3000}))
+      (let [w (:value (req h :worker/run {:framework :claude :prompt "hello" :scenario "error" :timeout_ms 3000}))
             result (deref (:completion w) 5000 {})]
         ;; Without the scenario argument the fixture reads its default path.
         (is (not= :claude-result (get-in result [:error :category])) (pr-str result)))

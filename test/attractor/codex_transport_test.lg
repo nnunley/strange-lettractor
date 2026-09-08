@@ -69,3 +69,57 @@
               (is (and (integer? @pid) (pos? @pid) (not (process-alive? @pid)))
                   "The same fixture PID is absent after close!"))
             (core/scope-close! scope 2000)))))))
+
+(defn- with-transport [mode f]
+  (let [open! (ns-resolve 'attractor.codex.transport 'open!)
+        close! (ns-resolve 'attractor.codex.transport 'close!)
+        messages (atom []) failures (atom [])
+        t (open! {:command (fixture-command mode) :max-frame-bytes 1048576 :shutdown-ms 1000
+                  :on-message #(swap! messages conj %) :on-failure #(swap! failures conj %)})]
+    (try (f t messages failures)
+         (finally (close! t)))))
+(defn- await-count [a n ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop [] (cond (>= (count @a) n) true (> (System/currentTimeMillis) deadline) false
+                   :else (do (core/sleep 10) (recur))))))
+
+(deftest split-and-coalesced-frames-decode-identically
+  (require 'attractor.codex.transport)
+  (let [send! (ns-resolve 'attractor.codex.transport 'send!)]
+    (doseq [mode ["split" "coalesced" "delayed"]]
+      (with-transport mode
+        (fn [t messages failures]
+          (send! t {"id" 7 "method" "fixture/echo" "params" {"value" mode}})
+          (is (true? (await-count messages 3 4000)) mode)
+          (is (= {"value" mode} (get-in (last @messages) ["result" "params"])) mode)
+          (is (empty? @failures) mode))))))
+
+(deftest protocol-failures-are-reported-once-and-close-still-reaps
+  (require 'attractor.codex.transport)
+  (let [send! (ns-resolve 'attractor.codex.transport 'send!) close! (ns-resolve 'attractor.codex.transport 'close!)
+        failed? (ns-resolve 'attractor.codex.transport 'failed?)]
+    (doseq [[mode kind] [["malformed" :invalid-json] ["partial-eof" :partial-frame] ["stderr-flood" :stderr-overflow]]]
+      (with-transport mode
+        (fn [t messages failures]
+          (send! t {"id" 1 "method" "initialize" "params" {"clientInfo" {"name" "t" "version" "1"}}})
+          (is (true? (await-count failures 1 4000)) mode)
+          (is (= kind (:kind (ex-data (first @failures)))) (str mode " " (pr-str (ex-data (first @failures)))))
+          (is (failed? t) mode)
+          (is (thrown? Object (send! t {"id" 2 "method" "fixture/echo"})) "send after failure throws")
+          (is (= 1 (count @failures)) "reported once"))))))
+
+(deftest child-that-ignores-eof-is-terminated-by-close
+  (require 'attractor.codex.transport)
+  (let [send! (ns-resolve 'attractor.codex.transport 'send!) close! (ns-resolve 'attractor.codex.transport 'close!)
+        open! (ns-resolve 'attractor.codex.transport 'open!) pid-of (ns-resolve 'attractor.codex.transport 'pid)
+        t (open! {:command (fixture-command "ignore-eof") :shutdown-ms 300 :on-message (fn [_] nil) :on-failure (fn [_] nil)})]
+    (send! t {"id" 1 "method" "fixture/echo" "params" {}})
+    (core/sleep 300)
+    (let [pid (pid-of t)
+          started (System/currentTimeMillis)
+          result (close! t)]
+      (is (true? (:closed? result)))
+      (is (true? (:reaped? result)))
+      (is (< (- (System/currentTimeMillis) started) 3000) "bounded shutdown")
+      (is (not (process-alive? pid)) "exact child PID is gone")
+      (is (= result (close! t)) "close is idempotent"))))

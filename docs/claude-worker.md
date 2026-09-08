@@ -9,7 +9,7 @@ Build with your local let-go, then use a prompt file:
 
 ```sh
 lgx build
-bin/attractor claude --prompt-file examples/claude-smoke.md --cwd . --model sonnet
+bin/attractor agent --framework claude --prompt-file examples/claude-smoke.md --cwd . --model sonnet
 ```
 
 Output is a stream of EDN event maps identifying the worker and Claude session.
@@ -24,7 +24,7 @@ longer tasks.
 Default access is `--tools Read --permission-mode plan`. To authorize editing:
 
 ```sh
-bin/attractor claude --prompt-file task.md --cwd . --tools Read,Edit,Write --permission-mode acceptEdits
+bin/attractor agent --framework claude --prompt-file task.md --cwd . --tools Read,Edit,Write --permission-mode acceptEdits
 ```
 
 This is explicit tool authority, not a sandbox. There is no permission-bypass flag.
@@ -37,7 +37,8 @@ subscription billing or remaining quota.
 ## Console use
 
 `attractor console` dispatches the same connector as a hub-owned worker:
-`/claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]`.
+`/agent --framework claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]`
+(`/alias claude agent --framework claude` if you want the short form).
 Worker defaults come from `--worker-cwd`, `--worker-model`, `--worker-tools`,
 `--worker-permission-mode` and `--worker-timeout-ms` on the console command.
 Events render as `[claude <id>]` lines; `/cancel` with the worker focused
@@ -61,8 +62,9 @@ explicit selection never falls back to mock or an API-key model adapter.
 `--mock` cannot be combined with it. `--auto-approve` concerns workflow human
 gates; it does not grant Claude additional tool permissions.
 
-The library entry points are `attractor.workers.claude/run!` and
-`attractor.workers.claude-backend/make-backend`. Options include `:prompt`,
+The library entry points are `attractor.workers.claude/run!`,
+`attractor.workers.registry/run!` (by framework) and
+`attractor.workers.backend/make-backend` (any framework as a codergen backend). Options include `:prompt`,
 `:working_dir`, `:model`, `:tools`, `:permission_mode`, `:timeout_ms`,
 `:cancelled?`, and `:on_event`. `run!` returns the final text/result or throws a
 tagged failure only after its owned command has been joined.

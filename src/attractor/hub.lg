@@ -1,7 +1,7 @@
 (ns attractor.hub
   (:require [clojure.core :as core] [async :as async] [clojure.string :as str]
             [attractor.agent :as agent] [attractor.pipeline :as pipeline]
-            [attractor.workers.claude :as claude]))
+            [attractor.workers.registry :as registry]))
 
 (defn- locked [lock f]
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
@@ -159,26 +159,29 @@
     (mapv (fn [[id e]] {:run_id id :source_path (:source_path e) :done (:done e) :cancelled @(:cancelled e)})
           @(:workflows hub))
     :worker/run
-    (do
-      (when-not (= :claude (:kind request)) (fail! :unknown-worker-kind))
+    (let [framework (try (registry/resolve-framework (:framework request)) (catch Object _ (fail! :unknown-framework)))]
       (when-not (string? (:prompt request)) (fail! :invalid-request))
       (let [worker-id (fresh-id "worker") cancelled (atom false) completion (promise)
-            base {:source :worker :kind :claude :worker_id worker-id}
-            ;; :scenario is a fixture-only argv extension; a request may only
-            ;; add it when the hub was started allowing it.
-            command (cond-> (or (:worker_command hub) ["claude"])
-                      (and (:allow_worker_scenario hub) (:scenario request)) (conj (:scenario request)))
-            options (cond-> {:prompt (:prompt request) :command command
-                             :cancelled? (fn [] @cancelled)
+            base {:source :worker :framework framework :worker_id worker-id}
+            ;; Commands are trusted startup configuration per framework. :scenario is
+            ;; a fixture-only argv extension a request may only add when the hub
+            ;; was started allowing it.
+            configured (get (:worker_commands hub) framework)
+            command (cond-> configured
+                      (and configured (:allow_worker_scenario hub) (:scenario request)) (conj (:scenario request)))
+            options (cond-> {:prompt (:prompt request) :cancelled? (fn [] @cancelled)
                              :on_event (fn [event] (append-envelope! hub (assoc base :event event)))}
+                      command (assoc :command command)
                       (:working_dir request) (assoc :working_dir (:working_dir request))
                       (:model request) (assoc :model (:model request))
                       (:tools request) (assoc :tools (:tools request))
                       (:permission_mode request) (assoc :permission_mode (:permission_mode request))
+                      (:sandbox request) (assoc :sandbox (:sandbox request))
+                      (:approval_policy request) (assoc :approval_policy (:approval_policy request))
                       (:timeout_ms request) (assoc :timeout_ms (:timeout_ms request)))
-            _ (swap! (:workers hub) assoc worker-id {:worker_id worker-id :kind :claude :cancelled cancelled
+            _ (swap! (:workers hub) assoc worker-id {:worker_id worker-id :framework framework :cancelled cancelled
                                                      :completion completion :done false})]
-        (launch! (fn [] (claude/run! options))
+        (launch! (fn [] (registry/run! framework options))
                      (fn [done result]
                        (finish-under-lock! hub
                          (fn []
@@ -193,7 +196,7 @@
       (reset! (:cancelled entry) true)
       {:worker_id (:worker_id request) :completion (:completion entry)})
     :worker/list
-    (mapv (fn [[id e]] {:worker_id id :kind (:kind e) :done (:done e) :cancelled @(:cancelled e)})
+    (mapv (fn [[id e]] {:worker_id id :framework (:framework e) :done (:done e) :cancelled @(:cancelled e)})
           @(:workers hub))
     :session/open
     (let [id (fresh-id "session")
@@ -316,7 +319,10 @@
       (fail! :invalid-capacity))
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts)
-               :workflow_registry_fn (:workflow_registry_fn opts) :worker_command (:worker_command opts)
+               :workflow_registry_fn (:workflow_registry_fn opts)
+               ;; {:claude [argv...] :codex [argv...]}; a framework without an entry
+               ;; uses its connector's default command.
+               :worker_commands (or (:worker_commands opts) {})
                :allow_worker_scenario (boolean (:allow_worker_scenario opts))
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})

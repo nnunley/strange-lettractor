@@ -1,6 +1,6 @@
-(ns claude-cli-tests
+(ns agent-cli-tests
   (:require [clojure.test :as test]
-            [attractor.claude-cli-test]
+            [attractor.agent-cli-test]
             [attractor.cli-test]
             [os :as os]))
 (defn -main [& _]

@@ -1,4 +1,4 @@
-(ns attractor.claude-cli-test
+(ns attractor.agent-cli-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [io :as io] [os :as os]
@@ -6,10 +6,11 @@
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.pipeline :as pipeline]
-            [attractor.workers.claude-backend :as backend]
-            [attractor.workers.claude :as claude]))
+            [attractor.workers.backend :as backend]
+            [attractor.workers.claude :as claude]
+            [attractor.workers.codex :as codex]))
 
-(deftest claude-command-reads-prompt-file-and-streams-worker-events
+(deftest agent-command-reads-prompt-file-and-streams-worker-events
   (let [path (str (os/temp-dir) "/claude-cli-" (random-uuid) ".txt")
         calls (atom []) exits (atom [])]
     (try
@@ -20,7 +21,7 @@
                                         (swap! calls conj opts)
                                         ((:on_event opts) {:source :claude :worker_id "worker-1" :type :text_delta :text "hello"})
                                         {:worker_id "worker-1" :text "hello" :exit_code 0})]
-              (with-out-str (cli/-main "claude" "--prompt-file" path "--cwd" "/repo")))]
+              (with-out-str (cli/-main "agent" "--framework" "claude" "--prompt-file" path "--cwd" "/repo")))]
         (is (= [0] @exits))
         (is (= 1 (count @calls)))
         (is (= "Inspect literal $() and : (forms)\n" (:prompt (first @calls))))
@@ -31,13 +32,15 @@
         (is (str/includes? output ":text_delta")))
       (finally (os/sh "/bin/rm" "-f" "--" path)))))
 
-(deftest claude-command-rejects-invalid-options-without-launch
-  (doseq [args [["--prompt-file"] ["--prompt" "oops"]
-                ["--prompt-file" "/missing" "--permission-mode" "bypassPermissions"]]]
+(deftest agent-command-rejects-invalid-options-without-launch
+  (doseq [args [["--framework" "claude" "--prompt-file"] ["--framework" "claude" "--prompt" "oops"]
+                ["--framework" "claude" "--prompt-file" "/missing" "--permission-mode" "bypassPermissions"]
+                ["--prompt-file" "/missing"]
+                ["--framework" "gemini" "--prompt-file" "/missing"]]]
     (let [calls (atom 0) exits (atom [])]
       (with-redefs [os/exit #(swap! exits conj %)
                     claude/run! (fn [_] (swap! calls inc))]
-        (with-out-str (apply cli/-main "claude" args)))
+        (with-out-str (apply cli/-main "agent" args)))
       (is (= [1] @exits))
       (is (zero? @calls)))))
 
@@ -62,7 +65,7 @@
 
 (deftest worker-backend-preserves-cancellation-and-rejects-unsupported-contracts
   (let [calls (atom []) events (atom []) cancelled (atom false)
-        run (backend/make-backend {:on_event #(swap! events conj %)})]
+        run (backend/make-backend :claude {:on_event #(swap! events conj %)})]
     (with-redefs [claude/run! (fn [opts]
                                (swap! calls conj opts)
                                ((:on_event opts) {:type :text_delta :worker_id "w" :text "ok"})
@@ -85,7 +88,7 @@
       (io/spit path "prompt")
       (let [output (with-redefs [os/exit #(swap! exits conj %)
                                 claude/run! (fn [_] (throw (ex-info "Not authenticated" {:category :worker-error :stderr "diagnostic detail"})))]
-                     (with-out-str (cli/-main "claude" "--prompt-file" path)))]
+                     (with-out-str (cli/-main "agent" "--framework" "claude" "--prompt-file" path)))]
         (is (= [1] @exits))
         (is (str/includes? output "Not authenticated"))
         (is (str/includes? output "diagnostic detail")))
@@ -99,3 +102,19 @@
              (try (with-out-str (cli/cmd-run ["examples/hello.dot" "--worker"])) nil
                   (catch Object error (:category (ex-data error)))))))
     (is (zero? @calls))))
+
+(deftest dot-run-selects-codex-framework-through-the-same-backend
+  (let [dir (str (os/temp-dir) "/codex-dot-" (random-uuid))
+        path (str dir "/workflow.dot") calls (atom []) exits (atom [])]
+    (io/mkdir dir)
+    (io/spit path "digraph Worker { start [shape=Mdiamond]; work [prompt=\"Inspect\"]; exit [shape=Msquare]; start -> work -> exit }")
+    (with-redefs [os/exit #(swap! exits conj %)
+                  codex/run! (fn [opts] (swap! calls conj opts) {:text "Codex result"})
+                  pipeline/run (fn [_ opts]
+                                 (let [node {:id "work" :type "codergen" :prompt "Inspect" :cancelled? (fn [] false)}
+                                       handler (handlers/resolve-handler (:registry opts) node)]
+                                   (handler node (context/make-context) {} dir)))]
+      (with-out-str (cli/cmd-run [path "--worker" "codex" "--auto-approve" "--cwd" dir "--sandbox" "workspace-write"])))
+    (is (= [0] @exits))
+    (is (= "workspace-write" (:sandbox (first @calls))))
+    (is (= "Codex result" (io/slurp (str dir "/work/response.md"))))))

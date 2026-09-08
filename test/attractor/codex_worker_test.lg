@@ -1,0 +1,40 @@
+(ns attractor.codex-worker-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
+            [attractor.workers.codex :as worker]))
+
+;; SCN-CODEX-WORKER: one owned app-server turn against the let-go fake child.
+(defn- command [mode]
+  [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+   (str (os/cwd) "/test/fixtures/codex_app_server.lg") mode])
+(defn- attempt [options] (try (worker/run! options) (catch Object e {:error (ex-data e) :message (ex-message e)})))
+
+(deftest completed-turn-streams-deltas-and-returns-text
+  (let [events (atom [])
+        result (attempt {:prompt "hello codex" :command (command "agent") :timeout_ms 5000 :on_event #(swap! events conj %)})]
+    (is (= "echo: hello codex" (:text result)) (pr-str result))
+    (is (= "completed" (:status result)))
+    (is (= "thread-1" (:thread_id result)))
+    (is (= ["echo: " "hello codex"] (mapv :text (filter #(= :text_delta (:type %)) @events))))
+    (is (every? #(= :codex (:source %)) @events))
+    (is (some #(= "turn/completed" (get-in % [:event "method"])) @events))
+    (is (= 1 (count (filter #(= :completed (:type %)) @events))))))
+
+(deftest failed-turn-and-refused-approval-are-errors
+  (is (= :codex-result (get-in (attempt {:prompt "x" :command (command "agent-fail") :timeout_ms 5000}) [:error :category])))
+  (let [events (atom []) result (attempt {:prompt "x" :command (command "agent-approval") :timeout_ms 5000 :on_event #(swap! events conj %)})]
+    (is (= :codex-result (get-in result [:error :category])) (pr-str result))
+    (is (str/includes? (:message result) "approval refused"))
+    (is (some #(= "item/commandExecution/requestApproval" (get-in % [:event "method"])) @events) "the request was observed, not granted")))
+
+(deftest invalid-options-and-cancellation
+  (is (= :invalid-request (get-in (attempt {:prompt "" :command (command "agent")}) [:error :category])))
+  (is (= :invalid-request (get-in (attempt {:prompt "x" :command (command "agent") :sandbox "readOnly"}) [:error :category])))
+  (let [cancel (atom false)
+        events (atom [])
+        job (core/future (attempt {:prompt "slow" :command (command "agent-hang") :timeout_ms 8000
+                                   :cancelled? (fn [] @cancel) :on_event #(swap! events conj %)}))]
+    ;; The hanging turn only ends through turn/interrupt.
+    (core/sleep 400)
+    (reset! cancel true)
+    (is (= :cancelled (get-in (deref job 6000 {:error {:category :test-timeout}}) [:error :category])))
+    (is (some #(= "interrupted" (get-in % [:event "params" "turn" "status"])) @events) "interrupt reached the server")))

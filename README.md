@@ -24,8 +24,9 @@ Prerequisites:
   stock release runs most of the suite, but the console's evaluation capture
   and held-stream cancellation depend on those fixes; see
   [let-go follow-ups](docs/let-go-followups.md).
-- Optional: [Claude Code](https://code.claude.com) on `PATH` for `/claude`
-  workers, and a llama.cpp or Ollama-compatible endpoint for live models.
+- Optional agentic frameworks on `PATH`: [Claude Code](https://code.claude.com)
+  (`claude`) and [Codex](https://github.com/openai/codex) (`codex`, app-server
+  protocol). Optional: a llama.cpp or Ollama-compatible endpoint for live models.
 
 Every command below reads the runtime from `LGX_LG`; the `lg` on your `PATH`
 may be older, so always set it:
@@ -64,7 +65,8 @@ Inside the console:
 | `:{` … `:}` | multiline evaluation |
 | `\text` | literal agent text |
 | `/run file.dot --auto-approve` | launch a workflow and stream its events |
-| `/claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]` | dispatch an owned Claude Code worker |
+| `/agent --framework claude\|codex <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p] [--sandbox s] [--approval-policy p]` | dispatch an owned agentic-framework worker |
+| `/alias claude agent --framework claude` | define an explicit shortcut (`/claude …`); none exist by default. `--alias name=expansion` at startup does the same |
 | `/agents`, `/focus <id>`, `/new`, `/cancel`, `/quit` | list, select, open, cancel, leave |
 
 In the TUI, Ctrl-C discards a multiline draft, cancels busy focused work, or
@@ -76,7 +78,8 @@ quits when idle. Human-gated workflows need `--auto-approve` for now. See
 ```sh
 bin/attractor validate examples/hello.dot
 bin/attractor run examples/hello.dot --auto-approve      # mock model unless keys/--llm
-bin/attractor run examples/hello.dot --worker claude     # Claude Code as the codergen worker
+bin/attractor run examples/hello.dot --worker claude     # an agentic framework as the codergen worker
+bin/attractor run examples/hello.dot --worker codex --sandbox workspace-write
 lgx run-pipeline examples/hello.dot                      # the same through lgx
 ```
 
@@ -84,24 +87,23 @@ See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and C
 See [deployment context discovery](docs/context-capacity.md) for live capacity,
 explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 
-## Claude Code workers
+## Agentic framework workers
 
-Dispatch Claude through the let-go framework with a prompt file:
+Three things are configured separately: the **provider** (the network model
+client: OpenAI, Anthropic, Gemini, Ollama, llama.cpp), the **model** name, and
+the **agentic framework** (a streaming wrapper around an external coding agent
+that runs its own tool loop). Frameworks are selected explicitly with
+`--framework`; nothing is assumed when it is absent.
 
 ```sh
-bin/attractor claude --prompt-file examples/claude-smoke.md --cwd .
+bin/attractor agent --framework claude --prompt-file examples/claude-smoke.md --cwd .
+bin/attractor agent --framework codex  --prompt-file examples/claude-smoke.md --cwd . --sandbox read-only
 ```
 
-This streams identified EDN events and defaults to read-only tools. DOT runs can
-select the same connector with `--worker claude`, and the console dispatches it
-with `/claude`. See [worker usage and permissions](docs/claude-worker.md).
-
-A Codex app-server worker is in progress on the `codex-app-server` branch:
-bounded JSONL framing and a let-go fake child are implemented, while process
-transport is blocked on let-go interop issues
-[#813](https://github.com/nooga/let-go/issues/813) and
-[#814](https://github.com/nooga/let-go/issues/814). See
-`docs/codex-app-server.md` on that branch.
+Both stream identified EDN events and default to read-only access. DOT runs
+select a framework with `--worker <framework>`; the console with
+`/agent --framework <framework>`. See [Claude Code worker](docs/claude-worker.md)
+and [Codex app-server worker](docs/codex-app-server.md).
 
 ## Workflow lifecycle
 

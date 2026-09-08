@@ -19,7 +19,7 @@
 
 (defn- status-line [state]
   (let [{:keys [kind id]} (session/focus (:console state))
-        parts (remove nil? [(when kind (str ({:session "session" :run "run" :worker "claude"} kind) " "
+        parts (remove nil? [(when kind (str ({:session "session" :run "run" :worker "agent"} kind) " "
                                             (last (str/split id #"-"))))
                             (when (:buffering state) "multiline eval draft")])]
     (style/bold (str "attractor console" (when (seq parts) (str " — " (str/join " · " parts)))
