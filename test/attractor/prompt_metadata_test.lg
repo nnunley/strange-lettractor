@@ -1,0 +1,75 @@
+(ns attractor.prompt-metadata-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.agent :as agent] [attractor.profiles :as profiles]
+            [attractor.models :as models] [attractor.execution :as execution]))
+
+(defn capture [profile]
+  (let [calls (atom []) requests (atom []) changed (atom false)
+        values {"git rev-parse --show-toplevel" "/fixture"
+                "git branch --show-current" "feature-before"
+                "git status --short" " M tracked.lg\n?? new.lg\n"
+                "git log -5 --pretty=%s" "commit one\ncommit two\n"
+                "date +%F" "2026-09-08"}
+        env (execution/make-environment
+              {:working_directory (fn [] "/fixture")
+               :platform (fn [] "fixture-platform") :os_version (fn [] "fixture-os")
+               :inspect_command (fn [command] (swap! calls conj command)
+                                  {:exit_code 0 :stdout (if @changed "AFTER" (get values command ""))})})
+        session (agent/make-session
+                  {:execution_env env :project_docs ["PROJECT RULE"] :user_instructions "FINAL RULE"
+                   :max_subagent_depth 0 :provider_profile (assoc profile :supports_streaming false)
+                   :complete_fn (fn [request] (swap! requests conj request)
+                                  {:message {:role :assistant :content "done"} :tool_calls []})})]
+    (try
+      (let [first-result (agent/process-input! session "first")
+            _ (reset! changed true)
+            second-result (agent/process-input! session "second")]
+        {:results [first-result second-result] :requests @requests :commands @calls
+         :snapshot (:environment_snapshot @session)
+         :prompts (mapv #(get-in % [:messages 0 :content]) @requests)})
+      (finally (agent/close-session! session)))))
+
+(deftest actual-request-environment-is-snapshotted-and-complete
+  (let [{:keys [results prompts commands requests snapshot]} (capture (profiles/create-openai-profile "gpt-5.2-codex"))
+        block (second (re-find #"(?s)<environment>\n(.*?)</environment>" (first prompts)))]
+    (is (= ["done" "done"] results))
+    (is (= 2 (count prompts)))
+    (is (= (first prompts) (second prompts)))
+    (is (= 5 (count commands)))
+    (doseq [line ["Working directory: /fixture" "Is git repository: true"
+                 "Git branch: feature-before" "Git changed files: 2"
+                 "Recent commits:\ncommit one\ncommit two" "Platform: fixture-platform"
+                 "OS version: fixture-os" "Today's date: 2026-09-08"
+                 "Model: GPT-5.2 Codex" "Knowledge cutoff: unknown"]]
+      (is (str/includes? (or block "") line) line))
+    (is (= "gpt-5.2-codex" (:model snapshot)))
+    (is (= ["gpt-5.2-codex" "gpt-5.2-codex"] (mapv :model requests)))
+    (is (str/starts-with? (first prompts) "You are an OpenAI Codex coding agent."))
+    (is (str/ends-with? (first prompts) "FINAL RULE"))))
+
+(deftest profile-metadata-and-safe-fallbacks-do-not-change-model-routing
+  (doseq [[provider model metadata display cutoff]
+          [["openai" "codex" {} "GPT-5.2 Codex" "unknown"]
+           ["custom" "local-model" {:display_name "Local Model" :knowledge_cutoff "2025-01"} "Local Model" "2025-01"]
+           ["openai" "gpt-5.2-codex" {:display_name "Configured Model" :knowledge_cutoff "2025-02"} "Configured Model" "2025-02"]
+           ["custom" "codex" {} "codex" "unknown"]
+           ["custom" "unlisted" {:display_name "  " :knowledge_cutoff false} "unlisted" "unknown"]
+           ["openai" "gpt-5.2-codex" {:display_name 7 :knowledge_cutoff ""} "GPT-5.2 Codex" "unknown"]]]
+    (let [{:keys [prompts requests snapshot]} (capture (profiles/make-profile (merge {:id provider :model model} metadata)))]
+      (doseq [prompt prompts]
+        (is (str/includes? prompt (str "Model: " display "\n")))
+        (is (str/includes? prompt (str "Knowledge cutoff: " cutoff "\n"))))
+      (is (= display (:model_display_name snapshot)))
+      (is (= cutoff (:knowledge_cutoff snapshot)))
+      (is (= [model model] (mapv :model requests))))))
+
+(deftest matching-catalog-metadata-is-used-below-profile-overrides
+  ;; Synthetic catalog facts exercise precedence without inventing real dates.
+  (with-redefs [models/catalog [{:id "fixture" :provider "custom" :display_name "Catalog Fixture"
+                                :knowledge_cutoff "2024-03" :aliases ["fixture-alias"]}]]
+    (doseq [[metadata display cutoff] [[{} "Catalog Fixture" "2024-03"]
+                                      [{:knowledge_cutoff "2025-04"} "Catalog Fixture" "2025-04"]
+                                      [{:display_name "Profile Fixture"} "Profile Fixture" "2024-03"]]]
+      (let [{:keys [snapshot]} (capture (profiles/make-profile (merge {:id "custom" :model "fixture-alias"} metadata)))]
+        (is (= display (:model_display_name snapshot)))
+        (is (= cutoff (:knowledge_cutoff snapshot)))))))

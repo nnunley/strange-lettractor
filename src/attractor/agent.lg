@@ -307,7 +307,20 @@
                     [(str (utf8-prefix rendered (- 32768 (count (bytes marker))))
                           marker)]))))))))))
 
-(defn- environment-snapshot [environment model]
+(defn- valid-metadata-string [value]
+  (when (and (string? value) (not (str/blank? value)))
+    value))
+
+(defn- resolve-model-metadata [profile]
+  (let [model (:model profile)
+        catalog-info (llm/get-model-info model)
+        catalog-matches? (and catalog-info (= (:provider catalog-info) (:id profile)))
+        catalog-display (when catalog-matches? (valid-metadata-string (:display_name catalog-info)))
+        catalog-cutoff (when catalog-matches? (valid-metadata-string (:knowledge_cutoff catalog-info)))]
+    {:model_display_name (or (valid-metadata-string (:display_name profile)) catalog-display model)
+     :knowledge_cutoff (or (valid-metadata-string (:knowledge_cutoff profile)) catalog-cutoff "unknown")}))
+
+(defn- environment-snapshot [environment profile]
   (let [working-dir ((:working_directory environment))
         git-root (environment-command environment "git rev-parse --show-toplevel")
         branch (when git-root
@@ -315,7 +328,8 @@
         status (when git-root
                  (environment-command environment "git status --short"))
         recent (when git-root
-                 (environment-command environment "git log -5 --pretty=%s"))]
+                 (environment-command environment "git log -5 --pretty=%s"))
+        {:keys [model_display_name knowledge_cutoff]} (resolve-model-metadata profile)]
     {:working_directory working-dir
      :is_git_repository (boolean git-root)
      :git_branch (or branch "")
@@ -326,7 +340,9 @@
      :platform ((:platform environment))
      :os_version ((:os_version environment))
      :date (or (environment-command environment "date +%F") "unknown")
-     :model model}))
+     :model (:model profile)
+     :model_display_name model_display_name
+     :knowledge_cutoff knowledge_cutoff}))
 
 (defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions]
   (let [base (profiles/build-system-prompt profile environment [])
@@ -346,7 +362,8 @@
              "Platform: " (:platform snapshot) "\n"
              "OS version: " (:os_version snapshot) "\n"
              "Today's date: " (:date snapshot) "\n"
-             "Model: " (:model snapshot) "\n"
+             "Model: " (:model_display_name snapshot) "\n"
+             "Knowledge cutoff: " (:knowledge_cutoff snapshot) "\n"
              "</environment>")]
     (str base
          "\n\n" environment-text
@@ -419,7 +436,7 @@
           (if (contains? options :project_docs)
             (vec (:project_docs options))
             (discover-project-docs environment (:id profile)))
-          snapshot (environment-snapshot environment (:model profile))
+          snapshot (environment-snapshot environment profile)
           session
           (atom {:id (or (:id options) (str "agent-" (random-uuid)))
                  :model (:model profile)

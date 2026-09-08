@@ -400,7 +400,7 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Given repository instructions larger than 32 KB plus platform, working-directory, and git metadata
 - When the layered system prompt is built
 - Then required metadata is present and instructions are deterministically bounded with an explicit truncation marker
-- Seam: prompt-builder integration. Discovery/budget component implemented in `a38e37a`; `project_docs_contract_test.lg` has 6 tests / 30 assertions, freshly passing natively and in an outside-checkout bundle on 2026-09-08. Covers exact and overflowing UTF-8 rendered budgets, root-first provider filtering, cutoff reads, marker reservation and actual model-request consumption. `dev/project_docs_tests.lg run` is the focused entrypoint. Full environment/git metadata and provider-base prompt evidence remains separate; this is not full CAL-SYSTEM-01 closure.
+- Seam: prompt-builder integration. Discovery/budget component implemented in `a38e37a`; `project_docs_contract_test.lg` has 6 tests / 30 assertions, passing natively and bundled. `prompt_metadata_test.lg` adds 3/66 native/bundle proof for two-turn runtime/git snapshots, model labels/cutoff fallbacks and unchanged request model IDs; full suite 722/6992/0. Focused entrypoints: `dev/project_docs_tests.lg run` and `dev/prompt_metadata_tests.lg run`. Sourced catalog cutoff coverage remains pending: `unknown` is an honest fallback, not a verified date. See `docs/prompt-model-metadata.md`.
 
 ### SCN-FAIL-RETRY-CONTRACT — Returned failure semantics
 

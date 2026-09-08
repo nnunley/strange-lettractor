@@ -1,7 +1,17 @@
 # Progress
 
-**Phase:** hub agent-ownership component verified
-**Next:** RPC transport and hub-side eval/workflow/worker integration; full Attractor conformance backlog remains open
+**Phase:** prompt model-metadata fix verified
+**Next:** remaining environment/adapter contracts and hub integration; full Attractor conformance backlog remains open
+
+The section 6.3 model display-name and missing cutoff-field defects are fixed.
+Actual Claude implemented the bounded agent change through our connector, and a
+separate bounded Claude review approved it. Main's permanent RED had 3 tests /
+26 passing / 40 failing assertions / zero errors; native and outside-checkout
+bundle GREEN each pass 3/66/0. Full default suite: 722/6992/0; build/help pass.
+Model routing stays unchanged; snapshot metadata uses trusted profile values,
+matching-provider catalog fallback and explicit unknown cutoff. No fabricated
+cutoff dates: sourced catalog coverage remains pending. See
+`docs/prompt-model-metadata.md`.
 
 Hub worker integration scope is awaiting user approval; discovery is recorded in
 `docs/hub-worker-findings.md`. Independent conformance reconciliation found the
