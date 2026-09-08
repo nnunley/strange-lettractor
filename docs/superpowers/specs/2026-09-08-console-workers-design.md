@@ -1,5 +1,10 @@
 # Combined console and external workers
 
+Historical design snapshot. The current architecture incorporates the user's
+RPC-hub ownership correction in [console-workers-design.md](../../console-workers-design.md).
+Use that document and [current evidence](../../console-requirements.md) for ongoing
+implementation; the sequence and implementation status below are historical.
+
 Status: proposed design, not implemented. User requested an agent/workflow
 console and let-go evaluation in the same console with different escaping.
 This extends the project beyond the StrongDM conformance baseline; it does not
