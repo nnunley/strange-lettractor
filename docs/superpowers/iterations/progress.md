@@ -1,7 +1,20 @@
 # Progress
 
-**Phase:** explicit command-environment isolation verified
-**Next:** remaining environment/adapter contracts and hub integration; full Attractor conformance backlog remains open
+**Phase:** local native HTTP cancellation and relative command cwd fixes verified
+**Next:** wire dynamic deployment context-capacity discovery using cancellable HTTP;
+remaining adapter/environment and hub contracts remain open
+
+Local let-go checkpoint `f8c3eb13` on `fix/http-scope-cancellation` attaches the
+calling scope to get/post/request, including response-body lifetime. Nine real
+socket regressions fail on base and pass after the fix, with server cancellation
+and zero live workers. Focused repeated/race, compiled Lisp catch, full runtime/
+VM/API, vet, and focused bootstrap checks pass. It is not yet upstream or installed
+over the original local lg. See `docs/let-go-http-cancellation.md` for boundaries.
+Relative command cwd overrides now use the environment's path resolver. Native
+and outside-checkout bundle tests each pass 3/23/0 after a reproduced 10 failures.
+Discovery is still pending; no fixed Qwen context-window value has been introduced.
+Actual Claude review through the connector found no actionable runtime defects.
+Fresh full Attractor suite on the fixed runtime: 728/7035/0, exit 0.
 
 Caller environment names could replace the wrapper command, launch array or
 timeout. Child-only environment argv now fixes these explicit-assignment cases;

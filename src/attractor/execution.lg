@@ -436,7 +436,7 @@
         path-for (fn [path] (resolve-path working-dir path))
         exec-command
         (fn [command timeout-ms requested-dir env-vars]
-          (let [dir (or requested-dir working-dir)
+          (let [dir (if requested-dir (path-for requested-dir) working-dir)
                 started (System/currentTimeMillis)
                 timeout (min max-timeout (max 1 (or timeout-ms default-timeout)))
                 command-id (str environment-id "-" started "-"

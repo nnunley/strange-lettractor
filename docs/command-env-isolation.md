@@ -33,9 +33,15 @@ and `-source-paths src:test`.
 
 This does not close CAL-ENV-01. Inherited environment values whose names collide
 with wrapper variables may still lose their original values; investigate that
-separately. A relative `exec_command` working-directory override is also passed
-straight to shell `cd`, unlike file-path resolution; confirm and test its intended
-base before changing that contract. Windows support is not proved by POSIX tests.
+separately. The relative `exec_command` working-directory regression is now fixed:
+overrides use the environment's path resolver, including directory views and the
+private stdin entrypoint. `execution_cwd_test.lg` demonstrates real command
+locations, absolute paths, nested relative paths, spaces, parent references,
+unchanged host/environment directories, and invalid-directory rejection.
+Its base run had 10 failures; fixed native and outside-checkout bundled runs each
+have 3 tests and 23 passing assertions. The fresh full suite with the local HTTP
+runtime fix passes 728 tests / 7,035 assertions / zero failures, exit 0.
+Windows support is not proved by these POSIX tests.
 
 Do not weaken default secret filtering to match only the spec's listed suffixes:
 additional credential exclusions are not evidence of a defect by themselves.

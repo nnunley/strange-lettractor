@@ -1,0 +1,53 @@
+(ns attractor.execution-cwd-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.execution :as execution] [io :as io] [os :as os]))
+
+(defn fixture [f]
+  (let [created (os/sh "/usr/bin/mktemp" "-d") root (str/trim (:out created))]
+    (when-not (and (= 0 (:exit created)) (not (str/blank? root)))
+      (throw (ex-info "Unable to create cwd fixture" {})))
+    (let [child (str root "/sub dir") deep (str child "/deeper")
+          env (execution/make-local-environment {:working_dir root})]
+      (try
+        (io/mkdir deep)
+        (let [initial ((:exec_command env) "/bin/pwd" 1000 nil nil)]
+          (when-not (= 0 (:exit_code initial)) (throw (ex-info "Initial cwd failed" initial)))
+          (f env root (str/trim (:stdout initial))))
+        (finally
+          ((:cleanup env))
+          (doseq [path [deep child root]] (os/sh "/bin/rmdir" "--" path)))))))
+
+(deftest command-cwd-is-relative-to-environment-not-host
+  (fixture
+    (fn [env root physical]
+      (let [host (os/cwd)]
+        (doseq [[requested suffix] [[nil ""] ["." ""] ["sub dir" "/sub dir"]
+                                    ["./sub dir/deeper" "/sub dir/deeper"]
+                                    [(str root "/sub dir") "/sub dir"]]]
+          (let [result ((:exec_command env) "/bin/pwd" 1000 requested nil)]
+            (is (= 0 (:exit_code result)) (str requested))
+            (is (= (str physical suffix) (str/trim (:stdout result))) (str requested))))
+        (is (= host (os/cwd)))
+        (is (= root ((:working_directory env))))))))
+
+(deftest directory-views-use-their-own-command-base
+  (fixture
+    (fn [env root physical]
+      (let [view ((:with_working_directory env) "sub dir")]
+        (doseq [[requested expected] [[nil (str physical "/sub dir")]
+                                      ["deeper" (str physical "/sub dir/deeper")]
+                                      [".." physical]]]
+          (let [result ((:exec_command view) "/bin/pwd" 1000 requested nil)]
+            (is (= 0 (:exit_code result)))
+            (is (= expected (str/trim (:stdout result))))))
+        (is (= root ((:working_directory env))))))))
+
+(deftest private-stdin-and-invalid-cwd-share-resolution-contract
+  (fixture
+    (fn [env _ physical]
+      (let [result ((:exec_command_stdin env) "/bin/pwd; /bin/cat" 1000 "sub dir" nil "payload λ\n")
+            invalid ((:exec_command env) "printf must-not-run" 1000 "absent-directory" nil)]
+        (is (= 0 (:exit_code result)))
+        (is (= (str physical "/sub dir\npayload λ\n") (:stdout result)))
+        (is (= 126 (:exit_code invalid)))
+        (is (= "" (:stdout invalid)))))))

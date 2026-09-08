@@ -1,5 +1,41 @@
 # Native HTTP scope cancellation gap
 
+## Local runtime fix, 2026-09-08
+
+A fix is implemented in the isolated local let-go workspace
+`.worktrees/let-go-http-cancellation`, jj workspace `http-scope-cancellation`,
+based on `bdd8268c`, checkpoint `f8c3eb13b433980968a9af94d7938c3b361bfb9f`
+(`fix/http-scope-cancellation`). This is not yet an upstream release, and the existing
+`~/development/let-go/lg` executable has not been replaced.
+
+`http/get`, `http/post`, and `http/request` now use the runtime's existing
+context-aware native entrypoint and attach `ec.Context()` to the Go HTTP
+request. The context remains attached to streamed bodies after the native call
+returns; there is no premature deferred cancellation at that boundary.
+
+Runtime tests in `pkg/rt/http_cancellation_test.go` cover all three methods
+while held before headers, during buffered body reads, and during streamed
+body reads. All nine cases failed on the base with one live worker each.
+They pass with the fix, including server-observed disconnect, a cancellation
+error, and zero live workers. Normal buffered/streamed responses and sibling
+scope isolation are also covered. Ten repeated focused runs and five race
+runs passed. `pkg/api/http_cancellation_test.go` additionally exercises a
+compiled let-go function and verifies that cancellation reaches Lisp `catch`;
+ten race runs passed. Runtime/API vet, full `pkg/rt`, `pkg/vm`, and `pkg/api`
+tests, and the focused bootstrap-mode tests passed.
+An actual Claude read-only review through the Attractor connector found no
+actionable defects. Abandoned streams with no read/close are not directly covered
+by these tests. Attractor's full suite against the freshly built runtime and cwd
+fix passed: 728 tests, 7,035 assertions, zero failures, exit 0.
+
+Build the isolated runtime with `go build -o build/lg .` and point `LGX_LG`
+at that executable for Attractor. These tests do not establish native support
+for Attractor's signal/timeout map options, nor complete Attractor's separate
+abort/join semantics. Dynamic context-capacity discovery still needs wiring;
+this fix supplies its cancellable native HTTP prerequisite.
+
+## Original reproduction
+
 Verified 2026-09-07 using local `lg dev (bdd8268)`, source HEAD
 `bdd8268c9cb3acf369f0854bada47af79d1d673d`. No runtime source was edited.
 Tracked upstream as [nooga/let-go #816](https://github.com/nooga/let-go/issues/816).
