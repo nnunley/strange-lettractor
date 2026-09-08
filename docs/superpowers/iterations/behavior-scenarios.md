@@ -458,6 +458,16 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Then endpoint/auth configuration and normalized results follow the documented extension contract
 - Seam: local HTTP integration
 
+## User-requested console extension
+
+### SCN-CONSOLE-INPUT — Frontend framing extension
+
+- Story: CONSOLE-INPUT-01, user-requested console extension.
+- Contract and transcript: `docs/console-requirements.md#scn-console-input`.
+- Seam: pure public reducer, never native reader/evaluator or RPC execution.
+- Evidence: `dev/console_input_tests.lg`, 7 tests / 92 assertions / zero failures.
+- Hub, terminal lifecycle and actual evaluation require separate integration tests.
+
 ## Credential-gated residual scenarios
 
 ### SCN-ATTR-SMOKE-LIVE — Real Attractor journey

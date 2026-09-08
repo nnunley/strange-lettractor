@@ -1,0 +1,98 @@
+(ns attractor.console-input-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.console.input :as input]))
+
+;; SCN-CONSOLE-INPUT: framing only; no RPC dispatch, reading or evaluation.
+(def selection {:session "agent-1" :run "run-1"})
+(defn- line [state text & [selected]]
+  (input/accept state {:type :line :text text} (or selected selection)))
+(defn- action [type text] {:type type :text text :selection selection})
+
+(deftest literal-agent-and-explicit-eval-framing
+  (doseq [[text expected]
+          [["hello" (action :agent "hello")]
+           ["  hello  " (action :agent "  hello  ")]
+           ["é😀雪" (action :agent "é😀雪")]
+           [":keyword" (action :agent ":keyword")]
+           [":\t(code)" (action :agent ":\t(code)")]
+           [" : (+ 1 2)" (action :agent " : (+ 1 2)")]
+           [" /quit" (action :agent " /quit")]
+           [": (+ 1 2)  " (action :eval "(+ 1 2)  ")]
+           [":  (+ 1 2)" (action :eval " (+ 1 2)")]
+           [": " (action :eval "")]
+           ["\\/quit" (action :agent "/quit")]
+           ["\\: (code)" (action :agent ": (code)")]
+           ["\\:{" (action :agent ":{")]
+           ["\\\\literal" (action :agent "\\literal")]
+           ["\\ordinary" (action :agent "ordinary")]
+           ["" nil] [" \t\r" nil] ["\\" nil] ["\\ \t" nil]]]
+    (is (= {:state {} :action expected} (line {} text)))))
+
+(deftest command-names-arguments-and-unknowns
+  (doseq [command [:help :agents :focus :run :cancel :quit]]
+    (is (= {:state {} :action {:type :command :command command :args "" :selection selection}}
+           (line {} (str "/" (name command)))))
+    (is (= {:state {} :action {:type :command :command command :args "agent 雪  " :selection selection}}
+           (line {} (str "/" (name command) "\t  agent 雪  ")))))
+  (is (= {:state {} :action {:type :command :command :help :args "" :selection selection}}
+         (line {} "/help \t\r")))
+  (doseq [text ["/" "/unknown args" "/Help" "/quit-now" "/helpful"]]
+    (let [result (line {} text)]
+      (is (= {} (:state result)))
+      (is (= :error (get-in result [:action :type])))
+      (is (string? (get-in result [:action :message])))
+      (is (= selection (get-in result [:action :selection]))))))
+
+(deftest exact-multiline-delimiters-and-verbatim-content
+  (let [opened (line {} ":{")
+        text ["(do" " /quit" "/focus other" ": (+ 1 2)" ":{" "\\ordinary" "\\:}" ":} " ":}\r" "雪😀)" ""]
+        buffered (reduce (fn [state next-line]
+                           (let [result (line state next-line)]
+                             (is (nil? (:action result)))
+                             (:state result))) (:state opened) text)
+        submitted (line buffered ":}")]
+    (is (nil? (:action opened)))
+    (is (= {:state {} :action (action :eval "(do\n /quit\n/focus other\n: (+ 1 2)\n:{\n\\ordinary\n:}\n:} \n:}\r\n雪😀)\n")}
+           submitted)))
+  (is (= {:state {} :action (action :eval "")}
+         (line (:state (line {} ":{")) ":}")))
+  (doseq [text [":{ " ":{\r" " :{" ":}" ":} " ":}\r"]]
+    (is (= {:state {} :action (action :agent text)} (line {} text)))))
+
+(deftest selection-is-captured-at-submission-not-buffer-open
+  (let [later {:session "agent-2" :run "run-2"}
+        opened (:state (line {} ":{" selection))
+        buffered (:state (line opened "(+ 1 2)" selection))
+        submitted (line buffered ":}" later)]
+    (is (= {:state {} :action {:type :eval :text "(+ 1 2)" :selection later}} submitted))
+    (is (= selection (:selection (:action (line {} "hello" selection)))))
+    (is (= {:session "agent-2" :run "run-2"} (:selection (:action submitted))))))
+
+(deftest interrupts-eof-and-unknown-events
+  (let [buffered (:state (line (:state (line {} ":{")) "unfinished"))]
+    (is (= {:state {} :action nil} (input/accept buffered {:type :interrupt} selection)))
+    (is (= {:state {} :action {:type :cancel :selection selection}}
+           (input/accept {} {:type :interrupt} selection)))
+    (doseq [state [{} buffered]]
+      (is (= {:state {} :action {:type :quit :selection selection}}
+             (input/accept state {:type :eof} selection)))
+      (let [unknown (input/accept state {:type :resize} selection)]
+        (is (= state (:state unknown)))
+        (is (= :error (get-in unknown [:action :type])))
+        (is (string? (get-in unknown [:action :message])))))))
+
+(deftest malformed-line-does-not-discard-buffer
+  (let [state (:state (line (:state (line {} ":{")) "kept"))
+        rejected (input/accept state {:type :line :text nil} selection)]
+    (is (= state (:state rejected)))
+    (is (= :error (get-in rejected [:action :type])))
+    (is (= (action :eval "kept") (:action (line (:state rejected) ":}"))))))
+
+(deftest reducer-never-reads-or-evaluates-code-looking-input
+  (let [calls (atom 0) forbidden (fn [& _] (swap! calls inc) (throw (ex-info "must not execute" {})))]
+    (with-redefs [core/eval forbidden core/read-string forbidden]
+      (is (= (action :agent "(throw :never)") (:action (line {} "(throw :never)"))))
+      (is (= (action :eval "#=(dangerous) ") (:action (line {} ": #=(dangerous) "))))
+      (is (= (action :eval "(os/exit 9)")
+             (:action (line (:state (line (:state (line {} ":{")) "(os/exit 9)")) ":}")))))
+    (is (= 0 @calls))))

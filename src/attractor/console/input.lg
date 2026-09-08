@@ -1,0 +1,42 @@
+(ns attractor.console.input (:require [clojure.string :as str]))
+
+(def ^:private commands #{:help :agents :focus :run :cancel :quit})
+
+(defn- result [state action selection]
+  {:state state :action (when action (assoc action :selection selection))})
+
+(defn- agent-line [state text selection]
+  (result state (when-not (str/blank? text) {:type :agent :text text}) selection))
+
+(defn- idle-line [state text selection]
+  (cond
+    (str/starts-with? text "\\") (agent-line state (subs text 1) selection)
+    (= text ":{") (result {:buffer []} nil selection)
+    (str/starts-with? text ": ") (result state {:type :eval :text (subs text 2)} selection)
+    (str/starts-with? text "/")
+    (let [[_ name args] (re-matches #"/([^\s]*)(?:\s+(.*))?" text)
+          command (when name (keyword name))]
+      (result state
+              (if (contains? commands command)
+                {:type :command :command command :args (or args "")}
+                {:type :error :message "Unknown console command"}) selection))
+    :else (agent-line state text selection)))
+
+(defn accept
+  "Pure console framing. State starts as {}; :buffer holds unsubmitted eval
+   lines. Returned actions capture the caller's selection at submission time.
+   This reducer never reads/evaluates code or dispatches commands."
+  [state event selection]
+  (case (:type event)
+    :eof (result {} {:type :quit} selection)
+    :interrupt (result {} (when-not (contains? state :buffer) {:type :cancel}) selection)
+    :line
+    (let [text (:text event)]
+      (if-not (string? text)
+        (result state {:type :error :message "Console line must be a string"} selection)
+        (if (contains? state :buffer)
+          (if (= text ":}")
+            (result {} {:type :eval :text (str/join "\n" (:buffer state))} selection)
+            (result (update state :buffer conj (if (= text "\\:}") ":}" text)) nil selection))
+          (idle-line state text selection))))
+    (result state {:type :error :message "Unknown console input event"} selection)))

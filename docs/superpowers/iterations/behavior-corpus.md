@@ -57,3 +57,10 @@ Additional full-goal residual gates from the ITER-0005 audit:
 - `SCN-CLOJURE-READER`: `/Users/ndn/development/let-go/lg -source-paths src:. compat/run_mapping.lg` — currently 1 test / 5 failed assertions / exit 1. This is failing acceptance evidence, not a skip or pass; broader artifact-reader checks must accompany restoration.
 
 Build/AOT release check: `LGX_LG=/Users/ndn/development/let-go/lg lgx build`.
+
+User-requested extension (not a StrongDM conformance substitute):
+
+- `SCN-CONSOLE-INPUT`: public pure reducer, impacted cadence;
+  `/Users/ndn/development/let-go/lg -source-paths src:test dev/console_input_tests.lg run`.
+  7 tests / 92 assertions / zero failures; also discovered in the full suite.
+  Scope and remaining integration obligations: `docs/console-requirements.md`.

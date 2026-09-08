@@ -259,3 +259,24 @@ impacted run correctly caught a turn-count ordering regression; it was repaired,
 not waived. See `docs/subagent-lifecycle-evidence.edn` for commands and scope.
 Profile/model/directory fidelity, remaining depth/live proof, general event
 shutdown and native-Go AOT parity remain open. No console/TUI code is included.
+
+## Component checkpoint — Console input framing (2026-09-08)
+
+**Completed:** 2026-09-08, pure frontend component; paired final audit clean.
+**Stories delivered:** CONSOLE-INPUT-01 only, user-requested extension.
+**Tasks executed:** reviewed input contract, red/green reducer implementation,
+focused/full/bundle verification, native nREPL capability investigation.
+**Scenarios:** SCN-CONSOLE-INPUT at the public pure reducer seam.
+**Summary:** Agent text, slash commands and explicit evaluation requests remain
+distinct data. Multiline draft cancellation cannot cancel a worker, selection
+is captured at submission, and no input is evaluated by the router.
+
+Evidence: baseline 679/6613/0; focused/outside-checkout bundle 7/92/0; full suite
+686/6705/0, terminal exit 0. CLI build/help pass. Paired scope/spec/quality reviews
+include actual Claude Code CLI; paired final audit clean. These direct CLI reviews
+are not Attractor-managed Claude workers. Private notes excluded.
+
+The console is a client of a future RPC hub, not the owner of the framework.
+Stock nREPL gaps and existing upstream issues are in `docs/nrepl-hub-findings.md`.
+Hub/eval/TUI/worker integration and all outstanding StrongDM requirements remain
+open; no native-Go AOT or usable console command is claimed by this component.

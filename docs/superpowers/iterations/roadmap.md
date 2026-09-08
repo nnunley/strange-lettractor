@@ -21,6 +21,16 @@ The repository already has a walking skeleton: DOT parse → transform/validate 
 
 Every iteration closes with the impacted scenarios, the full sentinel suite, AOT compilation, parallel adversarial audit, and a public checkpoint commit. ITER-0013 records full-goal residuals identified by the ITER-0005 audit; it is not permission to treat the temporary reader subset as complete specification conformance. Its independent graph-merging proof has been brought forward and verified; the reader dependency must not prevent progress on unrelated pending iterations.
 
+## User-requested console/RPC extension
+
+Tracked independently in `docs/console-requirements.md`; does not replace any
+StrongDM conformance iteration. Frontend framing (CONSOLE-INPUT-01) is implemented
+with 7/92 focused and bundled evidence; paired audit clean. Full suite 686/6705/0.
+The console must connect to a hub, not own the framework. Next: hub transport
+capability/contract, real hub-side evaluation and worker controls, then line-client
+integration and tiny-tui presentation. See `docs/nrepl-hub-findings.md` for upstream
+runtime dependencies and `docs/console-workers-design.md` for ownership boundaries.
+
 ## Future design: executable packets and skill packages
 
 Requested by the user on 2026-09-06. Record this as future design work, not an implemented capability or a replacement for the Attractor conformance iterations above.

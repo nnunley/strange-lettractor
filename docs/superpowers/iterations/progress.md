@@ -1,7 +1,13 @@
 # Progress
 
-**Phase:** subagent lifecycle verified checkpoint, CAL-SUBAGENT-01 (ITER-0007)
-**Task:** paired final audit clean; ready to commit and push
+**Phase:** console extension input component verified checkpoint
+**Task:** input reducer 7/92 passing; full suite 686/6705 passing; paired audit clean
+
+User-directed console extension is tracked in `docs/console-requirements.md`.
+The console/TUI is an RPC client; a hub owns Attractor. Stock nREPL limitations
+and existing upstream issues are recorded in `docs/nrepl-hub-findings.md`.
+No console CLI, hub or worker connector is claimed. Existing conformance backlog
+below remains open. Lifecycle checkpoint was committed/pushed as edcab16.
 
 **Current subagent slice:** `.worktrees/subagent-lifecycle`, base `39338c4`.
 Baseline full suite: 667 tests / 6507 assertions / zero failures. Native bounded
