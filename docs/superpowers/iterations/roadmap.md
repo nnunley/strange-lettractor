@@ -35,6 +35,13 @@ separate-process RPC/nREPL transport with reconnect/replay, Codex app-server
 worker, native resize/exception coverage, and a bounded live implementer
 trial. See `docs/console-requirements.md` for evidence.
 
+## Future work
+
+User-requested extensions are collected in [`docs/future_work.md`](../../future_work.md).
+User configuration beyond `.env` (settings file, precedence, trust) was
+requested on 2026-09-08 and is recorded there as a bounded design item that
+precedes packets. It is not part of any conformance iteration.
+
 ## Future design: executable packets and skill packages
 
 Requested by the user on 2026-09-06. Record this as future design work, not an implemented capability or a replacement for the Attractor conformance iterations above.
