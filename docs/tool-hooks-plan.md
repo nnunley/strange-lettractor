@@ -1,8 +1,7 @@
 # Tool-call hooks — scoped implementation plan
 
-Status: scope approved; stdin transport component implemented and verified.
-Standalone agent hooks and stage logging pass focused review; workflow wiring and
-integration evidence remain pending.
+Status: implemented and verified for ATTR-HOOK-01. The broader iteration and full
+Attractor goal remain incomplete.
 
 Source: snapshotted Attractor specification §9.7. This implements ATTR-HOOK-01
 and SCN-TOOL-HOOKS within ITER-0007, not completion of that iteration.
@@ -118,7 +117,7 @@ directories whose paths were not retained. Their payloads were removed. No broad
 cleanup was attempted; the regression now captures owned paths for exact cleanup.
 This component creates no new upstream let-go issue and does not complete hooks.
 
-## Standalone hook checkpoint (workflow integration pending)
+## Standalone hook checkpoint (before workflow integration)
 
 The agent accepts `:tool_hooks` with `:pre`, `:post`, `:node_id`, `:stage_dir`
 and optional positive `:timeout_ms` (default 10000). Descendants share the session's
@@ -143,3 +142,23 @@ The test count includes the final native-cancellation test; a development syntax
 error briefly triggered known let-go #807 silent trailing-form truncation and was
 corrected before these counts. Workflow inheritance, admission and recovery are
 not established by these standalone tests.
+
+## Public workflow integration checkpoint
+
+Graph/node attribute resolution, dynamic defaults, full-fidelity refresh,
+descendant pinning across refresh, rejected-call isolation, pending cancellation,
+parallel stage separation, hook-reported cancellation and captured resume are
+verified in `tool_hook_workflow_test.lg`: 11 tests / 47 assertions. The direct
+handler cancellation regression failed with a status-codec error before the fix;
+cancelled outcomes now bypass that incompatible status-file format. Admission
+cancellation evidence waits for the actual successful CAS before releasing its
+gate, not merely evaluation of the cancellation predicate.
+
+Combined focused and standalone bundled hooks: 23 tests / 132 assertions.
+Impacted agent/engine/status/recovery: 203 / 1579. Final full suite: 639 / 5885.
+All report zero failures and exit 0. CLI build/help pass. Paired spec and quality
+reviews approve. See [tool-hooks.md](tool-hooks.md) for usage.
+
+A separately reproduced preexisting completion-handoff cancellation race is
+tracked in [turn-ownership-gap.md](turn-ownership-gap.md), CAL-OWN-01. It is not
+closed by the rejected/pending admission guard or these hook evidence counts.

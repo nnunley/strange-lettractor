@@ -99,3 +99,22 @@ final default 616/5753/0. Standalone bundle 7/74/0; CLI build/help pass. Paired
 scope/spec/quality reviews approve. See `docs/tool-hooks-plan.md` for commands,
 failure semantics and remaining agent/workflow integration. No native-Go AOT
 conformance or complete hooks behavior is claimed by this component.
+
+## Component checkpoint — Tool-call hooks
+
+ATTR-HOOK-01 / SCN-TOOL-HOOKS is verified. Graph/node hooks execute through agent
+environments with literal-key JSON stdin, environment metadata, pre veto and
+nonblocking post auditing. EDN stage records, per-call context pinning, refreshed
+fidelity defaults, descendant and parallel isolation, pending/busy admission
+ownership, cancellation and captured recovery have permanent tests.
+
+Evidence: baseline 616/5753/0; standalone core 12/85/0; workflow 11/47/0; combined
+and external-directory bundle 23/132/0; impacted agent/engine/status/recovery
+203/1579/0; full default suite 639/5885/0. CLI build/help pass. Paired spec and
+quality reviews approve. `docs/tool-hooks.md` documents use and
+`docs/tool-hooks-evidence.edn` records reusable verification.
+
+ITER-0007 and the full goal remain incomplete. Audit discovered a separately
+verified preexisting stale-turn cancellation race at the completion callback
+handoff; CAL-OWN-01 / SCN-CAL-TURN-OWNERSHIP records the pending regression/fix in
+ITER-0008. No native-Go AOT conformance is inferred from these bundle/build checks.

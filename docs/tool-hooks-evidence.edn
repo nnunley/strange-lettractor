@@ -1,0 +1,24 @@
+{:requirement "ATTR-HOOK-01"
+ :scenario "SCN-TOOL-HOOKS"
+ :scope :component
+ :base_commit "f38af5727b0a26554885ce9b5bc2b28629d39fb0"
+ :compiler "/Users/ndn/development/let-go/lg"
+ :baseline {:tests 616 :assertions 5753 :failures 0 :exit 0}
+ :focused {:tests 23 :assertions 132 :failures 0 :exit 0
+           :command "/Users/ndn/development/let-go/lg -source-paths src:test dev/tool_hook_tests.lg run"}
+ :impacted {:tests 203 :assertions 1579 :failures 0 :exit 0
+            :namespaces [attractor.tool-hooks-test attractor.tool-hook-workflow-test
+                         attractor.agent-test attractor.agent-loop-contract-test
+                         attractor.tool-output-contract-test attractor.session-error-contract-test
+                         attractor.engine-test attractor.status-contract-test
+                         attractor.workflow-recovery-contract-test]}
+ :default_suite {:tests 639 :assertions 5885 :failures 0 :exit 0
+                 :command "env PATH=/Users/ndn/development/let-go:/opt/homebrew/bin:/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin /Users/ndn/.local/share/mise/installs/github-abogoyavlensky-lgx/0.1.0-rc2/lgx test"}
+ :standalone_bundle {:tests 23 :assertions 132 :failures 0 :exit 0
+                     :working_directory "/tmp/lettractor-stdin-evidence.K5KscVkc"
+                     :argument "run"}
+ :cli_build {:exit 0 :help_exit 0 :native_go_aot_conformance false}
+ :reviews {:paired_spec :approved :paired_quality :approved}
+ :residuals ["CAL-OWN-01 preexisting completion-handoff cancellation race"
+             "Remaining ITER-0007 and broader Attractor requirements"
+             "Native-Go AOT conformance remains unproved"]}

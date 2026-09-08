@@ -1,9 +1,21 @@
 # Progress
 
-**Phase:** implementing tool hooks, ATTR-HOOK-01 component (ITER-0007)
-**Task:** safe hook stdin transport verified; session/workflow integration next
+**Phase:** verified tool hooks, ATTR-HOOK-01 component (ITER-0007)
+**Task:** final evidence audit and public checkpoint
 
-**Current baseline:** public main `c373771` contains the reviewed session-error
+**Hook completion checkpoint:** the standalone core and public workflow integration
+pass paired spec and quality review. Focused/bundled evidence is 23 tests / 132
+assertions; impacted agent/engine/status/recovery is 203/1579; final full suite is
+639/5885, all zero failures. CLI build/help pass. This completes ATTR-HOOK-01,
+not ITER-0007 or the full goal. Native-Go AOT conformance is not claimed.
+
+**Next verified gap:** CAL-OWN-01 tracks stale-turn cancellation after the session
+becomes idle but before its completion callback returns. A gated reproduction on
+both `f38af57` and the hook candidate shows cancellation of A closing newly admitted
+B. See `docs/turn-ownership-gap.md`; permanent regression/fix are pending. This is
+Attractor lifecycle work, not a new let-go bug or a hooks regression.
+
+**Historical hook baseline:** public main `c373771` contained the reviewed session-error
 component. Fresh hook-worktree sentinel suite: 609 tests / 5,679 assertions / zero
 failures, exit 0. Paired scope review approved `docs/tool-hooks-plan.md` after
 clarifying per-call context snapshots, concurrent EDN logging and failure policy,
@@ -94,11 +106,12 @@ tests / 4458 assertions / zero failures**, exit 0; AOT builds successfully. The
 separate reader suite still fails its five assertions. This is an Attractor bug
 fix, not a let-go change or completion of the broader tools requirement.
 
-**Hook gap reproduced:** a public workflow with a codergen node carrying
+**Historical hook gap (now resolved by ATTR-HOOK-01):** a public workflow with a codergen node carrying
 `tool_hooks.pre="exit 23"` still executes its registered tool once and returns
 success. The proposed existing-environment hook runner, node-over-graph precedence,
-JSON stdin metadata, EDN stage logs, and per-turn refresh for reused sessions await
-design approval. This dependency does not prevent independent tool-contract fixes.
+JSON stdin metadata, EDN stage logs, and per-turn refresh for reused sessions were
+then awaiting design approval. The verified hook checkpoint above supersedes this
+historical state.
 
 **Local agent-loop checkpoint:** `agent_loop_contract_test.lg` adds three session
 integration tests through a deterministic adapter registered with the real unified

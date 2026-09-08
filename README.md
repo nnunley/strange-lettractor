@@ -35,6 +35,9 @@ even if the original DOT file has changed or disappeared. Source changes produce
 drift warnings; missing or corrupt captures stop recovery before execution.
 Loop restarts retain independently resumable captures in their fresh run directories.
 
+[Tool-call hooks](docs/tool-hooks.md) provide pre-call checks and post-call auditing,
+with graph/node configuration and EDN stage logs.
+
 ## License
 
 [Apache License 2.0](LICENSE)

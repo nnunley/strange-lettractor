@@ -1,5 +1,6 @@
 (ns main
-  (:require [attractor.tool-hooks-test]))
+  (:require [attractor.tool-hooks-test]
+            [attractor.tool-hook-workflow-test]))
 
 (defn -main [& _]
   (let [output (with-out-str (clojure.test/run-tests))]

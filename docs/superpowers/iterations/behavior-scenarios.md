@@ -204,9 +204,30 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 
 - Given configured pre- and post-hooks around an LLM tool call
 - When pre succeeds, the tool runs and post observes its result; when pre fails, the tool is skipped; when post fails, the tool result is retained and failure evidence is emitted
-- Seam: coding-loop integration
+- Then environment metadata and literal-key stdin JSON match the call, raw post
+  output is distinct from bounded model output, and stage audit forms remain
+  readable under concurrent in-process writers
+- Public workflows resolve each hook from node attributes over graph defaults,
+  preserving explicit empty disable; session reuse refreshes stage identity and
+  defaults without moving an in-flight descendant call's pre/post audit context
+- A rejected concurrent caller cannot refresh, close, evict or cancel the active
+  cached session; a cancellation before admission cannot later start that input
+- Pinned recovery executes captured hooks despite source drift and logs to the
+  resumed stage directory without persisting runtime context cells in the capture
+- Seam: public workflow and coding-loop integration
+- Status: verified component, 23 tests / 132 assertions; whole ITER-0007 remains incomplete
 
-#### SCN-TOOL-HOOKS-STDIN — Native input transport component
+### SCN-CAL-TURN-OWNERSHIP — Completion-handoff cancellation isolation
+
+- Given cached turn A paused in its processing-end callback after becoming idle
+  and turn B admitted into that session with its provider gated
+- When A is cancelled or its cleanup fails, B's session, abort controller and
+  cache entry remain owned by B and usable until B's own completion
+- Seam: session/backend concurrency integration with deterministic gates
+- Status: verified existing bug; permanent harness and fix pending CAL-OWN-01
+- See `docs/turn-ownership-gap.md` for the bounded reproduction and baseline
+
+### SCN-TOOL-HOOKS-STDIN — Native input transport component
 
 - Given a local execution environment and an input string, including empty input,
   Unicode, shell-sensitive text and a multi-MiB result

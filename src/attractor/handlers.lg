@@ -169,7 +169,16 @@
 
        (try
          (let [backend-result (if backend
-                                (backend node prompt ctx)
+                                (backend
+                                  (assoc node :attractor.tool-hooks/invocation
+                                    (reduce (fn [resolved [attribute phase]]
+                                              (cond
+                                                (contains? (:attrs node) attribute) (assoc resolved phase (get (:attrs node) attribute))
+                                                (contains? (:attrs graph) attribute) (assoc resolved phase (get (:attrs graph) attribute))
+                                                :else resolved))
+                                            {:node_id node-id :stage_dir stage-dir}
+                                            [[:tool_hooks.pre :pre] [:tool_hooks.post :post]]))
+                                  prompt ctx)
                                 (str "[Simulated] Response for stage: " node-id))]
            (if (and (map? backend-result) (:status backend-result))
              ;; Backend returned an Outcome directly
@@ -196,11 +205,12 @@
                           (status/outcome->status-json outcome)))
                outcome)))
          (catch Object e
-           (let [fail-outcome {:status :fail :failure_reason (str e)}]
-             (when-not engine-managed-status?
+           (let [cancelled? (= :cancelled (:category (ex-data e)))
+                 fail-outcome {:status (if cancelled? :cancelled :fail) :failure_reason (str e)}]
+             (when-not (or engine-managed-status? cancelled?)
                (io/spit (str stage-dir "/status.json")
                         (status/outcome->status-json fail-outcome)))
-             (throw e))))))))
+             (if cancelled? fail-outcome (throw e)))))))))
 
 ;; Wait.human Handler (Section 4.6)
 (defn make-wait-human-handler [interviewer]

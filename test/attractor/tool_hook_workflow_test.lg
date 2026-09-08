@@ -1,0 +1,200 @@
+(ns attractor.tool-hook-workflow-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [attractor.agent :as agent]
+            [attractor.handlers :as handlers] [attractor.context :as context]
+            [attractor.execution :as execution] [attractor.profiles :as profiles]
+            [attractor.pipeline :as pipeline] [attractor.interviewer :as interviewer]
+            [io :as io] [os :as os] [clojure.string :as str]))
+
+(deftest handler-resolves-independent-presence-overrides
+  (let [seen (atom []) root (str (os/temp-dir) "/lettractor-hook-handler-" (rand-int 1000000000))
+        handler (handlers/make-codergen-handler (fn [node _ _] (swap! seen conj node) "done"))
+        graph {:attrs {:tool_hooks.pre "graph-pre" :tool_hooks.post "graph-post"}}
+        node {:id "stage" :prompt "work" :attrs {:tool_hooks.pre ""}}]
+    (handler node (context/make-context) graph root)
+    (is (= {:pre "" :post "graph-post" :node_id "stage" :stage_dir (str root "/stage")}
+           (:attractor.tool-hooks/invocation (first @seen))))
+    (is (= {:tool_hooks.pre ""} (:attrs node)))))
+
+(declare root-dir)
+(deftest direct-handler-cancellation-does-not-serialize-unsupported-status
+  (let [root (root-dir)
+        handler (handlers/make-codergen-handler (fn [& _] (throw (ex-info "cancelled" {:category :cancelled}))))
+        result (handler {:id "cancel" :prompt "work"} (context/make-context) {} root)]
+    (is (= :cancelled (:status result)))
+    (is (nil? (os/stat (str root "/cancel/status.json"))))))
+
+(defn backend-fixture [options]
+  (let [registry (profiles/make-tool-registry) hook-calls (atom []) requests (atom [])]
+    (profiles/register-tool! registry {:definition {:name "sample" :parameters {:type "object"}}
+                                      :executor (fn [_ _] "result")})
+    {:hooks hook-calls :requests requests
+     :backend (agent/make-agent-codergen-backend
+                (merge {:provider_profile (profiles/make-profile {:id "mock" :model "test" :tool_registry registry})
+                        :project_docs [] :tool_hooks {:pre "base-pre" :post "base-post"}
+                        :execution_env (execution/make-environment {:exec_command_stdin
+                                          (fn [command & _] (swap! hook-calls conj command) {:exit_code 0})})
+                        :complete_fn (fn [request]
+                                       (swap! requests conj request)
+                                       (if (odd? (count @requests))
+                                         {:tool_calls [{:id "call" :name "sample" :arguments {}}]}
+                                         {:message {:role :assistant :content "done"}}))} options))}))
+
+(deftest cached-backend-recomputes-current-defaults-without-stale-overrides
+  (let [threads (atom {}) {:keys [backend hooks requests]} (backend-fixture {})
+        node {:id "first" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}]
+    (try
+      (backend (assoc node :attractor.tool-hooks/invocation {:pre "first-pre" :post ""}) "one" nil)
+      (let [id (:id @(get-in @threads ["shared" :session]))]
+        (backend (assoc node :id "second" :attractor.tool-hooks/invocation {:post "second-post"}) "two" nil)
+        (backend (assoc node :id "third" :attractor.tool-hooks/invocation {}) "three" nil)
+        (is (= id (:id @(get-in @threads ["shared" :session])))))
+      (is (= ["first-pre" "base-pre" "second-post" "base-pre" "base-post"] @hooks))
+      (is (= 6 (count @requests)))
+      (finally (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(defn root-dir [] (str/trim (:out (os/sh "/usr/bin/mktemp" "-d" (str (os/temp-dir) "/lettractor-hook-workflow.XXXXXXXX")))))
+(defn audit [root node] (read-string (str "[" (io/slurp (str root "/" node "/tool-hooks.edn")) "]")))
+(deftest public-full-fidelity-pipeline-hooks-have-real-stage-audits
+  (let [root (root-dir) events (atom []) env (execution/make-local-environment {:env_policy :none})
+        {:keys [backend requests]} (backend-fixture {:execution_env env :on_event #(swap! events conj %)})
+        registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
+        source "digraph hooks { graph [default_fidelity=full, thread_id=shared, tool_hooks.pre=\"printf graph-pre\", tool_hooks.post=\"printf graph-post\"]; start [shape=Mdiamond]; first [tool_hooks.pre=\"printf first-pre\"]; second [tool_hooks.post=\"\"]; third; exit [shape=Msquare]; start -> first -> second -> third -> exit; }"
+        result (pipeline/run source {:registry registry :logs-root root})]
+    (is (= :success (:status result)))
+    (is (= 1 (count (filter #(= :session_start (:type %)) @events))))
+    (is (= 6 (count @requests)))
+    (is (< (count (:messages (first @requests))) (count (:messages (last @requests)))))
+    (doseq [[node expected] [["first" ["first-pre" "graph-post"]] ["second" ["graph-pre"]] ["third" ["graph-pre" "graph-post"]]]]
+      (is (= expected (mapv #(get-in % [:command_result :stdout]) (audit root node))))
+      (is (every? #(= node (:node_id %)) (audit root node))))))
+
+(deftest rejected-busy-caller-cannot-refresh-close-or-evict-active-session
+  (let [threads (atom {}) started (promise) release (promise) active? (atom false)
+        {:keys [backend hooks]} (backend-fixture {:complete_fn (fn [_]
+                                 (when @active? (deliver started true) @release)
+                                 {:message {:role :assistant :content "done"}})})
+        node {:id "owner" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}]
+    (try
+      (backend node "warm" nil)
+      (reset! active? true)
+      (let [session (get-in @threads ["shared" :session])
+            owner (future (backend (assoc node :attractor.tool-hooks/invocation {:pre "owner-pre"}) "owner" nil))]
+        (is (= true (deref started 1000 false)))
+        (let [error (try (backend (assoc node :attractor.tool-hooks/invocation {:pre "intruder"} :cancelled? (fn [] true)) "busy" nil)
+                         nil (catch Object e (ex-data e)))]
+          (is (contains? #{:session-busy :cancelled} (:category error))))
+        (is (= :processing (:state @session)))
+        (is (= "owner-pre" (:pre @(:tool_hook_context @session))))
+        (is (identical? session (get-in @threads ["shared" :session])))
+        (deliver release true)
+        (is (= "done" (deref owner 2000 ::pending))))
+      (finally (deliver release true) (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest pinned-resume-uses-captured-hooks-not-edited-dot
+  (let [root (root-dir) source-path (str root "/source.dot") run-root (str root "/run")
+        env (execution/make-local-environment {:env_policy :none})
+        {:keys [backend]} (backend-fixture {:execution_env env})
+        registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
+        source "digraph hooks { start [shape=Mdiamond]; work [tool_hooks.pre=\"printf captured\", tool_hooks.post=\"\"]; exit [shape=Msquare]; start -> work -> exit; }"]
+    (io/spit source-path source)
+    (let [initial (pipeline/run source {:source-path source-path :logs-root run-root :max-steps 1 :registry registry})]
+      (is (= ["start"] (:completed_nodes initial)))
+      (is (nil? (os/stat (str run-root "/work/tool-hooks.edn")))))
+    (io/spit source-path (str/replace source "printf captured" "printf changed"))
+    (is (= :success (:status (pipeline/resume (str run-root "/checkpoint.edn") {:registry registry}))))
+    (is (= ["captured"] (mapv #(get-in % [:command_result :stdout]) (audit run-root "work"))))))
+
+(deftest hook-reported-cancellation-is-a-cancelled-workflow
+  (let [root (root-dir) {:keys [backend]} (backend-fixture
+          {:execution_env (execution/make-environment {:exec_command_stdin (fn [& _] {:exit_code 130 :cancelled true})})})
+        registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
+        result (pipeline/run "digraph x { start [shape=Mdiamond]; work [tool_hooks.pre=\"cancel\"]; exit [shape=Msquare]; start -> work -> exit; }"
+                             {:registry registry :logs-root root})]
+    (is (= :cancelled (:status result)))))
+
+(deftest dynamic-hook-defaults-merge-independently
+  (let [{:keys [backend hooks]} (backend-fixture {:session_options_fn (fn [_] {:tool_hooks {:post "dynamic-post"}})})]
+    (backend {:id "stage"} "work" nil)
+    (is (= ["base-pre" "dynamic-post"] @hooks))))
+
+(deftest active-descendant-keeps-old-call-context-then-sees-parent-refresh
+  (let [old-root (root-dir) new-root (root-dir) started (promise) release (promise) hooks (atom [])
+        threads (atom {})
+        {:keys [backend]} (backend-fixture
+          {:execution_env (execution/make-environment {:exec_command_stdin
+                             (fn [command & _]
+                               (swap! hooks conj command)
+                               (when (= "old-pre" command) (deliver started true) @release)
+                               {:exit_code 0})})
+           :complete_fn (fn [request]
+                          (let [last-message (last (:messages request))]
+                            (if (and (= :user (:role last-message)) (str/starts-with? (str (:content last-message)) "child"))
+                              {:tool_calls [{:id "call" :name "sample" :arguments {}}]}
+                              {:message {:role :assistant :content "done"}})))})
+        node {:id "parent" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}]
+    (try
+      (backend (assoc node :attractor.tool-hooks/invocation {:pre "old-pre" :post "old-post" :stage_dir old-root}) "warm" nil)
+      (let [parent (get-in @threads ["shared" :session])
+            child-id (:agent_id (agent/spawn-subagent! parent {"task" "child-one"}))]
+        (is (= true (deref started 2000 false)))
+        (backend (assoc node :attractor.tool-hooks/invocation {:pre "new-pre" :post "new-post" :stage_dir new-root}) "refresh" nil)
+        (deliver release true)
+        (is (:success (agent/wait-subagent! parent child-id)))
+        (agent/send-subagent-input! parent child-id "child-two")
+        (is (:success (agent/wait-subagent! parent child-id)))
+        (is (= ["old-pre" "old-post" "new-pre" "new-post"] @hooks))
+        (doseq [root [old-root new-root]]
+          (let [records (read-string (str "[" (io/slurp (str root "/tool-hooks.edn")) "]"))]
+            (is (= [:pre :post] (mapv :phase records))))))
+      (finally (deliver release true) (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest cancellation-before-admission-cannot-later-enter-session
+  (let [threads (atom {}) entered (promise) observed (promise) cancelled (atom false)
+        original-cas core/compare-and-set!
+        {:keys [backend requests]} (backend-fixture {})
+        node {:id "stage" :resolved_fidelity "full" :resolved_thread_id "shared" :fidelity_threads threads}]
+    (backend node "warm" nil)
+    (let [session (get-in @threads ["shared" :session]) lock (:lifecycle_lock @session)
+          before-history (:history @session) before-hooks @(:tool_hook_context @session)]
+      (reset! lock true)
+      (with-redefs [core/compare-and-set!
+                    (fn [reference old new]
+                      (let [changed? (original-cas reference old new)]
+                        (when (and changed? (= :pending old) (= :cancelled new))
+                          (deliver observed true))
+                        changed?))]
+      (let [worker (future (try (backend
+                          (assoc node :attractor.tool-hooks/invocation {:pre "must-not-install"}
+                            :cancelled? (fn [] (deliver entered true) @cancelled))
+                          "must-not-admit" nil) nil (catch Object e (ex-data e))))]
+        (try
+          (is (= true (deref entered 1000 false)))
+          (reset! cancelled true)
+          (is (= true (deref observed 1000 false)))
+          (reset! lock false)
+          (is (= :cancelled (:category (deref worker 2000 {}))))
+          (is (= before-history (:history @session)))
+          (is (= before-hooks @(:tool_hook_context @session)))
+          (is (= :idle (:state @session)))
+          (is (identical? session (get-in @threads ["shared" :session])))
+          (finally (reset! lock false) (doseq [[_ entry] @threads] ((:close entry))))))))))
+
+(deftest public-parallel-branches-have-independent-hook-context-and-stage-paths
+  (let [root (root-dir) stages (atom {})
+        {:keys [backend]} (backend-fixture
+          {:session_options_fn (fn [node]
+                                 (swap! stages assoc (:id node) (get-in node [:attractor.tool-hooks/invocation :stage_dir]))
+                                 {:execution_env (execution/make-local-environment {:env_policy :none})})
+           :complete_fn (fn [request]
+                          (if (= :user (:role (last (:messages request))))
+                            {:tool_calls [{:id "call" :name "sample" :arguments {}}]}
+                            {:message {:role :assistant :content "done"}}))})
+        registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
+        result (pipeline/run "digraph x { graph [tool_hooks.post=\"\"]; start [shape=Mdiamond]; fork [shape=component]; left [tool_hooks.pre=\"printf left\"]; right [tool_hooks.pre=\"printf right\"]; join [shape=tripleoctagon]; exit [shape=Msquare]; start -> fork; fork -> left; fork -> right; left -> join; right -> join; join -> exit; }"
+                             {:registry registry :logs-root root})
+        records (mapv (fn [node] (first (read-string (str "[" (io/slurp (str (get @stages node) "/tool-hooks.edn")) "]")))) ["left" "right"])]
+    (is (= :success (:status result)))
+    (is (= ["left" "right"] (mapv #(get-in % [:command_result :stdout]) records)))
+    (is (= ["left" "right"] (mapv :node_id records)))
+    (is (= 2 (count (set (map :session_id records)))))
+    (is (not= (get @stages "left") (get @stages "right")))))
