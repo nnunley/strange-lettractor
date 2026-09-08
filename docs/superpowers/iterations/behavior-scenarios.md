@@ -206,6 +206,18 @@ Each scenario has a stable ID, an observable contract, and the strongest appropr
 - When pre succeeds, the tool runs and post observes its result; when pre fails, the tool is skipped; when post fails, the tool result is retained and failure evidence is emitted
 - Seam: coding-loop integration
 
+### SCN-CAL-CONTEXT-RECOVERY — Typed errors and reusable overflow sessions
+
+- Given typed complete/stream provider failures, including partial output and queued inputs
+- When authentication fails, the original error is surfaced and the session closes once
+- When context overflow fails an input, the stream closes, warning/processing-end
+  events appear, resources/history/queues remain usable, and a later explicit input succeeds
+- Warning-triggered abort/close cannot reopen the session or emit post-terminal events
+- Seam: public agent session plus native loopback HTTP through all four adapters
+- Local proof: `dev/session_error_contract_tests.lg run` — 5 tests / 177 assertions
+- Native proof: `dev/session_error_http_bounded.lg run` — 8 cases with exact request counts
+- Component only: no incremental SSE or general cancellation/retry conformance claim
+
 ### SCN-HANDLER-MATRIX — Registry-to-engine dispatch
 
 - Given each built-in handler shape/type and a registered custom handler

@@ -1,0 +1,23 @@
+{:scope :typed-session-errors-and-context-recovery
+ :base "699f26b"
+ :runtime "lg dev (bdd8268)"
+ :baseline {:tests 604 :assertions 5502 :failures 0 :exit 0}
+ :core-red {:tests 5 :pass 113 :fail 64 :error 0 :exit 1}
+ :core-green {:tests 5 :pass 177 :fail 0 :error 0 :exit 0}
+ :impacted {:tests 62 :pass 949 :fail 0 :error 0 :exit 0}
+ :fixture-unit {:tests 1 :pass 26 :fail 0 :error 0 :exit 0}
+ :outer-unit {:tests 1 :pass 7 :fail 0 :error 0 :exit 0}
+ :native-http {:providers ["openai" "anthropic" "gemini" "ollama"]
+               :cases 8 :passed 8 :exit 0 :timed-out false :duration-ms 2208
+               :auth {:status 401 :first-requests 1 :final-requests 1 :state :closed}
+               :context {:status 413 :first-requests 1 :final-requests 2 :state :idle
+                         :explicit-next-input "recovered"}
+               :fixture-cleanup {:child-exit 130 :cancelled true :settled true}}
+ :default-suite {:tests 609 :assertions 5679 :failures 0 :exit 0}
+ :bundle {:core-tests 5 :assertions 177 :exit 0 :run-directory "/tmp"}
+ :build {:lgx-exit 0 :built-cli-help-exit 0 :native-go-aot-proven false}
+ :reviews {:core-spec 2 :core-quality 2 :fixture-spec 2 :fixture-quality 2
+           :outer-spec-and-quality 2 :blocking-findings 0}
+ :remaining [:native-http-cancellation :incremental-sse-flushing
+             :general-retry-contracts :full-shutdown-order :live-provider-parity
+             :native-go-aot-release-proof]}

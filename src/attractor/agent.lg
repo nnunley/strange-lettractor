@@ -756,10 +756,13 @@
             :text_end nil
             :finish (reset! finish-seen true)
             :error
-            (throw
-              (ex-info (str "LLM stream failed: " (:error event))
-                       {:category :provider-stream
-                        :provider_error (:error event)}))
+            (let [error (:error event)]
+              (throw
+                (if (:category (ex-data error))
+                  error
+                  (ex-info (str "LLM stream failed: " error)
+                           {:category :provider-stream
+                            :provider_error error}))))
             nil)))
       (if (session-stopped? session)
         nil
@@ -805,6 +808,21 @@
                           (get recent (mod index pattern-length))))
                      (range pattern-length window))))
             [1 2 3]))))))
+
+(defn- recover-context-overflow! [session error event-fn]
+  ;; Only the input failed: keep history, queued inputs, environment and child
+  ;; sessions. A warning listener may close/abort, so it must not be reopened.
+  (event-fn {:type :warning :category :context-length
+             :message (ex-message error)})
+  (when (with-session-lock
+          session
+          (fn []
+            (when (and (= :processing (:state @session))
+                       (not (:abort_signaled @session))
+                       (not @(:session_end_emitted @session)))
+              (swap! session assoc :state :idle)
+              true)))
+    (event-fn {:type :processing_end})))
 
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn- process-input-cycle! [session prompt on-event followup?]
@@ -902,9 +920,12 @@
                           (if (session-stopped? session)
                             nil
                             (do
-                              (event-fn {:type :error :error (str e)
-                                         :category (:category (ex-data e))})
-                              (close-session-after-error! session e on-event)
+                              (if (= :context-length (:category (ex-data e)))
+                                (recover-context-overflow! session e event-fn)
+                                (do
+                                  (event-fn {:type :error :error (str e)
+                                             :category (:category (ex-data e))})
+                                  (close-session-after-error! session e on-event)))
                               (throw e)))))]
                   (if (session-stopped? session)
                     last-text

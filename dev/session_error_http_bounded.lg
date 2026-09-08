@@ -1,0 +1,27 @@
+(ns session-error-http-bounded
+  (:require [attractor.execution :as execution] [os :as os]))
+
+(defn command [args]
+  (when (> (count args) 1) (throw (ex-info "Expected at most one port argument" {})))
+  (let [raw (first args)
+        port (when raw (when (re-matches #"[0-9]+" raw) (parse-long raw)))]
+    (when (and raw (not (and port (<= 1024 port 65535))))
+      (throw (ex-info "Expected nonprivileged port in 1024..65535" {})))
+    (str "/Users/ndn/development/let-go/lg -source-paths src:test:dev dev/session_error_http_check.lg run"
+         (when port (str " " port)))))
+
+(defn -main [& args]
+  (if (= ["--help"] (vec args))
+    (println "session_error_http_bounded.lg run [PORT] — 60-second owned checker; run from the project checkout.")
+    (let [_ (when-not (= "run" (first args)) (throw (ex-info "Expected run and optional port" {})))
+          cmd (command (rest args))
+          env (execution/make-local-environment
+                {:working_dir (os/cwd) :env_policy :none :max_command_timeout_ms 60000})
+          result (try
+                   (let [result ((:exec_command env) cmd 60000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"})]
+                     (prn result)
+                     result)
+                   (finally ((:cleanup env))))]
+      (os/exit (:exit_code result)))))
+
+(when *command-line-args* (apply -main *command-line-args*))

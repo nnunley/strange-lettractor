@@ -1,0 +1,3 @@
+(require '[session-error-http-fixture-test] '[clojure.test :as test])
+(test/run-tests)
+(os/exit (if test/*test-result* 0 1))

@@ -69,3 +69,18 @@
 - Audit remediation: the first paired audit found that an unmatched closing delimiter caused let-go's namespace loader to stop cleanly after engine test 26. Fixing the source exposed a real manager-artifact loss: codergen's self-written JSON status file narrowed its richer internal Outcome. The engine now marks managed invocations so codergen returns the complete internal Outcome while the engine persists canonical JSON; direct handler status behavior and custom file authority remain unchanged. A separate sentinel asserts all 43 engine test vars, including the final test, are loaded.
 - Safety and policy: no `TODO(ITER-0003)` or `FIXME` markers remain; no recursive deletion command was introduced; EDN remains the internal persistence format and JSON remains limited to external contracts.
 - Reviews: every implementation task passed paired acceptance/evidence review and paired code-quality/boxing-in review. After remediation, two independent three-tier auditors returned CLEAN for ATTR-CTX-01, ATTR-ENG-05, all impacted engine/status/manager/fidelity/resume/cancellation behavior, and the four sentinel scenarios.
+
+## Component checkpoint — Session error recovery (2026-09-07)
+
+CAL-ERROR-01 remains partial; ITER-0008 remains in progress. This checkpoint
+delivers SCN-CAL-CONTEXT-RECOVERY, not the broader failure/shutdown scenario.
+Typed stream errors retain their SDK identity, authentication stays fatal, and
+context overflow fails only the current input while retaining a usable session.
+All new HTTP fixture/checker code is let-go with owned process lifetimes.
+
+Evidence: baseline 604/5502/0; core RED 5 tests, 113 pass/64 fail; GREEN 5/177/0;
+impacted 62/949/0; final default suite 609/5679/0. Native HTTP checks pass 8/8
+through four adapters. The standalone core bundle passes 5/177 from /tmp, build
+and CLI help pass, and paired independent spec/quality reviews approve.
+See `docs/session-error-contract.md` and its EDN evidence record for commands,
+scope and explicit native HTTP cancellation/SSE/live-provider/AOT residuals.

@@ -1,0 +1,16 @@
+(ns session-error-http-fixture-test
+  (:require [clojure.test :refer [deftest is]] [session-error-http-server :as fixture]))
+(deftest fixture-counts-and-native-recovery
+  (let [counts (atom {}) handler (fixture/make-handler "secret" counts)]
+    (is (= "secret" (:body (handler {:path "/ready"}))))
+    (is (= 404 (:status (handler {:path "/wrong/openai/auth/responses"}))))
+    (doseq [provider ["openai" "anthropic" "gemini" "ollama"]]
+      (let [auth {:path (str "/secret/" provider "/auth/responses")}
+            context {:path (str "/secret/" provider "/context/responses")}]
+        (is (= 401 (:status (handler auth))))
+        (is (= 413 (:status (handler context))))
+        (let [recovery (handler context)]
+          (is (= 200 (:status recovery)))
+          (is (clojure.string/includes? (:body recovery) "recovered")))
+        (is (= 1 (get @counts (str provider "/auth"))))
+        (is (= 2 (get @counts (str provider "/context"))))))))

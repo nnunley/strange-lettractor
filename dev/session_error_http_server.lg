@@ -1,0 +1,47 @@
+(ns session-error-http-server
+  (:require [http :as http] [json :as json] [clojure.string :as str]))
+
+(defn frame [event body]
+  (str (when event (str "event: " event "\n")) "data: " (json/write-json body) "\n\n"))
+(defn success-body [provider]
+  (case provider
+    "openai" (str (frame "response.output_text.delta" {:type "response.output_text.delta" :item_id "m" :content_index 0 :delta "recovered"})
+                  (frame "response.completed" {:type "response.completed" :response {:id "r" :status "completed" :model "fixture"
+                    :output [{:id "m" :type "message" :role "assistant" :content [{:type "output_text" :text "recovered"}]}]}}))
+    "anthropic" (str (frame "message_start" {:type "message_start" :message {:id "m" :role "assistant" :model "fixture" :content []}})
+                     (frame "content_block_start" {:type "content_block_start" :index 0 :content_block {:type "text" :text ""}})
+                     (frame "content_block_delta" {:type "content_block_delta" :index 0 :delta {:type "text_delta" :text "recovered"}})
+                     (frame "content_block_stop" {:type "content_block_stop" :index 0})
+                     (frame "message_delta" {:type "message_delta" :delta {:stop_reason "end_turn"}})
+                     (frame "message_stop" {:type "message_stop"}))
+    "gemini" (frame nil {:responseId "r" :candidates [{:content {:role "model" :parts [{:text "recovered"}]} :finishReason "STOP"}]})
+    "ollama" (str (frame nil {:id "r" :model "fixture" :choices [{:index 0 :delta {:role "assistant" :content "recovered"} :finish_reason "stop"}]}) "data: [DONE]\n\n")))
+
+(defn make-handler [token counts]
+  (fn [request]
+    (let [path (:path request)
+          [_ supplied provider kind] (str/split path #"/")]
+      (cond
+        (= path "/ready") {:status 200 :body token}
+        (not= token supplied) {:status 404 :body "unknown fixture token"}
+        (= provider "counts") {:status 200 :body (pr-str @counts)}
+        (not (and (contains? #{"openai" "anthropic" "gemini" "ollama"} provider)
+                  (contains? #{"auth" "context"} kind))) {:status 404 :body "unknown fixture case"}
+        :else
+        (let [key (str provider "/" kind)
+              n (get (swap! counts update key (fnil inc 0)) key)]
+          (if (or (= kind "auth") (= n 1))
+            {:status (if (= kind "auth") 401 413)
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-json {:error {:code "fixture_error" :message (if (= kind "auth") "Request rejected" "context length exceeded")}})}
+            {:status 200 :headers {"Content-Type" "text/event-stream"}
+             :body (success-body provider)}))))))
+
+(defn -main [port token]
+  (let [port (parse-long port)]
+    (when-not (and port (<= 1024 port 65535) (re-matches #"[a-zA-Z0-9-]+" token))
+      (throw (ex-info "Expected nonprivileged numeric port and alphanumeric fixture token" {})))
+    (http/serve (make-handler token (atom {})) (str "127.0.0.1:" port))))
+
+;; Caller owns and terminates this blocking server process; no flush semantics.
+(when (= 2 (count *command-line-args*)) (apply -main *command-line-args*))

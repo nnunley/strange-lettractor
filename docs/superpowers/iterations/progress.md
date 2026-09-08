@@ -1,7 +1,25 @@
 # Progress
 
-**Phase:** implementing ITER-0006
-**Task:** raw/model output bounds verified, including previously unbounded error results; hook design remains awaiting approval
+**Phase:** resumed core conformance, CAL-ERROR-01 component (ITER-0008)
+**Task:** finish typed session-error/context-overflow behavior and native HTTP evidence
+
+**Current checkpoint:** main is `699f26b`, including the independently reviewed
+Qwen-authored quota-code fix. Fresh sentinel/default baseline: 604 tests / 5,502
+assertions / zero failures. The session-error worktree preserves its previously
+drafted patch and is now based on that main. Fresh baseline RED: 5 tests / 113
+passing and 64 failing assertions; candidate GREEN: 5 tests / 177 passing
+assertions. Paired independent spec and quality reviews approve the core change.
+The let-go-authored, owned-child HTTP fixture/checker passes all 8 cases through
+the reusable 60-second wrapper (2,208 ms, exit 0, no timeout). Paired fixture and
+wrapper reviews approve. Final candidate default suite: 609 tests / 5,679
+assertions / zero failures; standalone bundled core tests: 5/177; lgx build and
+built CLI help pass. This closes the component's evidence, not CAL-ERROR-01,
+ITER-0008 or the full implementation goal.
+
+RLM discovery and executable skill/package work remain follow-ups, not gates on
+Attractor conformance. No handwritten Go fixtures or local runtime edits are
+authorized by this slice. Historical checkpoints below are retained as history,
+not the current test count or completion status.
 
 **Output bounds checkpoint:** the shared tool path previously truncated success
 output but sent exception and unknown-tool error content to the model unbounded.

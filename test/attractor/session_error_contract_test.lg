@@ -1,0 +1,179 @@
+(ns attractor.session-error-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]))
+
+(defn caught [f]
+  (try (f) nil (catch Object e e)))
+
+(defn event-types [session]
+  (mapv :type (agent/session-events session)))
+
+(defn fixture [category mode partial?]
+  (let [calls (atom 0)
+        closes (atom 0)
+        cleanups (atom 0)
+        error (ex-info "provider rejected input"
+                       {:category category :provider "anthropic"
+                        :status_code (if (= category :context-length) 413 401)
+                        :error_code "fixture_code" :retryable false
+                        :raw {"error" {"message" "provider rejected input"}}})
+        session
+        (agent/make-session
+          (merge
+            {:project_docs []
+             :execution_env (execution/make-environment
+                              {:cleanup #(swap! cleanups inc)})}
+            (if (= mode :complete)
+              {:complete_fn
+               (fn [_]
+                 (if (= 1 (swap! calls inc))
+                   (throw error)
+                   {:message {:role :assistant :content "recovered"}
+                    :tool_calls []}))}
+              {:stream_fn
+               (fn [request]
+                 ((:register_stream_close request) #(swap! closes inc))
+                 (if (= 1 (swap! calls inc))
+                   (concat
+                     (if partial?
+                       [{:type :text_delta :delta "partial"}
+                        {:type :tool_call_end
+                         :tool_call {:id "must-not-run" :name "missing_tool"
+                                     :arguments {}}}]
+                       [])
+                     (if (= mode :thrown)
+                       (lazy-seq (throw error))
+                       [{:type :error :error error}])
+                     (lazy-seq (throw (ex-info "tail must not be read" {}))))
+                   [{:type :text_delta :delta "recovered"}
+                    {:type :finish :response
+                     {:message {:role :assistant :content "recovered"}
+                      :tool_calls []}}]))})))]
+    {:session session :error error :calls calls :closes closes :cleanups cleanups}))
+
+(deftest typed-authentication-failures-remain-fatal
+  (doseq [mode [:complete :event :thrown]]
+    (let [{:keys [session error calls closes cleanups]}
+          (fixture :authentication mode true)
+          failure (caught #(agent/process-input! session "first"))
+          events (agent/session-events session)
+          error-event (first (filter #(= :error (:type %)) events))]
+      (is (= (ex-data error) (ex-data failure)))
+      (is (= (ex-message error) (ex-message failure)))
+      (is (= :authentication (:category error-event)))
+      (is (string? (:error error-event)))
+      (is (= [:session_start :user_input :assistant_text_start]
+             (subvec (event-types session) 0 3)))
+      (is (= (if (= mode :complete)
+               [:session_start :user_input :assistant_text_start :error :session_end]
+               [:session_start :user_input :assistant_text_start :assistant_text_delta
+                :error :session_end])
+             (event-types session)))
+      (is (= [:user] (mapv :type (:history @session))))
+      (is (= 1 @calls))
+      (is (= (if (= mode :complete) 0 1) @closes))
+      (is (= 1 @cleanups))
+      (is (= :closed (:state @session)))
+      (is (= :session-closed
+             (:category (ex-data (caught #(agent/process-input! session "next"))))))
+      (agent/close-session! session)
+      (is (= 1 @cleanups))
+      (is (= 1 (count (filter #(= :session_end (:type %))
+                            (agent/session-events session))))))))
+
+(deftest context-overflow-fails-input-but-preserves-session
+  (doseq [mode [:complete :event :thrown]
+          partial? (if (= mode :complete) [false] [false true])]
+    (let [{:keys [session error calls closes cleanups]}
+          (fixture :context-length mode partial?)
+          _ (agent/follow-up-session! session "queued")
+          failure (caught #(agent/process-input! session "first"))
+          warning (first (filter #(= :warning (:type %))
+                                 (agent/session-events session)))
+          prefix (cond
+                   (= mode :complete) [:session_start :user_input :assistant_text_start]
+                   partial? [:session_start :user_input :assistant_text_start :assistant_text_delta]
+                   :else [:session_start :user_input])]
+      (is (= (ex-data error) (ex-data failure)))
+      (is (= (ex-message error) (ex-message failure)))
+      (is (= :context-length (:category warning)))
+      (is (string? (:message warning)))
+      (is (nil? (:error warning)))
+      (is (= (into prefix [:warning :processing_end]) (event-types session)))
+      (is (= (if partial? ["partial"] [])
+             (mapv :delta (filter #(= :assistant_text_delta (:type %))
+                                  (agent/session-events session)))))
+      (is (= :idle (:state @session)))
+      (is (= [:user] (mapv :type (:history @session))))
+      (is (= "first" (get-in @session [:history 0 :content])))
+      (is (= ["queued"] (:followup-queue @session)))
+      (is (= 1 @calls))
+      (is (= (if (= mode :complete) 0 1) @closes))
+      (is (= 0 @cleanups))
+      (is (false? (:abort_signaled @session)))
+      (is (false? ((get-in @session [:llm_abort_controller :signal :aborted?]))))
+      (is (false? @(:cleanup_started @session)))
+      (is (= "recovered"
+             (try (agent/process-input! session "second")
+                  (catch Object e [:failed (ex-data e)]))))
+      (is (= 3 @calls))
+      (is (= [:user :user :assistant :user :assistant]
+             (mapv :type (:history @session))))
+      (is (= 0 @cleanups))
+      (agent/close-session! session)
+      (is (= 1 @cleanups)))))
+
+(deftest context-warning-callback-cannot-reopen-closed-session
+  (doseq [stop! [agent/abort-session! agent/close-session!]]
+    (let [{:keys [session error calls closes cleanups]}
+          (fixture :context-length :event true)
+          failure (caught
+                    #(agent/process-input!
+                       session "first"
+                       (fn [event]
+                         (when (= :warning (:type event)) (stop! session)))))]
+      (is (= (ex-data error) (ex-data failure)))
+      (is (= [:session_start :user_input :assistant_text_start
+              :assistant_text_delta :warning :session_end]
+             (event-types session)))
+      (is (= :closed (:state @session)))
+      (is (= 1 @calls))
+      (is (= 1 @closes))
+      (is (= 1 @cleanups))
+      (agent/close-session! session)
+      (is (= :session_end (last (event-types session)))))))
+
+(deftest recoverable-overflow-keeps-owned-child-and-existing-history
+  (let [{:keys [session error cleanups]} (fixture :context-length :complete false)
+        child (agent/make-session
+                {:project_docs []
+                 :complete_fn (fn [_]
+                                {:message {:role :assistant :content "child works"}
+                                 :tool_calls []})})
+        prior [{:type :user :role :user :content "old question"}
+               {:type :assistant :role :assistant :content "old answer"
+                :tool_calls []}]]
+    (swap! session assoc :history prior :subagents {"child" {:session child}})
+    (is (= (ex-data error)
+           (ex-data (caught #(agent/process-input! session "overflow")))))
+    (is (= prior (subvec (:history @session) 0 2)))
+    (is (= 3 (count (:history @session))))
+    (is (= :idle (:state @child)))
+    (is (= "child works"
+           (try (agent/process-input! child "continue")
+                (catch Object e [:failed (ex-data e)]))))
+    (is (= 0 @cleanups))
+    (agent/close-session! session)
+    (is (= :closed (:state @child)))
+    (is (= 1 @cleanups))))
+
+(deftest untyped-stream-errors-retain-compatibility-wrapper
+  (let [raw {"code" "legacy_error"}
+        session (agent/make-session
+                  {:project_docs []
+                   :stream_fn (fn [_] [{:type :error :error raw}])})
+        error (caught #(agent/process-input! session "input"))]
+    (is (= :provider-stream (:category (ex-data error))))
+    (is (= raw (:provider_error (ex-data error))))
+    (is (= :closed (:state @session)))))
