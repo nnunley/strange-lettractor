@@ -1,0 +1,31 @@
+(ns attractor.tool-images (:require [attractor.llm :as llm]))
+
+(defn- field? [value field]
+  (or (contains? value field) (contains? value (name field))))
+(defn attachment-output? [value]
+  (and (map? value)
+       (or (field? value :image_base64) (field? value :images)
+           (some? (:image_data value)) (some? (get value "image_data")))))
+(defn- invalid! []
+  (throw (ex-info "Invalid tool attachment output" {:category :invalid-tool-output})))
+(defn normalize-output
+  "Preserve plain output; canonicalize explicit agent attachments before hooks."
+  [value]
+  (if-not (attachment-output? value) value
+    (let [content (if (contains? value :content) (:content value) (get value "content"))
+          _ (when (or (not (string? content))
+                      (and (contains? value :content) (contains? value "content")
+                           (not= (:content value) (get value "content")))) (invalid!))
+          images (llm/tool-result-images value)
+          plural? (field? value :images)
+          sources (if plural? (if (contains? value :images) (:images value) (get value "images"))
+                    [(dissoc value :content "content")])
+          clean (fn [source]
+                  (dissoc source :image_data "image_data"
+                          :image_base64 "image_base64" :image_media_type "image_media_type" :images "images"))
+          canonical (mapv (fn [source image]
+                            (merge (clean source) {:image_base64 (:data image)
+                                                   :image_media_type (:media_type image)})) sources images)
+          base (assoc (dissoc (clean value) :content "content") :content content)]
+      (if plural? (assoc base :images canonical)
+        (merge base (first canonical))))))

@@ -40,6 +40,39 @@
                        (str (+ start index 1) " | " line))
                      (subvec lines start end))))))
 
+(defn- image-media-type [raw]
+  ;; subs counts characters, so its bounded 12-character prefix can contain
+  ;; up to 48 bytes. Preserve those raw bytes, then select exactly the first
+  ;; 12 bytes before inspecting fixed signature offsets (not rune offsets).
+  ;; This identifies formats, not image validity or model format support.
+  (let [prefix (vec (take 12 (bytes (subs raw 0 (min 12 (count raw))))))
+        starts? (fn [signature]
+                  (and (>= (count prefix) (count signature))
+                       (= signature (subvec prefix 0 (count signature)))))]
+    (cond
+      (starts? [137 80 78 71 13 10 26 10]) "image/png"
+      (starts? [255 216 255]) "image/jpeg"
+      (or (starts? [71 73 70 56 55 97])
+          (starts? [71 73 70 56 57 97])) "image/gif"
+      (and (= 12 (count prefix)) (starts? [82 73 70 70])
+           (= [87 69 66 80] (subvec prefix 8 12))) "image/webp"
+      :else nil)))
+
+(defn- read-local-file [path offset limit]
+  (let [raw (io/slurp path)]
+    (if-let [media-type (image-media-type raw)]
+      {:content (str "Image file (" media-type ").")
+       :image_base64 (base64-encode raw)
+       :image_media_type media-type}
+      (do
+        ;; Match capture/valid-source: decoding and re-encoding must preserve
+        ;; every UTF-8 byte, including genuine replacement characters.
+        (when (or (not= raw (apply str (seq raw)))
+                  (re-find #"[\x00-\x08\x0e-\x1f\x7f]" raw))
+          (throw (ex-info "Cannot read unsupported binary file as text"
+                          {:category :unsupported-binary-file :path path})))
+        (numbered-lines raw offset limit)))))
+
 (defn- occurrence-count [content needle]
   ;; Whitespace is valid exact-match text; only an empty needle cannot advance.
   (when (empty? needle)
@@ -563,7 +596,7 @@
             :stderr (:err result)}))
        :read_file
        (fn [path offset limit]
-         (numbered-lines (io/slurp (path-for path)) offset limit))
+         (read-local-file (path-for path) offset limit))
        :read_text (fn [path] (io/slurp (path-for path)))
        :write_file
        (fn [path content]

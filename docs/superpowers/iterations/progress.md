@@ -1,7 +1,37 @@
 # Progress
 
-**Phase:** verified shared interviewer queue, ATTR-HUM-01 component (ITER-0006)
-**Task:** public checkpoint after clean paired three-tier audit
+**Phase:** verified read_file component, CAL-TOOLS-01 (ITER-0007)
+**Task:** verified checkpoint after clean paired three-tier audit
+
+**Current read_file slice:** `.worktrees/read-file-contract`, public base
+`892db06`. Fresh full baseline completed with 653 tests / 6,068 assertions /
+zero failures, exit 0. At that base, local reads number arbitrary binary as text,
+and the agent stringifies structured outputs before model continuation.
+`docs/read-file-contract-plan.md` defines byte-preserving local classification
+and actual agent-to-provider wire evidence. Paired scope review approved after
+adding Gemini mixed-batch preservation and legacy SDK content compatibility.
+Task 1 permanent RED: 3 tests / 17 pass / 40 fail / 0 error, exit 1.
+Initial GREEN: 3 tests / 57 pass / 0 fail / 0 error, exit 0. Review then exposed
+a WebP byte-offset error when RIFF size bytes form multibyte UTF-8; permanent RED
+4 tests / 67 pass / 3 fail / 0 error. Final local-reader focused evidence is
+4/70/0; parent impacted execution/environment/profiles evidence is 48/249/0,
+both terminal exit 0. Paired spec and quality reviews approve Task 1. Real
+permission denial and unchanged `read_text` bytes are covered. This was an
+Attractor character-versus-byte assumption, not a new let-go runtime defect.
+Local reader now returns image maps and rejects non-image binary. SDK Task 2
+now passes the combined focused runner (8 tests / 316 assertions) and parent
+impacted SDK runner (91/811), zero failures/errors and exit 0. Original nullable
+raw image/media and adapter-specific omitted-content behavior were rechecked on
+public main and preserved. Paired Task 2 spec and quality reviews approve;
+Task 3 agent/batch propagation now passes paired spec/quality review. Description
+loss in plural normalization and mixed-batch aggregation was reproduced and fixed
+with native hook/event regressions. Focused/bundle evidence is 14/439; impacted
+217/1667; default full suite 667/6507, all zero failures/errors and terminal exit 0.
+CLI build/help also pass. Paired component audit is clean after correcting a
+documentation overclaim: all four formats have local recognition evidence, while
+agent/wire fixtures use PNG across all three providers and PNG/GIF in Gemini.
+Provider-reference fidelity remains explicitly open
+in `docs/provider-reference-alignment-gap.md`.
 
 **Current queue slice:** `.worktrees/interviewer-queue`, public base `6d6e813`,
 fresh baseline 647 tests / 6,034 assertions / zero failures. A shared queue reads

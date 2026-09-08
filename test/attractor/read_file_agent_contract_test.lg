@@ -1,0 +1,158 @@
+(ns attractor.read-file-agent-contract-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.read-file-contract-test :as reader-test]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.profiles :as profiles] [attractor.llm :as llm]
+            [io :as io] [os :as os] [json :as json]))
+
+(defn- response [provider first? tool args]
+  (case provider
+    "openai" {:id "response" :status "completed" :usage {}
+              :output (if first? [{:type "function_call" :id "fc" :call_id "call-image"
+                                  :name tool :arguments (json/write-json args)}]
+                        [{:type "message" :role "assistant" :content [{:type "output_text" :text "done"}]}])}
+    "anthropic" {:id "response" :usage {} :stop_reason (if first? "tool_use" "end_turn")
+                 :content (if first? [{:type "tool_use" :id "call-image" :name tool :input args}]
+                            [{:type "text" :text "done"}])}
+    {:responseId "response" :usageMetadata {}
+     :candidates [{:finishReason "STOP" :content {:role "model"
+                  :parts (if first? [{:functionCall {:name tool :args args}}] [{:text "done"}])}}]}))
+
+(defn- exercise [provider tool args override]
+  (let [root (str (os/temp-dir) "/read-agent-" (random-uuid))
+        _ (io/mkdir root) native (execution/make-local-environment {:working_dir root})
+        handle (io/open (str root "/picture.png") :write)
+        _ (try (io/write! handle (base64-decode reader-test/png-base64)) (finally (io/close! handle)))
+        _ (io/spit (str root "/text.txt") "hello")
+        _ (io/spit (str root "/second.gif") "GIF89a")
+        env (if override (assoc native :read_file (fn [& _] override)) native)
+        requests (atom []) events (atom [])
+        profile ((case provider "openai" profiles/create-openai-profile
+                                "anthropic" profiles/create-anthropic-profile profiles/create-gemini-profile) "fixture")
+        adapter (llm/make-provider-adapter provider
+                  {:api_key "unused" :transport (fn [request]
+                    (swap! requests conj (json/read-json (:body request)))
+                    {:status 200 :body (json/write-json (response provider (= 1 (count @requests)) tool args))})})
+        session (agent/make-session
+                  {:provider_profile (assoc profile :supports_streaming false)
+                   :llm_client (llm/make-client {:providers {provider adapter}})
+                   :execution_env env :project_docs [] :max_subagent_depth 0
+                   :tool_output_limits {"read_file" 50}
+                   :tool_hooks {:post "/bin/cat > post.json"}
+                   :on_event #(swap! events conj %)})]
+    (try
+      (is (= "done" (agent/process-input! session "inspect")))
+      (is (= 2 (count @requests)))
+      {:wire (second @requests) :model (get-in @session [:history 2 :results 0])
+       :event (first (filter #(= :tool_call_end (:type %)) @events))
+       :hook (json/read-json (io/slurp (str root "/post.json")))}
+      (finally (agent/close-session! session)))))
+
+(defn- wire-images [provider wire]
+  (case provider
+    "openai" (let [output (first (filter #(= "function_call_output" (get % "type")) (get wire "input")))]
+               (if (vector? (get output "output"))
+                 (mapv #(get % "image_url") (rest (get output "output"))) []))
+    "anthropic" (vec (mapcat (fn [message]
+                    (mapcat (fn [part]
+                      (if (and (map? part) (= "tool_result" (get part "type")) (vector? (get part "content")))
+                        (map #(get-in % ["source" "data"]) (rest (get part "content"))) []))
+                      (if (vector? (get message "content")) (get message "content") []))) (get wire "messages")))
+    (vec (mapcat (fn [content]
+                  (keep #(get-in % ["inlineData" "data"]) (get content "parts"))) (get wire "contents")))))
+
+(deftest local-images-reach-three-provider-continuations
+  (doseq [provider ["openai" "anthropic" "gemini"]]
+    (let [{:keys [wire model event hook]} (exercise provider "read_file" {:file_path "picture.png"} nil)]
+      (is (= [(if (= provider "openai") (str "data:image/png;base64," reader-test/png-base64) reader-test/png-base64)]
+             (wire-images provider wire)))
+      (is (= reader-test/png-base64 (:image_base64 model)))
+      (is (= "image/png" (:image_media_type model)))
+      (is (= (:tool_call_id model) (:call_id event)))
+      (is (= "read_file" (:tool_name model)))
+      (case provider
+        "openai" (let [output (first (filter #(= "function_call_output" (get % "type")) (get wire "input")))]
+                   (is (= (:tool_call_id model) (get output "call_id"))))
+        "anthropic" (let [part (first (mapcat (fn [message]
+                                             (filter #(and (map? %) (= "tool_result" (get % "type")))
+                                                     (if (vector? (get message "content")) (get message "content") [])))
+                                           (get wire "messages")))]
+                      (is (= (:tool_call_id model) (get part "tool_use_id")))
+                      (is (= "image/png" (get-in part ["content" 1 "source" "media_type"]))))
+        (let [parts (mapcat #(get % "parts") (get wire "contents"))]
+          (is (= "read_file" (get-in (first (filter #(contains? % "functionResponse") parts)) ["functionResponse" "name"])))
+          (is (= "image/png" (get-in (first (filter #(contains? % "inlineData") parts)) ["inlineData" "mimeType"])))))
+      (is (= reader-test/png-base64 (:image_base64 event)))
+      (is (= reader-test/png-base64 (get-in hook ["result" "image_base64"])))
+      (is (not (str/includes? (:content model) reader-test/png-base64))))))
+
+(deftest attachments-truncate-text-only-and-malformed-output-recovers
+  (let [raw {:content (apply str (repeat 300 "x")) :image_base64 "AP8=" :image_media_type "image/png" :metadata {:source "custom"}}
+        {:keys [model event hook]} (exercise "openai" "read_file" {:file_path "ignored"} raw)]
+    (is (str/includes? (:content model) "characters were removed"))
+    (is (= "AP8=" (:image_base64 model)))
+    (is (= (:content raw) (:output event)))
+    (is (= raw (:result event)))
+    (is (= "custom" (get-in hook ["result" "metadata" "source"])))
+    (is (= (:content raw) (get-in hook ["result" "content"]))))
+  (doseq [raw [{:content 7 :image_base64 "AA=="}
+               {:content "yes" "content" "no" :image_base64 "AA=="}
+               {:content "bad" :image_base64 "!"}
+               {:content "bad" :image_base64 "AA==" :image_media_type false}]]
+    (let [{:keys [model hook]} (exercise "openai" "read_file" {:file_path "ignored"} raw)]
+      (is (true? (:is_error model)))
+      (is (true? (get hook "is_error")))
+      (is (nil? (:image_base64 model))))))
+
+(deftest gemini-mixed-batch-retains-order-and-text-only-shape
+  (let [{:keys [model wire hook event]} (exercise "gemini" "read_many_files"
+                                  {:paths ["picture.png" "text.txt" "second.gif"]} nil)]
+    (is (= [reader-test/png-base64 "R0lGODlh"] (wire-images "gemini" wire)))
+    (is (= [reader-test/png-base64 "R0lGODlh"] (mapv :image_base64 (:images model))))
+    (is (= ["Image file (image/png)." "Image file (image/gif)."]
+           (mapv :content (get-in event [:result :images]))))
+    (is (= ["Image file (image/png)." "Image file (image/gif)."]
+           (mapv #(get % "content") (get-in hook ["result" "images"]))))
+    (is (str/includes? (:content model) "text.txt\n1 | hello"))
+    (is (< (or (str/index-of (:content model) "picture.png") -1) (or (str/index-of (:content model) "text.txt") -1)
+           (or (str/index-of (:content model) "second.gif") -1)))
+    (is (= [reader-test/png-base64 "R0lGODlh"] (mapv #(get % "image_base64") (get-in hook ["result" "images"])))))
+  (let [{:keys [model]} (exercise "gemini" "read_many_files" {:paths ["text.txt" "text.txt"]} nil)]
+    (is (= (pr-str ["1 | hello" "1 | hello"]) (:content model)))))
+
+(deftest ordinary-output-and-custom-legacy-raw-images
+  (doseq [raw [{:content "ordinary" :image_data nil} {:answer 42} 7 [1 {:image_base64 "not-an-attachment"}]]]
+    (let [{:keys [model event]} (exercise "openai" "read_file" {:file_path "ignored"} raw)]
+      (is (= (pr-str raw) (:content model)))
+      (is (= (pr-str raw) (:output event)))
+      (is (false? (:is_error model)))))
+  (let [{:keys [model event hook wire]}
+        (exercise "openai" "read_file" {:file_path "ignored"}
+                  {:content "raw image" :image_data (byte-array [0 255]) :metadata {:kept true}})]
+    (is (= "raw image" (:content model)))
+    (is (= "AP8=" (:image_base64 model)))
+    (is (= ["data:image/png;base64,AP8="] (wire-images "openai" wire)))
+    (is (= true (get-in hook ["result" "metadata" "kept"])))
+    (is (= "AP8=" (get-in event [:result :image_base64])))
+    (is (not (contains? (:result event) :image_data)))))
+
+(deftest nullable-media-defaults-in-agent-attachments
+  (doseq [raw [{:content "raw" :image_data (byte-array [0 255]) :image_media_type nil}
+               {:content "encoded" :image_base64 "AP8=" :image_media_type nil}]]
+    (let [{:keys [model hook]} (exercise "openai" "read_file" {:file_path "ignored"} raw)]
+      (is (false? (:is_error model)))
+      (is (= "image/png" (:image_media_type model)))
+      (is (= "AP8=" (:image_base64 model)))
+      (is (= "image/png" (get-in hook ["result" "image_media_type"]))))))
+
+(deftest plural-item-content-and-metadata-survive-hook-and-event
+  (let [raw {:content "batch"
+             :images [{:content "first description" :image_base64 "AP8=" :tag "keep"}
+                      {"content" "second description" :image_base64 "AQ==" :tag "also keep"}]}
+        {:keys [event hook wire]} (exercise "openai" "read_file" {:file_path "ignored"} raw)
+        expected (mapv #(assoc % :image_media_type "image/png") (:images raw))]
+    (is (= expected (get-in event [:result :images])))
+    (is (= "first description" (get-in hook ["result" "images" 0 "content"])))
+    (is (= "second description" (get-in hook ["result" "images" 1 "content"])))
+    (is (= "keep" (get-in hook ["result" "images" 0 "tag"])))
+    (is (= ["data:image/png;base64,AP8=" "data:image/png;base64,AQ=="] (wire-images "openai" wire)))))

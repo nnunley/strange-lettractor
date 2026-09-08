@@ -470,7 +470,7 @@
 (defn- tool-call-data [part]
   (content-data part :tool_call))
 
-(declare provider-tool-result-content tool-result-image)
+(declare provider-tool-result-content tool-result-images)
 
 (defn- openai-content-part [role part]
   (if (some? (:provider_data part))
@@ -545,16 +545,15 @@
                           (let [text (provider-tool-result-content
                                        (or (:content value)
                                            (get value "content") ""))
-                                image (tool-result-image value)]
+                                images (tool-result-images value)]
                             {:type "tool_result"
                              :tool_use_id (or (:tool_call_id value)
                                               (get value "tool_call_id"))
-                             :content (if image
-                                        [{:type "text" :text text}
-                                         {:type "image"
-                                          :source {:type "base64"
-                                                   :media_type (:media_type image)
-                                                   :data (:data image)}}]
+                             :content (if (seq images)
+                                        (into [{:type "text" :text text}]
+                                              (map (fn [image]
+                                                     {:type "image" :source {:type "base64"
+                                                       :media_type (:media_type image) :data (:data image)}}) images))
                                         text)
                              :is_error (boolean (or (:is_error value)
                                                     (get value "is_error")))})))
@@ -628,13 +627,66 @@
     content
     (json/write-json (json-safe content))))
 
-(defn- tool-result-image [result]
-  (let [data (or (:image_data result) (get result "image_data"))]
-    (when (some? data)
-      {:data (base64-encode data)
-       :media_type (or (:image_media_type result)
-                       (get result "image_media_type")
-                       "image/png")})))
+(defn- invalid-tool-image! [reason]
+  (throw (ex-info "Invalid tool result image"
+                  {:category :invalid-request :reason reason})))
+
+(defn- image-field-present? [result field]
+  (or (contains? result field) (contains? result (name field))))
+
+(defn- image-field [result field]
+  (let [left (get result field) right (get result (name field))
+        nullable? (contains? #{:image_data :image_media_type} field)]
+    ;; Legacy ToolResultData optionals accept None. A default-filled nil alias
+    ;; must neither mask meaningful data nor conflict with the other alias.
+    (when (and (contains? result field) (contains? result (name field))
+               (or (not nullable?) (and (some? left) (some? right)))
+               (not= left right))
+      (invalid-tool-image! :conflicting-aliases))
+    (if nullable? (if (some? left) left right)
+      (if (contains? result field) left right))))
+
+(defn- normalize-tool-image [result]
+  (when-not (map? result) (invalid-tool-image! :invalid-image-map))
+  (when (image-field-present? result :images) (invalid-tool-image! :nested-images))
+  (let [encoded? (image-field-present? result :image_base64)
+        raw? (some? (image-field result :image_data))
+        encoded (image-field result :image_base64)
+        raw (image-field result :image_data)
+        supplied-media (image-field result :image_media_type)
+        media (if (nil? supplied-media) "image/png" supplied-media)]
+    (when (= encoded? raw?) (invalid-tool-image! :ambiguous-image-source))
+    (when-not (and (string? media) (not (str/blank? media)))
+      (invalid-tool-image! :invalid-media-type))
+    {:media_type media
+     :data (if encoded?
+             (do
+               (when-not (and (string? encoded) (not (empty? encoded)))
+                 (invalid-tool-image! :invalid-base64))
+               (try (when-not (= encoded (base64-encode (base64-decode encoded)))
+                      (invalid-tool-image! :invalid-base64))
+                    (catch Object _ (invalid-tool-image! :invalid-base64)))
+               encoded)
+             (try
+               (when (nil? raw) (invalid-tool-image! :invalid-raw-image))
+               (base64-encode raw)
+               (catch Object _ (invalid-tool-image! :invalid-raw-image))))}))
+
+(defn tool-result-images
+  "Accepts a tool-result map; validates attachment fields independently of text. Returns
+   ordered {:data base64-string :media_type string} maps, or [] for plain output."
+  [result]
+  (let [plural? (image-field-present? result :images)
+        singular? (or (some? (image-field result :image_data))
+                      (image-field-present? result :image_base64))]
+    (when (and plural? singular?) (invalid-tool-image! :mixed-image-sources))
+    (cond
+      plural? (let [images (image-field result :images)]
+                (when-not (and (vector? images) (seq images))
+                  (invalid-tool-image! :invalid-images))
+                (mapv normalize-tool-image images))
+      singular? [(normalize-tool-image result)]
+      :else [])))
 
 (defn- canonical-option-map [options]
   (into {}
@@ -818,16 +870,16 @@
                      (let [text (provider-tool-result-content
                                   (or (:content value)
                                       (get value "content") ""))
-                           image (tool-result-image value)]
+                           images (tool-result-images value)]
                        {:type "function_call_output"
                         :call_id (or (:tool_call_id value)
                                      (get value "tool_call_id"))
-                        :output (if image
-                                  [{:type "input_text" :text text}
-                                   {:type "input_image"
-                                    :image_url
-                                    (str "data:" (:media_type image)
-                                         ";base64," (:data image))}]
+                        :output (if (seq images)
+                                  (into [{:type "input_text" :text text}]
+                                        (map (fn [image]
+                                               {:type "input_image" :image_url
+                                                (str "data:" (:media_type image)
+                                                     ";base64," (:data image))}) images))
                                   text)})))
                  content)
 
@@ -1415,11 +1467,11 @@
                 (mapcat
                   (fn [result]
                     (let [value (tool-result-data result)
+                          images (tool-result-images value)
                           result-content (or (:content value)
                                              (get value "content"))
                           is-error (or (:is_error value)
-                                       (get value "is_error"))
-                          image (tool-result-image value)]
+                                       (get value "is_error"))]
                       (concat
                         [{:functionResponse
                           {:name (or (:tool_name value)
@@ -1434,9 +1486,9 @@
                                        (if (map? result-content)
                                          result-content
                                          {:result result-content}))}}]
-                        (when image
-                          [{:inlineData {:mimeType (:media_type image)
-                                         :data (:data image)}}]))))
+                        (map (fn [image]
+                               {:inlineData {:mimeType (:media_type image)
+                                             :data (:data image)}}) images))))
                   content))}
 
       (= role :assistant)

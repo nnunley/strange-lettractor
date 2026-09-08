@@ -1,0 +1,82 @@
+(ns attractor.read-file-contract-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [clojure.edn :as edn] [attractor.execution :as execution]
+            [io :as io] [os :as os]))
+
+;; SCN-CAL-READ-FILE: native reader classification, not image decoding.
+(def png-base64 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6foAAAAASUVORK5CYII=")
+(defn- fixture []
+  (let [root (str (os/temp-dir) "/read-file-contract-" (random-uuid))]
+    (io/mkdir root)
+    {:root root :env (execution/make-local-environment {:working_dir root})}))
+(defn- write-bytes! [path bytes]
+  (let [handle (io/open path :write)]
+    (try (io/write! handle bytes) (finally (io/close! handle)))))
+(defn- read-error [reader path]
+  (try (reader path nil nil) nil (catch Object error error)))
+
+(deftest image-signatures-preserve-exact-bytes-and-ignore-extensions
+  (let [{:keys [root env]} (fixture) reader (:read_file env)]
+    (try
+      (doseq [[path bytes mime]
+              [["actual.txt" (base64-decode png-base64) "image/png"]
+               ["jpeg.bin" (byte-array [255 216 255 224 0 1]) "image/jpeg"]
+               ["gif87.bin" "GIF87a" "image/gif"]
+               ["gif89.bin" "GIF89a" "image/gif"]
+               ["webp.bin" (byte-array [82 73 70 70 4 0 0 0 87 69 66 80]) "image/webp"]
+               ["webp-utf8-size.bin" (byte-array [82 73 70 70 194 160 0 0 87 69 66 80 88]) "image/webp"]]]
+        (write-bytes! (str root "/" path) bytes)
+        (let [result (try (reader path 999 0) (catch Object error {:reader-error (str error)}))]
+          (is (map? result))
+          (is (= mime (:image_media_type result)))
+          (is (= (base64-encode bytes) (:image_base64 result)))
+          (is (= (base64-encode bytes) (base64-encode ((:read_text env) path))))
+          (is (and (string? (:content result)) (pos? (count (:content result)))
+                   (< (count (:content result)) 300)))
+          (is (= result (edn/read-string (pr-str result))))))
+      (io/spit (str root "/not-image.png") "plain text")
+      (is (= "1 | plain text" (reader "not-image.png" nil nil)))
+      (finally ((:cleanup env))))))
+
+(deftest unreadable-existing-file-is-an-error
+  (let [{:keys [root env]} (fixture) path (str root "/unreadable.txt")]
+    (io/spit path "private fixture")
+    (try
+      (is (= 0 (:exit (os/sh "/bin/chmod" "000" path))))
+      ;; If the process bypasses permissions this deliberately fails, rather
+      ;; than silently reporting permission-denied coverage it did not exercise.
+      (is (some? (read-error (:read_file env) path)))
+      (finally
+        (os/sh "/bin/chmod" "600" path)
+        ((:cleanup env))))))
+
+(deftest binary-and-malformed-utf8-are-explicit-errors
+  (let [{:keys [root env]} (fixture) reader (:read_file env)]
+    (try
+      (doseq [bytes [[0] [1] [7] [127] [255] [192 175] [237 160 128]
+                    [244 144 128 128] [226 130] [82 73 70 70 0 0 0 0 78 79 80 69]]]
+        (write-bytes! (str root "/binary.png") (byte-array bytes))
+        (let [error (read-error reader "binary.png")]
+          (is (some? error))
+          (is (= :unsupported-binary-file (:category (ex-data error))))))
+      (finally ((:cleanup env))))))
+
+(deftest text-default-ranges-unicode-empty-and-errors
+  (let [{:keys [root env]} (fixture) reader (:read_file env)]
+    (try
+      (io/spit (str root "/unicode.txt") "é😀�\n\tindented\r\nlast")
+      (is (= "1 | é😀�\n2 | \tindented\r\n3 | last" (reader "unicode.txt" nil nil)))
+      (is (= "2 | \tindented\r" (reader "unicode.txt" 2 1)))
+      (is (= "3 | last" (reader "unicode.txt" 3 10)))
+      (is (= "" (reader "unicode.txt" 4 2)))
+      (is (= "" (reader "unicode.txt" 1 0)))
+      (io/spit (str root "/empty") "")
+      (is (= "1 | " (reader "empty" nil nil)))
+      (io/spit (str root "/many") (str/join "\n" (map str (range 2002))))
+      (let [output (reader "many" nil nil)]
+        (is (= 2000 (count (str/split output #"\n"))))
+        (is (str/ends-with? output "2000 | 1999")))
+      (is (= "2001 | 2000\n2002 | 2001" (reader "many" 2001 10)))
+      (is (some? (read-error reader "missing")))
+      (is (some? (read-error reader ".")))
+      (finally ((:cleanup env))))))

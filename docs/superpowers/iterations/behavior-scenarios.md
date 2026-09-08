@@ -328,6 +328,29 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Then its schema/result contract is correct, cancellation reaches the operation, raw events retain full output, and model history receives bounded output
 - Seam: coding-loop integration
 
+### SCN-CAL-READ-FILE — Text, binary and image file continuation
+
+- Owner: CAL-TOOLS-01 (§3.3), with CAL-TRUNC-01 image/text separation impact.
+- Given real text, binary and PNG/JPEG/GIF/WebP files, including misleading
+  extensions, explicit ranges and default reads
+- When the local execution environment reads them
+- Then text retains line numbering/ranges and exact Unicode, unsupported binary
+  raises an error, and recognized images retain exact bytes and detected MIME.
+- When each built-in profile reads an image through the agent loop
+- Then the next encoded provider request carries an attachment with matching
+  bytes/MIME/call identity, separately from truncated text. Raw hooks/events retain
+  full evidence. Malformed explicit attachments become model-visible tool errors.
+- Gemini mixed `read_many_files` retains path labels and image occurrence order;
+  text-only batch representation and legacy SDK raw-image behavior stay compatible.
+- Seams: native filesystem integration; actual agent-to-provider encoded request
+  continuation with recording transports, not live vision/model acceptance.
+- Command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_tests.lg run`
+- Impacted command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_impacted_tests.lg run`
+- Status: verified implemented-format component: focused/bundled 14/439,
+  impacted 217/1667, default suite 667/6507, zero failures; CLI build/help pass.
+  Paired component audit clean. Other image formats, live model acceptance,
+  provider-reference fidelity and the rest of CAL-TOOLS-01 remain separate gaps.
+
 ### SCN-CAL-SUBAGENTS — Subagent lifecycle
 
 - Given nested subagents at and below the configured depth/turn bounds

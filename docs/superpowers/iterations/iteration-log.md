@@ -1,8 +1,45 @@
 # Iteration Log
 
+## ITER-0007 component — File images and binary rejection
+
+**Verified:** 2026-09-07 from public `892db06`; final paired component audit clean.
+
+**Completed:** implementation, verification and component audit on 2026-09-07; not iteration completion.
+**Stories delivered:** CAL-TOOLS-01 implemented-format read_file component; full story remains partial.
+**Tasks executed:** local reader; SDK attachment encoding/compatibility; agent and Gemini batch propagation.
+**Scenarios:** SCN-CAL-READ-FILE, with impacted tool truncation/hooks/agent/profile/SDK checks.
+**Summary:** byte-preserving image continuation and binary rejection, with complete raw evidence.
+
+`SCN-CAL-READ-FILE` adds real local text/binary/image reads, explicit base64 and
+ordered SDK image results, and actual agent-to-provider continuation for all
+three built-in families. Gemini mixed batches preserve path/image ordering;
+hooks/events retain untruncated descriptions and metadata, while only model text
+is truncated. Malformed attachments become tool errors. Legacy raw-image, nullable
+field, omitted/structured SDK content and ordinary executor output remain compatible.
+
+Permanent RED evidence caught binary/image handling, WebP character-versus-byte
+offset assumptions, missing encoded attachments, nullable-field regressions and
+description loss in plural/batch normalization. All repairs have reusable tests.
+Focused and standalone bundle pass 14 tests / 439 assertions; impacted runner
+passes 217/1667; default full suite passes 667/6507 against baseline 653/6068.
+All terminal exits are zero; CLI build/help and paired per-task spec/quality gates
+pass. `docs/read-file-contract-evidence.edn` records the staged evidence.
+
+No let-go runtime defect was identified or runtime source changed. Recognition
+covers PNG/JPEG/GIF/WebP signatures, not image decoding or universal provider
+acceptance. Other formats, live vision quality, provider-reference fidelity,
+remaining coding-agent tool requirements and native-Go AOT parity are not closed.
+CAL-TOOLS-01 and ITER-0007 remain incomplete; the full Attractor goal stays active.
+
 ## ITER-0006 component — Shared queue and interviewer matrix
 
 **Verified:** 2026-09-07 from public `6d6e813`.
+
+**Completed:** 2026-09-07, component only.
+**Stories delivered:** ATTR-HUM-01; ITER-0006 remains incomplete.
+**Tasks executed:** queue claim serialization, constructor compatibility, interviewer matrix evidence.
+**Scenarios:** shared parallel queue and public interviewer matrix.
+**Summary:** atomic queue claims with false/nil occupancy and native runtime breadcrumbs.
 
 QueueInterviewer now claims answers atomically through one shared instance,
 consumes false/nil scalar entries, and retains its factory and one-argument
@@ -29,6 +66,12 @@ conformance is not inferred from bundle/build success.
 
 **Verified:** 2026-09-07 from public `803ccb8`.
 
+**Completed:** 2026-09-07, supported-value component only.
+**Stories delivered:** ATTR-ART-01 store/layout; adopted discovery remains ATTR-ART-02.
+**Tasks executed:** EDN run metadata and artifact lifecycle/layout evidence.
+**Scenarios:** artifact threshold, publication failure, public restart and prior-file preservation.
+**Summary:** EDN root metadata and supported-value artifact storage, retaining reader limitations.
+
 New root run metadata uses `manifest.edn`; legacy JSON bytes, external stage
 `status.json`, and pinned `workflow/manifest.edn` remain unchanged. Public pipeline
 tests exercise handler artifact metadata/checkpoints, real loop restart plus a
@@ -51,6 +94,12 @@ to reject it. Full reader and Attractor conformance remain incomplete.
 ## ITER-0008 component — Current-turn ownership (CAL-OWN-01)
 
 **Verified:** 2026-09-07, from public baseline `1bdc933`.
+
+**Completed:** 2026-09-07, ownership component only.
+**Stories delivered:** CAL-OWN-01; ITER-0008 remains incomplete.
+**Tasks executed:** current-turn ownership, stale cleanup fencing, handoff and adoption regressions.
+**Scenarios:** SCN-CAL-TURN-OWNERSHIP.
+**Summary:** stale invocations cannot close or evict a newly admitted successor.
 
 Every admitted root input now establishes current ownership; queued follow-ups
 retain it. Backend cancellation/failure atomically claims closure under the

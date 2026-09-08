@@ -1,0 +1,109 @@
+(ns attractor.tool-result-image-contract-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.llm :as llm] [json :as json]))
+
+(defn- capture [provider result]
+  (let [requests (atom [])
+        complete (case provider :openai llm/openai-complete
+                                :anthropic llm/anthropic-complete llm/gemini-complete)
+        response (case provider
+                   :openai {:id "o" :status "completed" :output [] :usage {}}
+                   :anthropic {:id "a" :content [] :stop_reason "end_turn" :usage {}}
+                   {:responseId "g" :candidates [] :usageMetadata {}})]
+    (try
+      (complete {:model "fixture" :api_key "unused"
+                 :messages [{:role :tool :content [{:kind :tool_result
+                   :tool_result (merge {:tool_call_id "call-image" :tool_name "read_file"} result)}]}]
+                 :transport (fn [request] (swap! requests conj request)
+                              {:status 200 :body (json/write-json response)})})
+      {:body (json/read-json (:body (first @requests))) :requests (count @requests)}
+      (catch Object error {:error (ex-data error) :requests (count @requests)}))))
+
+(defn- wire-images [provider body]
+  (try (case provider
+    :openai (mapv (fn [part]
+                    (let [[_ mime data] (re-find #"^data:([^;]+);base64,(.*)$" (get part "image_url"))]
+                      [mime data]))
+                  (rest (get-in body ["input" 0 "output"])))
+    :anthropic (mapv #(vector (get-in % ["source" "media_type"]) (get-in % ["source" "data"]))
+                    (rest (get-in body ["messages" 0 "content" 0 "content"])))
+    (mapv #(vector (get-in % ["inlineData" "mimeType"]) (get-in % ["inlineData" "data"]))
+          (rest (get-in body ["contents" 0 "parts"]))))
+    (catch Object _ ::missing-images)))
+
+(deftest explicit-singular-and-ordered-plural-images-reach-every-wire
+  (doseq [provider [:openai :anthropic :gemini]
+          [result expected]
+          [[{:content "picture" :image_base64 "AP8=" :image_media_type "image/png"}
+            [["image/png" "AP8="]]]
+           [{"content" "picture" "image_base64" "AP8=" "image_media_type" "image/png"}
+            [["image/png" "AP8="]]]
+           [{:content "default media" :image_base64 "AP8="}
+            [["image/png" "AP8="]]]
+           [{:content "same aliases" :image_base64 "AP8=" "image_base64" "AP8="}
+            [["image/png" "AP8="]]]
+           [{"content" "plural alias" "images" [{"image_base64" "AP8="}]}
+            [["image/png" "AP8="]]]
+           [{:content "ordered" :images [{:image_base64 "AP8=" :image_media_type "image/png"}
+                                          {"image_data" "GIF89a" "image_media_type" "image/gif"}]}
+            [["image/png" "AP8="] ["image/gif" "R0lGODlh"]]]]]
+    (let [{:keys [body requests error]} (capture provider result)]
+      (is (nil? error))
+      (is (= 1 requests))
+      (is (= expected (wire-images provider body)))
+      (is (= (if (= provider :gemini) "read_file" "call-image")
+             (case provider :openai (get-in body ["input" 0 "call_id"])
+                            :anthropic (get-in body ["messages" 0 "content" 0 "tool_use_id"])
+                            (get-in body ["contents" 0 "parts" 0 "functionResponse" "name"])))))))
+
+(deftest malformed-images-fail-before-transport
+  (doseq [provider [:openai :anthropic :gemini]
+          result [{:image_base64 "!"} {:image_base64 nil} {:image_base64 7}
+                  {:image_data 7}
+                  {:image_base64 "AA==" :image_data "x"}
+                  {:image_base64 "AA==" "image_base64" "AQ=="}
+                  {:image_data "x" :image_media_type ""}
+                  {:image_data "x" :image_media_type 7}
+                  {:image_data "x" :image_media_type false}
+                  {:image_data "x" :image_media_type "image/png" "image_media_type" "image/jpeg"}
+                  {:images []} {:images nil} {:images '({:image_data "x"})}
+                  {:images [{}]} {:images ["x"]}
+                  {:images [{:image_base64 "AA=="}] :image_data "x"}
+                  {:images [{:image_data "x"}] "images" [{:image_data "y"}]}]]
+    (let [observed (capture provider result)]
+      (is (= :invalid-request (get-in observed [:error :category])))
+      (is (= 0 (:requests observed))))))
+
+(deftest legacy-raw-images-preserve-omitted-and-structured-content
+  (doseq [provider [:openai :anthropic :gemini]
+          content [::omitted {:forecast "sunny"} ["one" "two"]]]
+    (let [result (cond-> {:image_data (byte-array [0 255])}
+                   (not= content ::omitted) (assoc :content content))
+          {:keys [body requests error]} (capture provider result)]
+      (is (nil? error))
+      (is (= 1 requests))
+      (is (= [["image/png" "AP8="]] (wire-images provider body)))
+      (let [wire-content (case provider
+                           :openai (get-in body ["input" 0 "output" 0 "text"])
+                           :anthropic (get-in body ["messages" 0 "content" 0 "content" 0 "text"])
+                           (get-in body ["contents" 0 "parts" 0 "functionResponse" "response"]))]
+        (if (= provider :gemini)
+          (is (= (if (map? content) {"forecast" "sunny"}
+                    {"result" (if (= content ::omitted) nil content)}) wire-content))
+          (is (= (if (= content ::omitted) "" (json/write-json content)) wire-content)))))))
+
+(deftest legacy-null-optionals-preserve-provider-encoding
+  (is (= [] (llm/tool-result-images {:content {:ordinary [1 2]}})))
+  (doseq [provider [:openai :anthropic :gemini]]
+    (let [plain (capture provider {:content "plain"})
+          null-image (capture provider {:content "plain" :image_data nil})]
+      (is (= 1 (:requests null-image)))
+      (is (= (:body plain) (:body null-image))))
+    (doseq [result [{:image_data "x" :image_media_type nil}
+                    {:image_data "x" "image_data" nil :image_media_type nil}
+                    {:image_data nil "image_data" "x"}
+                    {:image_data nil :image_base64 "eA==" :image_media_type nil}
+                    {:image_data nil :images [{:image_data "x" :image_media_type nil}]}]]
+      (let [observed (capture provider result)]
+        (is (= 1 (:requests observed)))
+        (is (= [["image/png" "eA=="]] (wire-images provider (:body observed))))))))

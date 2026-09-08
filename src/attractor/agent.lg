@@ -6,6 +6,7 @@
             [attractor.llm :as llm]
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
+            [attractor.tool-images :as tool-images]
             [attractor.profiles :as profiles]))
 
 ;; Provider-profile tool output limits from Coding Agent Loop §5.
@@ -719,19 +720,24 @@
                 args (get-in registered [:definition :parameters]))
               _ (when-not valid?
                   (throw (ex-info reason {:category :invalid-tool-arguments})))
-                    raw-output ((:executor registered) args (:execution_env @session))]
+                    raw-output (tool-images/normalize-output
+                                 ((:executor registered) args (:execution_env @session)))]
                 {:result raw-output :is_error false :skipped false})
               (catch Object error {:result (str "Tool error (" tool-name "): " error)
                                    :is_error true :skipped (= :invalid-tool-arguments (:category (ex-data error)))})))
           raw-output (:result outcome)
-          raw-text (if (string? raw-output) raw-output (pr-str raw-output))]
+          attachment? (tool-images/attachment-output? raw-output)
+          attachments (when attachment? (select-keys raw-output [:images :image_base64 :image_media_type]))
+          raw-text (if attachment? (:content raw-output)
+                     (if (string? raw-output) raw-output (pr-str raw-output)))]
       (let [post (tool-hooks/run! hooks :post identity raw-args outcome (:execution_env @session) stopped? event-fn)]
         (when (:cancelled post) (abort-session! session)))
       (event-fn (merge {:type :tool_call_end :call_id call-id}
-                       (if (:is_error outcome) {:error raw-text} {:output raw-text})))
-      {:tool_call_id call-id :tool_name tool-name
+                       (if (:is_error outcome) {:error raw-text} {:output raw-text}) attachments
+                       (when attachment? {:result raw-output})))
+      (merge {:tool_call_id call-id :tool_name tool-name
        :content (truncate-tool-output raw-text tool-name (:config @session))
-       :is_error (:is_error outcome)})))
+       :is_error (:is_error outcome)} attachments))))
 
 (defn- response-content [response]
   (or (when (:message response) (llm/response-text response))

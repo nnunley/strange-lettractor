@@ -1,5 +1,5 @@
 (ns attractor.profiles
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str] [attractor.tool-images :as tool-images]))
 
 (defn- validate-registered-tool! [tool]
   (let [definition (:definition tool)
@@ -258,8 +258,18 @@
           (definition "read_many_files" "Read several files"
                       {:paths {:type "array"}} ["paths"])
           (fn [args env]
-            (mapv (fn [path] ((:read_file env) path nil nil))
-                  (arg args "paths"))))
+            (let [paths (arg args "paths")
+                  results (mapv (fn [path]
+                                  (tool-images/normalize-output ((:read_file env) path nil nil))) paths)]
+              (if-not (some tool-images/attachment-output? results) results
+                {:content (str/join "\n\n"
+                            (map (fn [path result]
+                                   (str path "\n" (if (tool-images/attachment-output? result)
+                                                     (:content result)
+                                                     (if (string? result) result (pr-str result))))) paths results))
+                 :images (vec (mapcat (fn [result]
+                                       (if (tool-images/attachment-output? result)
+                                         (or (:images result) [result]) [])) results))}))))
         list-dir
         (registered
           (definition "list_dir" "List directory entries"

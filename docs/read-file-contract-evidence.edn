@@ -1,0 +1,67 @@
+{:scope :read-file-contract
+ :status :verified-component
+ :base "892db06d5060fcec03976a9d29eb239e653265a5"
+ :format-evidence {:local-signatures [:png :jpeg :gif :webp]
+                   :agent-provider-wire {:openai [:png] :anthropic [:png]
+                                         :gemini [:png :gif]}
+                   :image-decoding :not-proven}
+ :runtime {:path "/Users/ndn/development/let-go/lg"
+           :revision "bdd8268c9cb3acf369f0854bada47af79d1d673d"
+           :reported-version "lg dev (bdd8268)"}
+ :baseline {:tests 653 :assertions 6068 :failures 0 :exit 0}
+ :local-reader
+ {:red {:tests 3 :pass 17 :fail 40 :error 0 :exit 1}
+  :review-regression {:case :webp-multibyte-riff-size
+                      :tests 4 :pass 67 :fail 3 :error 0 :exit 1}
+  :focused {:tests 4 :pass 70 :fail 0 :error 0 :exit 0}
+  :impacted {:namespaces [attractor.read-file-contract-test
+                         attractor.execution-test
+                         attractor.execution-env-test
+                         attractor.profiles-test]
+             :tests 48 :pass 249 :fail 0 :error 0 :exit 0}
+  :scope-review :paired-approved
+  :spec-review :paired-approved-after-fix
+  :quality-review :paired-approved
+  :notes ["Signatures classify formats, not full image validity."
+          "Permission denial was exercised by an unprivileged native process."
+          "read_text raw bytes remain unchanged."
+          "WebP regression was our byte-offset bug, not a let-go runtime bug."]}
+ :sdk-attachments
+ {:status :reviewed
+  :spec-review :paired-approved-after-compatibility-fix
+  :quality-review :paired-approved
+  :initial-red {:tests 7 :pass 135 :fail 109 :error 0 :exit 1
+                :note "Draft expectations later corrected to preserve nullable legacy fields and Gemini omitted content; not all failures were missing new behavior."}
+  :nullable-compatibility-red {:tests 8 :pass 274 :fail 36 :error 0 :exit 1}
+  :false-media-red {:tests 8 :pass 310 :fail 6 :error 0 :exit 1}
+  :combined-focused {:tests 8 :pass 316 :fail 0 :error 0 :exit 0}
+  :impacted {:namespaces [attractor.read-file-contract-test
+                         attractor.tool-result-image-contract-test
+                         attractor.llm-test]
+             :tests 91 :pass 811 :fail 0 :error 0 :exit 0}
+  :notes ["New explicit base64/plural sources are validated before transport."
+          "Raw image_data nil is no attachment; absent/nil media defaults PNG."
+          "Omitted legacy content retains adapter-specific wire representation."
+          "Recording transports prove encoding, not live model acceptance."]}
+ :agent-continuation
+ {:status :reviewed
+  :initial-red {:tests 11 :pass 352 :fail 27 :error 0 :exit 1}
+  :nullable-media-red {:tests 13 :pass 422 :fail 8 :error 0 :exit 1}
+  :plural-description-red {:tests 14 :pass 434 :fail 3 :error 0 :exit 1}
+  :mixed-batch-description-red {:tests 14 :pass 437 :fail 2 :error 0 :exit 1}
+  :combined-focused {:tests 14 :pass 439 :fail 0 :error 0 :exit 0}
+  :spec-review :paired-approved-after-description-fixes
+  :quality-review :paired-approved}
+ :gemini-batch :verified-with-native-hook-and-encoded-continuation
+ :final-impacted {:command "lg -source-paths src:test dev/read_file_impacted_tests.lg run"
+                  :tests 217 :pass 1667 :fail 0 :error 0 :exit 0}
+ :final-full-suite {:tests 667 :assertions 6507 :failures 0 :exit 0}
+ :bundle {:directory "/tmp/lettractor-read-file-bundle.DFfIBa"
+          :build-exit 0 :tests 14 :pass 439 :fail 0 :error 0 :exit 0}
+ :cli-build {:build-exit 0 :help-exit 0}
+ :final-audit {:status :clean :reviewers 2
+               :note "Corrected format-seam overclaim before final approval."}
+ :public-integration :ready-after-clean-audit
+ :not-proven [:live-model-acceptance :live-vision-quality
+              :provider-reference-fidelity :native-go-aot-parity
+              :complete-coding-agent-tools]}
