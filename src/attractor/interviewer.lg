@@ -98,13 +98,27 @@
 
 ;; QueueInterviewer (Section 6.4)
 ;; Reads answers from a pre-filled answer queue (atom wrapping a vector)
-(deftype QueueInterviewer [answers-atom]
+(defn- claim-queued-answer! [answers-atom claim-lock]
+  ;; Restore a direct atomic dequeue when native swap-vals!/collection CAS
+  ;; contracts are repaired: https://github.com/nooga/let-go/issues/824.
+  (loop []
+    (when-not (compare-and-set! claim-lock false true)
+      (sleep 1)
+      (recur)))
+  (try
+    (let [answers @answers-atom]
+      (when (seq answers)
+        (let [answer (first answers)]
+          (reset! answers-atom (subvec answers 1))
+          [answer])))
+    (finally (reset! claim-lock false))))
+
+(deftype QueueInterviewer [answers-atom claim-lock]
   IInterviewer
   (ask [_ question]
-    (let [ans (first @answers-atom)]
-      (if ans
-        (do
-          (swap! answers-atom (fn [q] (subvec q 1)))
+    (let [claimed (claim-queued-answer! answers-atom claim-lock)]
+      (if claimed
+        (let [ans (first claimed)]
           (if (map? ans) ans {:value ans :text (str ans)}))
         (or (:default question) {:value :skipped :text "queue exhausted"}))))
 
@@ -113,6 +127,12 @@
 
   (inform [_ _ _]
     nil))
+
+(def ^:private queue-interviewer-with-lock ->QueueInterviewer)
+
+;; Preserve the original public generated constructor's one-argument API.
+(defn ->QueueInterviewer [answers-atom]
+  (queue-interviewer-with-lock answers-atom (atom false)))
 
 (defn make-queue-interviewer [answers]
   (->QueueInterviewer (atom (vec answers))))

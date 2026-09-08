@@ -1,0 +1,24 @@
+{:requirement "ATTR-HUM-01"
+ :scenario "SCN-INTERVIEWERS"
+ :scope :interviewer-matrix-and-shared-instance-queue
+ :base_commit "6d6e813"
+ :compiler "/Users/ndn/development/let-go/lg"
+ :baseline {:tests 647 :assertions 6034 :failures 0 :exit 0}
+ :red {:tests 16 :passed 125 :failures 7 :errors 0 :exit 1}
+ :focused {:tests 18 :assertions 143 :failures 0 :exit 0
+           :command "/Users/ndn/development/let-go/lg -source-paths src:test dev/interviewer_tests.lg run"}
+ :impacted {:tests 119 :assertions 924 :failures 0 :exit 0
+            :namespaces [attractor.interviewer-contract-test attractor.interviewer-queue-test
+                         attractor.handlers-test attractor.handler-matrix-contract-test
+                         attractor.engine-test attractor.status-contract-test]}
+ :default_suite {:tests 653 :assertions 6068 :failures 0 :exit 0
+                 :command "env PATH=/Users/ndn/development/let-go:/opt/homebrew/bin:/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin /Users/ndn/.local/share/mise/installs/github-abogoyavlensky-lgx/0.1.0-rc2/lgx test"}
+ :standalone_bundle {:tests 18 :assertions 143 :failures 0 :exit 0
+                     :working_directory "/tmp/lettractor-interviewer-evidence.1TT29JCP"
+                     :command "./interviewer-tests run"}
+ :cli_build {:exit 0 :help_exit 0 :native_go_aot_conformance false}
+ :reviews {:paired_scope :approved :paired_spec :approved :paired_quality :approved
+           :paired_three_tier_component_audit :clean}
+ :residuals ["Native console deadlines ATTR-HUM-02 / let-go#822"
+             "Native atom update contracts let-go#824; narrow boolean-lock workaround"
+             "Remaining Attractor conformance, reader compatibility and artifact discovery"]}

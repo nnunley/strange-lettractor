@@ -289,7 +289,15 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Given console-injectable, callback, queue, auto-approve, and recording interviewers
 - When questions use choices, accelerators, defaults, and free text
 - Then normalized answers, metadata, recording, and routing match the question contract
-- Seam: interviewer integration
+- Concurrent queued asks claim each answer once; false/nil entries cannot stall
+  later answers, and excess callers follow the default/skipped policy
+- Real parallel human branches retain recorded question/answer-to-outcome
+  correlation without assuming branch claim order or recording invocation order
+- No-edge and unmatched-answer handler policies retain their §4.6 outcomes
+- Seam: interviewer/public parallel workflow integration; native console timeout
+  remains SCN-HUMAN-TIMEOUT, not implied by ready-input tests
+- Status: verified component, 18 tests / 143 assertions; locking applies to calls
+  through one interviewer instance, not uncoordinated external atom mutation
 
 ### SCN-VALIDATION — Diagnostics and execution gate
 

@@ -1,5 +1,30 @@
 # Iteration Log
 
+## ITER-0006 component — Shared queue and interviewer matrix
+
+**Verified:** 2026-09-07 from public `6d6e813`.
+
+QueueInterviewer now claims answers atomically through one shared instance,
+consumes false/nil scalar entries, and retains its factory and one-argument
+constructor. A narrow per-instance boolean-CAS lock protects only dequeue; answer
+normalization and recording remain outside. Direct external atom mutation and
+multiple instances wrapping the same atom are not coordinated by that lock.
+
+Permanent pre-fix RED: 16 tests / 125 passing and 7 failing assertions. Final
+interviewer suite: 18 tests / 143 assertions, including four new queue scenarios
+and two handler fallback/no-edge cases alongside the existing twelve tests.
+Public parallel gates correlate recorded pairs with checkpoint branch outcomes
+without assuming scheduling order. Focused and standalone bundle pass 18/143,
+impacted 119/924, full baseline 647/6034 becomes 653/6068; all zero failures,
+exit 0. CLI build/help pass. Paired scope/spec/quality reviews approve; final
+three-tier component audit is clean.
+
+The native atomic-update alternatives exposed two independently reproduced local
+runtime defects, filed as let-go #824 with JVM comparisons. The workaround has
+an explicit restoration breadcrumb. Native console timeout remains ATTR-HUM-02;
+this component closes ATTR-HUM-01, not ITER-0006 or the full goal. Native-Go AOT
+conformance is not inferred from bundle/build success.
+
 ## ITER-0006 component — Artifact store/layout and EDN run metadata
 
 **Verified:** 2026-09-07 from public `803ccb8`.

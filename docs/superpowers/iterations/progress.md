@@ -1,7 +1,19 @@
 # Progress
 
-**Phase:** verified artifact store/layout, ATTR-ART-01 component (ITER-0006)
+**Phase:** verified shared interviewer queue, ATTR-HUM-01 component (ITER-0006)
 **Task:** public checkpoint after clean paired three-tier audit
+
+**Current queue slice:** `.worktrees/interviewer-queue`, public base `6d6e813`,
+fresh baseline 647 tests / 6,034 assertions / zero failures. A shared queue reads
+its head separately from removing it; parallel asks can duplicate/lose answers.
+Native swap-vals! and collection CAS alternatives exposed verified runtime bugs
+filed as [let-go #824](https://github.com/nooga/let-go/issues/824). The proposed
+narrow boolean-CAS lock now guards dequeue only, not user input or callbacks.
+Permanent RED: 16 tests / 125 pass / 7 fail. Final focused/bundle: 18/143;
+impacted: 119/924; full: 653/6068, all zero failures. CLI build/help pass.
+Paired spec/quality approve; paired final audit is clean. Constructor compatibility
+and false/nil occupancy are covered. Native console deadlines, artifact reader
+compatibility and adopted discovery/recovery keep ITER-0006 incomplete.
 
 **Current artifact slice:** isolated `.worktrees/artifact-contract` from `803ccb8`.
 Fresh full baseline passes 644 tests / 5,970 assertions. Paired scope reviews

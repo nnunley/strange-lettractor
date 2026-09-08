@@ -1,0 +1,74 @@
+(ns attractor.interviewer-queue-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.interviewer :as i] [attractor.pipeline :as pipeline]
+            [attractor.context :as c] [attractor.handlers :as h] [os :as os]))
+
+;; SCN-INTERVIEWER-QUEUE: claim order, not parallel scheduling order.
+(deftest deterministic-overlap-claims-each-answer-once
+  (doseq [answers [[{:value "a" :metadata {:source 1}} {:value "b"}] ["only"]]]
+    (let [state (atom answers) queue (i/->QueueInterviewer state)
+          arrived (atom 0) ready (promise) release (promise)
+          swap-fn core/swap! cas-fn core/compare-and-set!
+          boundary (fn []
+                     (let [n (swap-fn arrived inc)]
+                       (when (= n 2) (deliver ready true))
+                       (when (<= n 2) (deref release 3000 nil))))]
+      (with-redefs [core/swap! (fn [a f & args]
+                                (when (identical? state a) (boundary))
+                                (apply swap-fn a f args))
+                    core/compare-and-set! (fn [a old new]
+                                            (when (and (false? old) (true? new)) (boundary))
+                                            (cas-fn a old new))]
+        (let [ask-one (fn [] (try (i/ask queue {}) (catch Object e {:error (str e)})))
+              a (core/future (ask-one)) b (core/future (ask-one))]
+          (try
+            (is (= true (deref ready 3000 :timeout)))
+            (deliver release true)
+            (let [results [(deref a 3000 :timeout) (deref b 3000 :timeout)]
+                  expected (if (= 2 (count answers)) answers
+                               [{:value "only" :text "only"}
+                                {:value :skipped :text "queue exhausted"}])]
+              (is (= (set expected) (set results)))
+              (is (= [] @state)))
+            (finally (deliver release true) (deref a 3000 nil) (deref b 3000 nil))))))))
+
+(deftest occupied-false-and-nil-and-constructor-compatibility
+  (let [state (atom [false nil "last"]) queue (i/->QueueInterviewer state)
+        default {:value "default" :metadata {:kept true}}]
+    (is (= {:value false :text "false"} (i/ask queue {})))
+    (is (= {:value nil :text ""} (i/ask queue {})))
+    (is (= {:value "last" :text "last"} (i/ask queue {})))
+    (is (= [] @state))
+    (is (= default (i/ask queue {:default default})))
+    (is (= :skipped (:value (i/ask queue {}))))))
+
+(deftest concurrent-exhaustion-preserves-defaults-and-maps
+  (let [answers (mapv (fn [n] {:value n :metadata {:n n}}) (range 4))
+        queue (i/make-queue-interviewer answers)
+        default {:value :default}
+        workers (mapv (fn [_] (core/future (i/ask queue {:default default}))) (range 12))]
+    (try
+      (let [results (mapv #(deref % 3000 :timeout) workers)]
+        (is (= (set answers) (set (remove #(= default %) results))))
+        (is (= 8 (count (filter #(= default %) results)))))
+      (finally (doseq [worker workers] (deref worker 3000 nil))))))
+
+(deftest public-parallel-human-gates-share-recorded-queue
+  (let [queue (i/make-queue-interviewer [{:value "A"} {:value "B"}])
+        recording (i/make-recording-interviewer queue)
+        logs (str (os/temp-dir) "/interviewer-queue-" (random-uuid))
+        result (pipeline/run
+                 "digraph Shared { start [shape=Mdiamond]; fork [shape=component, join_policy=wait_all, max_parallel=2]; left [shape=hexagon]; right [shape=hexagon]; join [shape=tripleoctagon]; exit [shape=Msquare]; start -> fork; fork -> left; fork -> right; left -> join [label=\"[A] Alpha\"]; left -> join [label=\"[B] Beta\"]; right -> join [label=\"[A] Alpha\"]; right -> join [label=\"[B] Beta\"]; join -> exit; }"
+                 {:logs-root logs :registry (h/make-handler-registry (:interviewer recording) nil)})
+        checkpoint (c/load-checkpoint (str logs "/checkpoint.edn"))
+        branches (get-in checkpoint [:context_values "parallel.results"])
+        records @(:recordings recording)]
+    (is (= :success (:status result)))
+    (is (= 2 (count records)))
+    (is (= #{"A" "B"} (set (map #(get-in % [:answer :value]) records))))
+    (is (= #{"left" "right"} (set (map #(get-in % [:question :stage]) records))))
+    (doseq [{:keys [question answer]} records]
+      (let [branch (first (filter #(= (:id %) (:stage question)) branches))]
+        (is (= :success (:status branch)))
+        (is (= (:value answer) (get-in branch [:context_updates "human.gate.selected"])))))
+    (is (= :skipped (:value (i/ask queue {}))))))

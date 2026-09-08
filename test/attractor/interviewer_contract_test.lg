@@ -205,6 +205,26 @@
         (is (= [{:value "sentinel"} {:value :skipped :text "queue exhausted"}]
                (:remaining evidence)))))))
 
+(deftest entirely-unmatched-answer-falls-back-to-first-choice
+  (let [answer {:value "unknown" :text "also unknown"}
+        evidence (run-human-route answer nil)
+        checkpoint (:checkpoint evidence)]
+    (is (= :success (get-in evidence [:result :status])))
+    (is (= ["start" "review" "approve" "done"] (:completed_nodes checkpoint)))
+    (is (= ["approve"] (get-in checkpoint [:node_outcomes "review" :suggested_next_ids])))
+    (is (= "A" (get-in checkpoint [:context_values "human.gate.selected"])))
+    (assert-gate-recording (:recordings evidence) answer)))
+
+(deftest no-outgoing-edges-fails-without-consuming-an-answer
+  (let [queue (interview/make-queue-interviewer [{:value "untouched"}])
+        handler (handlers/make-wait-human-handler queue)
+        graph (parser/parse-dot "digraph NoChoices { review [shape=hexagon]; }")
+        ctx (context/make-context)]
+    (is (= {:status :fail :failure_reason "No outgoing edges for human gate"}
+           (handler (parser/find-node graph "review") ctx graph "")))
+    (is (= {:value "untouched"} (interview/ask queue {})))
+    (is (nil? (context/ctx-get ctx "human.gate.selected")))))
+
 (deftest skipped-and-timeout-without-default-return-distinct-handler-outcomes
   ;; Direct handler calls avoid engine retry backoff; no elapsed-time claim.
   (doseq [[answer expected]
