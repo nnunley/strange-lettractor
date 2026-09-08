@@ -1,5 +1,5 @@
 (ns attractor.server
-  (:require [attractor.ids :as ids] [clojure.string :as str]
+  (:require [attractor.ids :as ids] [clojure.string :as str] [clojure.core :as core]
             [json :as json]
             [io :as io]
             [os :as os]
@@ -266,9 +266,34 @@
       (json-response {:error (str "Failed to start pipeline: " e)} 400))))
 
 ;; Route HTTP requests (Section 9.5)
+(def ^:private terminal-statuses #{:success :fail :cancelled :partial_success})
+
+(defn- sse-frame [index event]
+  (str "id: " index "\nevent: " (name (or (:type event) :event)) "\ndata: " (json/write-json event) "\n\n"))
+
+(defn event-stream
+  "Lazy SSE body for a pipeline: frames for recorded events from `from`, then
+   new events as they are recorded, then one `end` frame once the pipeline is
+   terminal or gone. Each element is realized on demand and flushed by the
+   runtime, so a slow or disconnected client never blocks the pipeline; the
+   wait loop stays inside one thunk to avoid nesting a lazy seq per poll."
+  [pipeline-id from]
+  (lazy-seq
+    (loop []
+      (let [pipe (get @active-pipelines pipeline-id)
+            events (if pipe @(:events pipe) [])]
+        (cond
+          (< from (count events))
+          (cons (sse-frame from (nth events from)) (event-stream pipeline-id (inc from)))
+          (or (nil? pipe) (contains? terminal-statuses (:status pipe)))
+          (list (str "event: end\ndata: " (json/write-json {:status (str (or (:status pipe) :gone)) :event_count from}) "\n\n"))
+          :else (do (core/sleep 25) (recur)))))))
+
 (defn app-handler [req]
   (let [path (or (:path req) "")
-        method (keyword (str/lower-case (or (:request-method req) "get")))]
+                ;; http/serve delivers the method as a keyword; tests pass strings.
+        method (let [m (or (:request-method req) "get")]
+                 (keyword (str/lower-case (if (keyword? m) (name m) (str m)))))]
     (cond
       ;; CORS preflight
       (= method :options)
@@ -303,16 +328,17 @@
                             :completed_nodes (or (:completed_nodes (:outcome pipe)) [])
                             :event_count (count @(:events pipe))})
 
-            ;; GET /pipelines/:id/events
+            ;; GET /pipelines/:id/events — a maintained SSE stream (§9.5):
+            ;; replay from Last-Event-ID, then hold the connection and deliver
+            ;; later events until the pipeline reaches a terminal status.
             (and (= method :get) (= sub-route "events"))
-            (let [sse-body (str/join ""
-                                     (map (fn [ev] (str "data: " (json/write-json ev) "\n\n"))
-                                          @(:events pipe)))]
+            (let [last-id (some-> (or (get-in req [:headers "Last-Event-ID"]) (get-in req [:headers "last-event-id"]))
+                                  str str/trim parse-long)]
               {:status 200
                :headers {"Content-Type" "text/event-stream"
                          "Cache-Control" "no-cache"
                          "Access-Control-Allow-Origin" "*"}
-               :body sse-body})
+               :body (event-stream pipe-id (if last-id (inc last-id) 0))})
 
             ;; POST /pipelines/:id/cancel
             (and (= method :post) (= sub-route "cancel"))

@@ -1,0 +1,68 @@
+(ns attractor.server-sse-live-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str]
+            [io :as io] [os :as os] [http :as http] [json :as json]
+            [attractor.server :as server] [attractor.handlers :as handlers]))
+
+;; SCN-SSE-LIVE COMPLETE
+;; A client attached to /events before completion receives later ordered
+;; events on the same connection, then a terminal end frame, over real HTTP.
+
+(def ^:private dot
+  "digraph S { graph [goal=\"sse\"] start [shape=Mdiamond] slow [shape=box, prompt=\"slow\"] exit [shape=Msquare] start -> slow -> exit }")
+
+(defn- index-of [coll x] (first (keep-indexed (fn [i v] (when (= v x) i)) coll)))
+
+(defn- parse-frames [lines]
+  ;; Group SSE lines into frames of {:id :event :data}.
+  (loop [remaining lines frame {} frames []]
+    (if (empty? remaining)
+      (if (seq frame) (conj frames frame) frames)
+      (let [line (first remaining)]
+        (cond
+          (str/blank? line) (recur (rest remaining) {} (if (seq frame) (conj frames frame) frames))
+          (str/starts-with? line "id: ") (recur (rest remaining) (assoc frame :id (parse-long (subs line 4))) frames)
+          (str/starts-with? line "event: ") (recur (rest remaining) (assoc frame :event (subs line 7)) frames)
+          (str/starts-with? line "data: ") (recur (rest remaining) (assoc frame :data (json/read-json (subs line 6))) frames)
+          :else (recur (rest remaining) frame frames))))))
+
+(deftest events-stream-stays-connected-and-delivers-later-events
+  (let [release (promise) entered (promise)
+        port (+ 41000 (rand-int 9000)) base (str "http://127.0.0.1:" port)
+        original handlers/make-handler-registry]
+    (reset! server/active-pipelines {})
+    (with-redefs [handlers/make-handler-registry
+                  (fn [interviewer backend & [opts]]
+                    (let [registry (original interviewer backend (or opts {}))]
+                      (handlers/register-handler! registry "codergen"
+                        (fn [_ _ _ _] (deliver entered true) (deref release 5000 nil) {:status :success}))
+                      registry))]
+      (let [serving (core/future (try (http/serve server/app-handler (str "127.0.0.1:" port)) (catch Object _ nil)))]
+        (core/sleep 150)
+        (let [started (json/read-json (:body (http/request {:method :post :url (str base "/pipelines") :body dot})))
+              id (get started "id")]
+          (is (string? id))
+          (is (true? (deref entered 5000 false)) "pipeline is mid-stage when the client attaches")
+          ;; Attach while the slow stage is still running.
+          (let [response (http/request {:url (str base "/pipelines/" id "/events") :as :stream})
+                body (:body response)
+                lines (atom []) reader (core/future (doseq [line (io/line-seq body)] (swap! lines conj line)) :eof)]
+            (is (= 200 (:status response)))
+            (core/sleep 200)
+            (let [early (parse-frames @lines)]
+              (is (some #(= "pipeline.started" (:event %)) early) (pr-str early))
+              (is (not-any? #(= "end" (:event %)) early) "the stream is still open"))
+            (deliver release true)
+            (is (= :eof (deref reader 10000 :still-open)) "connection closes after the terminal frame")
+            (let [frames (parse-frames @lines) events (map :event frames)]
+              (is (= "end" (last events)))
+              (is (some #(= "pipeline.completed" %) events))
+              (is (= (range (dec (count frames))) (map :id (butlast frames))) "ids are consecutive")
+              (is (< (index-of events "pipeline.started") (index-of events "pipeline.completed")))
+              ;; Replay from a cursor: only later events return.
+              (let [replay (http/request {:url (str base "/pipelines/" id "/events") :headers {"Last-Event-ID" "1"}})
+                    replayed (parse-frames (str/split (:body replay) #"\n"))]
+                (is (= 2 (:id (first replayed))))
+                (is (= "end" (:event (last replayed)))))))
+          (is (= 404 (:status (http/request {:url (str base "/pipelines/nope/events")}))))
+          (core/sleep 50)
+          (deref serving 10 nil))))))

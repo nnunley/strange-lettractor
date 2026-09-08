@@ -421,3 +421,11 @@
     (is (= 201 (:status (:response result))))
     (is (= true (:background result)))
     (is (= 1 (count @server/active-pipelines)))))
+
+(deftest routes-accept-the-runtime-keyword-request-method
+  ;; http/serve delivers :request-method as a keyword (:get), while these
+  ;; tests pass strings; both must route.
+  (reset! server/active-pipelines {})
+  (is (= 200 (:status (server/app-handler {:request-method :get :path "/pipelines"}))))
+  (is (= 200 (:status (server/app-handler {:request-method "GET" :path "/pipelines"}))))
+  (is (= 404 (:status (server/app-handler {:request-method :get :path "/pipelines/none/events"})))))
