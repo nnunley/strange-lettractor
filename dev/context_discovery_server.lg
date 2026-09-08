@@ -1,0 +1,33 @@
+(ns context-discovery-server
+  (:require [http :as http] [json :as json] [clojure.string :as str]))
+
+(defn reply [body] {:status 200 :headers {"Content-Type" "application/json"}
+                    :body (json/write-json body)})
+(defn handler [token state]
+  (fn [request]
+    (let [[_ supplied scenario operation] (str/split (:path request) #"/")]
+      (cond
+        (= (:path request) "/ready") {:status 200 :body token}
+        (not= supplied token) {:status 404 :body "unknown fixture"}
+        (= scenario "control")
+        (do (reset! state (read-string (:body request))) {:status 200 :body "ok"})
+        (= scenario "http-error") {:status 503 :body "fixture secret must not escape"}
+        (= scenario "bad-json") {:status 200 :body "{"}
+        (= operation "v1")
+        (do
+          (when (= scenario "held") (sleep 3000))
+          (reply {:data [{:id (if (= scenario "mismatch") "other" (or (:model @state) "fixture"))
+                         :owned_by (if (= scenario "unsupported") "other" "llamacpp")
+                         :meta {:n_ctx_train 9999999}}]}))
+        (= operation "props")
+        (reply {:default_generation_settings {:n_ctx (if (= scenario "bad-capacity") 0 (:n_ctx @state))}
+                :model_alias (if (= scenario "changed-model") "other" (or (:model @state) "fixture"))
+                :total_slots 9 :secret "private-fixture-props"})
+        :else {:status 404 :body "unknown route"}))))
+
+(defn -main [port token]
+  (let [number (parse-long port)]
+    (when-not (and number (<= 1024 number 65535) (re-matches #"[a-zA-Z0-9-]+" token))
+      (throw (ex-info "Invalid fixture arguments" {})))
+    (http/serve (handler token (atom {:n_ctx 2048})) (str "127.0.0.1:" number))))
+(when (= 2 (count *command-line-args*)) (apply -main *command-line-args*))

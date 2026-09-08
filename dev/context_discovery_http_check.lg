@@ -1,0 +1,128 @@
+(ns main
+  (:require [attractor.context-discovery :as capacity] [attractor.execution :as execution]
+            [http :as http] [os :as os] [io :as io] [clojure.string :as str]
+            [clojure.core :as core] [clojure.test :refer [deftest is]]))
+
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn run-fixture [f]
+  (let [runtime (os/getenv "LGX_LG")
+        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
+        port (+ 30000 (rand-int 20000)) token (str "capacity-" (rand-int 1000000000))
+        base (str "http://127.0.0.1:" port)
+        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
+                                                :max_command_timeout_ms 30000})
+        command (str (quote-shell runtime) " " (quote-shell (str (os/cwd) "/dev/context_discovery_server.lg"))
+                     " " port " " token)
+        worker (future ((:exec_command env) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      (loop [remaining 100]
+        (let [response (capacity/call! #(http/request {:url (str base "/ready")}) {:timeout_ms 100})]
+          (cond
+            (= 200 (:status response))
+            (when-not (= token (:body response)) (throw (ex-info "Fixture port collision" {})))
+            (or (zero? remaining) (realized? worker)) (throw (ex-info "Fixture not ready" {}))
+            :else (do (core/sleep 20) (recur (dec remaining))))))
+      (f (str base "/" token))
+      (finally
+        ((:cleanup env))
+        (when (= ::pending (deref worker 3000 ::pending))
+          (throw (ex-info "Fixture process failed to join" {})))))))
+
+(deftest native-discovery-refresh-validation-and-cleanup
+  (run-fixture
+    (fn [base]
+      (let [opts {:base_url (str base "/normal/v1") :model "fixture" :timeout_ms 1000}
+            raw (capacity/call! #(http/request {:url (str base "/normal/v1/models")}) {})
+            first-result (capacity/discover! opts)]
+        (is (= 200 (:status raw)) (pr-str raw))
+        (let [empty-headers (capacity/call! #(try (http/request {:method :get :url (str base "/normal/v1/models") :headers {}})
+                                                   (catch Object e {:error (str e)})) {})]
+          (is (= 200 (:status empty-headers)) (pr-str empty-headers)))
+        (is (= 200 (:status (http/get (str base "/normal/v1/models") {:headers {}}))))
+        (is (= 200 (:status (http/post (str base "/normal/v1/models") "" {:headers {}}))))
+        (is (= :available (:status first-result)) (pr-str first-result))
+        (is (= 2048 (:context_window_size first-result)))
+        (is (not (str/includes? (pr-str first-result) "private-fixture-props")))
+        (capacity/call! #(http/request {:url (str base "/control") :method :post :body "{:n_ctx 1024}"}) {})
+        (is (= 1024 (:context_window_size (capacity/discover! opts))))
+        (doseq [scenario ["http-error" "bad-json" "bad-capacity" "changed-model" "mismatch" "unsupported"]]
+          (let [result (capacity/discover! (assoc opts :base_url (str base "/" scenario "/v1")))]
+            (is (not= :available (:status result)) scenario)
+            (is (nil? (:context_window_size result)))
+            (is (not (str/includes? (pr-str result) "secret")))))
+        (let [scope (core/scope-open)]
+          (try
+            (let [held (capacity/discover! (assoc opts :base_url (str base "/held/v1") :timeout_ms 30))]
+              (is (= :timeout (:reason held)) (pr-str held)))
+            (is (= 0 (core/scope-live scope)))
+            (is (= :abort (:reason (capacity/discover! (assoc opts :aborted? (fn [] true))))))
+            (is (= 0 (core/scope-live scope)))
+            (finally (core/scope-close! scope 1000))))))))
+
+(deftest distinct-endpoints-and-models-do-not-share-observations
+  (run-fixture
+    (fn [first-base]
+      (run-fixture
+        (fn [second-base]
+          (capacity/call! #(http/request {:url (str second-base "/control") :method :post
+                                          :body "{:n_ctx 4096 :model \"second-fixture\"}"}) {})
+          (let [first-opts {:base_url (str first-base "/normal/v1") :model "fixture"}
+                second-opts {:base_url (str second-base "/normal/v1") :model "second-fixture"}
+                first-result (capacity/discover! first-opts)
+                second-result (capacity/discover! second-opts)]
+            (is (= [2048 4096] (mapv :context_window_size [first-result second-result])))
+            (is (= [(:base_url first-opts) (:base_url second-opts)]
+                   (mapv :endpoint [first-result second-result])))
+            (is (= :model-mismatch (:reason (capacity/discover! (assoc second-opts :model "fixture")))))
+            (is (= 2048 (:context_window_size (capacity/discover! first-opts))))))))))
+
+(defn run-held-body [f]
+  (let [runtime (os/getenv "LGX_LG") port (+ 30000 (rand-int 20000))
+        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
+                                                :max_command_timeout_ms 15000})
+        command (str (quote-shell runtime) " " (quote-shell (str (os/cwd) "/dev/context_held_body.lg"))
+                     " | nc -l 127.0.0.1 " port)
+        worker (future ((:exec_command env) command 15000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      ;; Connection-refused is a readiness observation, not a successful probe.
+      ;; The first accepted request consumes the one-shot response producer.
+      (loop [remaining 100]
+        (let [result (f (str "http://127.0.0.1:" port))]
+          (if (and (= :http-error (:reason result)) (pos? remaining) (not (realized? worker)))
+            (do (core/sleep 20) (recur (dec remaining)))
+            result)))
+      (finally
+        ((:cleanup env))
+        (when (= ::pending (deref worker 3000 ::pending))
+          (throw (ex-info "Held-body pipeline failed to join" {})))))))
+
+(deftest native-held-body-cancels-and-joins
+  (let [headers (promise)
+        scope (core/scope-open)]
+    (try
+      (let [result
+            (run-held-body
+              (fn [base]
+                (capacity/call!
+                  #(try
+                     (let [response (http/request {:url base :as :stream})]
+                       (deliver headers (:status response))
+                       (try (io/slurp (:body response))
+                            (finally (io/close (:body response)))))
+                     (catch Object _ {:status :unavailable :reason :http-error}))
+                  {:timeout_ms 200})))]
+        (is (= 200 (deref headers 1 nil)) "Headers arrived before the body stalled")
+        (is (= :timeout (:reason result)))
+        (is (= 0 (core/scope-live scope))))
+      (let [result (run-held-body #(capacity/discover! {:base_url (str % "/v1")
+                                                        :model "fixture" :timeout_ms 200}))]
+        (is (= :timeout (:reason result)) "Actual buffered discovery body read is canceled")
+        (is (= 0 (core/scope-live scope))))
+      (finally (core/scope-close! scope 1000)))))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+(when *command-line-args* (apply -main *command-line-args*))

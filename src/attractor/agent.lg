@@ -4,6 +4,7 @@
             [io :as io]
             [json :as json]
             [attractor.llm :as llm]
+            [attractor.context-discovery :as capacity]
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
             [attractor.tool-images :as tool-images]
@@ -404,14 +405,26 @@
 
 (defn make-session [& [opts]]
   (let [options (or opts {})
+        _capacity-config
+        (when (or (and (contains? options :context_window_size)
+                       (not (capacity/valid-window? (:context_window_size options))))
+                  (and (contains? options :context_discovery_timeout_ms)
+                       (not (and (integer? (:context_discovery_timeout_ms options))
+                                 (<= 1 (:context_discovery_timeout_ms options) 60000)))))
+          (throw (ex-info "Invalid context capacity or discovery time budget"
+                          {:category :configuration})))
         reasoning-effort (validated-reasoning-effort
                            (:reasoning_effort options))
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
         base-profile (or (:provider_profile options)
                          (profiles/create-profile (:provider parsed-model)
                                                   (:model parsed-model)))
-        profile (assoc base-profile :tool_registry
-                       (atom @(get base-profile :tool_registry)))
+        profile (assoc base-profile
+                       :context_window_fallback
+                       (if (contains? base-profile :context_window_fallback)
+                         (:context_window_fallback base-profile)
+                         (:context_window_size base-profile))
+                       :tool_registry (atom @(get base-profile :tool_registry)))
         _depth-tools
         (when (>= (or (:subagent_depth options) 0)
                   (or (:max_subagent_depth options) 1))
@@ -441,6 +454,7 @@
           (atom {:id (or (:id options) (str "agent-" (random-uuid)))
                  :model (:model profile)
                  :provider_profile profile
+                 :context_capacity_fallback (:context_window_fallback profile)
                  :execution_env environment
                  :tool_hook_context (or (:tool_hook_context options) (atom (or (:tool_hooks options) {})))
                  :llm_client (:llm_client options)
@@ -666,11 +680,11 @@
   (let [window (or (get-in @session [:provider_profile :context_window_size]) 0)
         characters (reduce + 0 (map turn-character-count (:history @session)))]
     (when (and (> window 0)
-               (> (* characters 5) (* window 16))
+               (> (*' characters 5) (*' window 16))
                (compare-and-set! (:context_warning_emitted @session)
                                  false true))
-      (let [approx-tokens (quot (+ characters 3) 4)
-            percent (quot (+ (* characters 25) (quot window 2)) window)]
+      (let [approx-tokens (quot (+' characters 3) 4)
+            percent (quot (+' (*' characters 25) (quot window 2)) window)]
         (event-fn {:type :warning
                    :category :context_usage
                    :message (str "Context usage at ~" percent
@@ -678,6 +692,72 @@
                    :approx_tokens approx-tokens
                    :context_window_size window
                    :percent percent})))))
+
+(defn- refresh-context-capacity! [session owner request event-fn]
+  (let [config (:config @session)
+        stopped? (fn [] (or (session-stopped? session)
+                            (not (identical? owner (:current_turn_owner @session)))))
+        discovery-request (assoc request
+                                 :context_discovery_timeout_ms
+                                 (get config :context_discovery_timeout_ms 1000)
+                                 :context_discovery_aborted? stopped?)
+        override? (contains? config :context_window_size)
+        discovered
+        (cond
+          (stopped?) {:status :unavailable :reason :abort}
+          override? {:status :available :source :override :model (:model request)
+                     :context_window_size (:context_window_size config)}
+          (or (:complete_fn config) (:stream_fn config))
+          {:status :unsupported :reason :injected-generation}
+          (:llm_client @session) (llm/client-discover-context (:llm_client @session) discovery-request)
+          :else (llm/discover-context discovery-request))
+        valid? (and (map? discovered) (= :available (:status discovered))
+                    (= (:model request) (:model discovered))
+                    (capacity/valid-window? (:context_window_size discovered)))
+        metadata
+        (if valid?
+          (cond->
+            {:status :available :source (if override? :override :discovery)
+             :model (:model request) :context_window_size (:context_window_size discovered)
+             :observed_at (if (and (integer? (:observed_at discovered))
+                                   (pos? (:observed_at discovered)))
+                            (:observed_at discovered)
+                            (System/currentTimeMillis))}
+            (capacity/safe-endpoint? (:endpoint discovered))
+            (assoc :endpoint (:endpoint discovered)))
+          {:status (if (= :unsupported (:status discovered)) :unsupported :unavailable)
+           :source :profile :model (:model request)
+           :context_window_size (or (:context_capacity_fallback @session) 0)
+           :reason (if (contains? #{:timeout :abort :unsupported :model-mismatch
+                                   :invalid-capacity :invalid-json :http-error
+                                   :runtime-prerequisite :injected-generation :error
+                                   :configuration} (:reason discovered))
+                     (:reason discovered) :invalid-result)
+           :observed_at (System/currentTimeMillis)})
+        published?
+        (with-session-lock
+          session
+          (fn []
+            (when-not (stopped?)
+              (let [prior (:context_capacity @session)]
+                (when (not= (select-keys prior [:source :context_window_size])
+                            (select-keys metadata [:source :context_window_size]))
+                  (reset! (:context_warning_emitted @session) false))
+                (swap! session (fn [state]
+                                 (-> state
+                                     (assoc :context_capacity metadata)
+                                     (assoc-in [:provider_profile :context_window_size]
+                                               (:context_window_size metadata))))))
+              true)))]
+    (when published?
+      (when (= :unavailable (:status metadata))
+        (event-fn {:type :warning :category :context_discovery
+                   :message "Context discovery unavailable; using an advisory profile estimate"
+                   :context_capacity metadata}))
+      (when (and (:require_context_discovery config) (not valid?))
+        (throw (ex-info "Required context discovery is unavailable"
+                        {:category :context-discovery :reason (:reason metadata)
+                         :retryable false}))))))
 
 (def built-in-tool-names
   #{"read_file" "write_file" "edit_file" "execute_command" "directory_list"})
@@ -933,13 +1013,13 @@
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))]
-              (check-context-usage! session event-fn)
               (cond
                 (session-stopped? session) last-text
 
                 (or (and (> round-limit 0) (>= round-count round-limit))
                     (and (> turn-limit 0) (>= assistant-count turn-limit)))
                 (do
+                  (check-context-usage! session event-fn)
                   (event-fn {:type :turn_limit :round round-count
                              :total_turns assistant-count})
                   last-text)
@@ -965,11 +1045,14 @@
                                (get-in @session [:llm_abort_controller :signal])}
                       response
                       (try
-                        (if stream-fn
-                          (stream-response! session stream-fn request event-fn)
-                          (do
-                            (event-fn {:type :assistant_text_start})
-                            (complete-fn request)))
+                        (refresh-context-capacity! session owner request event-fn)
+                        (check-context-usage! session event-fn)
+                        (when-not (session-stopped? session)
+                          (if stream-fn
+                            (stream-response! session stream-fn request event-fn)
+                            (do
+                              (event-fn {:type :assistant_text_start})
+                              (complete-fn request))))
                         (catch Object e
                           (if (session-stopped? session)
                             nil

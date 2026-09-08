@@ -1,0 +1,6 @@
+(ns main (:require [attractor.llm :as llm] [os :as os]))
+(defn -main [base model]
+  (let [result (llm/discover-context {:provider "ollama" :model model :base_url base})]
+    (prn result)
+    (os/exit (if (= :available (:status result)) 0 1))))
+(when (= 2 (count *command-line-args*)) (apply -main *command-line-args*))

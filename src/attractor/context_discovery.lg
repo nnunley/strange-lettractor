@@ -1,0 +1,155 @@
+(ns attractor.context-discovery
+  (:require [clojure.core :as core]
+            [clojure.string :as str]
+            [http :as http]
+            [io :as io]
+            [json :as json]))
+
+(defn valid-window? [n]
+  (and (integer? n) (pos? n) (<= n Long/MAX_VALUE)))
+
+(defn- configuration-error [message]
+  (ex-info message {:category :configuration}))
+
+;; Returns the validated timeout budget, or throws before any worker starts.
+(defn- validate-call-opts [opts]
+  (let [timeout (or (:timeout_ms opts) 1000)
+        aborted? (:aborted? opts)]
+    (when-not (and (integer? timeout) (<= 1 timeout 60000))
+      (throw (configuration-error
+               "call! requires an integer :timeout_ms between 1 and 60000")))
+    (when (and (some? aborted?) (not (fn? aborted?)))
+      (throw (configuration-error "call! :aborted? must be a zero-arg function")))
+    timeout))
+
+(defn call!
+  "Invokes zero-arg f in an owned native child scope/future bounded by
+   opts :timeout_ms (default 1000ms). opts :aborted? is an optional zero-arg
+   poll. Returns f's result, or a typed {:status :unavailable ...} outcome on
+   worker error/timeout/abort. Worker errors are redacted: never surface raw
+   exception text, which may carry secrets from the caller's closure."
+  [f opts]
+  (let [opts (or opts {})
+        timeout-ms (validate-call-opts opts)
+        aborted? (or (:aborted? opts) (fn [] false))
+        deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (if (aborted?)
+      {:status :unavailable :reason :abort}
+      (let [scope (core/scope-open)
+            result (promise)
+            outcome
+            (try
+              (core/future
+                (try
+                  (deliver result {:ok (f)})
+                  (catch Object _ (deliver result {:error true}))))
+              (loop []
+                (cond
+                  (aborted?) {:status :unavailable :reason :abort}
+                  (>= (System/currentTimeMillis) deadline) {:status :unavailable :reason :timeout}
+                  (realized? result)
+                  (let [value @result]
+                    (if (:error value) {:status :unavailable :reason :error} (:ok value)))
+                  :else (do (core/sleep 1) (recur))))
+              (catch Object _ {:status :unavailable :reason :error})
+              (finally (core/scope-close! scope 1000)))]
+        ;; An uncooperative callback must not be mistaken for joined cleanup.
+        (when (pos? (core/scope-live scope))
+          (throw (ex-info "context-discovery worker did not join within the cleanup budget"
+                          {:category :context-discovery-unjoined})))
+        outcome))))
+
+(defn- unsafe-url? [url]
+  (let [after-scheme (if-let [idx (str/index-of url "://")] (subs url (+ idx 3)) url)
+        authority-end (or (str/index-of after-scheme "/") (count after-scheme))
+        authority (subs after-scheme 0 authority-end)]
+    (or (str/includes? url "?") (str/includes? url "#")
+        (str/includes? authority "@"))))
+
+(defn safe-endpoint? [endpoint]
+  (and (string? endpoint)
+       (or (str/starts-with? endpoint "http://")
+           (str/starts-with? endpoint "https://"))
+       (not (unsafe-url? endpoint))))
+
+(defn- strip-suffix [s suffix]
+  (if (str/ends-with? s suffix) (subs s 0 (- (count s) (count suffix))) s))
+
+(defn- strip-trailing-slash [s]
+  (if (and (str/ends-with? s "/") (> (count s) 1)) (subs s 0 (dec (count s))) s))
+
+;; Terminal generation operations sit on the same OpenAI-compatible base as
+;; /models; strip them so the discovery request targets the actual endpoint.
+(defn- models-prefix [base]
+  (-> base strip-trailing-slash (strip-suffix "/chat/completions")
+      (strip-suffix "/responses") strip-trailing-slash))
+
+;; Only the terminal /v1 is stripped for /props; deployment path prefixes
+;; ahead of it are preserved.
+(defn- props-prefix [prefix]
+  (-> prefix (strip-suffix "/v1") strip-trailing-slash))
+
+(defn- get-json [url headers]
+  (try
+    (let [resp (http/request {:method :get :url url :headers headers})]
+      (if (= 200 (:status resp))
+        (try {:body (json/read-json (str (:body resp)))}
+             (catch Object _ {:reason :invalid-json}))
+        {:reason :http-error}))
+    (catch Object _ {:reason :http-error})))
+
+(defn- perform-discovery [base model headers]
+  (let [prefix (models-prefix base)
+        models-result (get-json (str prefix "/models") headers)]
+    (if (:reason models-result)
+      {:status :unavailable :reason (:reason models-result)}
+      (let [data (or (get (:body models-result) "data") [])
+            entry (first (filter #(= (get % "id") model) data))]
+        (cond
+          (nil? entry) {:status :unsupported :reason :model-mismatch}
+          (not= "llamacpp" (get entry "owned_by")) {:status :unsupported :reason :unsupported}
+          :else
+          (let [props-result (get-json (str (props-prefix prefix) "/props?autoload=false&model="
+                                             (io/encode :url model)) headers)]
+            (if (:reason props-result)
+              {:status :unavailable :reason (:reason props-result)}
+              (let [props (:body props-result)
+                    alias (get props "model_alias")
+                    n-ctx (get-in props ["default_generation_settings" "n_ctx"])]
+                (cond
+                  (and (some? alias) (not= alias model))
+                  {:status :unsupported :reason :model-mismatch}
+
+                  (not (valid-window? n-ctx))
+                  {:status :unavailable :reason :invalid-capacity}
+
+                  :else
+                  {:status :available :source :llamacpp :model model
+                   :context_window_size n-ctx :endpoint base
+                   :observed_at (System/currentTimeMillis)})))))))))
+
+(defn probe!
+  "Internal adapter operation. Caller must own a bounded call! scope.
+   Resolves active llama.cpp capacity without creating a second scope."
+  [opts]
+  (let [opts (or opts {})
+        base (:base_url opts) model (:model opts)
+        headers (or (:headers opts) {})]
+    (cond
+      (or (str/blank? base) (str/blank? model))
+      {:status :unavailable :reason :configuration}
+
+      (unsafe-url? base)
+      {:status :unavailable :reason :configuration}
+
+      (not (true? (:scope-cancellation (meta #'http/request))))
+      {:status :unavailable :reason :runtime-prerequisite}
+
+      :else
+      (perform-discovery base model headers))))
+
+(defn discover!
+  "Discovers active llama.cpp capacity in one bounded, joined scope.
+   Both metadata requests share opts :timeout_ms (default 1000ms)."
+  [opts]
+  (call! #(probe! opts) (select-keys opts [:timeout_ms :aborted?])))

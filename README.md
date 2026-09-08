@@ -20,6 +20,8 @@ lgx run-pipeline examples/hello.dot
 ```
 
 See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and CLI usage.
+See [deployment context discovery](docs/context-capacity.md) for live capacity,
+explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 
 ## Claude Code workers
 

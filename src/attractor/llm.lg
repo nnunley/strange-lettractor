@@ -6,6 +6,7 @@
             [io :as io]
             [math :as math]
             [http :as http]
+            [attractor.context-discovery :as capacity]
             [attractor.models :as models]))
 
 (defn- response-header [response header-name]
@@ -2507,7 +2508,30 @@
    :options (or (:options opts) {})
    :initialize (:initialize opts)
    :close (:close opts)
+   :discover_context (:discover_context opts)
    :supports_tool_choice (:supports_tool_choice opts)})
+
+(defn- probe-context [request options]
+  (let [opts (merge options request)
+        provider (str/lower-case (or (:provider opts) "openai"))
+        base (resolve-base-url provider (:base_url opts))]
+    (if (or (not (contains? #{"openai" "ollama"} provider))
+            (contains? #{"https://api.openai.com/v1" "https://ollama.com/v1"} base)
+            (:transport opts))
+      {:status :unsupported :reason :unsupported}
+      (let [key (resolve-api-key provider (:api_key opts))]
+        (capacity/probe!
+          {:base_url base :model (:model opts)
+           :headers (cond-> {"Content-Type" "application/json"}
+                      (seq key) (assoc "Authorization" (str "Bearer " key)))
+           :timeout_ms (or (:context_discovery_timeout_ms opts) 1000)
+           :aborted? (:context_discovery_aborted? opts)})))))
+
+(defn discover-context [request & [options]]
+  (let [opts (merge options request)]
+    (capacity/call! #(probe-context request options)
+                    {:timeout_ms (or (:context_discovery_timeout_ms opts) 1000)
+                     :aborted? (:context_discovery_aborted? opts)})))
 
 (defn make-provider-adapter [provider & [opts]]
   (let [name (str/lower-case provider)
@@ -2538,7 +2562,10 @@
               "gemini" (gemini-stream req (:api_key req) (:base_url req))
               (throw (ex-info (str "Streaming is not implemented for provider: " name)
                               {:provider name :category :configuration})))))]
-    (make-adapter name complete-fn stream-fn {:options options})))
+    (make-adapter name complete-fn stream-fn
+                  {:options options
+                   :discover_context
+                   (fn [request] (probe-context (assoc (request-with-options request) :provider name) nil))})))
 
 (defn- normalize-provider-name [provider]
   (when (some? provider)
@@ -2598,6 +2625,16 @@
     ((middleware-chain (:middleware client)
                        (fn [r] (stream-fn r)))
      (assoc request :provider provider))))
+
+(defn client-discover-context [client request]
+  (let [[provider adapter] (client-provider client request)
+        options (merge (:options adapter) request)]
+    (if-let [discover (:discover_context adapter)]
+      (capacity/call!
+        (fn [] (discover (assoc request :provider provider)))
+        {:timeout_ms (or (:context_discovery_timeout_ms options) 1000)
+         :aborted? (:context_discovery_aborted? options)})
+      {:status :unsupported :reason :unsupported})))
 
 (defn client-close! [client]
   (doseq [[_ adapter] (:providers client)]

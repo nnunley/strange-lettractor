@@ -1,0 +1,111 @@
+(ns attractor.context-discovery-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [http :as http] [json :as json]
+            [attractor.context-discovery :as capacity]))
+
+;; valid-window?
+
+(deftest valid-window-accepts-positive-integers
+  (is (true? (capacity/valid-window? 1)))
+  (is (true? (capacity/valid-window? 131072)))
+  (is (true? (capacity/valid-window? Long/MAX_VALUE))))
+
+(deftest valid-window-rejects-non-positive-or-non-integer
+  (is (false? (capacity/valid-window? 0)))
+  (is (false? (capacity/valid-window? -1)))
+  (is (false? (capacity/valid-window? 1.5)))
+  (is (false? (capacity/valid-window? nil)))
+  (is (false? (capacity/valid-window? "131072"))))
+
+;; call!
+
+(deftest call-returns-successful-result
+  (is (= 42 (capacity/call! (fn [] 42) {}))))
+
+(deftest call-uses-default-timeout-when-opts-omit-it
+  (is (= :ok (capacity/call! (fn [] :ok) nil))))
+
+(deftest call-redacts-thrown-worker-errors
+  (let [result (capacity/call! (fn [] (throw (ex-info "leaked-secret-token" {:api_key "sk-secret"})))
+                               {})]
+    (is (= {:status :unavailable :reason :error} result))
+    (is (not (str/index-of (pr-str result) "leaked-secret-token")))
+    (is (not (str/index-of (pr-str result) "sk-secret")))))
+
+(deftest call-times-out-and-joins-cooperative-worker
+  (let [cleaned (promise)
+        result (capacity/call!
+                 (fn []
+                   (try
+                     (core/sleep 5000)
+                     (finally (deliver cleaned true))))
+                 {:timeout_ms 20})]
+    (is (= {:status :unavailable :reason :timeout} result))
+    (is (true? (deref cleaned 2000 :not-cleaned)))))
+
+(deftest call-aborts-and-joins-cooperative-worker
+  (let [cleaned (promise) started (promise)
+        result (capacity/call!
+                 (fn []
+                   (try
+                     (deliver started true)
+                     (core/sleep 5000)
+                     (finally (deliver cleaned true))))
+                 {:timeout_ms 5000 :aborted? (fn [] (realized? started))})]
+    (is (= {:status :unavailable :reason :abort} result))
+    (is (true? (deref cleaned 2000 :not-cleaned)))))
+
+(deftest already-aborted-discovery-never-starts-work
+  (let [started (atom false)
+        result (capacity/call! #(reset! started true) {:aborted? (fn [] true)})]
+    (is (= :abort (:reason result)))
+    (is (false? @started))))
+
+(deftest call-rejects-invalid-timeout-before-starting-worker
+  (let [started (atom false)]
+    (doseq [bad [0 -1 60001 1.5 "1000"]]
+      (let [error (try (capacity/call! (fn [] (reset! started true)) {:timeout_ms bad})
+                       (catch Object e e))]
+        (is (= :configuration (:category (ex-data error))))))
+    (is (false? @started))))
+
+(deftest call-rejects-non-function-aborted-before-starting-worker
+  (let [started (atom false)
+        error (try (capacity/call! (fn [] (reset! started true)) {:aborted? "not-a-fn"})
+                   (catch Object e e))]
+    (is (= :configuration (:category (ex-data error))))
+    (is (false? @started))))
+
+(deftest call-allows-nil-aborted-callback
+  (is (= :fine (capacity/call! (fn [] :fine) {:aborted? nil}))))
+
+;; discover!
+
+(deftest discover-rejects-blank-base-url-or-model
+  (is (= {:status :unavailable :reason :configuration}
+         (capacity/discover! {:base_url "" :model "m"})))
+  (is (= {:status :unavailable :reason :configuration}
+         (capacity/discover! {:base_url "http://host/v1" :model ""}))))
+
+(deftest router-props-selects-the-exact-model-without-autoload
+  (let [urls (atom []) model "org/a+b:é?x&autoload=true"]
+    (with-redefs [http/request
+                  (fn [request]
+                    (swap! urls conj (:url request))
+                    {:status 200
+                     :body (json/write-json
+                             (if (str/ends-with? (:url request) "/models")
+                               {:data [{:id model :owned_by "llamacpp"}]}
+                               {:model_alias model :default_generation_settings {:n_ctx 2048}}))})]
+      (is (= 2048 (:context_window_size
+                    (capacity/discover! {:base_url "http://fixture/deployment/v1" :model model}))))
+      (is (= ["http://fixture/deployment/v1/models"
+              "http://fixture/deployment/props?autoload=false&model=org%2Fa%2Bb%3A%C3%A9%3Fx%26autoload%3Dtrue"]
+             @urls)))))
+
+(deftest discover-rejects-urls-with-userinfo-query-or-fragment
+  (is (= :configuration (:reason (capacity/discover! {:base_url "http://user:pass@host/v1" :model "m"}))))
+  (is (= :configuration (:reason (capacity/discover! {:base_url "http://host/v1?token=secret" :model "m"}))))
+  (is (= :configuration (:reason (capacity/discover! {:base_url "http://host/v1#frag" :model "m"})))))

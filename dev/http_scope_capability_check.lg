@@ -1,0 +1,12 @@
+(ns main (:require [clojure.test :refer [deftest is]] [http :as http] [os :as os]))
+
+(deftest http-client-vars-advertise-native-scope-cancellation
+  (doseq [v [#'http/get #'http/post #'http/request]]
+    (is (true? (:scope-cancellation (meta v))))))
+
+(defn -main [& _]
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+(when *command-line-args* (apply -main *command-line-args*))

@@ -1,0 +1,250 @@
+(ns attractor.context-capacity-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.agent :as agent] [attractor.llm :as llm]
+            [attractor.context-discovery :as capacity] [http :as http]
+            [attractor.profiles :as profiles] [attractor.execution :as execution]))
+
+(defn trial [observations options]
+  (let [remaining (atom observations) probes (atom []) windows (atom [])
+        holder (atom nil)
+        adapter (llm/make-adapter
+                  "custom"
+                  (fn [_]
+                    (swap! windows conj {:window (get-in @@holder [:provider_profile :context_window_size])
+                                         :metadata (:context_capacity @@holder)})
+                    {:message {:role :assistant :content "done"} :tool_calls []})
+                  nil
+                  {:discover_context
+                   (fn [request]
+                     (swap! probes conj (select-keys request [:provider :model]))
+                     (let [result (first @remaining)]
+                       (swap! remaining rest)
+                       result))})
+        profile (profiles/make-profile {:id "custom" :model "fixture"
+                                         :supports_streaming false :context_window_size 1000000})
+        session (agent/make-session
+                  (merge {:provider_profile profile :project_docs [] :max_subagent_depth 0
+                          :execution_env (execution/make-environment {:working_directory (fn [] "/fixture")})
+                          :llm_client (llm/make-client {:providers {"custom" adapter}})} options))]
+    (reset! holder session)
+    (try
+      (agent/process-input! session "first request with enough text to exercise a small discovered context")
+      (agent/process-input! session "second request")
+      {:windows @windows :probes @probes :events @(:events @session)
+       :profile (:provider_profile @session)}
+      (finally (agent/close-session! session)))))
+
+(deftest adapter-preserves-optional-context-discovery
+  (let [discover (fn [_] {:status :unsupported})
+        adapter (llm/make-adapter "custom" (fn [_] {}) nil {:discover_context discover})]
+    (is (= discover (:discover_context adapter)))))
+
+(deftest native-client-discovery-owns-one-bounded-operation
+  (let [calls (atom 0) bounded-call capacity/call!
+        client (llm/make-client {:providers {"ollama" (llm/make-provider-adapter
+                                                       "ollama" {:base_url "http://fixture.local/v1"})}})]
+    (with-redefs [capacity/call! (fn [f opts] (swap! calls inc) (bounded-call f opts))
+                  http/request (fn [request]
+                                 {:status 200
+                                  :body (if (clojure.string/ends-with? (:url request) "/models")
+                                          "{\"data\":[{\"id\":\"fixture\",\"owned_by\":\"llamacpp\"}]}"
+                                          "{\"model_alias\":\"fixture\",\"default_generation_settings\":{\"n_ctx\":2048}}")})]
+      (let [result (llm/client-discover-context client {:provider "ollama" :model "fixture"})]
+        (is (= 2048 (:context_window_size result)))
+        (is (= 1 @calls))))))
+
+(deftest client-discovery-honors-adapter-budget-and-request-override
+  (let [budgets (atom []) bounded-call capacity/call!
+        adapter (llm/make-adapter "custom" (fn [_] {}) nil
+                  {:options {:context_discovery_timeout_ms 25}
+                   :discover_context (fn [_] {:status :unsupported})})
+        client (llm/make-client {:providers {"custom" adapter}})]
+    (with-redefs [capacity/call! (fn [f opts] (swap! budgets conj (:timeout_ms opts))
+                                  (bounded-call f opts))]
+      (llm/client-discover-context client {:provider "custom" :model "fixture"})
+      (llm/client-discover-context client {:provider "custom" :model "fixture"
+                                           :context_discovery_timeout_ms 50})
+      (is (= [25 50] @budgets)))))
+
+(deftest session-refreshes-capacity-before-each-model-call
+  (let [result (trial [{:status :available :model "fixture" :context_window_size 16}
+                       {:status :available :model "fixture" :context_window_size 8}] {})]
+    (is (= [16 8] (mapv :window (:windows result))))
+    (is (= [{:provider "custom" :model "fixture"} {:provider "custom" :model "fixture"}]
+           (:probes result)))
+    (is (= [:available :available] (mapv #(get-in % [:metadata :status]) (:windows result))))
+    (is (= [16 8] (mapv :context_window_size
+                        (filter #(= :context_usage (:category %)) (:events result)))))))
+
+(deftest explicit-capacity-override-skips-probes
+  (let [result (trial [] {:context_window_size 42})]
+    (is (= [] (:probes result)))
+    (is (= [42 42] (mapv :window (:windows result))))
+    (is (= [:override :override] (mapv #(get-in % [:metadata :source]) (:windows result))))))
+
+(deftest large-valid-capacity-does-not-overflow-the-usage-warning
+  (let [result (trial [] {:context_window_size Long/MAX_VALUE})]
+    (is (= [] (filter #(= :context_usage (:category %)) (:events result))))))
+
+(deftest session-retains-safe-discovery-provenance
+  (let [observation {:status :available :model "fixture" :context_window_size 16
+                     :endpoint "http://fixture.local/deployment/v1" :observed_at 12345}
+        result (trial [observation observation] {})]
+    (is (= ["http://fixture.local/deployment/v1" "http://fixture.local/deployment/v1"]
+           (mapv #(get-in % [:metadata :endpoint]) (:windows result))))
+    (is (= [12345 12345] (mapv #(get-in % [:metadata :observed_at]) (:windows result))))))
+
+(deftest session-never-publishes-credential-bearing-endpoint-metadata
+  (doseq [endpoint ["http://secret-token@fixture.local/v1"
+                     "http://fixture.local/v1?key=secret-token"
+                     "http://fixture.local/v1#secret-token" 42 nil]]
+    (let [observation {:status :available :model "fixture" :context_window_size 16
+                       :endpoint endpoint :observed_at "secret-token"}
+          result (trial [observation observation] {})]
+      (is (every? #(nil? (get-in % [:metadata :endpoint])) (:windows result)))
+      (is (every? #(integer? (get-in % [:metadata :observed_at])) (:windows result)))
+      (is (not (clojure.string/includes? (pr-str result) "secret-token"))))))
+
+(deftest failed-refresh-never-reuses-a-stale-live-capacity
+  (let [result (trial [{:status :available :model "fixture" :context_window_size 16}
+                       {:status :unavailable :reason :timeout}] {})]
+    (is (= [16 1000000] (mapv :window (:windows result))))
+    (is (= :profile (get-in result [:windows 1 :metadata :source])))
+    (is (= :timeout (get-in result [:windows 1 :metadata :reason])))
+    (is (= 1 (count (filter #(= :context_discovery (:category %)) (:events result)))))))
+
+(deftest invalid-capacities-and-model-mismatch-are-labeled-fallbacks
+  (doseq [observation [{:status :available :model "other" :context_window_size 8}
+                       {:status :available :model "fixture" :context_window_size 0}
+                       {:status :available :model "fixture" :context_window_size "8"}
+                       {:status :available :model "fixture" :context_window_size 8.5}
+                       {:status :unavailable :reason "secret-token" :api_key "secret-token"}]]
+    (let [result (trial [observation observation] {})]
+      (is (= [1000000 1000000] (mapv :window (:windows result))))
+      (is (= [:profile :profile] (mapv #(get-in % [:metadata :source]) (:windows result))))
+      (is (not (clojure.string/includes? (pr-str result) "secret-token"))))))
+
+(deftest invalid-explicit-configuration-fails-before-session-initialization
+  (doseq [options [{:context_window_size 0} {:context_window_size "42"}
+                   {:context_window_size nil} {:context_discovery_timeout_ms 0}
+                   {:context_discovery_timeout_ms 60001}]]
+    (let [initialized (atom false)
+          result (try (agent/make-session
+                        (assoc options :execution_env
+                               (execution/make-environment {:initialize #(reset! initialized true)})))
+                      (catch Object e (ex-data e)))]
+      (is (= :configuration (:category result)))
+      (is (false? @initialized)))))
+
+(deftest aborted-discovery-cannot-publish-or-call-the-model
+  (let [started (promise) cleaned (promise) model-calls (atom 0)
+        adapter (llm/make-adapter "custom" (fn [_] (swap! model-calls inc)) nil
+                  {:discover_context (fn [_]
+                                       (deliver started true)
+                                       (try (sleep 5000)
+                                            {:status :available :model "fixture" :context_window_size 8}
+                                            (finally (deliver cleaned true))))})
+        session (agent/make-session
+                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
+                   :llm_client (llm/make-client {:providers {"custom" adapter}})
+                   :project_docs [] :max_subagent_depth 0
+                   :execution_env (execution/make-environment {})})
+        job (future (try (agent/process-input! session "hello") (catch Object e :failed)))]
+    (try
+      (is (true? (deref started 1000 false)))
+      (agent/abort-session! session)
+      (is (not= ::pending (deref job 2000 ::pending)))
+      (is (true? (deref cleaned 1000 false)))
+      (is (= 0 @model-calls))
+      (is (nil? (:context_capacity @session)))
+      (finally (agent/close-session! session)))))
+
+(deftest required-discovery-failure-stops-before-generation
+  (let [calls (atom 0)
+        adapter (llm/make-adapter "custom" #(swap! calls inc) nil
+                                  {:discover_context (fn [_] {:status :unsupported})})
+        session (agent/make-session
+                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
+                   :llm_client (llm/make-client {:providers {"custom" adapter}})
+                   :require_context_discovery true :project_docs [] :max_subagent_depth 0
+                   :execution_env (execution/make-environment {})})]
+    (try
+      (let [result (try (agent/process-input! session "hello") (catch Object e (ex-data e)))]
+        (is (= :context-discovery (:category result)))
+        (is (= 0 @calls)))
+      (finally (agent/close-session! session)))))
+
+(deftest late-predecessor-observation-cannot-overwrite-successor
+  ;; Pause at the adapter return boundary: cancellation may race with a result
+  ;; that already completed successfully, so publication must check ownership.
+  (let [started (promise) release (promise) predecessor (atom :owned) successor (atom :owned)
+        events (atom []) calls (atom 0)
+        session (agent/make-session
+                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture"})
+                   :llm_client {} :project_docs [] :max_subagent_depth 0
+                   :execution_env (execution/make-environment {})})
+        refresh @#'attractor.agent/refresh-context-capacity!
+        request {:provider "custom" :model "fixture"}]
+    (try
+      (swap! session assoc :current_turn_owner predecessor)
+      (with-redefs [llm/client-discover-context
+                    (fn [_ _]
+                      (if (= 1 (swap! calls inc))
+                        (do (deliver started true)
+                            (deref release 2000 nil)
+                            {:status :available :model "fixture" :context_window_size 8})
+                        {:status :available :model "fixture" :context_window_size 4096}))]
+        (let [old (future (refresh session predecessor request #(swap! events conj %)))]
+          (try
+            (is (true? (deref started 1000 false)))
+            (reset! predecessor :cancelled)
+            (swap! session assoc :current_turn_owner successor)
+            (refresh session successor request #(swap! events conj %))
+            (is (= 4096 (get-in @session [:context_capacity :context_window_size])))
+            (deliver release true)
+            (is (not= ::pending (deref old 1000 ::pending)))
+            (is (= 4096 (get-in @session [:context_capacity :context_window_size])))
+            (is (= 4096 (get-in @session [:provider_profile :context_window_size])))
+            (is (= [] @events))
+            (finally (deliver release true) (deref old 2500 nil)))))
+      (finally (agent/close-session! session)))))
+
+(deftest capacity-decrease-is-seen-between-tool-rounds
+  (let [calls (atom 0) probes (atom 0) windows (atom []) holder (atom nil)
+        registry (profiles/make-tool-registry
+                   [{:definition {:name "noop" :description "fixture" :parameters {:type "object"}}
+                     :executor (fn [_ _] "tool finished")}])
+        adapter (llm/make-adapter
+                  "custom"
+                  (fn [_]
+                    (swap! windows conj (get-in @@holder [:provider_profile :context_window_size]))
+                    (if (= 1 (swap! calls inc))
+                      {:message {:role :assistant :content "using tool"}
+                       :tool_calls [{:id "one" :name "noop" :arguments {}}]}
+                      {:message {:role :assistant :content "done"} :tool_calls []}))
+                  nil
+                  {:discover_context (fn [_]
+                                       (swap! probes inc)
+                                       {:status :available :model "fixture"
+                                        :context_window_size (if (zero? @calls) 1000 16)})})
+        session (agent/make-session
+                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture"
+                                                              :tool_registry registry :supports_streaming false})
+                   :llm_client (llm/make-client {:providers {"custom" adapter}})
+                   :project_docs [] :max_subagent_depth 0
+                   :execution_env (execution/make-environment {})})]
+    (reset! holder session)
+    (try
+      (is (= "done" (agent/process-input! session "use the fixture tool")))
+      (is (= [1000 16] @windows))
+      (is (= 2 @probes))
+      (is (= 1 (count (filter #(= :tool_call_end (:type %)) (agent/session-events session)))))
+      (finally (agent/close-session! session)))))
+
+(deftest copied-session-profiles-do-not-turn-live-observations-into-fallbacks
+  (let [observed (trial [{:status :available :model "fixture" :context_window_size 16}
+                         {:status :available :model "fixture" :context_window_size 8}] {})
+        copied (trial [{:status :unavailable :reason :timeout}
+                       {:status :unavailable :reason :timeout}]
+                      {:provider_profile (:profile observed)})]
+    (is (= [1000000 1000000] (mapv :window (:windows copied))))))

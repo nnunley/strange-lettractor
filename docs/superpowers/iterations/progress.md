@@ -1,8 +1,32 @@
 # Progress
 
-**Phase:** local native HTTP cancellation and relative command cwd fixes verified
-**Next:** wire dynamic deployment context-capacity discovery using cancellable HTTP;
-remaining adapter/environment and hub contracts remain open
+**Phase:** dynamic deployment context discovery implemented and mechanically verified
+**Next:** publish the verified discovery checkpoint; remaining
+adapter/environment and hub contracts remain open
+
+Deployment capacity is refreshed before each actual model/tool round, with
+explicit override precedence, validated model/endpoint provenance, advisory
+fallback, and guarded late-result publication. There is no hardcoded Qwen
+capacity. Native llama.cpp probes share a bounded joined scope, route props by
+encoded model without autoload, and use the same resolved endpoint/credentials
+as generation. Usage warnings use overflow-safe arithmetic.
+
+Evidence: focused native and outside-checkout bundle session16/76/0 and
+transport14/35/0; let-go-owned loopback3/39/0 includes distinct endpoints/models,
+held headers, streaming and buffered held bodies, timeout and worker cleanup.
+The body fixture uses nc only as a socket relay because native net lacks listen.
+Latest full suite758/7146/0; standalone CLI build and `help` exit0. Live read-only
+discovery returns131072 for the then-running local deployment, not a default.
+The broad correctness review timed out without a verdict; the narrower review
+completed. Its sole finding about invalid overrides was rejected against
+constructor validation and passing tests. See `docs/context-capacity.md` and
+the discovery implementation plan for the adjudication and exact limits.
+
+Native HTTP prerequisites remain local, checkpoint `7ea895f4`, not an upstream
+release. Empty headers are fixed and tracked as nooga/let-go#828; tests for
+unread/unclosed streams, runtime rt/vm/api, vet and focused race runs pass.
+
+### Prior checkpoint
 
 Local let-go checkpoint `f8c3eb13` on `fix/http-scope-cancellation` attaches the
 calling scope to get/post/request, including response-body lifetime. Nine real
@@ -12,7 +36,7 @@ VM/API, vet, and focused bootstrap checks pass. It is not yet upstream or instal
 over the original local lg. See `docs/let-go-http-cancellation.md` for boundaries.
 Relative command cwd overrides now use the environment's path resolver. Native
 and outside-checkout bundle tests each pass 3/23/0 after a reproduced 10 failures.
-Discovery is still pending; no fixed Qwen context-window value has been introduced.
+Discovery was still pending at this checkpoint; no fixed Qwen value was introduced.
 Actual Claude review through the connector found no actionable runtime defects.
 Fresh full Attractor suite on the fixed runtime: 728/7035/0, exit 0.
 

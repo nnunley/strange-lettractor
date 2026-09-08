@@ -1,0 +1,7 @@
+;; Test-only response producer. nc supplies the listening socket because the
+;; current let-go net namespace has client operations only. All HTTP bytes and
+;; timing remain let-go; the parent checker owns and joins the whole pipeline.
+(require '[io :as io])
+(print "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n{")
+(io/flush *out*)
+(sleep 10000)

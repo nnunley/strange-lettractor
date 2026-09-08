@@ -2,6 +2,21 @@
 
 ## Local runtime fix, 2026-09-08
 
+Discovery follow-up checkpoint:
+`7ea895f4502845248125b5fb2af01e5686048cde` in the same isolated workspace.
+It adds `:scope-cancellation true` metadata to the three HTTP client vars, so
+Attractor can reject unsupported runtimes before probing. It also fixes empty
+client headers maps, reported as [#828](https://github.com/nooga/let-go/issues/828):
+the native loop treated an empty sequence sentinel as a map entry and dereferenced
+nil. Let-go loopback tests exercise `{}` through request/get/post.
+
+Unread, unclosed streamed bodies are now covered by
+`TestHTTPClientScopeCancelsUnreadStream`, including server-observed cancellation;
+20 race repetitions passed. After the latest empty-header fix, full rt/vm/api
+tests and vet passed, as did five race repetitions of HTTP client scope tests
+and the API catchability test. These are local runtime fixes, not an upstream
+release. The earlier checkpoint and evidence below are retained as history.
+
 A fix is implemented in the isolated local let-go workspace
 `.worktrees/let-go-http-cancellation`, jj workspace `http-scope-cancellation`,
 based on `bdd8268c`, checkpoint `f8c3eb13b433980968a9af94d7938c3b361bfb9f`
