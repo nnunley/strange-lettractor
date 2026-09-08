@@ -1,0 +1,212 @@
+(ns attractor.tool-hooks-test
+  (:require [clojure.test :refer [deftest is]] [attractor.agent :as agent]
+            [attractor.execution :as execution] [attractor.profiles :as profiles]
+            [json :as json] [io :as io] [os :as os] [clojure.string :as str]))
+
+(defn fixture [hooks hook-executor calls executor]
+  (let [registry (profiles/make-tool-registry) requests (atom []) invoked (atom 0)
+        _ (profiles/register-tool! registry {:definition {:name "sample" :description "test" :parameters {:type "object"}}
+                                            :executor (fn [args env] (swap! invoked inc) (executor args env))})
+        profile (profiles/make-profile {:id "mock" :model "test" :tool_registry registry :supports_parallel_tool_calls false})
+        env (execution/make-environment (if hook-executor {:exec_command_stdin hook-executor} {}))
+        session (agent/make-session {:provider_profile profile :execution_env env :project_docs []
+                                     :tool_hooks hooks :max_tool_rounds_per_input 2
+                                     :tool_output_limits {"sample" 10}
+                                     :complete_fn (fn [request]
+                                                    (swap! requests conj request)
+                                                    (if (= 1 (count @requests))
+                                                      {:tool_calls calls :message {:role :assistant :content ""}}
+                                                      {:message {:role :assistant :content "done"}}))})]
+    {:session session :requests requests :invoked invoked}))
+(def call {:id "call" :name "sample" :arguments {"" "empty" "n/key" "value" "quote\"" "雪\n$(bad)"}})
+(deftest pre-and-post-wrap-real-session-tool
+  (let [seen (atom []) raw (apply str (repeat 100 "x"))
+        {:keys [session invoked]} (fixture {:pre "before" :post "after" :node_id "node"}
+          (fn [command timeout cwd env input]
+            (swap! seen conj {:command command :timeout timeout :env env :payload (json/read-json input)})
+            {:exit_code 0 :stdout "" :stderr ""}) [call] (fn [_ _] raw))]
+    (try
+      (is (= "done" (agent/process-input! session "work")))
+      (is (= 1 @invoked)) (is (= ["before" "after"] (mapv :command @seen)))
+      (is (= (:arguments call) (get-in @seen [0 :payload "arguments"])))
+      (is (= raw (get-in @seen [1 :payload "result"])))
+      (is (= false (get-in @seen [1 :payload "is_error"])))
+      (is (= "node" (get-in @seen [0 :env "ATTRACTOR_NODE_ID"])))
+      (is (= 10000 (get-in @seen [0 :timeout])))
+      (is (= 1 (count (filter #(= :tool_call_start (:type %)) (agent/session-events session)))))
+      (is (= 1 (count (filter #(= :tool_call_end (:type %)) (agent/session-events session)))))
+      (finally (agent/close-session! session)))))
+
+(deftest error-cases-still-run-post-and-preserve-results
+  (doseq [[tool-call throws? expected-invocations skipped?]
+          [[(assoc call :name "missing") false 0 true]
+           [(assoc call :arguments "malformed{") false 0 true]
+           [call true 1 false]]]
+    (let [seen (atom []) {:keys [session invoked]}
+          (fixture {:pre "pre" :post "post"}
+            (fn [command _ _ _ input]
+              (swap! seen conj (json/read-json input))
+              {:exit_code (if (= command "post") 9 0) :stderr "post failed"})
+            [tool-call] (fn [_ _] (if throws? (throw (ex-info "tool failed" {})) "value")))]
+      (try
+        (agent/process-input! session "work")
+        (is (= expected-invocations @invoked)) (is (= 2 (count @seen)))
+        (is (= (:arguments tool-call) (get-in @seen [0 "arguments"])))
+        (is (= skipped? (get-in @seen [1 "skipped"])))
+        (is (true? (get-in @seen [1 "is_error"])))
+        (is (not (str/includes? (get-in @session [:history 2 :results 0 :content]) "post failed")))
+        (finally (agent/close-session! session))))))
+
+(deftest pre-unsupported-thrown-and-timeout-are-vetoes
+  (doseq [runner [nil (fn [& _] (throw (ex-info "hook threw" {})))
+                 (fn [& _] {:exit_code 124 :timed_out true})]]
+    (let [{:keys [session invoked]} (fixture {:pre "pre" :post "post"} runner [call] (fn [_ _] "not run"))]
+      (try (agent/process-input! session "work")
+           (is (= 0 @invoked))
+           (is (true? (get-in @session [:history 2 :results 0 :is_error])))
+           (is (= 2 (count (filter #(= :tool_hook (:type %)) (agent/session-events session)))))
+           (finally (agent/close-session! session))))))
+
+(deftest callback-cancellation-prevents-further-hook-or-tool-launch
+  (doseq [stop-at [:tool_call_start :tool_hook]]
+    (let [seen (atom []) {:keys [session invoked]}
+          (fixture {:pre "pre" :post "post"}
+                   (fn [command & _] (swap! seen conj command) {:exit_code 0})
+                   [call] (fn [_ _] "not run"))]
+      (try
+        (agent/process-input! session "work" (fn [event] (when (= stop-at (:type event)) (agent/abort-session! session))))
+        (is (= 0 @invoked)) (is (= (if (= stop-at :tool_call_start) [] ["pre"]) @seen))
+        (is (= :session_end (:type (last (agent/session-events session)))))
+        (finally (agent/close-session! session))))))
+
+(deftest returned-hook-cancellation-stops-subsequent-work
+  (doseq [throws? [false true]]
+   (let [seen (atom []) {:keys [session invoked]}
+        (fixture {:pre "pre" :post "post"}
+                 (fn [command & _] (swap! seen conj command)
+                   (if throws? (throw (ex-info "cleanup failed" {:category :stdin-temp-cleanup :command_result {:exit_code 130 :cancelled true}}))
+                     {:exit_code 130 :cancelled true}))
+                 [call] (fn [_ _] "not run"))]
+    (try (agent/process-input! session "work")
+         (is (= ["pre"] @seen)) (is (= 0 @invoked))
+         (is (= :closed (:state @session)))
+         (finally (agent/close-session! session))))))
+
+(defn temp-dir []
+  (let [result (os/sh "/usr/bin/mktemp" "-d" (str (os/temp-dir) "/lettractor-hooks.XXXXXXXX"))]
+    (when-not (= 0 (:exit result)) (throw (ex-info "Unable to create test directory" {})))
+    (str/trim (:out result))))
+(defn forms [path] (read-string (str "[" (io/slurp path) "]")))
+(defn remove-fixture! [root files]
+  (doseq [file files] (os/sh "/bin/rm" "-f" "--" (str root "/" file)))
+  (os/sh "/bin/rmdir" "--" root))
+
+(deftest native-shell-json-and-real-edn-audit
+  (let [root (temp-dir) local (execution/make-local-environment {:working_dir root :env_policy :none})
+        raw (apply str (repeat 10000 "λ"))
+        {:keys [session invoked]}
+        (fixture {:pre "/bin/cat > pre.json" :post "/bin/cat > post.json" :node_id "native" :stage_dir root}
+                 (:exec_command_stdin local) [call] (fn [_ _] raw))]
+    (try
+      (is (= "done" (agent/process-input! session "work")))
+      (is (= 1 @invoked))
+      (is (= (:arguments call) (get (json/read-json (io/slurp (str root "/pre.json"))) "arguments")))
+      (is (= raw (get (json/read-json (io/slurp (str root "/post.json"))) "result")))
+      (is (= [:pre :post] (mapv :phase (forms (str root "/tool-hooks.edn")))))
+      (is (every? #(= :success (:status %)) (forms (str root "/tool-hooks.edn"))))
+      (is (not= raw (get-in @session [:history 2 :results 0 :content])))
+      (finally (agent/close-session! session) ((:cleanup local))
+               (remove-fixture! root ["pre.json" "post.json" "tool-hooks.edn"])))))
+
+(deftest log-failure-vetoes-pre-but-not-post-result
+  (let [root (temp-dir)]
+    (try
+      (doseq [phase [:pre :post]]
+        (let [{:keys [session invoked]}
+              (fixture {phase "hook" :stage_dir (str root "/missing")}
+                       (fn [& _] {:exit_code 0}) [call] (fn [_ _] "original"))]
+          (try
+            (agent/process-input! session "work")
+            (is (= (if (= phase :pre) 0 1) @invoked))
+            (is (= (= phase :pre) (get-in @session [:history 2 :results 0 :is_error])))
+            (when (= phase :post) (is (= "original" (get-in @session [:history 2 :results 0 :content]))))
+            (is (= 1 (count (filter #(= :tool_hook_error (:type %)) (agent/session-events session)))))
+            (is (= :fail (:status (first (filter #(= :tool_hook_error (:type %)) (agent/session-events session))))))
+            (finally (agent/close-session! session)))))
+      (finally (remove-fixture! root [])))))
+
+(deftest pre-veto-still-audits-post
+  (let [seen (atom []) {:keys [session invoked]}
+        (fixture {:pre "deny" :post "audit"}
+          (fn [command _ _ _ input]
+            (swap! seen conj (json/read-json input))
+            {:exit_code (if (= command "deny") 7 0) :stdout "denied" :stderr ""})
+          [call] (fn [_ _] "not run"))]
+    (try
+      (agent/process-input! session "work")
+      (is (= 0 @invoked)) (is (= 2 (count @seen)))
+      (is (true? (get-in @seen [1 "skipped"])))
+      (is (true? (get-in @seen [1 "is_error"])))
+      (is (true? (get-in @session [:history 2 :results 0 :is_error])))
+      (is (str/includes? (get-in @seen [1 "result"]) "exit 7"))
+      (finally (agent/close-session! session)))))
+
+(deftest invocation-context-snapshot-precedes-start-callback
+  (let [seen (atom []) {:keys [session]}
+        (fixture {:pre "old-pre" :post "old-post" :node_id "old"}
+                 (fn [command & _] (swap! seen conj command) {:exit_code 0})
+                 [call (assoc call :id "next")] (fn [_ _] "value"))]
+    (try
+      (agent/process-input! session "work"
+        (fn [event]
+          (when (and (= :tool_call_start (:type event)) (= "call" (:call_id event)))
+            (reset! (:tool_hook_context @session) {:pre "new-pre" :post "new-post" :node_id "new"}))))
+      (is (= ["old-pre" "old-post" "new-pre" "new-post"] @seen))
+      (finally (agent/close-session! session)))))
+
+(deftest concurrent-sessions-append-complete-edn-forms
+  (let [root (temp-dir)
+        sessions (mapv (fn [_] (:session (fixture {:pre "pre" :post "post" :stage_dir root}
+                         (fn [& _] {:exit_code 0}) [call] (fn [_ _] "value")))) (range 8))]
+    (try
+      (let [workers (mapv (fn [session] (future (agent/process-input! session "work"))) sessions)
+            results (mapv #(deref % 3000 ::pending) workers)
+            records (forms (str root "/tool-hooks.edn"))]
+        (is (= (vec (repeat 8 "done")) results))
+        (is (= 16 (count records)))
+        (is (= 16 (count (set (map #(vector (:session_id %) (:phase %)) records))))))
+      (finally (doseq [session sessions] (agent/close-session! session))
+               (remove-fixture! root ["tool-hooks.edn"])))))
+
+(deftest native-hook-timeout-vetoes-but-post-still-runs
+  (let [root (temp-dir) local (execution/make-local-environment {:working_dir root :env_policy :none})
+        {:keys [session invoked]}
+        (fixture {:pre "/bin/sleep 2" :post "printf audit > audited" :timeout_ms 500 :stage_dir root}
+                 (:exec_command_stdin local) [call] (fn [_ _] "not run"))]
+    (try
+      (agent/process-input! session "work")
+      (is (= 0 @invoked)) (is (= "audit" (io/slurp (str root "/audited"))))
+      (is (= [124 0] (mapv #(get-in % [:command_result :exit_code]) (forms (str root "/tool-hooks.edn")))))
+      (is (true? (get-in (forms (str root "/tool-hooks.edn")) [0 :command_result :timed_out])))
+      (finally (agent/close-session! session) ((:cleanup local))
+               (remove-fixture! root ["audited" "tool-hooks.edn"])))))
+
+(deftest native-hook-cancellation-joins-without-post-or-late-descendant
+  (let [root (temp-dir) local (execution/make-local-environment {:working_dir root :env_policy :none})
+        {:keys [session invoked]}
+        (fixture {:pre "printf started > started; (/bin/sleep 1; printf late > late) & wait"
+                  :post "printf forbidden > post"}
+                 (:exec_command_stdin local) [call] (fn [_ _] "not run"))]
+    (swap! session update :execution_env assoc :cleanup (:cleanup local))
+    (let [worker (future (agent/process-input! session "work"))]
+      (try
+        (loop [n 100] (when (and (nil? (os/stat (str root "/started"))) (pos? n)) (sleep 10) (recur (dec n))))
+        (is (some? (os/stat (str root "/started"))))
+        (agent/abort-session! session)
+        (is (not= ::pending (deref worker 4000 ::pending)))
+        (sleep 1100)
+        (is (= 0 @invoked)) (is (nil? (os/stat (str root "/post"))))
+        (is (nil? (os/stat (str root "/late"))))
+        (is (= :session_end (:type (last (agent/session-events session)))))
+        (finally (agent/close-session! session) ((:cleanup local))
+                 (remove-fixture! root ["started" "late" "post"]))))))

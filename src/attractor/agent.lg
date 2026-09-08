@@ -5,6 +5,7 @@
             [json :as json]
             [attractor.llm :as llm]
             [attractor.execution :as execution]
+            [attractor.tool-hooks :as tool-hooks]
             [attractor.profiles :as profiles]))
 
 ;; Provider-profile tool output limits from Coding Agent Loop §5.
@@ -415,6 +416,7 @@
                  :model (:model profile)
                  :provider_profile profile
                  :execution_env environment
+                 :tool_hook_context (or (:tool_hook_context options) (atom (or (:tool_hooks options) {})))
                  :llm_client (:llm_client options)
                  :event_fn (:on_event options)
                  :events (atom [])
@@ -682,17 +684,21 @@
         args (normalize-tool-arguments raw-args)
         registered (profiles/registry-get
                      (get-in @session [:provider_profile :tool_registry])
-                     tool-name)]
+                     tool-name)
+        hooks @(:tool_hook_context @session)
+        identity {:node_id (:node_id hooks) :session_id (:id @session) :call_id call-id :tool_name tool-name}
+        stopped? #(session-stopped? session)]
     (event-fn {:type :tool_call_start :tool_name tool-name :call_id call-id})
-    (if (nil? registered)
-      (let [error-msg (str "Unknown tool: " tool-name)
-            result {:tool_call_id call-id :tool_name tool-name
-                    :content (truncate-tool-output error-msg tool-name (:config @session))
-                    :is_error true}]
-        (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
-        result)
-      (try
-        (let [_ (when-not (map? args)
+    (let [pre (tool-hooks/run! hooks :pre identity raw-args nil (:execution_env @session) stopped? event-fn)
+          _ (when (:cancelled pre) (abort-session! session))
+          outcome
+          (cond
+            (stopped?) {:result "Session cancelled" :is_error true :skipped true}
+            (not (:ok? pre)) {:result (or (:message pre) "Pre-hook vetoed tool") :is_error true :skipped true}
+            (nil? registered) {:result (str "Unknown tool: " tool-name) :is_error true :skipped true}
+            :else
+            (try
+              (let [_ (when-not (map? args)
                   (throw
                     (ex-info "Tool arguments must be a JSON object"
                              {:category :invalid-tool-arguments})))
@@ -701,20 +707,19 @@
                 args (get-in registered [:definition :parameters]))
               _ (when-not valid?
                   (throw (ex-info reason {:category :invalid-tool-arguments})))
-              raw-output ((:executor registered) args (:execution_env @session))
-              raw-text (if (string? raw-output) raw-output (pr-str raw-output))
-              truncated (truncate-tool-output raw-text tool-name (:config @session))
-              result {:tool_call_id call-id :tool_name tool-name
-                      :content truncated :is_error false}]
-          (event-fn {:type :tool_call_end :call_id call-id :output raw-text})
-          result)
-        (catch Object e
-          (let [error-msg (str "Tool error (" tool-name "): " e)
-                result {:tool_call_id call-id :tool_name tool-name
-                        :content (truncate-tool-output error-msg tool-name (:config @session))
-                        :is_error true}]
-            (event-fn {:type :tool_call_end :call_id call-id :error error-msg})
-            result))))))
+                    raw-output ((:executor registered) args (:execution_env @session))]
+                {:result raw-output :is_error false :skipped false})
+              (catch Object error {:result (str "Tool error (" tool-name "): " error)
+                                   :is_error true :skipped (= :invalid-tool-arguments (:category (ex-data error)))})))
+          raw-output (:result outcome)
+          raw-text (if (string? raw-output) raw-output (pr-str raw-output))]
+      (let [post (tool-hooks/run! hooks :post identity raw-args outcome (:execution_env @session) stopped? event-fn)]
+        (when (:cancelled post) (abort-session! session)))
+      (event-fn (merge {:type :tool_call_end :call_id call-id}
+                       (if (:is_error outcome) {:error raw-text} {:output raw-text})))
+      {:tool_call_id call-id :tool_name tool-name
+       :content (truncate-tool-output raw-text tool-name (:config @session))
+       :is_error (:is_error outcome)})))
 
 (defn- response-content [response]
   (or (when (:message response) (llm/response-text response))
@@ -1084,6 +1089,7 @@
           child
           (make-session
             {:id child-id
+             :tool_hook_context (:tool_hook_context @parent)
              :provider_profile child-profile
              :execution_env child-environment
              :llm_client (:llm_client @parent)

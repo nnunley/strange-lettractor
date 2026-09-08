@@ -1,0 +1,68 @@
+(ns attractor.tool-hooks
+  (:require [clojure.string :as str] [json :as json] [io :as io]))
+
+;; Shared across independent sessions as well as descendants writing one stage.
+(def append-lock (atom false))
+(defn json-text [value]
+  ;; let-go #817 double-quotes map string keys. Scalar encoding is correct.
+  (cond
+    (map? value) (str "{" (str/join "," (map (fn [[key item]]
+                        (let [key (cond (string? key) key (keyword? key) (subs (str key) 1)
+                                        :else (throw (ex-info "Hook JSON keys must be strings or keywords" {})))]
+                          (str (json/write-json key) ":" (json-text item)))) value)) "}")
+    (sequential? value) (str "[" (str/join "," (map json-text value)) "]")
+    (or (nil? value) (string? value) (number? value) (boolean? value)) (json/write-json value)
+    (keyword? value) (json/write-json (subs (str value) 1))
+    :else (throw (ex-info "Unsupported hook JSON value" {}))))
+
+(defn- append! [stage record]
+  (loop [] (when-not (compare-and-set! append-lock false true) (sleep 1) (recur)))
+  (try
+    (let [writer (io/open (str stage "/tool-hooks.edn") :append)]
+      (try (io/write! writer (str (pr-str record) "\n"))
+           (finally (io/close! writer))))
+    (finally (reset! append-lock false))))
+
+(defn- bounded [text] (let [text (str text)] (subs text 0 (min 2000 (count text)))))
+(defn run! [hooks phase identity arguments outcome environment stopped? emit]
+  (let [command (get hooks phase)]
+    (if (or (nil? command) (= "" command))
+      {:ok? true}
+      (if (stopped?)
+        {:ok? false :cancelled true :message "Session cancelled"}
+        (let [payload (merge identity {:phase (name phase) :arguments arguments} outcome)
+              execution-result
+              (try
+                (when-not (string? command) (throw (ex-info "Hook command must be a string" {})))
+                (when-not (:exec_command_stdin environment)
+                  (throw (ex-info "Execution environment does not support hook stdin" {})))
+                (let [timeout (or (:timeout_ms hooks) 10000)]
+                  (when-not (and (number? timeout) (pos? timeout))
+                    (throw (ex-info "Hook timeout must be positive" {})))
+                  ((:exec_command_stdin environment) command timeout nil
+                    {"ATTRACTOR_HOOK_PHASE" (name phase)
+                     "ATTRACTOR_NODE_ID" (str (or (:node_id identity) ""))
+                     "ATTRACTOR_SESSION_ID" (str (:session_id identity))
+                     "ATTRACTOR_TOOL_CALL_ID" (str (:call_id identity))
+                     "ATTRACTOR_TOOL_NAME" (str (:tool_name identity))}
+                    (json-text payload)))
+                (catch Object error
+                  (merge (:command_result (ex-data error))
+                         {:exit_code -1 :error (bounded (str error))})))
+              okay (and (= 0 (:exit_code execution-result))
+                        (not (:cancelled execution-result)) (not (:timed_out execution-result)))
+              record (merge identity {:phase phase :status (if okay :success :fail)
+                                      :command_result execution-result})
+              log-error (when (seq (:stage_dir hooks))
+                          (try (append! (:stage_dir hooks) record) nil
+                               (catch Object error (bounded (str error)))))
+              message (cond log-error (str "Hook audit log failed: " log-error)
+                            (not okay) (str "Hook " (name phase) " failed (exit " (:exit_code execution-result) "): "
+                                            (bounded (or (first (remove #(or (nil? %) (str/blank? %))
+                                                                        [(:error execution-result) (:stderr execution-result)
+                                                                         (:stdout execution-result)])) ""))))]
+          ;; Never invoke callbacks while holding the append lock.
+          (emit (merge {:type (if log-error :tool_hook_error :tool_hook)
+                        :phase phase :status (if log-error :fail (:status record)) :call_id (:call_id identity)}
+                       (when message {:message message})))
+          {:ok? (and okay (nil? log-error)) :cancelled (boolean (:cancelled execution-result)) :message message})))))
