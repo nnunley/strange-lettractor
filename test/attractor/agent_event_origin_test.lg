@@ -1,0 +1,97 @@
+(ns attractor.agent-event-origin-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; Native public-API coverage for the event-origin amendment: bound
+;; agent/*event-origin* travels with forwarded child events and with each
+;; captured child input (including queued sends), never inferred from an
+;; unrelated drainer thread.
+(defn- make-fixture-session [complete on-event]
+  (agent/make-session
+    {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                         :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+     :project_docs [] :complete_fn complete :on_event on-event}))
+
+(defn- user-content [request]
+  (:content (last (filter #(= :user (:role %)) (:messages request)))))
+
+(defn- forwarded-user-inputs [events content]
+  (filter #(and (= :subagent_event (:type %))
+                (= :user_input (get-in % [:event :type]))
+                (= content (get-in % [:event :content])))
+          events))
+
+(deftest forwarded-child-events-retain-bound-parent-turn-origin
+  (let [events (atom []) entered (promise) release (promise)
+        complete (fn [request]
+                   (let [content (user-content request)]
+                     (when (= content "child")
+                       (deliver entered true) (deref release 3000 nil))
+                     {:message {:role :assistant :content (str content "-done")}}))
+        session (make-fixture-session complete (fn [event] (swap! events conj event)))]
+    (try
+      (let [admission (binding [agent/*event-origin* {:hub_turn_id "A"}]
+                        (agent/spawn-subagent! session {"task" "child"}))
+            agent-id (:agent_id admission)]
+        (is (= true (deref entered 3000 false)))
+        (deliver release true)
+        (is (= "child-done" (:output (agent/wait-subagent! session agent-id))))
+        (let [forwarded (forwarded-user-inputs @events "child")]
+          (is (seq forwarded))
+          (is (every? #(= {:hub_turn_id "A"} (:origin %)) forwarded))))
+      (finally (deliver release true) (agent/close-session! session)))))
+
+(deftest queued-child-input-carries-its-own-admission-origin-not-the-running-turn
+  (let [events (atom []) first? (atom true)
+        entered (promise) release (promise) second-entered (promise)
+        complete (fn [request]
+                   (let [content (user-content request)]
+                     (if (and (= content "child") (compare-and-set! first? true false))
+                       (do (deliver entered true) (deref release 3000 nil)
+                           {:message {:role :assistant :content "child-done"}})
+                       (do (deliver second-entered true)
+                           {:message {:role :assistant :content (str content "-done")}}))))
+        session (make-fixture-session complete (fn [event] (swap! events conj event)))]
+    (try
+      (let [admission (binding [agent/*event-origin* {:hub_turn_id "A"}]
+                        (agent/spawn-subagent! session {"task" "child"}))
+            agent-id (:agent_id admission)]
+        (is (= true (deref entered 3000 false)))
+        (binding [agent/*event-origin* {:hub_turn_id "B"}]
+          (agent/send-subagent-input! session agent-id "second"))
+        (binding [agent/*event-origin* nil]
+          (agent/send-subagent-input! session agent-id "third"))
+        (deliver release true)
+        (is (= true (deref second-entered 3000 false)))
+        (is (= "third-done" (:output (agent/wait-subagent! session agent-id))))
+        (let [first-forwarded (forwarded-user-inputs @events "child")
+              second-forwarded (forwarded-user-inputs @events "second")
+              third-forwarded (forwarded-user-inputs @events "third")]
+          (is (seq first-forwarded))
+          (is (every? #(= {:hub_turn_id "A"} (:origin %)) first-forwarded))
+          (is (seq second-forwarded))
+          (is (every? #(= {:hub_turn_id "B"} (:origin %)) second-forwarded))
+          (is (seq third-forwarded))
+          (is (every? #(nil? (:origin %)) third-forwarded))))
+      (finally (deliver release true) (agent/close-session! session)))))
+
+(deftest forwarded-child-events-default-to-nil-origin-without-a-bound-turn
+  (let [events (atom []) entered (promise) release (promise)
+        complete (fn [request]
+                   (let [content (user-content request)]
+                     (when (= content "child")
+                       (deliver entered true) (deref release 3000 nil))
+                     {:message {:role :assistant :content (str content "-done")}}))
+        session (make-fixture-session complete (fn [event] (swap! events conj event)))]
+    (try
+      (let [admission (agent/spawn-subagent! session {"task" "child"})
+            agent-id (:agent_id admission)]
+        (is (= true (deref entered 3000 false)))
+        (deliver release true)
+        (is (= "child-done" (:output (agent/wait-subagent! session agent-id))))
+        (let [forwarded (forwarded-user-inputs @events "child")]
+          (is (seq forwarded))
+          (is (every? #(nil? (:origin %)) forwarded))))
+      (finally (deliver release true) (agent/close-session! session)))))

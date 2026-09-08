@@ -15,6 +15,40 @@ unless concrete evidence below says otherwise. No conformance story is removed.
 | CONSOLE-TUI-01 | tiny-tui full-screen presentation using same dispatcher as line console | Headless integration plus native PTY |
 | CONSOLE-HUB-01 | RPC hub owns framework sessions, workers and evaluation; console is a client; disconnect does not implicitly cancel work | Separate-process client/hub lifecycle tests, explicit cancel and reconnect/event subscription evidence |
 
+CONSOLE-HUB-01A is the implemented agent-ownership component of CONSOLE-HUB-01,
+specified in `docs/hub-session-plan.md`. Its public in-process integration scenario
+SCN-HUB-AGENT-OWNERSHIP proves actual agent ownership, scoped client detach,
+cancel/shutdown and bounded event history. It does not satisfy the parent story's
+separate-process RPC or workflow/evaluation obligations.
+
+## SCN-HUB-AGENT-OWNERSHIP
+
+The in-process `attractor.hub` owns actual agent sessions and native scoped turn
+workers. Public requests cover open/list/submit/cancel, client attach/detach and
+joined shutdown; bounded event history uses explicit replay cursors. Event origin
+is captured at emission and per queued child input, not callback delivery.
+
+Focused native and outside-checkout bundle: 20 tests / 149 assertions, no failures.
+Existing affected lifecycle checks: 166/1044/0. Full default suite: 719/6926/0.
+Build/help pass. A live tool-free Qwen turn through hub -> agent -> unified client
+-> llama.cpp returned `hub connected`, with 7 retained events and 2 text deltas
+after detach and attachment of a new observer. This is not a separate-process RPC
+or terminal client test.
+
+Actual Claude implemented the bounded origin change through the published
+let-go connector. Main stabilized the original failing fixture, strengthened
+queued-nil and active/idle-close evidence, and ran the commands. A separate
+read-only Claude review approved the agent/test changes; its hub read window
+missed the mapping, which main inspected directly. No full TUI/hub story closure.
+
+## SCN-CLAUDE-WORKER
+
+CONSOLE-WORKER-02's standalone/DOT worker component is public as `84c3b7a`.
+Native subprocess tests pass 7/40; CLI plus existing CLI tests pass 12/89. Both
+compiled direct and real DOT LICENSE trials succeeded through the connector.
+See [worker interface and permissions](claude-worker.md). Hub worker attachment
+and interleaved console rendering remain pending.
+
 ## SCN-CONSOLE-INPUT
 
 Status: implemented, focused/full/bundle verified; paired final audit clean.

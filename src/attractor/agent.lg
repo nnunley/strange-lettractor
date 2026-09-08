@@ -141,6 +141,11 @@
 
 (def ^:dynamic *delivering-session-id* nil)
 (def ^:dynamic *delivering-session-ids* #{})
+;; Trusted host context stamped onto every event before enqueueing. Never read
+;; from model-produced event payloads. Hub turn workers and forwarded child
+;; admissions bind this explicitly per invocation rather than relying on a
+;; worker's inherited core/future binding for later queued inputs.
+(def ^:dynamic *event-origin* nil)
 
 (defn- deliver-event! [session stamped listener]
   (binding [*delivering-session-id* (:id @session)
@@ -184,7 +189,8 @@
 (defn- stamped-event [session event]
   (assoc event
          :timestamp (System/currentTimeMillis)
-         :session_id (:id @session)))
+         :session_id (:id @session)
+         :origin *event-origin*))
 
 (defn- emit-event! [session event & [listener]]
   (let [stamped
@@ -1078,24 +1084,26 @@
 ;; send's admission share this lock, so neither can strand an accepted message.
 (defn- admit-subagent-run! [parent agent-id input]
   (parent-open! parent)
-  (let [handle (subagent-handle! parent agent-id)]
+  (let [handle (subagent-handle! parent agent-id)
+        entry {:input input :origin *event-origin*}]
     (when (or (= :closed (:status handle)) (= :closed (:state @(:session handle))))
       (throw (ex-info "Cannot send to a closed subagent" {:category :session-closed :agent_id agent-id})))
     (if (= :running (:status handle))
-      (do (swap! parent update-in [:subagents agent-id :pending] conj input)
+      (do (swap! parent update-in [:subagents agent-id :pending] conj entry)
           {:agent_id agent-id :status :running :queued true})
       (let [completion (promise)]
         (swap! parent update-in [:subagents agent-id]
                assoc :status :running :result nil :pending [] :future completion)
-        {:agent_id agent-id :status :running :completion completion :child (:session handle) :input input}))))
+        {:agent_id agent-id :status :running :completion completion :child (:session handle) :input entry}))))
 
 (defn- launch-subagent-run! [parent admission]
   (when-let [completion (:completion admission)]
     (let [agent-id (:agent_id admission) child (:child admission)]
       (core/future
-        (loop [input (:input admission)]
+        (loop [entry (:input admission)]
           (let [result (try
-                         (let [output (process-input! child input)]
+                         (let [output (binding [*event-origin* (:origin entry)]
+                                        (process-input! child (:input entry)))]
                            {:output output :success true
                             :turns_used (subagent-turn-count child)})
                          (catch Object e {:output (str e) :success false
@@ -1108,9 +1116,9 @@
                                       (= :closed (:state @parent))
                                       (:abort_signaled @child))]
                       (if (and (not closed?) (:success result) (seq (:pending handle)))
-                        (let [next-input (first (:pending handle))]
+                        (let [next-entry (first (:pending handle))]
                           (swap! parent update-in [:subagents agent-id] assoc :pending (vec (rest (:pending handle))))
-                          {:next next-input})
+                          {:next next-entry})
                         (let [final-result (if closed?
                                              {:output "Subagent cancelled" :success false
                                               :turns_used (subagent-turn-count child)} result)]
@@ -1173,10 +1181,11 @@
              :subagent_depth (inc depth)
              :on_event
              (fn [event]
-               (emit-event! parent
-                            {:type :subagent_event
-                             :agent_id child-id
-                             :event event}))})
+               (binding [*event-origin* (:origin event)]
+                 (emit-event! parent
+                              {:type :subagent_event
+                               :agent_id child-id
+                               :event event})))})
           agent-id (:id @child)]
       (let [admission
             (try

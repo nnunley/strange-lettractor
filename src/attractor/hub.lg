@@ -1,0 +1,183 @@
+(ns attractor.hub
+  (:require [clojure.core :as core] [async :as async] [attractor.agent :as agent]))
+
+(defn- locked [lock f]
+  (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
+  (try (f) (finally (reset! lock false))))
+(defn- fail! [category] (throw (ex-info (name category) {:category category})))
+(defn- error-data [error]
+  {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
+(defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
+(defn- append-event! [hub id event]
+  (locked (:event_lock hub)
+    (fn []
+      (let [log @(:log hub) seq (inc (:cursor log))
+            events (conj (:events log) {:seq seq :source :agent :session_id id
+                                        :turn_id (:hub_turn_id (:origin event)) :event event})
+            excess (- (count events) (:event_capacity hub))]
+        (reset! (:log hub) (assoc log :cursor seq :events (if (pos? excess) (subvec events excess) events)))))))
+
+(defn events-since [hub client-id cursor]
+  (locked (:event_lock hub)
+    (fn []
+      (let [{:keys [events clients] newest :cursor} @(:log hub)]
+        (when-not (contains? clients client-id) (fail! :unknown-client))
+        (when-not (and (integer? cursor) (<= 0 cursor newest)) (fail! :invalid-cursor))
+        (when (and (seq events) (< cursor (dec (:seq (first events))))) (fail! :cursor-expired))
+        {:cursor newest :events (vec (filter #(> (:seq %) cursor) events))}))))
+
+(defn- entry! [hub id]
+  (or (get @(:sessions hub) id) (fail! :unknown-session)))
+(defn- launch! [f & [publisher]]
+  (let [completion (promise) publish (or publisher deliver)]
+    (try
+      (core/future (publish completion (try {:value (f)} (catch Object e {:error (error-data e)}))))
+      (catch Object e (publish completion {:error (error-data e)})))
+    completion))
+(defn- cancel-entry! [hub entry]
+  ;; Cancellation and final result publication share one linearization lock.
+  ;; Abort/cleanup may invoke listeners, so always launch it after releasing.
+  ;; Capture the unfinished target turn's ID under that same lock; completed or
+  ;; idle sessions have no unfinished turn, so their close binds nil origin.
+  (let [turn-id (locked (:event_lock hub)
+                  (fn []
+                    (reset! (:closed entry) true)
+                    (let [turn (:turn entry)]
+                      (when (and turn (not (realized? (:completion turn))))
+                        (:turn_id turn)))))]
+    (or @(:cancellation entry)
+        (let [completion (launch! #(binding [agent/*event-origin* (when turn-id {:hub_turn_id turn-id})]
+                                      (agent/abort-session! (:agent entry))
+                                      {:cancelled true}))]
+          (reset! (:cancellation entry) completion)
+          completion))))
+
+(defn- operation! [hub request]
+  (case (:op request)
+    :session/open
+    (let [id (str "session-" (random-uuid))
+          session (binding [agent/*event-origin* nil]
+                    (agent/make-session
+                      (assoc (:session_options hub) :id id :on_event #(append-event! hub id %))))
+          entry {:agent session :closed (atom false) :cancellation (atom nil) :turn nil}]
+      (swap! (:sessions hub) assoc id entry)
+      {:session_id id})
+    :session/list
+    (mapv (fn [[id entry]] {:session_id id :closed (or @(:closed entry) (= :closed (:state @(:agent entry))))
+                            :busy (boolean (and (:turn entry) (not (realized? (:completion (:turn entry))))))})
+          @(:sessions hub))
+    :session/submit
+    (let [id (:session_id request) entry (entry! hub id) session (:agent entry)]
+      (when (or @(:closed entry) (= :closed (:state @session))) (fail! :session-closed))
+      (when (and (:turn entry) (not (realized? (:completion (:turn entry))))) (fail! :busy))
+      (when-not (string? (:text request)) (fail! :invalid-request))
+      (let [turn-id (str "turn-" (random-uuid))
+            completion (launch! (fn []
+                                  (let [output (binding [agent/*event-origin* {:hub_turn_id turn-id}]
+                                                 (agent/process-input! session (:text request)))]
+                                    (when (or @(:closed entry) (:abort_signaled @session)) (fail! :cancelled))
+                                    output))
+                         (fn [done result]
+                           (locked (:event_lock hub)
+                             (fn []
+                               ;; Realization and final-result publication share
+                               ;; event sequencing with cancellation.
+                               (deliver done (if (or @(:closed entry) (:abort_signaled @session))
+                                               {:error {:category :cancelled :message "Turn cancelled"}}
+                                               result))))))
+            turn {:session_id id :turn_id turn-id :completion completion}]
+        (swap! (:sessions hub) assoc-in [id :turn] turn)
+        turn))
+    :session/cancel
+    (let [entry (entry! hub (:session_id request))]
+      {:session_id (:session_id request) :completion (cancel-entry! hub entry)})
+    :client/attach
+    (locked (:event_lock hub)
+      (fn [] (let [id (str "client-" (random-uuid))]
+               (swap! (:log hub) update :clients conj id)
+               {:client_id id :cursor (:cursor @(:log hub))})))
+    :client/detach
+    (locked (:event_lock hub)
+      (fn [] (let [id (:client_id request)]
+               (when-not (contains? (:clients @(:log hub)) id) (fail! :unknown-client))
+               (swap! (:log hub) update :clients disj id)
+               {:client_id id :detached true})))
+    (fail! :unknown-operation)))
+
+(defn- shutdown! [hub scope failure]
+  ;; The supervisor goroutine belongs to its host scope, not this child scope.
+  ;; Admission is closed before draining queued replies. Never wait on workers
+  ;; while holding admission/event locks, and never publish via the mailbox.
+  (locked (:admission_lock hub) #(swap! (:admission hub) assoc :stopped true))
+  (loop [] (when-let [packet (async/poll! (:mailbox hub))]
+             (reply! packet {:error {:category :stopped}}) (recur)))
+  (let [entries (vals @(:sessions hub))]
+    (doseq [entry entries] (cancel-entry! hub entry))
+    ;; Allocation of abort futures is not proof they ran. Observe actual abort
+    ;; entry or a tagged failure before cancellation/drain of their native scope.
+    (doseq [entry entries]
+      (loop []
+        (when-not (or (:abort_signaled @(:agent entry)) (realized? @(:cancellation entry)))
+          (core/sleep 1) (recur))))
+    (core/scope-close! scope 0)
+    (let [error (or failure (first (keep #(get (deref @(:cancellation %)) :error) entries)))
+          result (if error {:error error} {:value {:stopped true}})]
+      (locked (:admission_lock hub)
+        (fn []
+          (swap! (:admission hub) assoc :done true :stop_result result)
+          (doseq [packet (:stop_replies @(:admission hub))] (reply! packet result))
+          (swap! (:admission hub) assoc :stop_replies []))))))
+
+(defn request!
+  "Nonblocking bounded mailbox admission. IDs correlate replies only: mutation
+   retries are NOT deduplicated. Client timeouts do not revoke admitted requests."
+  [hub request]
+  (let [packet {:request request :reply (promise)}]
+    (locked (:admission_lock hub)
+      (fn []
+        (let [state @(:admission hub)]
+          (cond
+            (not (and (map? request) (contains? request :id) (keyword? (:op request))))
+            (reply! packet {:error {:category :invalid-request}})
+            (= :hub/stop (:op request))
+            (cond
+              (:done state) (reply! packet (:stop_result state))
+              (or (:stop_requested state) (:stopped state)) (swap! (:admission hub) update :stop_replies conj packet)
+              (async/offer! (:mailbox hub) packet)
+              (swap! (:admission hub) assoc :stop_requested true :stop_replies [packet])
+              :else (reply! packet {:error {:category :mailbox-full}}))
+            (:stopped state) (reply! packet {:error {:category :stopped}})
+            (not (async/offer! (:mailbox hub) packet)) (reply! packet {:error {:category :mailbox-full}})))))
+    (:reply packet)))
+
+(defn start!
+  "Start under a host scope kept alive for the service lifetime. Session options
+   are trusted startup values, never remote request configuration/code."
+  [opts]
+  (let [capacity (get opts :event_capacity 1024) mailbox-capacity (get opts :mailbox_capacity 64)]
+    (when-not (and (integer? capacity) (pos? capacity) (integer? mailbox-capacity) (pos? mailbox-capacity))
+      (fail! :invalid-capacity))
+    (let [ready (promise)
+          hub {:event_capacity capacity :session_options (:session_options opts)
+               :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
+               :event_lock (atom false) :admission (atom {:stop_replies []})
+               :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}]
+      (try
+        (core/future
+          (try
+            (let [scope (core/scope-open) failure (atom nil)]
+              (deliver ready {:value true})
+              (try
+                (loop []
+                  (let [packet (async/<! (:mailbox hub))]
+                    (when-not packet (fail! :supervisor-stopped))
+                    (when-not (= :hub/stop (:op (:request packet)))
+                      (reply! packet (try {:value (operation! hub (:request packet))}
+                                          (catch Object e {:error (error-data e)})))
+                      (recur))))
+                (catch Object e (reset! failure (error-data e)))
+                (finally (shutdown! hub scope @failure))))
+            (catch Object e (deliver ready {:error (error-data e)}))))
+        (catch Object e (deliver ready {:error (error-data e)})))
+      (when-let [error (:error @ready)] (throw (ex-info "Hub startup failed" error)))
+      hub)))

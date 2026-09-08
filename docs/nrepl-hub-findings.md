@@ -21,9 +21,12 @@ implementation or a completed Attractor integration.
 
 Live probe: `/tmp/lettractor-nrepl-probe.AIcFXP/probe.lg`, native let-go only,
 1 test / 5 assertions / zero failures, exit 0. These assertions confirm observed
-limitations, not desired acceptance. The timeout assertion catches any exception,
-so source inspection is the stronger evidence for output buffering; tighten the
-probe before treating it as an upstream regression test. No runtime source edited.
+limitations, not desired acceptance. A subsequent run strengthened the timeout
+assertion to require a timeout diagnostic, and took the actual ephemeral port as
+an argument: 1/5/0, exit 0. Source inspection remains stronger evidence for the
+buffering/interrupt implementation than this time-bounded wire observation; the
+probe is not a comprehensive upstream session-isolation regression suite. The
+owned loopback server was stopped after both runs. No runtime source edited.
 
 ## Next decision
 

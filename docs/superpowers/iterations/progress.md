@@ -1,7 +1,86 @@
 # Progress
 
-**Phase:** console extension input component verified checkpoint
-**Task:** input reducer 7/92 passing; full suite 686/6705 passing; paired audit clean
+**Phase:** hub agent-ownership component verified
+**Next:** RPC transport and hub-side eval/workflow/worker integration; full Attractor conformance backlog remains open
+
+Final hub evidence: focused native and outside-checkout bundle20/149/0, existing
+affected lifecycle166/1044/0, full default suite719/6926/0, build/help pass. Live
+Qwen through hub/agent/unified streaming returned `hub connected` with7 events and
+2 text deltas recovered by a new observer after detach. Actual Claude implemented
+the origin repair through the shipped connector; main corrected the fixture's
+drainer-owner race and strengthened queued-nil/cancel-origin assertions. Bounded
+Claude review approved agent/test changes; main directly inspected the hub
+mapping omitted by that review's read-window interpretation. No runtime changes,
+RPC transport, console eval or full TUI completion claimed.
+
+## Historical checkpoints (superseded by current status above)
+
+Claude connector checkpoint `84c3b7a` is committed and remotely verified on public
+main/console. Root CLI was rebuilt. Both live standalone and DOT LICENSE trials
+succeeded through the actual let-go connector. Clean publication candidate full
+suite passes 699/6777/0; focused worker7/40 and CLI12/89 pass. Use this connector
+for subsequent Claude work, not ad hoc shell review scripts. Hub origin work
+below remains preserved, uncommitted, and separately incomplete.
+
+First actual implementation dispatch through `bin/attractor claude` has started
+with Read/Edit/Write, acceptEdits and four named files. No shell/tool-permission
+bypass or ad hoc lg-e dispatch. Fresh baseline exposed a fixture drainer-owner
+race: the parent could drain/block the child event itself. A provider-entry gate
+now forces the child-owned drainer; three consecutive native runs have exactly
+16 tests / 122 passing / 2 intended origin failures / zero errors. The worker
+is implementing against that stable RED; no green or completion claim yet.
+
+The user explicitly requested a proper let-go strange-lettractor interface for
+Claude dispatch instead of repeated ad hoc scripts and prolonged hub review loops.
+Implement the owned streaming CLI worker, short public command and DOT backend
+integration now. Preserve unfinished hub changes separately. The permanent hub
+origin regression is RED: 16 tests / 122 passing / 2 failing assertions / zero
+errors; both failures are the known delayed A-event attribution after B admission.
+No active hub test process remains. The external origin design retry finished
+successfully with approval, but implementing it is deferred to honor this priority.
+
+`docs/hub-session-plan.md` specifies hub supervisor ownership, bounded admission,
+nonblocking cancellation, client detach, event replay and shutdown proof. Paired
+Codex/actual Claude scope review approved after resolving self-closure and event
+listener duplication. The hub candidate is not yet approved. Most recent
+source baseline is 686 tests / 6705 assertions / zero failures; the input-router
+checkpoint and documentation-only listener request are public as 5e771ba/f36611e.
+Fresh existing agent/lifecycle impacted baseline: 166 tests / 1044 assertions /
+zero failures, terminal exit 0; hub implementation has not changed those APIs.
+Initial hub test RED: 5 tests / 0 passing / 5 failing assertions / zero errors,
+exit 1 against the minimal missing-behavior stub. These failures currently gate
+entry into deeper real-agent integration checks; they are not passing evidence.
+Spec review reproduced a missing cancellation/publication boundary: a cancel can
+acknowledge closure before a previously computed success is published. Permanent
+public cancel/stop regression RED: 15 tests / 106 passing / 2 failing assertions,
+zero errors. Cancellation marking and final result publication now share the
+event lock; abort remains outside it. After strengthening immediate shutdown
+completion and interleaved turn identity assertions, root independently verified
+15 tests / 114 assertions / zero failures, exit 0. Full-suite/live trial and
+component completion remain gated on the outstanding event-origin fix/reviews.
+Fresh post-fix existing agent/lifecycle checks also pass 166 tests / 1044
+assertions, zero failures, exit 0. These do not cover the outstanding origin bug.
+The second confirmed defect uses actual built-in `spawn_agent`: a child-forwarded
+callback holds the parent drainer while the parent completes; releasing queued
+`processing_end` then produces a nil hub turn ID. Delivery-time mutable identity
+is insufficient. Emission-time provenance is under design review before any
+agent API change. The cancellation/publication fix is frozen for re-review.
+
+Actual Claude spec review completed (exit 0). Native source adjudication rejects
+two suspected runtime problems: `CoreScopeClose` calls `CloseScoped`, whose
+`Await(0)` joins indefinitely and returns no boolean to Lisp; `CoreSubvecf` copies
+both array and persistent vector ranges. Immediate completion-realized assertions
+after shutdown were added. A separate native source/probe adjudication rejects
+the claimed cancellation-unwind publication hang: native sleep returns nil on
+cancel, future execution is not preempted, and a scope-cancelled worker held at a
+CAS lock still publishes after release and joins with zero liveness. The proposed
+shutdown-tail throw also has no supported reproducer: valid scope close/promise
+operations do not throw, and actual abort/cleanup errors are already tagged and
+tested. No speculative finally/timeout workaround was added.
+
+Emission-origin amendment now has one scope approval. The actual Claude second
+review ended with DNS ENOTFOUND (exit 1); a network-authorized retry is running.
+No agent API changes begin until that review is adjudicated.
 
 User-directed console extension is tracked in `docs/console-requirements.md`.
 The console/TUI is an RPC client; a hub owns Attractor. Stock nREPL limitations

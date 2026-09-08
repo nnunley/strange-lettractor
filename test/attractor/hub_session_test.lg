@@ -1,0 +1,421 @@
+(ns attractor.hub-session-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [async :as async] [attractor.hub :as hub]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+;; SCN-HUB-AGENT-OWNERSHIP: real agent sessions, in-process transport seam.
+(defn- options [complete]
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                         :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs [] :complete_fn complete}})
+(defn- answer [request] {:message {:role :assistant :content (:content (last (:messages request)))}})
+(defn- req [h op fields]
+  (deref (hub/request! h (merge {:id (str (random-uuid)) :op op} fields)) 3000 {:error {:category :test-timeout}}))
+(defn- open-session [h] (get-in (req h :session/open {}) [:value :session_id]))
+(defn- submit [h id text] (:value (req h :session/submit {:session_id id :text text})))
+(defn- stop [h] (when h (req h :hub/stop {})))
+
+(deftest real-session-reuse-and-identified-events
+  (let [requests (atom []) h (hub/start! (options (fn [request] (swap! requests conj request) (answer request))))]
+    (is (map? h))
+    (when h
+      (try
+        (let [client (:value (req h :client/attach {})) id (open-session h)
+              first (submit h id "first")]
+          (is (= "first" (:value (deref (:completion first) 3000 {}))))
+          (let [second (submit h id "second")]
+            (is (= "second" (:value (deref (:completion second) 3000 {}))))
+            (is (not= (:turn_id first) (:turn_id second))))
+          (is (= ["first" "second"] (mapv :content (filter #(= :user (:role %)) (:messages (second @requests))))))
+          (let [events (:events (hub/events-since h (:client_id client) (:cursor client)))]
+            (is (seq events))
+            (is (every? #(= :agent (:source %)) events))
+            (is (every? #(= id (:session_id %)) events))
+            (is (= 1 (count (filter #(= :session_start (get-in % [:event :type])) events))))
+            (is (= 2 (count (filter #(= :processing_end (get-in % [:event :type])) events))))))
+        (finally (stop h))))))
+
+(deftest detached-client-scope-does-not-own-turn-and-sibling-progresses
+  (let [entered (promise) release (promise) calls (atom [])
+        h (hub/start! (options (fn [request]
+             (let [text (:content (last (:messages request)))]
+               (swap! calls conj text)
+               (when (= text "slow") (deliver entered true) (deref release 3000 nil))
+               (answer request)))))]
+    (is (map? h))
+    (when h
+      (try
+        (let [a (open-session h) b (open-session h)
+              turn (core/with-scope [client-scope]
+                     (let [client (:value (req h :client/attach {})) turn (submit h a "slow")]
+                       (is (= true (deref entered 3000 false)))
+                       (req h :client/detach {:client_id (:client_id client)}) turn))]
+          (is (= :busy (get-in (req h :session/submit {:session_id a :text "duplicate"}) [:error :category])))
+          (let [fast (submit h b "fast")]
+          (is (= "fast" (:value (deref (:completion fast) 3000 {}))))
+          (is (= :pending (deref (:completion turn) 20 :pending)))
+          (deliver release true)
+          (is (= "slow" (:value (deref (:completion turn) 3000 {}))))
+          (let [client (:value (req h :client/attach {})) snapshot (hub/events-since h (:client_id client) 0)]
+            (is (= #{a b} (set (map :session_id (:events snapshot)))))
+            (is (= (vec (range 1 (inc (:cursor snapshot)))) (mapv :seq (:events snapshot))))
+            (doseq [[id expected] [[a (:turn_id turn)] [b (:turn_id fast)]]]
+              (let [events (filter #(and (= id (:session_id %))
+                                        (not= :session_start (get-in % [:event :type]))) (:events snapshot))]
+                (is (seq events))
+                (is (every? #(= expected (:turn_id %)) events)))))
+          (is (= #{"slow" "fast"} (set @calls)))
+          (is (= 2 (count @calls)))))
+        (finally (deliver release true) (stop h))))))
+
+(deftest cancellation-and-self-closure-are-terminal
+  (let [entered (promise) release (promise)
+        h (hub/start! (options (fn [request]
+             (let [text (:content (last (:messages request)))]
+               (when (= text "slow") (deliver entered true) (deref release 3000 nil))
+               (when (= text "fail") (throw (ex-info "provider failed" {:category :authentication})))
+               (answer request)))))]
+    (is (map? h))
+    (when h
+      (try
+        (let [a (open-session h) b (open-session h) turn (submit h a "slow")]
+          (is (= true (deref entered 3000 false)))
+          (let [cancel (:value (req h :session/cancel {:session_id a}))]
+            (is (= a (:session_id cancel)))
+            (is (not= :timeout (deref (:completion cancel) 3000 :timeout))))
+          (is (= "sibling" (:value (deref (:completion (submit h b "sibling")) 3000 {}))))
+          (deliver release true)
+          (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category])))
+          (is (= :session-closed (get-in (req h :session/submit {:session_id a :text "again"}) [:error :category])))
+          (let [failed (submit h b "fail")]
+            (is (= :authentication (get-in (deref (:completion failed) 3000 {}) [:error :category])))
+            (is (= :session-closed (get-in (req h :session/submit {:session_id b :text "again"}) [:error :category])))))
+        (finally (deliver release true) (stop h))))))
+
+(deftest correlation-errors-and-cursor-boundaries
+  (let [h (hub/start! (assoc (options answer) :event_capacity 3))]
+    (is (map? h))
+    (when h
+      (try
+        (doseq [request [{:id "bad" :op :unknown} {:id "bad" :op :session/submit :session_id "missing"}
+                         {:id "bad" :op :client/detach :client_id "missing"} {:id "bad"}]]
+          (let [reply (deref (hub/request! h request) 3000 {})]
+            (is (= "bad" (:id reply))) (is (map? (:error reply)))))
+        (let [client (:value (req h :client/attach {})) id (open-session h)
+              _ (deref (:completion (submit h id "rollover")) 3000 nil)
+              fresh (:value (req h :client/attach {})) cursor (:cursor fresh)
+              category (fn [c] (try (hub/events-since h (:client_id client) c) nil
+                                   (catch Object e (:category (ex-data e)))))]
+          (is (= :cursor-expired (category 0)))
+          (is (= :invalid-cursor (category -1)))
+          (is (= :invalid-cursor (category (inc cursor))))
+          (let [snapshot (hub/events-since h (:client_id client) (- cursor 3))]
+            (is (= 3 (count (:events snapshot))))
+            (is (= cursor (:cursor snapshot)))
+            (is (= [] (:events (hub/events-since h (:client_id client) cursor)))))
+          (req h :client/detach {:client_id (:client_id client)})
+          (is (= :unknown-client (category cursor))))
+        (finally (stop h))))))
+
+(deftest stop-aborts-native-workers-and-repeated-stops-resolve
+  (let [entered (promise) blocked (async/chan 1)
+        h (hub/start! (options (fn [_] (deliver entered true) (async/<! blocked) (answer {:messages [{:content "late"}]}))))]
+    (is (map? h))
+    (when h
+      (try
+        (let [id (open-session h) turn (submit h id "block")]
+          (is (= true (deref entered 3000 false)))
+          (let [a (hub/request! h {:id "stop-a" :op :hub/stop})
+                b (hub/request! h {:id "stop-b" :op :hub/stop})]
+            (is (= {:id "stop-a" :value {:stopped true}} (deref a 3000 :timeout)))
+            (is (= {:id "stop-b" :value {:stopped true}} (deref b 3000 :timeout))))
+          (is (realized? (:completion turn)))
+          (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category])))
+          (is (= :stopped (get-in (req h :session/open {}) [:error :category]))))
+        (finally (async/offer! blocked true) (stop h))))))
+
+(deftest mailbox-saturation-and-requests-behind-stop-always-resolve
+  (let [entered (promise) release (promise) original agent/make-session
+        h (hub/start! (assoc (options answer) :mailbox_capacity 2))]
+    (try
+      (with-redefs [agent/make-session (fn [opts] (deliver entered true) (deref release 3000 nil) (original opts))]
+        (let [opening (hub/request! h {:id "opening" :op :session/open})]
+          (try
+            (is (= true (deref entered 3000 false)))
+            (let [stopping (hub/request! h {:id "stop" :op :hub/stop})
+                  behind (hub/request! h {:id "behind" :op :session/list})
+                  full (hub/request! h {:id "full" :op :session/list})
+                  repeated (hub/request! h {:id "repeat" :op :hub/stop})]
+              (is (= {:id "full" :error {:category :mailbox-full}} (deref full 20 :timeout)))
+              (deliver release true)
+              (is (some? (get-in (deref opening 3000 {}) [:value :session_id])))
+              (is (= {:id "behind" :error {:category :stopped}} (deref behind 3000 :timeout)))
+              (is (= {:id "stop" :value {:stopped true}} (deref stopping 3000 :timeout)))
+              (is (= {:id "repeat" :value {:stopped true}} (deref repeated 3000 :timeout))))
+            (finally (deliver release true) (deref opening 3000 nil)))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest busy-until-worker-completion-and-launch-errors-resolve
+  (let [entered (promise) release (promise) original agent/process-input!
+        h (hub/start! (options answer)) id (open-session h)]
+    (try
+      (with-redefs [agent/process-input! (fn [session text]
+                                         (let [result (original session text)]
+                                           (deliver entered true) (deref release 3000 nil) result))]
+        (let [turn (submit h id "first")]
+          (is (= true (deref entered 3000 false)))
+          (is (= :busy (get-in (req h :session/submit {:session_id id :text "race"}) [:error :category])))
+          (let [client (:value (req h :client/attach {}))
+                end (last (filter #(= :processing_end (get-in % [:event :type]))
+                                  (:events (hub/events-since h (:client_id client) 0))))]
+            (is (= (:turn_id turn) (:turn_id end))))
+          (deliver release true)
+          (is (= "first" (:value (deref (:completion turn) 3000 {}))))))
+      (with-redefs [core/future* (fn [_] (throw (ex-info "launch failed" {:category :launch-failed})))]
+        (let [turn (submit h id "not launched")]
+          (is (= :launch-failed (get-in (deref (:completion turn) 3000 {}) [:error :category])))))
+      (is (= "next" (:value (deref (:completion (submit h id "next")) 3000 {}))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest slow-cancel-cleanup-does-not-stall-sibling-admission
+  (let [cleanup-entered (promise) cleanup-release (promise) first? (atom true)
+        opts (options answer)
+        h (hub/start! (assoc-in opts [:session_options :execution_env :cleanup]
+                      (fn [] (when (compare-and-set! first? true false)
+                               (deliver cleanup-entered true) (deref cleanup-release 3000 nil)))))
+        a (open-session h) b (open-session h)]
+    (try
+      (let [cancel (:value (req h :session/cancel {:session_id a}))]
+        (is (= true (deref cleanup-entered 3000 false)))
+        (is (= :pending (deref (:completion cancel) 20 :pending)))
+        (is (= "sibling" (:value (deref (:completion (submit h b "sibling")) 3000 {}))))
+        (deliver cleanup-release true)
+        (is (not= :timeout (deref (:completion cancel) 3000 :timeout))))
+      (finally (deliver cleanup-release true) (stop h)))))
+
+(deftest idle-session-end-has-no-stale-turn-id
+  (let [h (hub/start! (options answer)) id (open-session h)]
+    (try
+      (deref (:completion (submit h id "finished")) 3000 nil)
+      (deref (get-in (req h :session/cancel {:session_id id}) [:value :completion]) 3000 nil)
+      (let [client (:value (req h :client/attach {}))
+            end (last (filter #(= :session_end (get-in % [:event :type]))
+                              (:events (hub/events-since h (:client_id client) 0))))]
+        (is (some? end))
+        (is (nil? (:turn_id end))))
+      (finally (stop h)))))
+
+(deftest stop-surfaces-cleanup-errors-and-supervisor-finally-drains
+  (let [cleanups (atom 0)
+        h (hub/start! (assoc-in (options answer) [:session_options :execution_env :cleanup]
+                       (fn [] (swap! cleanups inc) (throw (ex-info "cleanup failed" {:category :cleanup-failed})))))]
+    (try
+      (open-session h) (open-session h)
+      (is (= :cleanup-failed (get-in (stop h) [:error :category])))
+      (is (= 2 @cleanups))
+      (is (= :cleanup-failed (get-in (stop h) [:error :category])))
+      (finally (stop h))))
+  (let [cleaned (promise) h (hub/start! (assoc-in (options answer) [:session_options :execution_env :cleanup]
+                                        (fn [] (deliver cleaned true))))]
+    (try
+      (open-session h)
+      ;; A native mailbox end is an abnormal supervisor exit, not a normal stop.
+      (async/close! (:mailbox h))
+      (is (= true (deref cleaned 500 false)))
+      (is (= :stopped (get-in (req h :session/list {}) [:error :category])))
+      (finally
+        (doseq [[_ entry] @(:sessions h)] (agent/close-session! (:agent entry)))
+        (stop h)))))
+
+(deftest shutdown-starts-all-aborts-before-draining-slow-cleanup
+  (let [entered (promise) entered-count (atom 0) cleanup-count (atom 0)
+        cleanups-entered (promise) release-cleanup (promise) blocked (async/chan 1)
+        opts (options (fn [_]
+                        (when (= 2 (swap! entered-count inc)) (deliver entered true))
+                        (async/<! blocked)
+                        {:message {:role :assistant :content "late"}}))
+        h (hub/start! (assoc-in opts [:session_options :execution_env :cleanup]
+                       (fn []
+                         (when (= 2 (swap! cleanup-count inc)) (deliver cleanups-entered true))
+                         (deref release-cleanup 3000 nil))))]
+    (try
+      (let [a (submit h (open-session h) "a") b (submit h (open-session h) "b")]
+        (is (= true (deref entered 3000 false)))
+        (let [stopping (hub/request! h {:id "drain" :op :hub/stop})]
+          (is (= true (deref cleanups-entered 3000 false)))
+          (is (= :pending (deref stopping 20 :pending)))
+          (deliver release-cleanup true)
+          (is (= {:id "drain" :value {:stopped true}} (deref stopping 3000 :timeout)))
+          (is (= :cancelled (get-in (deref (:completion a) 3000 {}) [:error :category])))
+          (is (= :cancelled (get-in (deref (:completion b) 3000 {}) [:error :category])))))
+      (finally (deliver release-cleanup true) (async/close! blocked) (stop h)))))
+
+(deftest startup-errors-and-malformed-requests-are-data
+  (with-redefs [core/future* (fn [_] (throw (ex-info "launch failed" {:category :launch-failed})))]
+    (is (= :launch-failed (try (hub/start! (options answer)) nil
+                              (catch Object e (:category (ex-data e)))))))
+  (let [h (hub/start! (options answer))]
+    (try
+      (doseq [request [nil "invalid" [] {:id "bad" :op "session/open"}]]
+        (is (= :invalid-request (get-in (deref (hub/request! h request) 100 {}) [:error :category]))))
+      (is (some? (open-session h)))
+      (finally (stop h)))))
+
+(deftest stop-during-abnormal-shutdown-shares-final-result
+  (let [entered (promise) release (promise)
+        h (hub/start! (assoc-in (options answer) [:session_options :execution_env :cleanup]
+                       (fn [] (deliver entered true) (deref release 3000 nil))))]
+    (try
+      (open-session h)
+      (async/close! (:mailbox h))
+      (is (= true (deref entered 3000 false)))
+      (let [waiting (hub/request! h {:id "during" :op :hub/stop})]
+        (is (= :pending (deref waiting 20 :pending)))
+        (deliver release true)
+        (let [reply (deref waiting 3000 {})]
+          (is (= "during" (:id reply)))
+          (is (= :supervisor-stopped (get-in reply [:error :category])))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest agent-self-abort-is-not-success-and-capacities-are-positive
+  (let [session-ref (atom nil) original agent/make-session
+        h (hub/start! (options (fn [_] (agent/abort-session! @session-ref)
+                                {:message {:role :assistant :content "not success"}})))]
+    (try
+      (with-redefs [agent/make-session (fn [opts]
+                                        (let [session (original opts)] (reset! session-ref session) session))]
+        (let [id (open-session h) turn (submit h id "self abort")]
+          (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category])))
+          (is (= :session-closed (get-in (req h :session/submit {:session_id id :text "again"}) [:error :category])))))
+      (finally (stop h))))
+  (doseq [opts [{:event_capacity 0} {:mailbox_capacity -1} {:event_capacity false}]]
+    (let [created (atom nil)]
+      (try
+        (is (= :invalid-capacity (try (reset! created (hub/start! opts)) nil
+                                     (catch Object e (:category (ex-data e))))))
+        (finally (when @created (stop @created)))))))
+
+(deftest cancellation-linearizes-with-final-result-publication
+  (doseq [operation [:session/cancel :hub/stop]]
+    (let [h (hub/start! (options answer)) id (open-session h)
+          returned (atom false) gated (atom false) at-publish (promise) release (promise)
+          abort-finished (promise) original-process agent/process-input!
+          original-cas core/compare-and-set! original-abort agent/abort-session!]
+      (try
+        (with-redefs [agent/process-input! (fn [session text]
+                                            (let [output (original-process session text)]
+                                              (reset! returned true) output))
+                      core/compare-and-set! (fn [lock old new]
+                                              (when (and (identical? lock (:event_lock h)) @returned
+                                                         (original-cas gated false true))
+                                                (deliver at-publish true) (deref release 3000 nil))
+                                              (original-cas lock old new))
+                      agent/abort-session! (fn [session & args]
+                                             (let [result (apply original-abort session args)]
+                                               (deliver abort-finished true) result))]
+          (let [turn (submit h id "late success")]
+            (is (= true (deref at-publish 3000 false)))
+            (is (not (realized? (:completion turn))))
+            (let [closing (hub/request! h {:id "close" :op operation :session_id id})]
+              (when (= operation :session/cancel)
+                (is (= id (get-in (deref closing 3000 {}) [:value :session_id]))))
+              (is (= true (deref abort-finished 3000 false)))
+              (deliver release true)
+              (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category])))
+              (is (not= :timeout (deref closing 3000 :timeout)))
+              (when (= operation :hub/stop) (is (realized? (:completion turn)))))))
+        (finally (deliver release true) (stop h)))))
+  (let [h (hub/start! (options answer)) id (open-session h)
+        turn (submit h id "published")]
+    (try
+      (is (= {:value "published"} (deref (:completion turn) 3000 {})))
+      (req h :session/cancel {:session_id id})
+      (is (= {:value "published"} (deref (:completion turn) 3000 {})))
+      (finally (stop h)))))
+
+(deftest delayed-parent-and-child-events-retain-origin-after-next-admission
+  (let [drainer-held (promise) release-drainer (promise) parent-end-delivered (promise)
+        parent-provider-entered (promise)
+        b-entered (promise) release-b (promise) held? (atom false)
+        original agent/make-session
+        complete (fn [request]
+                   (let [users (filter #(= :user (:role %)) (:messages request))
+                         first-input (:content (first users)) latest (:content (last users))]
+                     (cond
+                       (= first-input "child") {:message {:role :assistant :content "child done"}}
+                       (= latest "B") (do (deliver b-entered true) (deref release-b 3000 nil)
+                                          {:message {:role :assistant :content "B done"}})
+                       (some #(= :tool (:role %)) (:messages request))
+                       (do (deliver parent-provider-entered true)
+                           (deref drainer-held 3000 nil) {:message {:role :assistant :content "A done"}})
+                       :else {:message {:role :assistant :content ""}
+                              :tool_calls [{:id "spawn" :name "spawn_agent" :arguments {"task" "child"}}]})))
+        h (hub/start! (options complete))]
+    (try
+      (with-redefs [agent/make-session
+                    (fn [opts]
+                      (if (:subagent_depth opts)
+                        (let [listener (:on_event opts)]
+                          (original (assoc opts :on_event
+                            (fn [event]
+                              ;; Force the child to own the parent drainer while
+                              ;; the parent is waiting inside its next provider call.
+                              (when (= :user_input (:type event))
+                                (deref parent-provider-entered 3000 nil))
+                              (listener event)))))
+                        (let [listener (:on_event opts)]
+                          (original (assoc opts :on_event
+                            (fn [event]
+                              (when (and (= :subagent_event (:type event))
+                                         (= :user_input (get-in event [:event :type]))
+                                         (compare-and-set! held? false true))
+                                (deliver drainer-held true) (deref release-drainer 3000 nil))
+                              (listener event)
+                              (when (= :processing_end (:type event)) (deliver parent-end-delivered true))))))))]
+        (let [id (open-session h) client (:value (req h :client/attach {}))
+              a (submit h id "A")]
+          (is (= true (deref drainer-held 3000 false)))
+          (is (= "A done" (:value (deref (:completion a) 3000 {}))))
+          (let [b (submit h id "B")]
+            (is (= true (deref b-entered 3000 false)))
+            (is (not= (:turn_id a) (:turn_id b)))
+            (deliver release-drainer true)
+            (is (= true (deref parent-end-delivered 3000 false)))
+            (let [events (:events (hub/events-since h (:client_id client) 0))
+                  parent-end (first (filter #(= :processing_end (get-in % [:event :type])) events))
+                  forwarded (first (filter #(and (= :subagent_event (get-in % [:event :type]))
+                                                  (= :user_input (get-in % [:event :event :type]))) events))]
+              (is (some? parent-end))
+              (is (some? forwarded))
+              (is (= (:turn_id a) (:turn_id parent-end)))
+              (is (= (:turn_id a) (:turn_id forwarded))))
+            (deliver release-b true)
+            (is (= "B done" (:value (deref (:completion b) 3000 {})))))))
+      (finally (deliver parent-provider-entered true)
+               (deliver release-drainer true) (deliver release-b true) (stop h)))))
+
+(deftest hub-close-origin-distinguishes-active-and-idle-sessions
+  (let [entered (promise) release (promise)
+        h (hub/start! (options (fn [request]
+                                (deliver entered true) (deref release 3000 nil)
+                                (answer request))))
+        client (:client_id (:value (req h :client/attach {})))
+        active (open-session h) idle (open-session h)]
+    (try
+      (let [turn (submit h active "active")]
+        (is (true? (deref entered 3000 false)))
+        (let [cancel (:value (req h :session/cancel {:session_id active}))]
+          (is (some? (:value (deref (:completion cancel) 3000 {})))))
+        (let [cancel (:value (req h :session/cancel {:session_id idle}))]
+          (is (some? (:value (deref (:completion cancel) 3000 {})))))
+        (let [events (:events (hub/events-since h client 0))
+              ended (filter #(= :session_end (get-in % [:event :type])) events)]
+          (is (= 2 (count ended)))
+          (is (= [(:turn_id turn)] (mapv :turn_id (filter #(= active (:session_id %)) ended))))
+          (is (= [nil] (mapv :turn_id (filter #(= idle (:session_id %)) ended))))
+          (is (every? #(nil? (:turn_id %)) (filter #(= :session_start (get-in % [:event :type])) events))))
+        (deliver release true)
+        (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category]))))
+      (finally (deliver release true) (stop h)))))
