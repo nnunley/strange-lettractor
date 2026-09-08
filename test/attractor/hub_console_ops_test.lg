@@ -1,0 +1,132 @@
+(ns attractor.hub-console-ops-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [clojure.string :as str] [os :as os] [io :as io]
+            [attractor.hub :as hub] [attractor.execution :as execution]
+            [attractor.profiles :as profiles] [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+
+;; SCN-HUB-CONSOLE-OPS: hub-owned evaluation, workflows and external workers
+;; behind the same request/event contract as agent sessions.
+
+(defn- answer [request] {:message {:role :assistant :content (:content (last (:messages request)))}})
+(defn- options []
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                                                 :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs [] :complete_fn answer}
+   :workflow_registry_fn (fn [_] (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {}))
+   :worker_command [(let [override (os/getenv "LGX_LG")] (if (str/blank? override) "lg" override))
+                    (str (os/cwd) "/test/fixtures/claude_worker.lg")]})
+(defn- req [h op fields]
+  (deref (hub/request! h (merge {:id (str (random-uuid)) :op op} fields)) 5000 {:error {:category :test-timeout}}))
+(defn- stop [h] (when h (req h :hub/stop {})))
+(defn- eval! [h fields]
+  (let [r (req h :eval/submit fields)]
+    (if (:error r) r (deref (:completion (:value r)) 5000 {:error {:category :test-timeout}}))))
+(defn- events [h client] (:events (hub/events-since h (:client_id client) (:cursor client))))
+(defn- await-true [f ms] (let [deadline (+ (System/currentTimeMillis) ms)]
+                           (loop [] (cond (f) true (> (System/currentTimeMillis) deadline) false
+                                          :else (do (core/sleep 5) (recur))))))
+
+(deftest eval-persists-namespace-binds-selection-and-renders-errors
+  (let [h (hub/start! (options))]
+    (try
+      (let [client (:value (req h :client/attach {}))
+            first (eval! h {:code "(def x 41) (inc x)" :session_id "s1" :run_id nil})
+            error (eval! h {:code "(undefined-fn x)"})
+            second (eval! h {:code "[x *session* *run*] " :session_id "s2" :run_id "r9"})
+            printed (eval! h {:code "(println \"hi\") :done"})]
+        (is (= 42 (get-in first [:value :value])))
+        (is (= :eval-error (get-in error [:error :category])))
+        (is (str/includes? (get-in error [:error :message]) "undefined-fn"))
+        (is (= [41 "s2" "r9"] (get-in second [:value :value])))
+        (is (= "hi\n" (get-in printed [:value :printed])))
+        (is (= :done (get-in printed [:value :value])))
+        (let [evs (filter #(and (= :eval (:source %)) (= :eval_result (get-in % [:event :type]))) (events h client))]
+          (is (= 4 (count evs)))
+          (is (= [:ok :error :ok :ok] (mapv #(get-in % [:event :status]) evs)))
+          (is (= "s2" (:session_id (nth evs 2))))))
+      (finally (stop h)))))
+
+(deftest eval-is-serialized-and-busy-rejects
+  (let [h (hub/start! (options))]
+    (try
+      (let [slow (eval! h {:code "(sleep 300) :slow"})]
+        (is (= :slow (get-in slow [:value :value]))))
+      (let [slow (req h :eval/submit {:code "(sleep 300) :slow"})]
+        (is (= :busy (get-in (req h :eval/submit {:code ":fast"}) [:error :category])))
+        (is (= :slow (get-in (deref (:completion (:value slow)) 3000 {}) [:value :value]))))
+      (finally (stop h)))))
+
+(def ^:private dot "digraph T { graph [goal=\"hub\"] start [shape=Mdiamond] work [shape=box, label=\"Work\", prompt=\"do $goal\"] exit [shape=Msquare] start -> work -> exit }")
+(defn- dot-file [root] (let [path (str root "/inline.dot")] (io/spit path dot) path))
+
+(deftest workflow-runs-emit-identified-events-and-complete
+  (let [h (hub/start! (options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [client (:value (req h :client/attach {}))
+            run (:value (req h :workflow/run {:dot_source dot :source_path (dot-file root) :logs_root (str root "/logs")}))
+            outcome (deref (:completion run) 10000 {:error {:category :test-timeout}})]
+        (is (string? (:run_id run)))
+        (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
+        (let [evs (filter #(= :workflow (:source %)) (events h client))]
+          (is (every? #(= (:run_id run) (:run_id %)) evs))
+          (is (some #(= :pipeline.started (get-in % [:event :type])) evs))
+          (is (some #(= :pipeline.completed (get-in % [:event :type])) evs)))
+        (is (= [{:run_id (:run_id run) :done true}]
+               (mapv #(select-keys % [:run_id :done]) (:value (req h :workflow/list {}))))))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest workflow-cancel-stops-the-run-and-keeps-the-hub
+  (let [entered (promise) release (promise)
+        opts (assoc (options) :workflow_registry_fn
+                    (fn [_] (let [registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {})]
+                              (handlers/register-handler! registry "codergen"
+                                (fn [node _ _ _]
+                                  (deliver entered true)
+                                  (loop [] (when-not (or (realized? release) ((:cancelled? node))) (core/sleep 5) (recur)))
+                                  (if ((:cancelled? node))
+                                    {:status :cancelled :failure_reason "cancelled"}
+                                    {:status :success})))
+                              registry)))
+        h (hub/start! opts) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [run (:value (req h :workflow/run {:dot_source dot :source_path (dot-file root) :logs_root (str root "/logs")}))]
+        (is (true? (deref entered 3000 false)))
+        (let [cancel (req h :workflow/cancel {:run_id (:run_id run)})
+              outcome (deref (:completion run) 5000 {:error {:category :test-timeout}})]
+          (is (nil? (:error cancel)) (pr-str cancel))
+          (is (not= :test-timeout (get-in outcome [:error :category])) (pr-str outcome))
+          (is (not= :success (get-in outcome [:value :status])) (pr-str outcome)))
+        (is (= 42 (get-in (eval! h {:code "42"}) [:value :value])) "hub still serves requests"))
+      (finally (deliver release true) (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest worker-runs-stream-identified-events-and-report-failure
+  (let [h (hub/start! (options))]
+    (try
+      (let [client (:value (req h :client/attach {}))
+            ok (:value (req h :worker/run {:kind :claude :prompt "hello" :scenario "success" :timeout_ms 3000}))
+            result (deref (:completion ok) 5000 {:error {:category :test-timeout}})]
+        (is (string? (:worker_id ok)))
+        (is (= "hello" (get-in result [:value :text])) (pr-str result))
+        (let [evs (filter #(= :worker (:source %)) (events h client))]
+          (is (every? #(= (:worker_id ok) (:worker_id %)) evs))
+          (is (= ["héλ🙂"] (mapv #(get-in % [:event :text]) (filter #(= :text_delta (get-in % [:event :type])) evs)))
+              (pr-str (mapv #(select-keys (:event %) [:type :text]) evs))))
+        (let [bad (:value (req h :worker/run {:kind :claude :prompt "x" :scenario "error" :timeout_ms 3000}))
+              failure (deref (:completion bad) 5000 {:error {:category :test-timeout}})]
+          (is (= :claude-result (get-in failure [:error :category])) (pr-str failure)))
+        (is (= :unknown-worker-kind (get-in (req h :worker/run {:kind :codex :prompt "x"}) [:error :category])))
+        (is (= 2 (count (:value (req h :worker/list {}))))))
+      (finally (stop h)))))
+
+(deftest worker-cancel-terminates-the-process
+  (let [h (hub/start! (options)) dir (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) gate (str dir "/release")]
+    (try
+      (let [client (:value (req h :client/attach {}))
+            w (:value (req h :worker/run {:kind :claude :prompt gate :scenario "gated" :timeout_ms 10000}))]
+        (is (true? (await-true #(some (fn [e] (= :text_delta (get-in e [:event :type]))) (events h client)) 3000)))
+        (is (nil? (:error (req h :worker/cancel {:worker_id (:worker_id w)}))))
+        (let [outcome (deref (:completion w) 5000 {:error {:category :test-timeout}})]
+          (is (contains? #{:cancelled :claude-exit :claude-protocol} (get-in outcome [:error :category])) (pr-str outcome))))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" dir)))))

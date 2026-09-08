@@ -1,5 +1,7 @@
 (ns attractor.hub
-  (:require [clojure.core :as core] [async :as async] [attractor.agent :as agent]))
+  (:require [clojure.core :as core] [async :as async] [clojure.string :as str]
+            [attractor.agent :as agent] [attractor.pipeline :as pipeline]
+            [attractor.workers.claude :as claude]))
 
 (defn- locked [lock f]
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
@@ -8,14 +10,18 @@
 (defn- error-data [error]
   {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
-(defn- append-event! [hub id event]
+(defn- append-envelope! [hub envelope]
+  ;; Every source (agent, eval, workflow, worker) shares one bounded log and
+  ;; one sequence so a client sees interleaved events in emission order.
   (locked (:event_lock hub)
     (fn []
       (let [log @(:log hub) seq (inc (:cursor log))
-            events (conj (:events log) {:seq seq :source :agent :session_id id
-                                        :turn_id (:hub_turn_id (:origin event)) :event event})
+            events (conj (:events log) (assoc envelope :seq seq))
             excess (- (count events) (:event_capacity hub))]
         (reset! (:log hub) (assoc log :cursor seq :events (if (pos? excess) (subvec events excess) events)))))))
+(defn- append-event! [hub id event]
+  (append-envelope! hub {:source :agent :session_id id
+                         :turn_id (:hub_turn_id (:origin event)) :event event}))
 
 (defn events-since [hub client-id cursor]
   (locked (:event_lock hub)
@@ -52,8 +58,121 @@
           (reset! (:cancellation entry) completion)
           completion))))
 
+(def ^:private user-ns-name 'attractor.console.user)
+(defn- eval-in-user-ns! [hub code session-id run-id]
+  ;; let-go's `*ns*` is process-global and `binding` does not restore it, so
+  ;; switch explicitly and restore in finally. Evaluations are serialized by
+  ;; the busy flag, so no other hub eval observes the switch.
+  (let [ns (:user_ns hub) saved (ns-name *ns*)]
+    (intern ns '*session* session-id)
+    (intern ns '*run* run-id)
+    (try
+      (in-ns user-ns-name)
+      (let [forms (read-string (str "[" code "\n]"))
+            holder (atom nil)
+            printed (with-out-str (reset! holder (reduce (fn [_ form] (eval form)) nil forms)))]
+        {:value @holder :printed printed})
+      (finally (in-ns saved)))))
+
+(defn- finish-under-lock! [hub f]
+  (locked (:event_lock hub) f))
+
+(defn- workflow-entry! [hub id]
+  (or (get @(:workflows hub) id) (fail! :unknown-run)))
+(defn- worker-entry! [hub id]
+  (or (get @(:workers hub) id) (fail! :unknown-worker)))
+
 (defn- operation! [hub request]
   (case (:op request)
+    :eval/submit
+    (let [code (:code request)]
+      (when-not (string? code) (fail! :invalid-request))
+      (when (:busy @(:eval hub)) (fail! :busy))
+      (swap! (:eval hub) assoc :busy true)
+      (let [eval-id (str "eval-" (random-uuid))
+            base {:source :eval :eval_id eval-id :session_id (:session_id request) :run_id (:run_id request)}
+            completion
+            (launch! (fn []
+                       (try (eval-in-user-ns! hub code (:session_id request) (:run_id request))
+                            (catch Object e
+                              (throw (ex-info (str e) {:category :eval-error :cause (ex-data e)})))))
+                     (fn [done result]
+                       ;; The event lock is not reentrant: publish the result
+                       ;; event first, then flip busy and deliver under it.
+                       (append-envelope! hub (assoc base :event (if (:error result)
+                                                                 {:type :eval_result :status :error :error (:error result)}
+                                                                 {:type :eval_result :status :ok :value (:value (:value result))
+                                                                  :printed (:printed (:value result))})))
+                       (finish-under-lock! hub
+                         (fn []
+                           (swap! (:eval hub) assoc :busy false)
+                           (deliver done result)))))]
+        (append-envelope! hub (assoc base :event {:type :eval_start :code code}))
+        {:eval_id eval-id :completion completion}))
+    :workflow/run
+    (let [source (:dot_source request)]
+      (when-not (string? source) (fail! :invalid-request))
+      (when-not (:workflow_registry_fn hub) (fail! :workflows-unavailable))
+      (let [run-id (str "run-" (random-uuid)) cancelled (atom false)
+            base {:source :workflow :run_id run-id}
+            emit (fn [event] (append-envelope! hub (assoc base :event event)))
+            registry ((:workflow_registry_fn hub) request)
+            completion
+            (launch! (fn []
+                       (let [outcome (pipeline/run source
+                                       {:logs-root (:logs_root request) :source-path (:source_path request)
+                                        :registry registry :on-event emit :cancelled? (fn [] @cancelled)})]
+                         (if @cancelled (assoc outcome :cancelled true) outcome)))
+                     (fn [done result]
+                       (finish-under-lock! hub
+                         (fn []
+                           (swap! (:workflows hub) assoc-in [run-id :done] true)
+                           (deliver done result)))))]
+        (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
+                                              :source_path (:source_path request) :done false})
+        {:run_id run-id :completion completion}))
+    :workflow/cancel
+    (let [entry (workflow-entry! hub (:run_id request))]
+      (reset! (:cancelled entry) true)
+      {:run_id (:run_id request) :completion (:completion entry)})
+    :workflow/list
+    (mapv (fn [[id e]] {:run_id id :source_path (:source_path e) :done (:done e) :cancelled @(:cancelled e)})
+          @(:workflows hub))
+    :worker/run
+    (do
+      (when-not (= :claude (:kind request)) (fail! :unknown-worker-kind))
+      (when-not (string? (:prompt request)) (fail! :invalid-request))
+      (let [worker-id (str "worker-" (random-uuid)) cancelled (atom false)
+            base {:source :worker :kind :claude :worker_id worker-id}
+            command (cond-> (or (:worker_command hub) ["claude"])
+                      (:scenario request) (conj (:scenario request)))
+            options (cond-> {:prompt (:prompt request) :command command
+                             :cancelled? (fn [] @cancelled)
+                             :on_event (fn [event] (append-envelope! hub (assoc base :event event)))}
+                      (:working_dir request) (assoc :working_dir (:working_dir request))
+                      (:model request) (assoc :model (:model request))
+                      (:tools request) (assoc :tools (:tools request))
+                      (:permission_mode request) (assoc :permission_mode (:permission_mode request))
+                      (:timeout_ms request) (assoc :timeout_ms (:timeout_ms request)))
+            completion
+            (launch! (fn [] (claude/run! options))
+                     (fn [done result]
+                       (finish-under-lock! hub
+                         (fn []
+                           (swap! (:workers hub) assoc-in [worker-id :done] true)
+                           (deliver done (if (and @cancelled (:error result))
+                                           {:error {:category :cancelled :message "Worker cancelled"}}
+                                           result))))))]
+        (swap! (:workers hub) assoc worker-id {:worker_id worker-id :kind :claude :cancelled cancelled
+                                               :completion completion :done false})
+        {:worker_id worker-id :completion completion}))
+    :worker/cancel
+    (let [entry (worker-entry! hub (:worker_id request))]
+      (reset! (:cancelled entry) true)
+      {:worker_id (:worker_id request) :completion (:completion entry)})
+    :worker/list
+    (mapv (fn [[id e]] {:worker_id id :kind (:kind e) :done (:done e) :cancelled @(:cancelled e)})
+          @(:workers hub))
     :session/open
     (let [id (str "session-" (random-uuid))
           session (binding [agent/*event-origin* nil]
@@ -112,6 +231,10 @@
   (loop [] (when-let [packet (async/poll! (:mailbox hub))]
              (reply! packet {:error {:category :stopped}}) (recur)))
   (let [entries (vals @(:sessions hub))]
+    ;; Hub-owned workflows and workers stop cooperatively, then the scope
+    ;; close below cancels and joins whatever they spawned.
+    (doseq [e (vals @(:workflows hub))] (reset! (:cancelled e) true))
+    (doseq [e (vals @(:workers hub))] (reset! (:cancelled e) true))
     (doseq [entry entries] (cancel-entry! hub entry))
     ;; Allocation of abort futures is not proof they ran. Observe actual abort
     ;; entry or a tagged failure before cancellation/drain of their native scope.
@@ -150,6 +273,18 @@
             (not (async/offer! (:mailbox hub) packet)) (reply! packet {:error {:category :mailbox-full}})))))
     (:reply packet)))
 
+(defn- init-user-ns! [hub]
+  ;; One persistent namespace for explicit human evaluation. Helpers are
+  ;; interned, never read from data; user code runs with the user's authority.
+  (let [ns (:user_ns hub)]
+    (intern ns 'hub hub)
+    (intern ns 'request! (fn [op & [fields]]
+                           (deref (request! hub (merge {:id (str (random-uuid)) :op op} fields)))))
+    (intern ns 'events-since (fn [client-id cursor] (events-since hub client-id cursor)))
+    (intern ns '*session* nil)
+    (intern ns '*run* nil)
+    hub))
+
 (defn start!
   "Start under a host scope kept alive for the service lifetime. Session options
    are trusted startup values, never remote request configuration/code."
@@ -159,9 +294,13 @@
       (fail! :invalid-capacity))
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts)
+               :workflow_registry_fn (:workflow_registry_fn opts) :worker_command (:worker_command opts)
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})
-               :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}]
+               :eval (atom {:busy false}) :workflows (atom {}) :workers (atom {})
+               :user_ns (create-ns user-ns-name)
+               :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}
+          hub (init-user-ns! hub)]
       (try
         (core/future
           (try
