@@ -6,14 +6,14 @@ unless concrete evidence below says otherwise. No conformance story is removed.
 | Story | Acceptance / proof obligation | Evidence seam |
 |---|---|---|
 | CONSOLE-INPUT-01 | Prefix routing, literal escapes, multiline framing, discard/EOF, immutable submission selection; never evaluate during routing | Public reducer transcript tests, SCN-CONSOLE-INPUT |
-| CONSOLE-EVAL-01 | Persistent native namespace; values/errors rendered; selected session/run bound at submission; explicit human input only | Real evaluator integration, including error then successful next eval |
-| CONSOLE-CONTROL-01 | Agent text and workflow commands share console; focus and events preserve session/run identity | Console transcript through actual controller with deterministic provider |
-| CONSOLE-INPUT-02 | One owned input source, concurrent stream redraw, cancellation, EOF and terminal restoration | Native PTY including Ctrl-C, resize, exception, shutdown |
-| CONSOLE-WORKER-01 | Qwen invoked through Attractor; bounded live implementer trial and mechanical acceptance | Framework live run against llama.cpp, not a direct CLI substitute |
+| CONSOLE-EVAL-01 | Persistent native namespace; values/errors rendered; selected session/run bound at submission; explicit human input only | Verified in-process: SCN-HUB-CONSOLE-OPS and SCN-CONSOLE-CONTROL |
+| CONSOLE-CONTROL-01 | Agent text and workflow commands share console; focus and events preserve session/run identity | Verified: SCN-CONSOLE-CONTROL transcript through the real hub with the fixture provider |
+| CONSOLE-INPUT-02 | One owned input source, concurrent stream redraw, cancellation, EOF and terminal restoration | Partial: native PTY covers Ctrl-C, EOF and restoration (SCN-CONSOLE-TUI); resize and exception paths pending |
+| CONSOLE-WORKER-01 | Qwen invoked through Attractor; bounded live implementer trial and mechanical acceptance | Partial: live Qwen conversation turn through the console hub (SCN-CONSOLE-LINE); bounded implementer trial pending |
 | CONSOLE-WORKER-02 | Owned Claude Code subprocess, streaming events, explicit permissions, failure/cancel/exit; no silent fallback | Let-go protocol fixture plus separately recorded live framework trial |
 | CONSOLE-WORKER-03 | Codex app-server orchestration and interleaved identified worker events | Protocol integration and live framework trial |
-| CONSOLE-TUI-01 | tiny-tui full-screen presentation using same dispatcher as line console | Headless integration plus native PTY |
-| CONSOLE-HUB-01 | RPC hub owns framework sessions, workers and evaluation; console is a client; disconnect does not implicitly cancel work | Separate-process client/hub lifecycle tests, explicit cancel and reconnect/event subscription evidence |
+| CONSOLE-TUI-01 | tiny-tui full-screen presentation using same dispatcher as line console | Verified: SCN-CONSOLE-TUI headless plus native PTY |
+| CONSOLE-HUB-01 | RPC hub owns framework sessions, workers and evaluation; console is a client; disconnect does not implicitly cancel work | Partial: in-process hub owns sessions, evaluation, workflows and workers and client detach leaves work running (SCN-HUB-CONSOLE-OPS, SCN-CONSOLE-CONTROL); separate-process RPC and reconnect/replay pending |
 
 CONSOLE-HUB-01A is the implemented agent-ownership component of CONSOLE-HUB-01,
 specified in `docs/hub-session-plan.md`. Its public in-process integration scenario
@@ -48,6 +48,47 @@ Native subprocess tests pass 7/40; CLI plus existing CLI tests pass 12/89. Both
 compiled direct and real DOT LICENSE trials succeeded through the connector.
 See [worker interface and permissions](claude-worker.md). Hub worker attachment
 and interleaved console rendering remain pending.
+
+## SCN-HUB-CONSOLE-OPS
+
+Story: CONSOLE-EVAL-01, CONSOLE-HUB-01 (in-process operations component).
+`attractor.hub` serves `:eval/submit` (persistent `attractor.console.user`
+namespace with interned `hub`, `request!`, `events-since`, `*session*`,
+`*run*`; one evaluation at a time, busy rejected, printed output captured,
+errors rendered), `:workflow/run|cancel|list` (hub-owned pipeline runs with
+cooperative cancellation) and `:worker/run|cancel|list` (owned external
+coding-agent workers through the existing connector). Every source shares the
+bounded event log. Evidence 2026-09-08: `dev/hub_console_ops_tests.lg` 6 tests /
+33 assertions with the fixture provider, a mock DOT workflow and the let-go
+worker fixture, including busy, cancel-leaves-hub-alive and failure paths.
+Requires the local runtime's context-aware `eval` (nooga/let-go#833).
+
+## SCN-CONSOLE-CONTROL and SCN-CONSOLE-LINE
+
+Stories: CONSOLE-CONTROL-01, CONSOLE-EVAL-01 (client side), CONSOLE-INPUT-02
+(line frontend part). `attractor.console.session` is the frontend-independent
+dispatcher (attachment, focus, reducer state, rendering of identified events);
+`attractor.console.line` is the streaming line frontend; `attractor console`
+starts an in-process hub with the run/resume model, worker and interviewer
+configuration. Evidence: `dev/console_session_tests.lg` 4 / 39 (agent text,
+eval values/errors/multiline/selection binding, /run + /claude + /agents +
+/focus + /cancel + escapes, interrupt routing, quit detaches without stopping
+the hub); `dev/console_line_tests.lg` 2 / 12 (scripted transcript, EOF).
+Live: a Qwen turn through `attractor console --model qwen3.8-27b --provider
+ollama` against llama.cpp returned `console connected` and `turn complete`.
+
+## SCN-CONSOLE-TUI
+
+Story: CONSOLE-TUI-01, CONSOLE-INPUT-02 (TUI part). `attractor.console.tui`
+runs the same dispatcher on tiny-tui (pinned `v0.1.3`, `3d2aeaa6`) with an
+app-owned reader merging keys and hub-event ticks; Ctrl-C discards a draft,
+cancels busy focused work, or quits when idle. Evidence:
+`dev/console_tui_tests.lg` 2 / 13 headless (scripted keys, captured frames);
+`dev/console_pty_check.lg` 2 / 11 drives the built CLI under a real
+pseudo-terminal through script(1): alternate screen entered and restored,
+status line, echoed input, mock reply, evaluation, exit 0, and the line
+frontend quitting on EOF. Resize and exception-restoration cases are not yet
+covered natively.
 
 ## SCN-CONSOLE-INPUT
 

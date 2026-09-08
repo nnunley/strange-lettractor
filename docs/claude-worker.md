@@ -34,6 +34,16 @@ is retained. Authenticate using Claude's own CLI; the connector does not copy
 credentials or choose a replacement provider. CLI availability does not prove
 subscription billing or remaining quota.
 
+## Console use
+
+`attractor console` dispatches the same connector as a hub-owned worker:
+`/claude <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]`.
+Worker defaults come from `--worker-cwd`, `--worker-model`, `--worker-tools`,
+`--worker-permission-mode` and `--worker-timeout-ms` on the console command.
+Events render as `[claude <id>]` lines; `/cancel` with the worker focused
+requests cooperative cancellation; `/agents` lists running and finished
+workers. See `docs/console-requirements.md` (SCN-CONSOLE-CONTROL).
+
 ## Workflow and library use
 
 ```sh

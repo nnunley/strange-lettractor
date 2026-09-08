@@ -26,10 +26,14 @@ Every iteration closes with the impacted scenarios, the full sentinel suite, AOT
 Tracked independently in `docs/console-requirements.md`; does not replace any
 StrongDM conformance iteration. Frontend framing (CONSOLE-INPUT-01) is implemented
 with 7/92 focused and bundled evidence; paired audit clean. Full suite 686/6705/0.
-The console must connect to a hub, not own the framework. Next: hub transport
-capability/contract, real hub-side evaluation and worker controls, then line-client
-integration and tiny-tui presentation. See `docs/nrepl-hub-findings.md` for upstream
-runtime dependencies and `docs/console-workers-design.md` for ownership boundaries.
+The console must connect to a hub, not own the framework. Milestone reached on
+2026-09-08 (`docs/superpowers/specs/2026-09-08-console-milestone-design.md`):
+the in-process hub owns evaluation, workflows and external workers alongside
+agent sessions; `attractor console` (line) and `attractor console --tui`
+(tiny-tui) share one dispatcher; a live Qwen turn ran through it. Remaining:
+separate-process RPC/nREPL transport with reconnect/replay, Codex app-server
+worker, native resize/exception coverage, and a bounded live implementer
+trial. See `docs/console-requirements.md` for evidence.
 
 ## Future design: executable packets and skill packages
 

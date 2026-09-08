@@ -159,3 +159,15 @@ operation owner wraps every submitted job with `bound-fn*` so tool callbacks and
 custom clients see the caller's dynamic bindings; with the released runtime those
 jobs would silently become uncancellable. After the upstream fix, rerun
 `jobs-see-caller-bindings-and-remain-owned` and the shared/native ownership checks.
+
+## eval execution context: #833
+
+`eval` built its frame with a nil execution context, so evaluated code ignored
+the caller's bindings and scope ([nooga/let-go #833](https://github.com/nooga/let-go/issues/833)).
+The local runtime (`aeb44ef4`) runs the compiled form in the caller's context
+via `vm.NewFrameIn`. The hub's `:eval/submit` relies on it to capture printed
+output with `with-out-str` inside the evaluation future; with the released
+runtime that output would leak to the hub process's stdout. Note also that
+`*ns*` is process-global and `binding` does not restore it, so the hub switches
+namespaces explicitly with `in-ns` and restores in `finally`; evaluations are
+serialized. After the upstream fix, rerun `dev/hub_console_ops_tests.lg`.
