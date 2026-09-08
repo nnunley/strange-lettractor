@@ -1,8 +1,11 @@
 # Progress
 
 **Phase:** dynamic deployment context discovery implemented and mechanically verified
-**Next:** publish the verified discovery checkpoint; remaining
-adapter/environment and hub contracts remain open
+**Next:** resume remaining adapter/environment and hub contracts
+
+Discovery checkpoint `84e2212` is published and remotely verified on both public
+main/console. Local main is fast-forwarded and its CLI rebuilt with the fixed
+runtime; `help` exits0. Private notes remain untracked and untouched.
 
 Deployment capacity is refreshed before each actual model/tool round, with
 explicit override precedence, validated model/endpoint provenance, advisory

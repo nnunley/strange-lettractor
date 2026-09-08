@@ -15,7 +15,10 @@ clojure.test; no new Go fixture or product implementation.
 
 ## In-progress review checkpoint (2026-09-08)
 
-Implementation and verification are complete; publication is next. Claude spec review through
+Implementation, verification and publication are complete. Public main/console
+were verified at `84e22123623e0ff7ec4197548ee37ddbccc6dd03`; local main and CLI
+were updated, with `help` exit0. The full Attractor goal remains open.
+Claude spec review through
 `bin/attractor claude` completed (session
 `a0ada828-52c0-4478-8df2-c7b02f36fcc3`). Remaining findings:
 
@@ -32,7 +35,7 @@ Implementation and verification are complete; publication is next. Claude spec r
   router model selection using `io/encode :url` plus `autoload=false`.
 - Final narrow correctness review completed; its sole finding was rejected
   against constructor validation and passing tests (see adjudication below).
-- Pending: publication verification.
+- Publication verified on public main/console at `84e2212`.
 
 Current focused evidence: native/bundled session tests 16/76/0 and transport
 tests 14/35/0; loopback 3/39/0. The final full suite passed 758/7146/0;
@@ -130,5 +133,5 @@ Files: `src/attractor/agent.lg`, `test/attractor/context_capacity_test.lg`.
   do not hardcode the observed number or modify server configuration.
 - [x] Run `LGX_LG=FIXED_RUNTIME lgx test`, build/help, and bounded independent
   spec and correctness review through the framework connector.
-- [ ] Update progress/evidence documents, commit scoped Attractor files, push
+- [x] Update progress/evidence documents, commit scoped Attractor files, push
   public main/console and verify remote refs. Keep private notes untracked.
