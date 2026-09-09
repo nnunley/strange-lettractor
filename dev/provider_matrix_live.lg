@@ -1,0 +1,108 @@
+(ns main
+  "SCN-PROVIDER-MATRIX: equivalent journeys against each configured real
+   provider (OpenAI, Anthropic, Gemini), plus any OpenAI-compatible endpoint
+   named by ATTRACTOR_COMPAT_MODEL (provider/name, e.g. ollama/qwen3.8-27b).
+   Credentials come only from the environment; a provider without one is
+   recorded as :skipped, never as a pass. Exit 0 only when every provider that
+   was configured passed every journey; exit 3 when nothing was configured.
+   Evidence is written to docs/provider-matrix-evidence.edn with secrets
+   redacted (provider, model, journey, status, duration, error category)."
+  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json]
+            [attractor.llm :as llm] [attractor.agent :as agent] [attractor.profiles :as profiles]
+            [attractor.execution :as execution]))
+
+(def default-models {"openai" "gpt-4.1-mini" "anthropic" "claude-sonnet-4-5" "gemini" "gemini-2.5-flash"})
+(defn- env [k] (let [v (os/getenv k)] (when-not (str/blank? v) v)))
+(defn- configured []
+  (cond-> []
+    (env "OPENAI_API_KEY") (conj {:provider "openai" :model (or (env "ATTRACTOR_OPENAI_MODEL") (default-models "openai"))})
+    (env "ANTHROPIC_API_KEY") (conj {:provider "anthropic" :model (or (env "ATTRACTOR_ANTHROPIC_MODEL") (default-models "anthropic"))})
+    (or (env "GEMINI_API_KEY") (env "GOOGLE_API_KEY")) (conj {:provider "gemini" :model (or (env "ATTRACTOR_GEMINI_MODEL") (default-models "gemini"))})
+    (env "ATTRACTOR_COMPAT_MODEL") (conj (let [spec (env "ATTRACTOR_COMPAT_MODEL") i (str/index-of spec "/")]
+                                          {:provider (subs spec 0 i) :model (subs spec (inc i)) :compat true}))))
+
+(def ^:private png-1x1 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+(defn- journeys [{:keys [provider model compat]}]
+  (let [spec (str provider "/" model)
+        ;; §2.2: the environment client registers only native providers; an
+        ;; OpenAI-compatible endpoint (§7.10) is configured explicitly.
+        client (if compat
+                 (llm/make-client {:providers {provider (llm/make-provider-adapter provider
+                                                          {:api_key (env (str (str/upper-case provider) "_API_KEY"))
+                                                           :base_url (env (str (str/upper-case provider) "_BASE_URL"))})}
+                                   :default_provider provider})
+                 (llm/client-from-env))
+        opts {:client client :max_retries 1 :timeout {:total 120}}]
+    [[:text (fn [] (let [r (llm/generate spec "Reply with exactly the word: pong" opts)]
+                     (when-not (str/includes? (str/lower-case (or (:text r) "")) "pong") (throw (ex-info "unexpected text" {:text (:text r)})))
+                     {:usage (:usage r) :finish (:finish_reason r)}))]
+     [:stream (fn [] (let [s (llm/stream spec "Count from 1 to 3 separated by commas" opts)
+                           events (doall (:events s)) text (get-in ((:response s)) [:message :text] "")]
+                       (when-not (some #(= :text_delta (:type %)) events) (throw (ex-info "no text deltas" {})))
+                       (when-not (str/includes? text "3") (throw (ex-info "unexpected stream text" {:text text})))
+                       {:events (count events)}))]
+     [:structured (fn [] (let [schema {:type "object" :properties {"city" {:type "string"} "country" {:type "string"}} :required ["city" "country"]}
+                               ask (fn [] (llm/generate-object spec "Give a city and its country. Respond with JSON only." schema opts))
+                               ;; Compatible endpoints lack strict schema mode; one retry absorbs a stray non-JSON reply.
+                               r (if compat (try (ask) (catch Object _ (ask))) (ask))]
+                           (when-not (and (string? (get-in r [:output "city"])) (string? (get-in r [:output "country"]))) (throw (ex-info "invalid object" {:output (:output r)})))
+                           {:output (:output r)}))]
+     [:tool-continuation (fn [] (let [calls (atom 0)
+                                     r (llm/generate spec "Use the get_time tool, then tell me the time it returned."
+                                         (assoc opts :max_tool_rounds 2
+                                                :tools [{:name "get_time" :description "Current time" :parameters {:type "object" :properties {}}
+                                                         :execute (fn [_] (swap! calls inc) "14:30")}]))]
+                                 (when (zero? @calls) (throw (ex-info "tool was not called" {})))
+                                 (when-not (str/includes? (or (:text r) "") "14:30") (throw (ex-info "tool result not used" {:text (:text r)})))
+                                 {:tool_calls @calls :steps (count (:steps r))}))]
+     [:image-base64 (fn [] (if compat
+                             :skipped
+                             (let [r (llm/generate spec nil (assoc opts :messages [{:role :user :content [{:kind :text :text "What color is this image? One word."}
+                                                                                                      {:kind :image :image {:base64 png-1x1 :media_type "image/png"}}]}]))]
+                               (when (str/blank? (or (:text r) "")) (throw (ex-info "no image answer" {})))
+                               {:text (:text r)})))]
+     [:reasoning (fn [] (if compat :skipped
+                          (let [r (llm/generate spec "What is 17*23? Answer with the number only." (assoc opts :reasoning_effort "low"))]
+                            (when-not (str/includes? (or (:text r) "") "391") (throw (ex-info "wrong answer" {:text (:text r)})))
+                            {:reasoning (boolean (seq (:reasoning r)))})))]
+     [:invalid-key (fn [] (if compat :skipped
+                            (let [bad (llm/make-client {:providers {provider (llm/make-provider-adapter provider {:api_key "invalid-key-for-matrix"})} :default_provider provider})
+                                  outcome (try (llm/generate spec "hi" {:client bad :max_retries 0}) {:unexpected true}
+                                               (catch Object e {:category (:category (ex-data e))}))]
+                              (when-not (= :authentication (:category outcome)) (throw (ex-info "invalid key not classified" outcome)))
+                              outcome)))]
+     [:agent-loop (fn [] (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))
+                               registry (profiles/make-tool-registry)
+                               _ (profiles/register-tool! registry {:definition {:name "lookup" :description "Look up a code" :parameters {:type "object" :properties {"code" {:type "string"}} :required ["code"]}}
+                                                                    :executor (fn [args _] (str "code " (get args "code") " means READY"))})
+                               profile (assoc (profiles/create-profile provider model) :tool_registry registry)
+                               session (agent/make-session {:provider_profile profile :llm_client client :project_docs [] :max_subagent_depth 0
+                                                            :execution_env (execution/make-local-environment {:working_dir root})})
+                               output (agent/process-input! session "Call the lookup tool with code X7 and report what it means in one sentence.")]
+                           (os/sh "/bin/rm" "-rf" "--" root)
+                           (when-not (str/includes? (str output) "READY") (throw (ex-info "loop did not use the tool result" {:output output})))
+                           {:output (subs (str output) 0 (min 80 (count (str output))))}))]]))
+
+(defn- run-journey [target [name f]]
+  (let [started (System/currentTimeMillis)
+        result (try (let [v (f)] (if (= :skipped v) {:status :skipped} {:status :pass :detail v}))
+                    (catch Object e {:status :fail :category (:category (ex-data e)) :message (subs (ex-message e) 0 (min 200 (count (ex-message e))))}))]
+    (merge {:provider (:provider target) :model (:model target) :journey name
+            :duration_ms (- (System/currentTimeMillis) started)} result)))
+
+(defn -main [& _]
+  (let [targets (configured)]
+    (if (empty? targets)
+      (do (prn {:scenario "SCN-PROVIDER-MATRIX" :status :skipped :reason "no provider credentials in the environment"})
+          (os/exit 3))
+      (let [rows (vec (for [t targets j (journeys t)] (run-journey t j)))
+            evidence {:scenario "SCN-PROVIDER-MATRIX" :recorded_at (str (System/currentTimeMillis))
+                      :providers (mapv #(select-keys % [:provider :model]) targets) :rows rows}]
+        (io/spit "docs/provider-matrix-evidence.edn" (pr-str evidence))
+        (doseq [r rows] (prn (dissoc r :detail)))
+        (let [failed (filter #(= :fail (:status %)) rows)]
+          (prn {:providers (count targets) :journeys (count rows) :passed (count (filter #(= :pass (:status %)) rows))
+                :skipped (count (filter #(= :skipped (:status %)) rows)) :failed (count failed)})
+          (os/exit (if (seq failed) 1 0)))))))
+(when *command-line-args* (apply -main *command-line-args*))
