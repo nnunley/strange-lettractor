@@ -335,3 +335,23 @@ jank suite and e2e pass on runtime `aeb44ef4`. Live: one Qwen turn through
 Not claimed: separate-process RPC/nREPL transport, reconnect/replay, Codex
 worker, human gates answered from the console, native resize/exception
 coverage, a bounded live implementer trial, pruning of finished entries.
+
+## Component checkpoint — Attractor spec conformance sweep (2026-09-08, evening)
+
+**Completed:** ATTR-HUM-02 at the hub seam, ATTR-ENG-04, ATTR-SERVER-01,
+ATTR-OBS-01, ATTR-SMOKE-01 (live opt-in). Every `ATTR-*` story is now proved
+or done as a component except ATTR-ART-02 (adopted project extension awaiting
+a discovery/recovery design) and ATTR-READ-01 (deferred on upstream reader
+compatibility); ATTR-HUM-02's standalone stdin path still depends on
+nooga/let-go#822.
+**Defects found and fixed on the way:** quoted integer/boolean DOT attributes
+stayed strings and crashed the retry policy; run directories and ids carried
+the `#uuid` reader tag (now `attractor.ids`); real HTTP requests never routed
+because the runtime's keyword method was lower-cased as a string; the operation
+owner's idle coordinator could miss a job under a 5 ms deadline (now wakes on
+submission).
+
+Evidence: hub console ops 12/69/0; console session 7/73/0; FAIL contract
+3/12/0; SSE live over real HTTP 1/13/0 (three runs); event families 4/65/0;
+live smoke against llama.cpp 1/19/0 (three runs); full suite 834/7757/0; CLI
+build/help and PTY check pass; runtime `aeb44ef4`.
