@@ -19,7 +19,7 @@ LGX_LG ?= $(firstword $(wildcard $(CANDIDATES)))
 LG := $(LGX_LG)
 LGX := lgx
 TINY_TUI := $(firstword $(wildcard $(HOME)/.lgx/gitlibs/github.com/abogoyavlensky/tiny-tui/*/src))
-SOURCE_PATHS := src:test$(if $(TINY_TUI),:$(TINY_TUI))
+SOURCE_PATHS := src:test:dev$(if $(TINY_TUI),:$(TINY_TUI))
 TIMEOUT ?= 1500
 
 RUNNERS := $(wildcard dev/*_tests.lg)
@@ -52,8 +52,10 @@ suite: test ## Alias for test
 runners: check-runtime ## Every focused dev/*_tests.lg runner, one line each
 	@fail=0; for r in $(RUNNERS); do \
 	  printf '%-44s ' "$$r"; \
-	  out=$$(perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) "$$r" run 2>&1 | head -1); \
-	  echo "$$out"; case "$$out" in *":fail 0}"*) ;; *) fail=1;; esac; \
+	  out=$$(perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) "$$r" run 2>&1 \
+	        | grep -E -m1 '^\{:error|^Finished running tests'); \
+	  echo "$${out:-no summary line (load or runtime error)}"; \
+	  case "$$out" in *":error 0,"*":fail 0}"*|*"Fail: 0 Error: 0"*) ;; *) fail=1;; esac; \
 	done; exit $$fail
 
 run-%: check-runtime ## One focused runner, e.g. make run-providers (dev/providers_tests.lg)
