@@ -1,25 +1,39 @@
 (ns main
-  "SCN-PROVIDER-MATRIX: equivalent journeys against each configured real
-   provider (OpenAI, Anthropic, Gemini), plus any OpenAI-compatible endpoint
-   named by ATTRACTOR_COMPAT_MODEL (provider/name, e.g. openai-compat/qwen3.8-27b).
-   Credentials come only from the environment; a provider without one is
-   recorded as :skipped, never as a pass. Exit 0 only when every provider that
-   was configured passed every journey; exit 3 when nothing was configured.
-   Evidence is written to docs/provider-matrix-evidence.edn with secrets
-   redacted (provider, model, journey, status, duration, error category)."
+  "SCN-PROVIDER-MATRIX: equivalent journeys against every provider in the
+   registry (built-ins plus attractor.edn) that has a key, from the
+   environment or a config file. Native-protocol providers use a default model
+   per protocol; a Chat Completions provider runs only when
+   ATTRACTOR_<ID>_MODEL names its model (ATTRACTOR_COMPAT_MODEL still works
+   for openai-compat). ATTRACTOR_MATRIX_PROVIDERS=a,b restricts the run.
+   A provider without a key or model is recorded as :skipped, never as a
+   pass. Exit 0 only when every provider that ran passed every journey; exit
+   3 when nothing was configured. Evidence is written to
+   docs/provider-matrix-evidence.edn with secrets redacted (provider, model,
+   journey, status, duration, error category)."
   (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json]
             [attractor.llm :as llm] [attractor.agent :as agent] [attractor.profiles :as profiles]
-            [attractor.execution :as execution]))
+            [attractor.providers :as providers] [attractor.execution :as execution]))
 
-(def default-models {"openai" "gpt-4.1-mini" "anthropic" "claude-sonnet-4-5" "gemini" "gemini-2.5-flash"})
+(def default-models {:openai-responses "gpt-4.1-mini" :anthropic-messages "claude-sonnet-4-5"
+                     :gemini-generate-content "gemini-2.5-flash"})
 (defn- env [k] (let [v (os/getenv k)] (when-not (str/blank? v) v)))
+(defn- model-for [id protocol]
+  (or (env (str "ATTRACTOR_" (providers/env-name id "_MODEL")))
+      (when (= id "openai-compat")
+        (when-let [spec (env "ATTRACTOR_COMPAT_MODEL")]
+          (subs spec (inc (str/index-of spec "/")))))
+      (default-models protocol)))
 (defn- configured []
-  (cond-> []
-    (env "OPENAI_API_KEY") (conj {:provider "openai" :model (or (env "ATTRACTOR_OPENAI_MODEL") (default-models "openai"))})
-    (env "ANTHROPIC_API_KEY") (conj {:provider "anthropic" :model (or (env "ATTRACTOR_ANTHROPIC_MODEL") (default-models "anthropic"))})
-    (or (env "GEMINI_API_KEY") (env "GOOGLE_API_KEY")) (conj {:provider "gemini" :model (or (env "ATTRACTOR_GEMINI_MODEL") (default-models "gemini"))})
-    (env "ATTRACTOR_COMPAT_MODEL") (conj (let [spec (env "ATTRACTOR_COMPAT_MODEL") i (str/index-of spec "/")]
-                                          {:provider (subs spec 0 i) :model (subs spec (inc i)) :compat true}))))
+  (let [only (when-let [v (env "ATTRACTOR_MATRIX_PROVIDERS")] (set (map str/trim (str/split v #","))))]
+    (vec (keep (fn [row]
+                 (let [id (:id row) protocol (:protocol row)
+                       key? (or (:key_present row)
+                                (and (= :openai-chat-completions protocol) (:base_url row)))
+                       model (model-for id protocol)]
+                   (when (and key? model (or (nil? only) (contains? only id))
+                              (or (not= :openai-chat-completions protocol) (:base_url row)))
+                     {:provider id :model model :compat (= :openai-chat-completions protocol)})))
+               (providers/effective)))))
 
 (def ^:private png-1x1 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
 
@@ -27,12 +41,9 @@
   (let [spec (str provider "/" model)
         ;; §2.2: the environment client registers only native providers; an
         ;; OpenAI-compatible endpoint (§7.10) is configured explicitly.
-        client (if compat
-                 (llm/make-client {:providers {provider (llm/make-provider-adapter provider
-                                                          {:api_key (env (str (str/replace (str/upper-case provider) "-" "_") "_API_KEY"))
-                                                           :base_url (env (str (str/replace (str/upper-case provider) "-" "_") "_BASE_URL"))})}
-                                   :default_provider provider})
-                 (llm/client-from-env))
+        ;; One client per provider, credentials and base URL from the registry.
+        client (llm/make-client {:providers {provider (llm/make-provider-adapter provider {})}
+                                 :default_provider provider})
         opts {:client client :max_retries 1 :timeout {:total 120}}]
     [[:text (fn [] (let [r (llm/generate spec "Reply with exactly the word: pong" opts)]
                      (when-not (str/includes? (str/lower-case (or (:text r) "")) "pong") (throw (ex-info "unexpected text" {:text (:text r)})))
@@ -59,7 +70,7 @@
      [:image-base64 (fn [] (if compat
                              :skipped
                              (let [r (llm/generate spec nil (assoc opts :messages [{:role :user :content [{:kind :text :text "What color is this image? One word."}
-                                                                                                      {:kind :image :image {:base64 png-1x1 :media_type "image/png"}}]}]))]
+                                                                                                      {:kind :image :image {:data (base64-decode png-1x1) :media_type "image/png"}}]}]))]
                                (when (str/blank? (or (:text r) "")) (throw (ex-info "no image answer" {})))
                                {:text (:text r)})))]
      [:reasoning (fn [] (if compat :skipped

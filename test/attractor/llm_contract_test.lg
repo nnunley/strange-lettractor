@@ -549,6 +549,20 @@
 ;; Marker comments for scenario completion
 ;; ============================================================================
 
+(deftest generate-object-accepts-fenced-or-prose-wrapped-json
+  (let [schema {:type "object" :properties {"city" {:type "string"}} :required ["city"]}
+        reply (fn [text] {:message {:role :assistant :content text} :finish_reason :stop :usage {}})]
+    (doseq [text ["```json\n{\"city\": \"Oslo\"}\n```"
+                  "Here you go:\n{\"city\": \"Oslo\"}\nAnything else?"
+                  "{\"city\": \"Oslo\"}"]]
+      (is (= {"city" "Oslo"}
+             (:output (llm/generate-object "mock/m" "city?" schema {:mock_handler (fn [_] (reply text))})))
+          (pr-str text)))
+    (is (= :no-object-generated
+           (try (llm/generate-object "mock/m" "city?" schema {:mock_handler (fn [_] (reply "no json here"))})
+                nil
+                (catch Object e (:category (ex-data e))))))))
+
 ;; SCN-ULLM-CLIENT COMPLETE
 ;; SCN-ULLM-HIGHLEVEL COMPLETE
 ;; SCN-ULLM-TOOLS COMPLETE

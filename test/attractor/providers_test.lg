@@ -169,6 +169,21 @@
           (is (= "https://proxy.test/anthropic/v1/messages" (:url @captured)))
           (is (= "proxy-key" (get-in @captured [:headers "x-api-key"])))
           (is (= "hello" (llm/response-text response)))))
+      (testing "a provider prefix routes and is stripped; a foreign prefix is part of the model name"
+        (let [captured (atom [])
+              adapter (llm/make-provider-adapter
+                        "openrouter"
+                        {:api_key "or-key"
+                         :transport (fn [request]
+                                      (swap! captured conj (get (json/read-json (:body request)) "model"))
+                                      {:status 200
+                                       :body (json/write-json {:id "c" :choices [{:message {:role "assistant" :content "hi"} :finish_reason "stop"}]})})})
+              client (llm/make-client {:providers {"openrouter" adapter} :default_provider "openrouter"})]
+          (llm/client-complete client {:model "openrouter/google/gemma-4:free" :messages [{:role :user :content "x"}]})
+          (llm/client-complete client {:model "google/gemma-4:free" :messages [{:role :user :content "x"}]})
+          (llm/generate "openrouter/google/gemma-4:free" "x" {:client client})
+          (is (= ["google/gemma-4:free" "google/gemma-4:free" "google/gemma-4:free"] @captured))
+          (is (= :configuration (category-of #(llm/client-complete client {:model "nowhere/m" :provider "nowhere" :messages []}))))))
       (testing "discovery toggle and unknown ids are configuration errors"
         (is (str/includes? (message-of #(llm/fetch-models "claude-proxy")) "model discovery"))
         (is (= :configuration (category-of #(llm/resolve-base-url "nowhere")))))

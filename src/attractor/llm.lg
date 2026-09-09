@@ -53,6 +53,9 @@
           (str/includes? message "safety")) :content-filter
       (and (str/includes? message "quota")
            (not (str/includes? message "rate"))) :quota-exceeded
+      (or (str/includes? message "credit balance")
+          (str/includes? message "insufficient credit")
+          (str/includes? message "billing")) :quota-exceeded
       (and (= error-code "insufficient_quota") (= status 429)) :quota-exceeded
       (or (= grpc-code "UNAUTHENTICATED") (= status 401)
           (str/includes? message "unauthorized")
@@ -2639,17 +2642,33 @@
      :default_provider default-provider
      :middleware (vec (or (:middleware options) []))}))
 
-(defn- client-provider [client request]
-  (let [provider (normalize-provider-name
-                   (or (:provider request) (:default_provider client)))]
+(defn- routed-request
+  "Resolve the provider for a request. A model written as `<id>/<name>` whose
+   prefix is a registered provider selects that provider and strips the
+   prefix from the model sent on the wire (an explicit :provider that differs
+   keeps the model untouched, since ids like `google/gemma` are legitimate
+   model names elsewhere). Returns the request with :provider and :model set."
+  [client request]
+  (let [spec (str (or (:model request) ""))
+        prefixed (when (and (str/includes? spec "/") (not (str/starts-with? spec "/")))
+                   (let [[prefix rest] (split-once spec "/")]
+                     (when (contains? (:providers client) (normalize-provider-name prefix))
+                       {:provider (normalize-provider-name prefix) :model rest})))
+        explicit (normalize-provider-name (:provider request))
+        provider (or explicit (:provider prefixed) (normalize-provider-name (:default_provider client)))]
     (when (nil? provider)
       (throw (ex-info "No provider specified and Client has no default provider"
                       {:category :configuration})))
-    (let [adapter (get (:providers client) provider)]
-      (when (nil? adapter)
-        (throw (ex-info (str "Provider is not registered: " provider)
-                        {:provider provider :category :configuration})))
-      [provider adapter])))
+    (when (nil? (get (:providers client) provider))
+      (throw (ex-info (str "Provider is not registered: " provider)
+                      {:provider provider :category :configuration})))
+    (cond-> (assoc request :provider provider)
+      (and prefixed (= provider (:provider prefixed))) (assoc :model (:model prefixed)))))
+
+(defn- client-provider [client request]
+  (let [routed (routed-request client request)
+        provider (:provider routed)]
+    [provider (get (:providers client) provider) routed]))
 
 (defn- middleware-chain [middleware terminal]
   (reduce (fn [next middleware-fn]
@@ -2658,22 +2677,21 @@
           (reverse middleware)))
 
 (defn client-complete [client request]
-  (let [[provider adapter] (client-provider client request)
-        req (assoc request :provider provider)
+  (let [[_ adapter req] (client-provider client request)
         invoke (middleware-chain
                  (:middleware client)
                  (fn [r] ((:complete adapter) r)))]
     (invoke req)))
 
 (defn client-stream [client request]
-  (let [[provider adapter] (client-provider client request)
+  (let [[provider adapter req] (client-provider client request)
         stream-fn (:stream adapter)]
     (when (nil? stream-fn)
       (throw (ex-info (str "Provider does not implement streaming: " provider)
                       {:provider provider :category :configuration})))
     ((middleware-chain (:middleware client)
                        (fn [r] (stream-fn r)))
-     (assoc request :provider provider))))
+     req)))
 
 (defn client-discover-context [client request]
   (let [[provider adapter] (client-provider client request)
@@ -3454,9 +3472,25 @@
 (defn validate-json-schema [value schema]
   (validate-json-schema* value schema schema))
 
+(defn- unfenced-json
+  "Models without a strict JSON mode often wrap the object in a Markdown code
+   fence or lead with prose; parse the fenced block or the outermost object
+   when the raw text is not JSON. Valid JSON is returned untouched."
+  [text]
+  (let [t (str/trim (str text))
+        fenced (re-find #"(?s)```(?:json)?\s*(.*?)\s*```" t)
+        candidate (if fenced (str/trim (second fenced)) t)
+        start (str/index-of candidate "{")
+        end (str/last-index-of candidate "}")]
+    (cond
+      (or (str/starts-with? candidate "{") (str/starts-with? candidate "[")) candidate
+      (and start end (< start end)) (subs candidate start (inc end))
+      :else candidate)))
+
 (defn- parse-validated-object [text schema]
   (let [parsed (try
-                 (json/read-json text)
+                 (try (json/read-json text)
+                      (catch Object _ (json/read-json (unfenced-json text))))
                  (catch Object e
                    (throw (ex-info "No object generated: response was not valid JSON"
                                    {:category :no-object-generated
