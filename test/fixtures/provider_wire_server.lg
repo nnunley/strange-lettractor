@@ -65,16 +65,26 @@
                         frames))})
 
 (defn stream-body [provider scenario]
-  (let [final (complete-body provider scenario)]
+  (let [final (complete-body provider scenario)
+        tools? (= scenario "tools")]
     (case provider
       "openai"
-      (sse [[nil {:type "response.output_item.added"
-                  :item {:id "msg-1" :type "message" :role "assistant" :content []}}]
-            [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "Hello "}]
-            [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "world"}]
-            [nil {:type "response.completed" :response final}]])
+      (sse (concat
+             [[nil {:type "response.output_item.added"
+                    :item {:id "msg-1" :type "message" :role "assistant" :content []}}]
+              [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "Hello "}]
+              [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "world"}]]
+             (when tools?
+               [[nil {:type "response.output_item.added"
+                      :item {:id "fc-1" :type "function_call" :call_id "call-1" :name "get_weather" :arguments ""}}]
+                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta "{\"city\":"}]
+                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta "\"Oslo\"}"}]
+                [nil {:type "response.output_item.done"
+                      :item {:id "fc-1" :type "function_call" :call_id "call-1" :name "get_weather" :arguments "{\"city\":\"Oslo\"}"}}]])
+             [[nil {:type "response.completed" :response final}]]))
       "anthropic"
-      (sse [["message_start" {:type "message_start"
+      (sse (concat
+           [["message_start" {:type "message_start"
                               :message {:id "msg-1" :type "message" :role "assistant" :model "claude-test"
                                         :usage {:input_tokens 11 :output_tokens 0}}}]
             ["content_block_start" {:type "content_block_start" :index 0
@@ -83,14 +93,26 @@
                                     :delta {:type "text_delta" :text "Hello "}}]
             ["content_block_delta" {:type "content_block_delta" :index 0
                                     :delta {:type "text_delta" :text "world"}}]
-            ["content_block_stop" {:type "content_block_stop" :index 0}]
-            ["message_delta" {:type "message_delta" :delta {:stop_reason "end_turn"}
+            ["content_block_stop" {:type "content_block_stop" :index 0}]]
+           (when tools?
+             [["content_block_start" {:type "content_block_start" :index 1
+                                      :content_block {:type "tool_use" :id "toolu-1" :name "get_weather" :input {}}}]
+              ["content_block_delta" {:type "content_block_delta" :index 1
+                                      :delta {:type "input_json_delta" :partial_json "{\"city\":"}}]
+              ["content_block_delta" {:type "content_block_delta" :index 1
+                                      :delta {:type "input_json_delta" :partial_json "\"Oslo\"}"}}]
+              ["content_block_stop" {:type "content_block_stop" :index 1}]])
+           [["message_delta" {:type "message_delta" :delta {:stop_reason (if tools? "tool_use" "end_turn")}
                               :usage {:output_tokens 7}}]
-            ["message_stop" {:type "message_stop"}]])
+            ["message_stop" {:type "message_stop"}]]))
       "gemini"
-      (sse [[nil {:candidates [{:content {:role "model" :parts [{:text "Hello "}]}}]}]
-            [nil {:candidates [{:content {:role "model" :parts [{:text "world"}]} :finishReason "STOP"}]
-                  :usageMetadata (:usageMetadata final)}]])
+      (sse (concat
+             [[nil {:candidates [{:content {:role "model" :parts [{:text "Hello "}]}}]}]]
+             (when tools?
+               [[nil {:candidates [{:content {:role "model"
+                                              :parts [{:functionCall {:name "get_weather" :args {:city "Oslo"}}}]}}]}]])
+             [[nil {:candidates [{:content {:role "model" :parts [{:text "world"}]} :finishReason "STOP"}]
+                    :usageMetadata (:usageMetadata final)}]]))
       "openai-compat"
       (sse [[nil {:id "chatcmpl-1" :model "compat-test"
                   :choices [{:index 0 :delta {:role "assistant" :content "Hello "}}]}]
@@ -133,6 +155,14 @@
               streaming? (or (and (map? body) (true? (get body "stream")))
                              (str/includes? path "streamGenerateContent"))]
           (swap! state update :requests (fnil conj []) recorded)
+          ;; "loop": first call per provider answers with a tool call, later
+          ;; calls with text, so a real agent session can run a full turn.
+          (let [counter (str provider "/" scenario)
+                attempt (if (map? body)
+                          (get-in (swap! state update-in [:attempts counter] (fnil inc 0)) [:attempts counter])
+                          ;; Bodyless probes (context discovery) do not consume a turn.
+                          0)
+                scenario (if (= scenario "loop") (if (= attempt 1) "tools" "text") scenario)]
           (cond
             (= scenario "auth") {:status 401
                                  :headers {"Content-Type" "application/json"}
@@ -140,7 +170,7 @@
             streaming? (or (stream-body provider scenario) {:status 404 :body "unknown provider"})
             :else (if-let [reply (complete-body provider scenario)]
                     (json-response reply)
-                    {:status 404 :body "unknown provider"})))))))
+                    {:status 404 :body "unknown provider"}))))))))
 
 (defn -main [port token]
   (let [number (parse-long port)]

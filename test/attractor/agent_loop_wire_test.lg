@@ -1,0 +1,167 @@
+(ns attractor.agent-loop-wire-test
+  "Native-wire parity for the coding-agent loop: a real `agent/make-session`
+   with each built-in provider profile runs a full tool turn through the
+   unified client and the real HTTP adapters against the loopback recording
+   server (`test/fixtures/provider_wire_server.lg`, scenario `loop`). The
+   recordings prove what actually reached the wire: profile tools and system
+   prompt, tool-result continuation in the provider's own shape, a steering
+   message entering after the tool result, and a mid-turn reasoning-effort
+   change reaching the next request."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]
+            [attractor.llm-contract-adapters-test :as wire]))
+
+(def providers
+  {"openai" {:model "gpt-test" :tool-call-id "call-1"}
+   "anthropic" {:model "claude-test" :tool-call-id "toolu-1"}
+   "gemini" {:model "gemini-test" :tool-call-id nil}})
+
+(defn- fresh-dir []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-wire-loop-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- session-for [root provider model events holder]
+  (let [client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter
+                                         provider
+                                         {:api_key (str "key-" provider)
+                                          :base_url (str root "/" provider "/loop")})}})
+        session (agent/make-session
+                  {:model (str provider "/" model)
+                   :llm_client client
+                   :execution_env (execution/make-local-environment {:working_dir (fresh-dir)})
+                   :project_docs []
+                   :max_subagent_depth 0
+                   :reasoning_effort "low"
+                   :on_event #(swap! events conj %)})]
+    (profiles/register-tool!
+      (:tool_registry (:provider_profile @session))
+      {:definition {:name "get_weather" :description "Weather by city"
+                    :parameters {:type "object" :properties {:city {:type "string"}}}}
+       :executor (fn [arguments _]
+                   (agent/steer-session! @holder "steer after tool")
+                   (agent/set-reasoning-effort! @holder "high")
+                   (str "sunny in " (get arguments "city")))})
+    session))
+
+(defn- requests-for
+  "Model calls only: the session's context-capacity discovery probe (a bodyless
+   GET) is recorded too and is not part of the loop contract."
+  [root provider]
+  (filterv #(and (str/includes? (get % "path") (str "/" provider "/loop/"))
+                 (map? (get % "body")))
+           (wire/recorded root)))
+
+(defn- tool-names [provider body]
+  (case provider
+    "openai" (mapv #(get % "name") (get body "tools"))
+    "anthropic" (mapv #(get % "name") (get body "tools"))
+    "gemini" (mapv #(get % "name") (get-in body ["tools" 0 "functionDeclarations"]))))
+
+(defn- text-of [content]
+  (cond (string? content) content
+        (sequential? content) (str/join (map #(or (get % "text") "") content))
+        :else ""))
+
+(deftest native-profiles-run-a-tool-turn-on-the-wire
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[provider {:keys [model tool-call-id]}] providers]
+        (let [events (atom []) holder (atom nil)
+              session (session-for root provider model events holder)]
+          (reset! holder session)
+          (try
+            (let [answer (agent/process-input! session "What is the weather in Oslo?")
+                  requests (requests-for root provider)
+                  first-body (get (first requests) "body")
+                  second-body (get (second requests) "body")]
+              (testing (str provider ": two wire requests, final answer from the second")
+                (is (= 2 (count requests)) (pr-str (mapv #(get % "path") requests)))
+                (is (= "Hello world" answer))
+                (is (= :idle (:state @session))))
+              (testing (str provider ": profile system prompt and tools reach the wire")
+                (let [system (case provider
+                               "openai" (get first-body "instructions")
+                               "anthropic" (let [s (get first-body "system")] (if (string? s) s (text-of s)))
+                               "gemini" (get-in first-body ["systemInstruction" "parts" 0 "text"]))
+                      names (set (tool-names provider first-body))]
+                  (is (string? system) provider)
+                  (is (str/includes? system (str "Platform: " (os/os-name))) "environment context §2.6")
+                  (is (contains? names "get_weather"))
+                  (is (< 1 (count names)) "built-in profile tools are offered alongside the custom tool")
+                  (is (= "What is the weather in Oslo?"
+                         (case provider
+                           "openai" (text-of (get-in first-body ["input" 0 "content"]))
+                           "anthropic" (text-of (get-in first-body ["messages" 0 "content"]))
+                           "gemini" (get-in first-body ["contents" 0 "parts" 0 "text"])))
+                      "user text is the first turn")
+                  (when (= provider "openai")
+                    (is (= "low" (get-in first-body ["reasoning" "effort"]))))))
+              (testing (str provider ": tool result continues in the provider's own shape")
+                (case provider
+                  "openai"
+                  (let [items (get second-body "input")
+                        call (first (filter #(= "function_call" (get % "type")) items))
+                        result (first (filter #(= "function_call_output" (get % "type")) items))]
+                    (is (= "call-1" (get call "call_id")))
+                    (is (= "call-1" (get result "call_id")))
+                    (is (= "sunny in Oslo" (get result "output")))
+                    (is (= "high" (get-in second-body ["reasoning" "effort"])) "effort change reaches the next request"))
+                  "anthropic"
+                  (let [messages (get second-body "messages")
+                        assistant (nth messages 1)
+                        result-msg (nth messages 2)
+                        use (first (filter #(= "tool_use" (get % "type")) (get assistant "content")))
+                        result (first (filter #(= "tool_result" (get % "type")) (get result-msg "content")))]
+                    (is (= "assistant" (get assistant "role")))
+                    (is (= "toolu-1" (get use "id")))
+                    (is (= "user" (get result-msg "role")))
+                    (is (= "toolu-1" (get result "tool_use_id")))
+                    (is (= "sunny in Oslo" (text-of (get result "content")))))
+                  "gemini"
+                  (let [contents (get second-body "contents")
+                        model-turn (nth contents 1)
+                        result-turn (nth contents 2)
+                        call (first (keep #(get % "functionCall") (get model-turn "parts")))
+                        result (first (keep #(get % "functionResponse") (get result-turn "parts")))]
+                    (is (= "model" (get model-turn "role")))
+                    (is (= "get_weather" (get call "name")))
+                    (is (= "user" (get result-turn "role")))
+                    (is (= "get_weather" (get result "name")))
+                    (is (str/includes? (pr-str (get result "response")) "sunny in Oslo")))))
+              (testing (str provider ": steering enters after the tool result, before the next model call")
+                (let [texts (case provider
+                              "openai" (mapv #(text-of (get % "content")) (filter #(= "message" (get % "type")) (get second-body "input")))
+                              "anthropic" (mapv #(text-of (get % "content")) (get second-body "messages"))
+                              "gemini" (mapv #(str/join (keep (fn [p] (get p "text")) (get % "parts"))) (get second-body "contents")))]
+                  (is (= "steer after tool" (last texts)) (pr-str texts))))
+              (testing (str provider ": session history and lifecycle events")
+                (is (= [:user :assistant :tool_results :steering :assistant]
+                       (mapv :type (:history @session))))
+                (is (= "sunny in Oslo"
+                       (get-in (first (filter #(= :tool_results (:type %)) (:history @session)))
+                               [:results 0 :content])))
+                (is (= [:session_start :user_input :assistant_text_start :assistant_text_end
+                        :tool_call_start :tool_call_end :steering_injected
+                        :assistant_text_start :assistant_text_end :processing_end]
+                       (mapv :type (remove #(= :assistant_text_delta (:type %)) @events))))
+                (is (pos? (count (filter #(= :assistant_text_delta (:type %)) @events)))
+                    "streamed deltas are delivered as events")
+                (is (= "sunny in Oslo" (:output (first (filter #(= :tool_call_end (:type %)) @events)))))
+                (when tool-call-id
+                  (is (= tool-call-id
+                         (:call_id (first (filter #(= :tool_call_start (:type %)) @events))))))))
+            (finally
+              (agent/close-session! session))))))))
+
+;; SCN-CAL-LOOP WIRE COMPLETE
+;; SCN-CAL-PROFILES WIRE COMPLETE

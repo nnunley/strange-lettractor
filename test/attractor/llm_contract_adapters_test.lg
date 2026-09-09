@@ -43,7 +43,7 @@
         (when (= :pending (deref worker 3000 :pending))
           (throw (ex-info "Fixture process failed to join" {})))))))
 
-(defn- recorded [root]
+(defn recorded [root]
   (json/read-json (str (:body (http/request {:url (str root "/recorded")})))))
 
 (defn- client-for [root provider scenario]
