@@ -50,8 +50,10 @@ Prerequisites:
   OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for
   live models, addressed as `openai-compat/<model>`.
 
-Every command below reads the runtime from `LGX_LG`; the `lg` on your `PATH`
-may be older, so always set it:
+Provider keys and live-runner options come from `.env` in the working
+directory; `.env.sample` lists every variable the code reads. Every command
+below reads the runtime from `LGX_LG`; the `lg` on your `PATH` may be older,
+so always set it:
 
 ```sh
 export LGX_LG=/path/to/let-go/build/lg   # the fixed local build

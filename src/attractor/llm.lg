@@ -166,7 +166,8 @@
           "openai-compat" (or (let [k (os/getenv "OPENAI_COMPAT_API_KEY")] (when-not (str/blank? k) k))
                               "local")
           "anthropic" (let [k (os/getenv "ANTHROPIC_API_KEY")] (when-not (str/blank? k) k))
-          "gemini" (let [k (os/getenv "GEMINI_API_KEY")] (when-not (str/blank? k) k))
+          "gemini" (or (let [k (os/getenv "GEMINI_API_KEY")] (when-not (str/blank? k) k))
+                       (let [k (os/getenv "GOOGLE_API_KEY")] (when-not (str/blank? k) k)))
           "openai" (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
           nil))))
 
