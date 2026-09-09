@@ -289,7 +289,7 @@
   (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
   (println "  serve [--port <port>]                               Start HTTP management server")
-  (println "  models [--provider <p>] [--base-url <u>]             List available models from provider API")
+  (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
   (println "  providers                                           Show the effective provider registry (attractor.edn)")
   (println (str "  agent <" (str/join "|" (registry/agent-names)) "> --prompt-file <file>          Run one external agent job, EDN events"))
   (println "    [--cwd <dir>] [--model <m>] [--timeout-ms <ms>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
@@ -500,33 +500,55 @@
     (println (str "    model_discovery: " (:model_discovery row))))
   (os/exit 0))
 
-(defn cmd-models [args]
-  (let [provider (or (find-arg-val args "--provider")
-                     ;; First configured provider that can be queried: has a key
-                     ;; (or is a local chat-completions server) and allows discovery.
-                     (some (fn [row] (when (and (:model_discovery row)
-                                                (or (:key_present row)
-                                                    (and (= :openai-chat-completions (:protocol row)) (:base_url row))))
-                                       (:id row)))
-                           (providers/effective))
-                     "openai")
-        base-url (find-arg-val args "--base-url")
-        api-key (find-arg-val args "--api-key")]
-    (let [outcome (try
-                    (println (str "Querying models from " provider " (" (llm/resolve-base-url provider base-url) ")..."))
-                    (let [models (llm/fetch-models provider {:base_url base-url :api_key api-key})]
-                      (if (seq models)
-                        (do
-                          (println (str "Found " (count models) " available model(s):"))
-                          (doseq [m (sort models)]
-                            (println (str "  • " m))))
-                        (println "No models found or request failed. Check your API key and base URL."))
-                      0)
-                    (catch Object error
-                      (if (= :configuration (:category (ex-data error)))
-                        (do (println (str "Error: " (ex-message error))) 1)
-                        (throw error))))]
-      (os/exit outcome))))
+(defn- queryable-providers []
+  ;; Providers whose /models endpoint can be asked: discovery allowed and a
+  ;; key present, or a local chat-completions server with a base URL.
+  (vec (keep (fn [row] (when (and (:model_discovery row)
+                                  (or (:key_present row)
+                                      (and (= :openai-chat-completions (:protocol row)) (:base_url row))))
+                         (:id row)))
+             (providers/effective))))
+
+(defn- list-models! [provider base-url api-key]
+  (try
+    (println (str "Querying models from " provider " (" (llm/resolve-base-url provider base-url) ")..."))
+    (let [models (llm/fetch-models provider {:base_url base-url :api_key api-key})]
+      (if (seq models)
+        (do
+          (println (str "Found " (count models) " available model(s):"))
+          (doseq [m (sort models)]
+            (println (str "  • " provider "/" m))))
+        (println "No models found or request failed. Check your API key and base URL."))
+      0)
+    (catch Object error
+      (if (= :configuration (:category (ex-data error)))
+        (do (println (str "Error: " (ex-message error))) 1)
+        (throw error)))))
+
+(defn cmd-models
+  "models [--provider <id>] [--base-url <u>] [--api-key <k>]: list models from
+   one provider, or from every provider that can be queried when no provider
+   is named."
+  [args]
+  (let [known #{"--provider" "--base-url" "--api-key" "--env-file"}
+        unknown (filter #(and (str/starts-with? % "--") (not (contains? known %))) args)]
+    (when (seq unknown)
+      (println (str "Error: unknown option " (first unknown) "; expected one of " (str/join ", " (sort known))))
+      (os/exit 2))
+    (let [provider (find-arg-val args "--provider")
+          base-url (find-arg-val args "--base-url")
+          api-key (find-arg-val args "--api-key")]
+      (if provider
+        (os/exit (list-models! provider base-url api-key))
+        (let [ids (queryable-providers)]
+          (when (empty? ids)
+            (println "No provider can be queried: add a key in attractor.edn or the environment, or pass --provider with --api-key.")
+            (os/exit 1))
+          (when (or base-url api-key)
+            (println "Error: --base-url and --api-key apply to one provider; pass --provider as well.")
+            (os/exit 2))
+          (let [codes (mapv (fn [id] (let [code (list-models! id nil nil)] (println) code)) ids)]
+            (os/exit (if (every? zero? codes) 0 1))))))))
 
 ;; CLI Entry Point
 (defn -main [& args]
