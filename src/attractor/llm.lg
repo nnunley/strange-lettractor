@@ -225,14 +225,14 @@
       (str/starts-with? m "gemini-")
       "gemini"
 
-      ;; A configured Chat Completions endpoint with a base URL is the only
-      ;; provider whose model names carry no recognizable prefix.
+      ;; Unprefixed names with no recognizable family fall back to the
+      ;; built-in Chat Completions provider when it has a base URL; other
+      ;; configured providers must be addressed by prefix.
+      (providers/base-url "openai-compat")
+      "openai-compat"
+
       :else
-      (or (some (fn [id] (when (and (= :openai-chat-completions (providers/protocol-of id))
-                                    (providers/base-url id))
-                           id))
-                (providers/ids))
-          "mock"))))
+      "mock")))
 
 ;; Split string once by separator
 (defn- split-once [s sep]
@@ -2701,17 +2701,21 @@
     (when-not (str/blank? value) value)))
 
 (defn client-from-env
-  "Register every configured provider whose key is present in the
-   environment (spec §2.2). Chat-completions providers also need a base URL.
-   The default provider is the first of openai, anthropic, gemini, then any
-   other configured id in sorted order."
+  "Register every configured provider whose key is present (spec §2.2):
+   from the process environment or a config file, or, when an explicit
+   environment map is given, from that map only. Chat-completions providers
+   also need a base URL. The default provider is the first of openai,
+   anthropic, gemini, then any other configured id in sorted order."
   [& [environment]]
   (let [env (or environment :process)
         get-env (fn [name] (env-get env name))
+        key-for (if (map? env)
+                  (fn [id] (some (fn [name] (present-env env name)) (providers/key-env-names id)))
+                  (fn [id] (providers/api-key id nil get-env)))
         providers
         (into {}
               (keep (fn [id]
-                      (let [key (providers/api-key id nil get-env)
+                      (let [key (key-for id)
                             base (providers/base-url id nil get-env)
                             protocol (providers/protocol-of id)]
                         (when (and key (or base (not= :openai-chat-completions protocol)))
