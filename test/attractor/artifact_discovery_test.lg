@@ -1,0 +1,73 @@
+(ns attractor.artifact-discovery-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str] [os :as os] [io :as io]
+            [attractor.context :as context] [attractor.pipeline :as pipeline]
+            [attractor.handlers :as handlers] [attractor.interviewer :as interviewer]))
+
+;; SCN-ARTIFACT-DISCOVERY COMPLETE
+;; ATTR-ART-02 (project extension beyond §5.5): artifacts a handler stores are
+;; discoverable from run state without the storing process's store object,
+;; correctly inline or file backed, and preserved across checkpoint resume,
+;; where a later handler retrieves them through a fresh store.
+
+(def ^:private big (apply str (repeat (+ context/file-backing-threshold 1) "x")))
+(def ^:private dot
+  (str/join "\n" ["digraph A {" "start [shape=Mdiamond]"
+                  "produce [shape=box, prompt=\"p\"]" "consume [shape=box, prompt=\"c\"]" "exit [shape=Msquare]"
+                  "start -> produce -> consume -> exit" "}"]))
+
+(defn- registry [seen]
+  (let [r (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {})]
+    (handlers/register-handler! r "codergen"
+      (fn [node _ _ logs-root]
+        (let [store (context/make-artifact-store logs-root)]
+          (case (:id node)
+            "produce" (let [small (context/store-artifact! store "notes" "Notes" {:kind "small" :items [1 2 3]})
+                            large (context/store-artifact! store "blob" "Blob" big)]
+                        {:status :success :artifacts [small large]})
+            "consume" (do (reset! seen {:listed (context/list-artifacts store)
+                                        :notes (context/retrieve-artifact store "notes")
+                                        :blob-size (count (context/retrieve-artifact store "blob"))})
+                          {:status :success})))))
+    r))
+
+(deftest artifacts-are-discoverable-from-run-state-and-a-fresh-store
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) logs (str root "/logs") seen (atom nil)
+        outcome (pipeline/run dot {:logs-root logs :registry (registry seen)})]
+    (try
+      (is (= :success (:status outcome)))
+      ;; A later handler in the same run, with its own store object, saw both.
+      (is (= #{"notes" "blob"} (set (map :id (:listed @seen)))))
+      (is (= {:kind "small" :items [1 2 3]} (:notes @seen)))
+      (is (= (count big) (:blob-size @seen)))
+      ;; Discovery from run state alone, in this process but with no store.
+      (let [found (context/discover-artifacts logs)
+            by-id (into {} (map (juxt :id identity) found))]
+        (is (= #{"notes" "blob"} (set (keys by-id))))
+        (is (false? (get-in by-id ["notes" :is_file_backed])))
+        (is (true? (get-in by-id ["blob" :is_file_backed])))
+        (is (os/stat (str logs "/artifacts/blob.edn")))
+        (is (os/stat (str logs "/artifacts/index.edn"))))
+      ;; The checkpoint records the metadata the handler returned.
+      (let [checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
+        (is (= #{"notes" "blob"} (set (map :id (get-in checkpoint [:node_outcomes "produce" :artifacts])))))
+        (is (= #{"notes" "blob"} (set (map :id (context/checkpoint-artifacts checkpoint))))))
+      (finally (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest artifacts-survive-checkpoint-resume-into-a-fresh-process-store
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) logs (str root "/logs") seen (atom nil)
+        source (str root "/a.dot") _ (io/spit source dot)
+        ;; Interrupt after produce: the step budget stops the run before consume.
+        first-run (pipeline/run dot {:logs-root logs :source-path source :registry (registry seen) :max-steps 2})]
+    (try
+      (is (= :fail (:status first-run)) (pr-str (dissoc first-run :context)))
+      (is (nil? @seen) "consume did not run yet")
+      (is (= #{"notes" "blob"} (set (map :id (context/discover-artifacts logs)))) "discoverable between runs")
+      (let [resumed (pipeline/resume (str logs "/checkpoint.edn") {:registry (registry seen)})]
+        (is (= :success (:status resumed)) (pr-str (dissoc resumed :context)))
+        (is (= #{"notes" "blob"} (set (map :id (:listed @seen)))) "a fresh store on resume lists prior artifacts")
+        (is (= {:kind "small" :items [1 2 3]} (:notes @seen)) "inline value preserved")
+        (is (= (count big) (:blob-size @seen)) "file-backed value preserved")
+        (is (= #{"notes" "blob"} (set (map :id (context/checkpoint-artifacts (context/load-checkpoint (str logs "/checkpoint.edn")))))))
+        ;; Handler-produced stage output from the first run is still there.
+        (is (os/stat (str logs "/produce/status.json"))))
+      (finally (os/sh "/bin/rm" "-rf" "--" root)))))

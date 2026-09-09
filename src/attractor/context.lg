@@ -255,11 +255,6 @@
              "Key Context:\n" (str/join "\n" key-context) "\n")))))
 
 ;; Create an ArtifactStore
-(defn make-artifact-store [base-dir]
-  (atom {:base-dir base-dir
-         :artifacts {}
-         :lock (atom false)}))
-
 (defn- acquire-artifact-lock! [lock]
   (loop []
     (when-not (compare-and-set! lock false true)
@@ -313,6 +308,57 @@
                        :error (:err result)})))))
 
 ;; Store an artifact (in memory if <= 100KB, file-backed if > 100KB)
+(defn- index-path [base-dir] (str base-dir "/artifacts/index.edn"))
+
+(defn- read-index
+  "Persistent registrations under base-dir: id -> {:info ... :inline value?}.
+   Data only, read with the non-evaluating EDN reader; absent or unreadable
+   index means no prior artifacts."
+  [base-dir]
+  (let [path (when-not (str/blank? base-dir) (index-path base-dir))]
+    (if (and path (io/file-exists? path))
+      (try (let [index (edn/read-string (io/slurp path))]
+             (if (map? index) (or (:artifacts index) {}) {}))
+           (catch Object _ {}))
+      {})))
+
+(defn- write-index! [base-dir artifacts]
+  (when-not (str/blank? base-dir)
+    (let [dir (str base-dir "/artifacts") path (index-path base-dir)
+          temp (str path ".tmp-" (ids/uuid-text))
+          persisted (into {} (map (fn [[id entry]]
+                                    [id (cond-> {:info (:info entry)}
+                                          (not (get-in entry [:info :is_file_backed])) (assoc :inline (:data entry)))])
+                                  artifacts))]
+      (io/mkdir dir)
+      (io/spit temp (pr-str {:artifacts persisted}))
+      (move-artifact-file! temp path))))
+
+(defn- entries-from-index [base-dir]
+  (into {} (map (fn [[id {:keys [info inline]}]]
+                  [id {:info info :data (if (:is_file_backed info) (str base-dir "/artifacts/" id ".edn") inline)}])
+                (read-index base-dir))))
+
+(defn make-artifact-store
+  "Open a store over base-dir. Registrations persist in artifacts/index.edn,
+   so a new store over the same run root (a later handler, a resumed run,
+   another process) discovers what earlier stores recorded (ATTR-ART-02)."
+  [base-dir]
+  (atom {:base-dir base-dir
+         :artifacts (if (str/blank? base-dir) {} (entries-from-index base-dir))
+         :lock (atom false)}))
+
+(defn discover-artifacts
+  "Artifact metadata recorded under a run root, without a store object."
+  [base-dir]
+  (mapv :info (vals (read-index base-dir))))
+
+(defn checkpoint-artifacts
+  "Artifact metadata handlers returned in their outcomes, as persisted in a
+   checkpoint's node outcomes."
+  [checkpoint]
+  (vec (mapcat (fn [[_ outcome]] (:artifacts outcome)) (:node_outcomes checkpoint))))
+
 (defn store-artifact! [store artifact-id name data]
   (let [id (validate-artifact-id! artifact-id)]
     (with-artifact-lock
@@ -353,6 +399,7 @@
             (delete-file-backed-entry! old-entry))
           (swap! store update :artifacts assoc id
                  {:info info :data stored-data})
+          (write-index! base-dir (:artifacts @store))
           info)))))
 
 ;; Retrieve an artifact
@@ -390,7 +437,8 @@
             entry (get-in @store [:artifacts id])]
         (when entry
           (delete-file-backed-entry! entry)
-          (swap! store update :artifacts dissoc id))
+          (swap! store update :artifacts dissoc id)
+          (write-index! (:base-dir @store) (:artifacts @store)))
         (some? entry)))))
 
 (defn clear-artifacts! [store]
@@ -400,6 +448,7 @@
       (doseq [[id entry] (:artifacts @store)]
         (delete-file-backed-entry! entry)
         (swap! store update :artifacts dissoc id))
+      (write-index! (:base-dir @store) {})
       nil)))
 
 ;; Initialize the run directory structure (Section 5.6)

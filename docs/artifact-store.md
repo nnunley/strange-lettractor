@@ -22,7 +22,10 @@ manifests are not removed or migrated. The external stage-status contract still
 requires `<node_id>/status.json`. Checkpoints use `checkpoint.edn`.
 
 A handler can create/use a store under the supplied run root and return artifact
-metadata in its outcome. This does **not** create a persistent discovery index:
-the store's registration map is process-local, and opening a new store does not
-reconstruct prior registrations. General run-result inventory and reconstruction
-on resume remain tracked by ATTR-ART-02 / SCN-ARTIFACT-DISCOVERY.
+metadata in its outcome. Registrations persist in `artifacts/index.edn` (written
+atomically on every store/remove/clear): metadata for each artifact, the value
+itself for inline artifacts, the file path for file-backed ones. Opening a new
+store over the same root reconstructs them, `discover-artifacts` lists them
+from run state without a store, and `checkpoint-artifacts` reads the metadata
+handlers returned in their outcomes, which survives resume (ATTR-ART-02,
+`SCN-ARTIFACT-DISCOVERY`).

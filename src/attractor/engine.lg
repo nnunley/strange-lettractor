@@ -51,7 +51,11 @@
                                            (get outcome "context_updates") {})
                       :notes (or (:notes outcome) (get outcome "notes") "")
                       :failure_reason (or (:failure_reason outcome)
-                                          (get outcome "failure_reason") "")}]
+                                          (get outcome "failure_reason") "")}
+                     ;; Artifact metadata a handler returned survives resume
+                     ;; (ATTR-ART-02); absent means none, never dropped.
+                     artifacts (or (:artifacts outcome) (get outcome "artifacts"))
+                     normalized (if (seq artifacts) (assoc normalized :artifacts (vec artifacts)) normalized)]
                  [(str node-id)
                   (cond-> normalized
                     next-node-id-present?
