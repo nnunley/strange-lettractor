@@ -1,0 +1,265 @@
+(ns attractor.environment-contract-test
+  "SCN-CAL-ENV: exact ExecutionEnvironment result contract (coding-agent-loop
+   spec §4.1/§4.2). Every assertion runs real local subprocesses through
+   `make-local-environment`; nothing in `attractor.execution` is replaced."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [io :as io]
+            [os :as os]
+            [attractor.execution :as execution]))
+
+(def exec-result-keys #{:stdout :stderr :exit_code :timed_out :duration_ms :cancelled})
+(def dir-entry-keys #{:name :is_dir :size})
+(def interface-keys
+  #{:read_file :write_file :file_exists :list_directory :exec_command
+    :grep :glob :initialize :cleanup :working_directory :platform :os_version})
+
+(defn- fresh-root [label]
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-env-contract-" label "-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- exec [environment command timeout & [dir env-vars]]
+  ((:exec_command environment) command timeout dir env-vars))
+
+(defmacro with-environment [[binding opts] & body]
+  `(let [~binding (execution/make-local-environment ~opts)]
+     (try ~@body (finally ((:cleanup ~binding))))))
+
+(deftest interface-exposes-every-specified-operation
+  (with-environment [environment {}]
+    (doseq [key interface-keys]
+      (is (fn? (get environment key)) (str "missing operation " key)))
+    (is (nil? ((:initialize environment))))
+    (is (= (os/cwd) ((:working_directory environment))))
+    (is (contains? #{"darwin" "linux" "windows" "wasm"} ((:platform environment))))
+    (is (str/starts-with? ((:os_version environment)) ((:platform environment))))
+    (is (not (str/blank? ((:os_version environment)))))))
+
+(deftest successful-command-has-exact-result-fields
+  (with-environment [environment {}]
+    (let [result (exec environment "printf out; printf err >&2; exit 0" 5000)]
+      (is (= exec-result-keys (set (keys result))))
+      (is (= "out" (:stdout result)))
+      (is (= "err" (:stderr result)) "stderr is captured separately and exactly")
+      (is (= 0 (:exit_code result)))
+      (is (false? (:timed_out result)))
+      (is (false? (:cancelled result)))
+      (is (integer? (:duration_ms result)))
+      (is (<= 0 (:duration_ms result) 5000)))))
+
+(deftest failing-command-reports-its-exit-status-and-separate-streams
+  (with-environment [environment {}]
+    (let [result (exec environment "printf 'o1\\no2'; printf 'e1\\ne2' >&2; exit 3" 5000)]
+      (is (= "o1\no2" (:stdout result)))
+      (is (= "e1\ne2" (:stderr result)))
+      (is (= 3 (:exit_code result)))
+      (is (false? (:timed_out result)))
+      (is (false? (:cancelled result))))
+    (is (= 42 (:exit_code (exec environment "exit 42" 5000))))
+    (is (= 127 (:exit_code (exec environment "definitely-not-a-command-xyz" 5000))))))
+
+(deftest duration-is-wall-clock-milliseconds
+  (with-environment [environment {}]
+    (let [result (exec environment "sleep 0.2" 5000)]
+      (is (= 0 (:exit_code result)))
+      (is (<= 150 (:duration_ms result) 4000)))))
+
+(deftest timeout-terminates-the-process-group-and-keeps-partial-output
+  (let [root (fresh-root "timeout")
+        survived (str root "/survived")]
+    (with-environment [environment {:working_dir root}]
+      (let [result (exec environment
+                         (str "printf partial; printf perr >&2; "
+                              "(sleep 3; printf survived > survived) & sleep 3; printf late")
+                         300)]
+        (is (= "partial" (:stdout result)) "partial stdout precedes the marker")
+        (is (= 124 (:exit_code result)))
+        (is (true? (:timed_out result)))
+        (is (false? (:cancelled result)))
+        (is (str/starts-with? (:stderr result) "perr\n[ERROR: Command timed out after 300ms."))
+        (is (str/includes? (:stderr result) "timeout_ms"))
+        (is (< (:duration_ms result) 3000) "deadline plus the 2s SIGTERM grace")
+        (core/sleep 3200)
+        (is (nil? (os/stat survived)) "background child in the group was killed")))))
+
+(deftest timeout-message-has-no-leading-newline-when-stderr-is-empty
+  (with-environment [environment {}]
+    (let [result (exec environment "sleep 2" 100)]
+      (is (true? (:timed_out result)))
+      (is (str/starts-with? (:stderr result) "[ERROR: Command timed out after 100ms")))))
+
+(deftest cleanup-cancels-active-commands-with-exact-fields
+  (let [root (fresh-root "cancel")
+        started (str root "/started")]
+    (let [environment (execution/make-local-environment {:working_dir root})
+          task (core/future
+                 (exec environment
+                       "printf started > started; printf before; sleep 5; printf after"
+                       5000))]
+      (loop [attempt 0]
+        (when (and (< attempt 200) (nil? (os/stat started)))
+          (core/sleep 5)
+          (recur (inc attempt))))
+      (is (some? (os/stat started)))
+      ((:cleanup environment))
+      (let [result (deref task 4000 :timeout)]
+        (is (not= :timeout result))
+        (is (= exec-result-keys (set (keys result))))
+        (is (= "before" (:stdout result)) "partial stdout is retained")
+        (is (= 130 (:exit_code result)))
+        (is (true? (:cancelled result)))
+        (is (false? (:timed_out result)))
+        (is (= "[ERROR: Command cancelled by session shutdown. Partial output is shown above.]"
+               (:stderr result))))
+      (testing "commands after cleanup are refused without spawning"
+        (let [result (exec environment "printf never" 1000)]
+          (is (= exec-result-keys (set (keys result))))
+          (is (= "" (:stdout result)))
+          (is (= 130 (:exit_code result)))
+          (is (true? (:cancelled result)))
+          (is (= 0 (:duration_ms result))))))))
+
+(deftest invalid-requests-are-rejected-before-spawning
+  (is (thrown? Object (execution/make-local-environment {:env_policy :bogus})))
+  (with-environment [environment {}]
+    (is (thrown? Object (exec environment "true" 1000 nil {"BAD-NAME" "x"})))
+    (is (thrown? Object (exec environment "true" 1000 nil {"1LEADING" "x"})))
+    (let [result (exec environment "true" 1000 "/definitely/not/a/dir/xyz")]
+      (is (= 126 (:exit_code result)) "missing working directory is refused with 126")
+      (is (str/includes? (:stderr result) "No such file or directory"))
+      (is (false? (:timed_out result))))))
+
+(deftest filtered-policy-drops-secret-shaped-names-case-insensitively
+  (with-environment [environment {}]
+    (let [result (exec environment
+                       (str "for n in MY_API_KEY my_api_key DB_SECRET GH_TOKEN Db_Password "
+                            "X_CREDENTIAL X_CREDENTIALS AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY "
+                            "PLAIN_VALUE APIKEYISH TOKENS_COUNT; do "
+                            "if [ \"${!n+x}\" = x ]; then printf '%s=%s\\n' \"$n\" \"${!n}\"; fi; done")
+                       5000 nil
+                       ;; Explicit values are caller authority; the filter applies to the
+                       ;; inherited environment. Export the fixtures into a child shell
+                       ;; that itself runs a filtered environment through the wrapper.
+                       nil)]
+      (is (= 0 (:exit_code result))))
+    ;; Run the filter against an inherited environment by exporting fixtures in
+    ;; an outer shell and executing a nested local environment inside it.
+    (let [outer (exec environment
+                      (str "export MY_API_KEY=a my_api_key=b DB_SECRET=c GH_TOKEN=d Db_Password=e "
+                           "X_CREDENTIAL=f X_CREDENTIALS=g AWS_ACCESS_KEY_ID=h AWS_SECRET_ACCESS_KEY=i "
+                           "PLAIN_VALUE=keep APIKEYISH=keep TOKENS_COUNT=keep; "
+                           "exec /bin/bash --noprofile --norc -p -c \"$WRAPPER\" lettractor \"$PWD\" 5 "
+                           "'env | sort' \"$TM\" \"$CM\" filtered")
+                      5000 nil
+                      {"WRAPPER" execution/command-wrapper
+                       "TM" (str (os/temp-dir) "/lettractor-contract-tm-" (rand-int 100000))
+                       "CM" (str (os/temp-dir) "/lettractor-contract-cm-" (rand-int 100000))})
+          names (set (map #(first (str/split % #"=")) (str/split (:stdout outer) #"\n")))]
+      (is (= 0 (:exit_code outer)) (:stderr outer))
+      (doseq [dropped ["MY_API_KEY" "my_api_key" "DB_SECRET" "GH_TOKEN" "Db_Password"
+                       "X_CREDENTIAL" "X_CREDENTIALS" "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY"]]
+        (is (not (contains? names dropped)) (str dropped " must be filtered")))
+      (doseq [kept ["PLAIN_VALUE" "APIKEYISH" "TOKENS_COUNT" "PATH" "HOME"]]
+        (is (contains? names kept) (str kept " must survive filtering"))))))
+
+(deftest policies-inherit-all-none-or-core-only
+  (let [probe "printf \"%s|%s|%s|%s\" \"${PATH:+p}\" \"${HOME:+h}\" \"${CONTRACT_MARKER:-}\" \"${CONTRACT_API_KEY:-}\""
+        run-with (fn [policy]
+                   (exec (execution/make-local-environment {:env_policy policy})
+                         (str "export CONTRACT_MARKER=m CONTRACT_API_KEY=k; "
+                              "exec /bin/bash --noprofile --norc -p -c \"$WRAPPER\" lettractor \"$PWD\" 5 "
+                              ;; Single quotes keep the probe's expansions for the
+                              ;; inner wrapper's child instead of the outer shell.
+                              "'" probe "'" " \"$TM\" \"$CM\" " (name policy))
+                         5000 nil
+                         ;; The outer shell hosts the nested wrapper, whose watchdog
+                         ;; needs `sleep` on PATH even under the :none policy.
+                         {"WRAPPER" execution/command-wrapper
+                          "PATH" "/usr/bin:/bin"
+                          "TM" (str (os/temp-dir) "/lettractor-contract-tm-" (rand-int 100000))
+                          "CM" (str (os/temp-dir) "/lettractor-contract-cm-" (rand-int 100000))}))]
+    (testing "all inherits everything including secret-shaped names"
+      (is (= "p|h|m|k" (:stdout (run-with :all)))))
+    (testing "filtered keeps core and ordinary names, drops secrets"
+      (is (= "p|h|m|" (:stdout (run-with :filtered)))))
+    (testing "core keeps only the always-present set"
+      (is (= "p|h||" (:stdout (run-with :core)))))
+    (testing "none starts clean"
+      (let [result (run-with :none)]
+        (is (= "|||" (:stdout result)) (pr-str result))))
+    (testing "explicit env_vars override the policy result"
+      (with-environment [environment {:env_policy :none}]
+        (is (= "explicit" (:stdout (exec environment "printf '%s' \"$ONLY\"" 5000 nil {"ONLY" "explicit"}))))))))
+
+(deftest core-policy-always-includes-the-documented-variables
+  (with-environment [environment {:env_policy :core}]
+    (let [result (exec environment "printf '%s' \"$PATH\"; test -n \"$HOME\" && test -n \"$PATH\"" 5000)]
+      (is (= 0 (:exit_code result)))
+      (is (str/includes? (:stdout result) "/")))))
+
+(deftest working-directory-override-and-relative-paths
+  (let [root (fresh-root "cwd")]
+    (io/mkdir (str root "/sub"))
+    (with-environment [environment {:working_dir root}]
+      (is (= root ((:working_directory environment))))
+      (is (= root (str/trim (:stdout (exec environment "pwd" 5000)))))
+      (is (= (str root "/sub") (str/trim (:stdout (exec environment "pwd" 5000 "sub")))))
+      (is (= (str root "/sub") (str/trim (:stdout (exec environment "pwd" 5000 (str root "/sub")))))))))
+
+(deftest directory-entries-have-exact-fields
+  (let [root (fresh-root "dir")]
+    (io/mkdir (str root "/a"))
+    (io/spit (str root "/a/inner.txt") "12345")
+    (io/spit (str root "/b.txt") "xyz")
+    (with-environment [environment {:working_dir root}]
+      (let [entries ((:list_directory environment) "." 1)
+            by-name (into {} (map (fn [e] [(:name e) e]) entries))]
+        (is (vector? entries))
+        (is (= #{"a" "b.txt"} (set (keys by-name))))
+        (doseq [entry entries]
+          (is (= dir-entry-keys (set (keys entry))) (str entry)))
+        (is (true? (:is_dir (by-name "a"))))
+        (is (false? (:is_dir (by-name "b.txt"))))
+        (is (= 3 (:size (by-name "b.txt"))))
+        (is (or (nil? (:size (by-name "a"))) (integer? (:size (by-name "a"))))))
+      (let [deep ((:list_directory environment) "." 2)]
+        (is (some #(= "a/inner.txt" (:name %)) deep) (pr-str deep))
+        (is (= 5 (:size (first (filter #(= "a/inner.txt" (:name %)) deep))))))
+      (is (true? ((:file_exists environment) "b.txt")))
+      (is (false? ((:file_exists environment) "missing.txt")))
+      ((:write_file environment) "c.txt" "written")
+      (is (= "written" (str/trim (:stdout (exec environment "cat c.txt" 5000)))))
+      (is (str/includes? ((:read_file environment) "c.txt" nil nil) "written"))
+      (let [matches (set ((:glob environment) "*.txt" "."))]
+        (is (contains? matches "b.txt"))
+        (is (contains? matches "c.txt"))))))
+
+(deftest composed-environments-share-lifecycle-and-metadata
+  (let [root (fresh-root "compose")]
+    (io/mkdir (str root "/nested"))
+    (with-environment [environment {:working_dir root}]
+      (let [nested ((:with_working_directory environment) "nested")]
+        (is (= (str root "/nested") ((:working_directory nested))))
+        (is (= (str root "/nested") (str/trim (:stdout (exec nested "pwd" 5000)))))
+        (is (= ((:platform environment)) ((:platform nested))))
+        (is (= ((:os_version environment)) ((:os_version nested))))
+        ((:cleanup environment))
+        (let [result (exec nested "printf never" 1000)]
+          (is (true? (:cancelled result)) "cleanup of the parent closes the composed view")
+          (is (= 130 (:exit_code result))))))))
+
+(deftest custom-environment-keeps-defaults-for-unspecified-operations
+  (let [environment (execution/make-environment
+                      {:exec_command (fn [command timeout dir env]
+                                       {:stdout (str "ran:" command) :stderr "" :exit_code 0
+                                        :timed_out false :cancelled false :duration_ms 1})})]
+    (is (nil? ((:initialize environment))))
+    (is (nil? ((:cleanup environment))))
+    (is (= (os/cwd) ((:working_directory environment))))
+    (is (= "" ((:os_version environment))))
+    (is (= "ran:x" (:stdout (exec environment "x" 10))))))
+
+;; SCN-CAL-ENV COMPLETE

@@ -355,7 +355,9 @@
     "' command-child \"$timeout_marker\" \"$cancel_marker\" \"$command_text\" &\n"
     "child=$!\n"
     ;; The group remains owned after monitor mode is disabled; helper jobs need
-    ;; no separate group, and disabling it avoids job notifications in stderr.
+    ;; no separate group. Each helper is disowned as soon as it starts so bash
+    ;; never prints a "Killed: 9" job notification into the captured stderr
+    ;; when the wrapper kills it (the spec requires exact separate stderr).
     "set +m\n"
     "(\n"
     "  sleep \"$timeout_s\"\n"
@@ -365,6 +367,7 @@
     "  kill -KILL -\"$child\" 2>/dev/null || true\n"
     ") >/dev/null 2>&1 &\n"
     "watchdog=$!\n"
+    "disown \"$watchdog\" 2>/dev/null\n"
     "(\n"
     "  while [ ! -e \"$cancel_marker\" ]; do sleep 0.05; done\n"
     "  kill -TERM -\"$child\" 2>/dev/null || exit 0\n"
@@ -372,6 +375,7 @@
     "  kill -KILL -\"$child\" 2>/dev/null || true\n"
     ") >/dev/null 2>&1 &\n"
     "canceller=$!\n"
+    "disown \"$canceller\" 2>/dev/null\n"
     "wait \"$child\" 2>/dev/null\n"
     "status=$?\n"
     "if [ -e \"$cancel_marker\" ]; then\n"
