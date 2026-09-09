@@ -71,3 +71,13 @@
         ;; Handler-produced stage output from the first run is still there.
         (is (os/stat (str logs "/produce/status.json"))))
       (finally (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(deftest set-valued-artifacts-round-trip-through-the-data-reader
+  ;; let-go #823 gap closed by the data reader: a stored set reads back as a set.
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))
+        store (context/make-artifact-store root)]
+    (try
+      (context/store-artifact! store "tags" "Tags" #{:a :b "c"})
+      (is (= #{:a :b "c"} (context/retrieve-artifact store "tags")))
+      (is (= #{:a :b "c"} (context/retrieve-artifact (context/make-artifact-store root) "tags")) "and through the persisted index")
+      (finally (os/sh "/bin/rm" "-rf" "--" root)))))

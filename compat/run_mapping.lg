@@ -1,6 +1,0 @@
-(require '[compat.clojure-reader-mapping-test]
-         '[test :as test]
-         '[os :as os])
-(test/run-tests)
-(os/exit (if (and (pos? (:test test/*report-counters*))
-                  (zero? (+ (:fail test/*report-counters*) (:error test/*report-counters*)))) 0 1))

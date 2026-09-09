@@ -11,10 +11,10 @@ or without a base directory, remain in memory. Metadata includes ID, name, size,
 storage time, and backing status. Artifact values must round-trip through the
 supported non-evaluating EDN reader.
 
-Set values currently fail that check because the local reader returns a
-`hash-set` form, not a set. This known limitation is tracked in
-[let-go #823](https://github.com/nooga/let-go/issues/823); see
-`let-go-set-reader-gap.md`. Full Clojure data-reader conformance is not claimed.
+Set values round-trip on the local runtime's data reader (2026-09-08); on a
+released let-go without it they would still be rejected, see
+[let-go #823](https://github.com/nooga/let-go/issues/823) and
+`let-go-set-reader-gap.md`.
 
 New run metadata is written to root `manifest.edn`; this is separate from the
 immutable captured workflow's `workflow/manifest.edn`. Existing root JSON

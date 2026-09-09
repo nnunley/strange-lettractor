@@ -1,5 +1,13 @@
 # Clojure reader compatibility findings
 
+Resolved locally on 2026-09-08: the local let-go runtime (`425d8461`) reads
+`clojure.edn/read-string` and `edn/read-all-string` in a data mode with Clojure
+semantics, and `attractor.composition/read-mapping` reads mappings natively.
+The five deferred acceptance cases now live in
+`test/attractor/composition_contract_test.lg` and pass; the `compat/` suite and
+the temporary scanner are removed. Upstream #801 and #823 remain open for the
+released runtime; see `let-go-followups.md`. The original findings follow.
+
 Additional set-literal data reading is tracked in [let-go #823](https://github.com/nooga/let-go/issues/823):
 the local reader returns a `hash-set` call rather than a set, so artifact
 round-trip validation rejects set-valued data. See `let-go-set-reader-gap.md`

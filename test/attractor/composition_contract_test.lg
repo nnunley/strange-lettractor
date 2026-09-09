@@ -38,20 +38,24 @@
       (is (nil? (:config result)))
       (is (= "subpipeline_config" (:rule (first (:diagnostics result))))))))
 
-(deftest temporary-reader-limitations-reject-cleanly
-  ;; User-approved temporary limitation pending nooga/let-go#801. Acceptance
-  ;; remains a separate failing compatibility suite, not a skipped assertion.
+(deftest clojure-reader-mapping-acceptance
+  ;; SCN-CLOJURE-READER: the whole input is read with the native Clojure data
+  ;; reader; discards, metadata, comments and Unicode escapes are accepted
+  ;; wherever the reader accepts them. Never evaluated.
   (doseq [s ["#_ :ignored {\"a\" \"b\"}"
              "{#_ [:ignored] \"a\" #_ :ignored \"b\" #_ {:discard \"value\"}}"
              "{\"a\" \"b\"} #_ [:discarded]"
              "^{:purpose :mapping} {\"a\" \"b\"}"
-             "^:mapping {\"\\u0061\" \"\\u0062\"}"]]
-    (let [result (config {:input_map s} {})]
-      (is (nil? (:config result)))
-      (is (= "subpipeline_config" (:rule (first (:diagnostics result)))))))
+             "^:mapping {\"\\u0061\" \"\\u0062\"}"
+             "{\"a\", \"b\"} ; trailing comment"]]
+    (is (= {"a" "b"} (get-in (config {:input_map s} {}) [:config :input-map])) s))
+  ;; Exactly one map, nothing hidden after it, and no evaluation of any kind.
   (doseq [s ["{}] {}" "{}] #_ [" "{}] ; hidden trailing input" "{} #_" "{} #_ 1 {}"
-             "{} #=(throw (ex-info \"must not execute\" {}))" "^:tag []" "^{:tag true} {} nil"]]
-    (is (seq (:diagnostics (config {:input_map s} {}))))))
+             "{} #=(throw (ex-info \"must not execute\" {}))" "^:tag []" "^{:tag true} {} nil"
+             "{\"a\" \"x\" \"a\" \"y\"}"]]
+    (let [result (config {:input_map s} {})]
+      (is (nil? (:config result)) s)
+      (is (= "subpipeline_config" (:rule (first (:diagnostics result)))) s))))
 
 (deftest destination-ownership-boundaries
   (doseq [attribute [:input_map :output_map]

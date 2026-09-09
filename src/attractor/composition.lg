@@ -15,63 +15,33 @@
 (defn- invalid [reason]
   (throw (ex-info reason {:reason reason})))
 
-(defn- character-at [s i]
-  (when (< i (count s)) (subs s i (inc i))))
-
-(defn- skip-space [s start]
-  (loop [i start comment? false]
-    (let [c (character-at s i)]
-      (cond
-        (nil? c) i
-        comment? (recur (inc i) (not (or (= c "\n") (= c "\r"))))
-        (= c ";") (recur (inc i) true)
-        (or (= c ",") (re-matches #"\s" c)) (recur (inc i) false)
-        :else i))))
-
-(defn- read-string-token [s start]
-  (when (not= "\"" (character-at s start))
-    (invalid "mapping keys and values must be strings"))
-  (loop [i (inc start) escaped? false]
-    (let [c (character-at s i)]
-      (cond
-        (nil? c) (invalid "unterminated EDN string")
-        escaped? (recur (inc i) false)
-        (= c "\\") (recur (inc i) true)
-        (= c "\"") [(edn/read-string (subs s start (inc i))) (inc i)]
-        :else (recur (inc i) false)))))
-
 (defn- reserved-destination? [s]
   (or (contains? #{"run.id" "current_node" "outcome" "preferred_label"} s)
       (str/starts-with? s "graph.")
       (str/starts-with? s "internal.retry_count.")))
 
 (defn- read-mapping [s]
-  ;; TEMPORARY user-approved subset pending nooga/let-go#801. Native Clojure
-  ;; reader syntax remains the desired contract; see compat/ and
-  ;; docs/let-go-reader-compatibility.md. Never evaluate reader output.
-  ;; Restoration checklist: docs/let-go-followups.md (#801).
-  ;; The runtime reader reads only the first form. Scan the restricted string-map
-  ;; grammar ourselves so closing delimiters and trailing forms cannot be hidden.
-  ;; Delegate individual quoted tokens to EDN for standard string escape decoding.
+  ;; Native Clojure data reading (ATTR-READ-01): the whole input is read with
+  ;; clojure.edn/read-all-string, so comments, commas, discards and metadata
+  ;; are accepted anywhere the reader accepts them, and the input must yield
+  ;; exactly one map of string keys to string values. Nothing is evaluated;
+  ;; reader output is inspected as data only.
   (if (or (nil? s) (and (string? s) (str/blank? s)))
     {}
     (do
       (when (not (string? s)) (invalid "must be an EDN map string"))
-      (let [start (skip-space s 0)]
-        (when (not= "{" (character-at s start)) (invalid "must be an EDN map"))
-        (loop [i (skip-space s (inc start)) result {} destinations #{}]
-          (if (= "}" (character-at s i))
-            (do
-              (when (not= (count s) (skip-space s (inc i)))
-                (invalid "must contain exactly one EDN map"))
-              result)
-            (let [[source after-source] (read-string-token s i)
-                  [destination after-destination] (read-string-token s (skip-space s after-source))]
-              (when (contains? result source) (invalid "duplicate source key"))
-              (when (contains? destinations destination) (invalid "duplicate destination"))
-              (when (reserved-destination? destination) (invalid "engine-owned destination"))
-              (recur (skip-space s after-destination)
-                     (assoc result source destination) (conj destinations destination)))))))))
+      (let [forms (try (edn/read-all-string s)
+                       (catch Object e (invalid (str "unreadable mapping: " (ex-message e)))))]
+        (when (not= 1 (count forms)) (invalid "must contain exactly one EDN map"))
+        (let [m (first forms)]
+          (when-not (map? m) (invalid "must be an EDN map"))
+          (reduce (fn [result [source destination]]
+                    (when-not (and (string? source) (string? destination))
+                      (invalid "mapping keys and values must be strings"))
+                    (when (some #(= destination %) (vals result)) (invalid "duplicate destination"))
+                    (when (reserved-destination? destination) (invalid "engine-owned destination"))
+                    (assoc result source destination))
+                  {} m))))))
 
 (defn- checked [node attr f]
   (try

@@ -7,7 +7,7 @@ the actual configured compiler and rerun the relevant behavior checks.
 
 | Issue | Current application seam | Revisit when fixed |
 |---|---|---|
-| [#801: metadata and map discards](https://github.com/nooga/let-go/issues/801) | `src/attractor/composition.lg` mapping scanner; `compat/clojure_reader_mapping_test.lg` | Restore native Clojure-reader acceptance and remove the ordinary-map restriction. |
+| [#801: metadata and map discards](https://github.com/nooga/let-go/issues/801) | Local runtime `425d8461` data-reading mode for `clojure.edn/read-string` and `edn/read-all-string`; `src/attractor/composition.lg` reads mappings natively (scanner and `compat/` suite removed 2026-09-08) | When upstream ships an equivalent data reader, verify `composition_contract_test.lg` and the artifact set round-trip on the release and drop the local patch. |
 | [#805: future exceptions](https://github.com/nooga/let-go/issues/805) | `src/attractor/handlers.lg` parallel worker error records and coordinator collection | Reassess explicit exception transport; preserve cleanup-before-propagation and ordered results. |
 | [#806: async helper scope ownership](https://github.com/nooga/let-go/issues/806) | Parallel invocation scope; `test/attractor/parallel_join_contract_test.lg` | Add real async-helper descendant cancellation/join evidence and remove the documented ownership exception only when proved. |
 | [#807: unfinished trailing forms](https://github.com/nooga/let-go/issues/807) | Test discovery checks and independent JVM reader checks | Verify malformed sources fail visibly across evaluation, namespace loading, and AOT; then reassess the extra manual syntax cross-check. |
@@ -128,7 +128,7 @@ the Attractor design, not a workaround for this bug.
 
 ## Scope cancellation predicate: #830
 
-Local runtime `aeb44ef4` on the same workspace adds `scope-cancelled?`
+Local runtime `425d8461` on the same workspace adds `scope-cancelled?`
 ([nooga/let-go #830](https://github.com/nooga/let-go/issues/830)). Blocking
 natives return early and silently on cancellation, so a coordinator parked on
 `sleep` cannot otherwise tell waking from cancellation; the operation owner's
@@ -164,7 +164,7 @@ jobs would silently become uncancellable. After the upstream fix, rerun
 
 `eval` built its frame with a nil execution context, so evaluated code ignored
 the caller's bindings and scope ([nooga/let-go #833](https://github.com/nooga/let-go/issues/833)).
-The local runtime (`aeb44ef4`) runs the compiled form in the caller's context
+The local runtime (`425d8461`) runs the compiled form in the caller's context
 via `vm.NewFrameIn`. The hub's `:eval/submit` relies on it to capture printed
 output with `with-out-str` inside the evaluation future; with the released
 runtime that output would leak to the hub process's stdout. Note also that
@@ -189,3 +189,13 @@ runtime source changes accompany these findings.
 - [#815: JSON integer precision](let-go-json-integer-precision.md): float64
   decoding rounds valid int64 values above 2^53. Preserve a large-ID regression
   for Codex RPC; small locally generated IDs do not fix server-supplied IDs.
+
+## Data reader mode: #801, #823
+
+The local runtime's `clojure.edn/read-string` and `edn/read-all-string` read
+with Clojure data semantics (metadata attached, real sets, discards splice
+nothing, duplicate keys and set elements rejected); code reading keeps the
+compiler's `(with-meta ...)` and `(hash-set ...)` forms. An approach note was
+left on #801. `attractor.composition/read-mapping` and the artifact store's
+round-trip validation depend on it; a released runtime without the mode would
+reject metadata and discards in mappings and set-valued artifacts again.
