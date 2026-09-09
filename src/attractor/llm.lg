@@ -103,11 +103,15 @@
       (let [b (str/trim custom-base)]
         (if (str/ends-with? b "/") (subs b 0 (dec (count b))) b))
 
-      (= p "ollama")
-      (let [u (os/getenv "OLLAMA_BASE_URL")]
+      ;; The OpenAI-compatible adapter (spec §7.10) has no canonical host:
+      ;; llama.cpp, Ollama, vLLM, Together and Groq all differ, so the base
+      ;; URL must be configured explicitly.
+      (= p "openai-compat")
+      (let [u (os/getenv "OPENAI_COMPAT_BASE_URL")]
         (if-not (str/blank? u)
           (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
-          "https://ollama.com/v1"))
+          (throw (ex-info "openai-compat requires a base URL: set OPENAI_COMPAT_BASE_URL or pass :base_url"
+                          {:category :configuration :provider "openai-compat" :retryable false}))))
 
       (= p "anthropic")
       (let [u (os/getenv "ANTHROPIC_BASE_URL")]
@@ -132,9 +136,10 @@
   (let [p (str/lower-case (or provider "openai"))]
     (or (when-not (str/blank? custom-key) custom-key)
         (case p
-          "ollama" (or (let [k (os/getenv "OLLAMA_API_KEY")] (when-not (str/blank? k) k))
-                       (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
-                       "ollama")
+          ;; Local OpenAI-compatible servers usually ignore the bearer token
+          ;; but the Chat Completions contract still sends one.
+          "openai-compat" (or (let [k (os/getenv "OPENAI_COMPAT_API_KEY")] (when-not (str/blank? k) k))
+                              "local")
           "anthropic" (let [k (os/getenv "ANTHROPIC_API_KEY")] (when-not (str/blank? k) k))
           "gemini" (let [k (os/getenv "GEMINI_API_KEY")] (when-not (str/blank? k) k))
           "openai" (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
@@ -152,7 +157,7 @@
         headers (case p
                   "anthropic" (cond-> {"anthropic-version" "2023-06-01"}
                                 (seq key) (assoc "x-api-key" key))
-                  ;; openai and ollama
+                  ;; openai and openai-compat
                   (cond-> {"Content-Type" "application/json"}
                     (seq key) (assoc "Authorization" (str "Bearer " key))))]
     (try
@@ -197,8 +202,8 @@
       (str/blank? m) "mock"
 
       ;; Check known provider model lists if available
-      (some #{m} (get @provider-models-cache "ollama" []))
-      "ollama"
+      (some #{m} (get @provider-models-cache "openai-compat" []))
+      "openai-compat"
 
       (some #{m} (get @provider-models-cache "openai" []))
       "openai"
@@ -216,9 +221,9 @@
       (str/starts-with? m "gemini-")
       "gemini"
 
-      (or (not (str/blank? (os/getenv "OLLAMA_API_KEY")))
-          (not (str/blank? (os/getenv "OLLAMA_BASE_URL"))))
-      "ollama"
+      (or (not (str/blank? (os/getenv "OPENAI_COMPAT_API_KEY")))
+          (not (str/blank? (os/getenv "OPENAI_COMPAT_BASE_URL"))))
+      "openai-compat"
 
       :else
       "mock")))
@@ -231,7 +236,7 @@
       [s ""])))
 
 ;; Parse LiteLLM-style provider/model convention
-;; e.g. "ollama/qwen3.5:397b" -> {:provider "ollama" :model "qwen3.5:397b"}
+;; e.g. "openai-compat/qwen3.5:397b" -> {:provider "openai-compat" :model "qwen3.5:397b"}
 ;;      "anthropic/claude-3-7-sonnet" -> {:provider "anthropic" :model "claude-3-7-sonnet"}
 ;;      "openai/gpt-4o" -> {:provider "openai" :model "gpt-4o"}
 ;;      "gpt-4o" -> {:provider "openai" :model "gpt-4o"}
@@ -288,7 +293,7 @@
       :else (str b "/responses"))))
 
 (defn resolve-openai-compatible-url [base-url & [provider]]
-  (let [b (resolve-base-url (or provider "ollama") base-url)]
+  (let [b (resolve-base-url (or provider "openai-compat") base-url)]
     (cond
       (str/ends-with? b "/chat/completions") b
       (str/ends-with? b "/") (str b "chat/completions")
@@ -1056,7 +1061,13 @@
         key (if (contains? request :api_key)
               (:api_key request)
               (resolve-api-key provider api-key))
-        url (resolve-openai-compatible-url (or base-url (:base_url request)) provider)
+        ;; An injected transport never reaches the network, so the base URL is
+        ;; only mandatory when the real HTTP transport would be used.
+        url (if (and (fn? (:transport request))
+                     (str/blank? (or base-url (:base_url request)))
+                     (str/blank? (os/getenv "OPENAI_COMPAT_BASE_URL")))
+              "http://openai-compat.invalid/v1/chat/completions"
+              (resolve-openai-compatible-url (or base-url (:base_url request)) provider))
         tools (mapv (fn [tool]
                       {:type "function"
                        :function {:name (:name tool)
@@ -1673,7 +1684,7 @@
         req (assoc request :provider provider :model actual-model)]
     (case provider
       "openai" (openai-complete req (:api_key opts) (:base_url opts))
-      "ollama" (openai-compatible-complete req (:api_key opts) (:base_url opts))
+      "openai-compat" (openai-compatible-complete req (:api_key opts) (:base_url opts))
       "anthropic" (anthropic-complete req (:api_key opts) (:base_url opts))
       "gemini" (gemini-complete req (:api_key opts) (:base_url opts))
       "mock" (mock-complete req (:mock_handler opts))
@@ -2398,7 +2409,7 @@
         req (assoc request :provider provider :model (:model parsed))]
     (case provider
       "openai" (openai-stream req (:api_key opts) (:base_url opts))
-      "ollama" (openai-compatible-stream req (:api_key opts) (:base_url opts))
+      "openai-compat" (openai-compatible-stream req (:api_key opts) (:base_url opts))
       "anthropic" (anthropic-stream req (:api_key opts) (:base_url opts))
       "gemini" (gemini-stream req (:api_key opts) (:base_url opts))
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
@@ -2516,8 +2527,8 @@
   (let [opts (merge options request)
         provider (str/lower-case (or (:provider opts) "openai"))
         base (resolve-base-url provider (:base_url opts))]
-    (if (or (not (contains? #{"openai" "ollama"} provider))
-            (contains? #{"https://api.openai.com/v1" "https://ollama.com/v1"} base)
+    (if (or (not (contains? #{"openai" "openai-compat"} provider))
+            (= "https://api.openai.com/v1" base)
             (:transport opts))
       {:status :unsupported :reason :unsupported}
       (let [key (resolve-api-key provider (:api_key opts))]
@@ -2547,7 +2558,7 @@
           (let [req (request-with-options request)]
             (case name
               "openai" (openai-complete req (:api_key req) (:base_url req))
-              "ollama" (openai-compatible-complete req (:api_key req) (:base_url req))
+              "openai-compat" (openai-compatible-complete req (:api_key req) (:base_url req))
               "anthropic" (anthropic-complete req (:api_key req) (:base_url req))
               "gemini" (gemini-complete req (:api_key req) (:base_url req))
               "mock" (mock-complete req (:mock_handler req))
@@ -2558,7 +2569,7 @@
           (let [req (request-with-options request)]
             (case name
               "openai" (openai-stream req (:api_key req) (:base_url req))
-              "ollama" (openai-compatible-stream req (:api_key req) (:base_url req))
+              "openai-compat" (openai-compatible-stream req (:api_key req) (:base_url req))
               "anthropic" (anthropic-stream req (:api_key req) (:base_url req))
               "gemini" (gemini-stream req (:api_key req) (:base_url req))
               (throw (ex-info (str "Streaming is not implemented for provider: " name)

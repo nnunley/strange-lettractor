@@ -2,7 +2,7 @@
 
 The first real repository task used the existing let-go DOT engine and native
 coding-agent loop with `qwen3.8-27b`, served by llama.cpp. The existing adapter
-named `ollama` supplied its OpenAI-compatible Chat Completions transport; no
+named `openai-compat` supplied its OpenAI-compatible Chat Completions transport; no
 Ollama service was involved. Streaming was disabled for this trial.
 
 Task: preserve a string `reasoning_content` field as normalized response

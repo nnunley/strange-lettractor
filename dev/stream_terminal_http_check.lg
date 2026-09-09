@@ -57,7 +57,7 @@
 (defn -main [base]
   (if (= base "--help")
     (println "Run with the URL printed by go run dev/http_error_server.go")
-    (let [results (try (mapv #(check-provider base %) ["openai" "anthropic" "gemini" "ollama"])
+    (let [results (try (mapv #(check-provider base %) ["openai" "anthropic" "gemini" "openai-compat"])
                        (finally (http/request {:url (str base "/shutdown")})))]
       (doseq [result results] (prn result))
       (os/exit (if (every? :pass results) 0 1)))))

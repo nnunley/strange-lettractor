@@ -1,6 +1,6 @@
 # OpenAI-compatible streaming reasoning
 
-The local-model adapter (currently named `ollama`, also used with llama.cpp)
+The local-model adapter (currently named `openai-compat`, also used with llama.cpp)
 preserved `reasoning_content` in non-streaming replies but discarded the same
 field in streaming deltas. A deterministic SSE probe containing `Think` followed
 by answer text produced no reasoning events and a nil final reasoning value.

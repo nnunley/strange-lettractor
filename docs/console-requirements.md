@@ -75,7 +75,7 @@ eval values/errors/multiline/selection binding, /run + /claude + /agents +
 /focus + /cancel + escapes, interrupt routing, quit detaches without stopping
 the hub); `dev/console_line_tests.lg` 2 / 12 (scripted transcript, EOF).
 Live: a Qwen turn through `attractor console --model qwen3.8-27b --provider
-ollama` against llama.cpp returned `console connected` and `turn complete`.
+openai-compat` (the provider was then still named `ollama`) against llama.cpp returned `console connected` and `turn complete`.
 
 ## SCN-CONSOLE-TUI
 

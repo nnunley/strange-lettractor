@@ -9,7 +9,7 @@
   [["openai" #(llm/openai-stream % "offline-test")]
    ["anthropic" #(llm/anthropic-stream % "offline-test")]
    ["gemini" #(llm/gemini-stream % "offline-test")]
-   ["ollama" llm/openai-compatible-stream]])
+   ["openai-compat" llm/openai-compatible-stream]])
 
 (def quota "{\"error\":{\"message\":\"quota exhausted\",\"code\":\"insufficient_quota\"}}")
 

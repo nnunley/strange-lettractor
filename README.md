@@ -26,7 +26,8 @@ Prerequisites:
   [let-go follow-ups](docs/let-go-followups.md).
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
-  llama.cpp or Ollama-compatible endpoint for live models.
+  OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for
+  live models, addressed as `openai-compat/<model>`.
 
 Every command below reads the runtime from `LGX_LG`; the `lg` on your `PATH`
 may be older, so always set it:
@@ -54,8 +55,8 @@ bin/attractor console --mock          # line console, mock model
 bin/attractor console --tui --mock    # full-screen tiny-tui console
 
 # live model through an OpenAI-compatible endpoint (llama.cpp shown)
-OLLAMA_BASE_URL=http://localhost:8080/v1 OLLAMA_API_KEY=local \
-  bin/attractor console --tui --model qwen3.8-27b --provider ollama
+OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 OPENAI_COMPAT_API_KEY=local \
+  bin/attractor console --tui --model qwen3.8-27b --provider openai-compat
 ```
 
 Inside the console:

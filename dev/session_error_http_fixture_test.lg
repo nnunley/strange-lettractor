@@ -4,7 +4,7 @@
   (let [counts (atom {}) handler (fixture/make-handler "secret" counts)]
     (is (= "secret" (:body (handler {:path "/ready"}))))
     (is (= 404 (:status (handler {:path "/wrong/openai/auth/responses"}))))
-    (doseq [provider ["openai" "anthropic" "gemini" "ollama"]]
+    (doseq [provider ["openai" "anthropic" "gemini" "openai-compat"]]
       (let [auth {:path (str "/secret/" provider "/auth/responses")}
             context {:path (str "/secret/" provider "/context/responses")}]
         (is (= 401 (:status (handler auth))))

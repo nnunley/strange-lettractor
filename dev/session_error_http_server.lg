@@ -15,7 +15,7 @@
                      (frame "message_delta" {:type "message_delta" :delta {:stop_reason "end_turn"}})
                      (frame "message_stop" {:type "message_stop"}))
     "gemini" (frame nil {:responseId "r" :candidates [{:content {:role "model" :parts [{:text "recovered"}]} :finishReason "STOP"}]})
-    "ollama" (str (frame nil {:id "r" :model "fixture" :choices [{:index 0 :delta {:role "assistant" :content "recovered"} :finish_reason "stop"}]}) "data: [DONE]\n\n")))
+    "openai-compat" (str (frame nil {:id "r" :model "fixture" :choices [{:index 0 :delta {:role "assistant" :content "recovered"} :finish_reason "stop"}]}) "data: [DONE]\n\n")))
 
 (defn make-handler [token counts]
   (fn [request]
@@ -25,7 +25,7 @@
         (= path "/ready") {:status 200 :body token}
         (not= token supplied) {:status 404 :body "unknown fixture token"}
         (= provider "counts") {:status 200 :body (pr-str @counts)}
-        (not (and (contains? #{"openai" "anthropic" "gemini" "ollama"} provider)
+        (not (and (contains? #{"openai" "anthropic" "gemini" "openai-compat"} provider)
                   (contains? #{"auth" "context"} kind))) {:status 404 :body "unknown fixture case"}
         :else
         (let [key (str provider "/" kind)

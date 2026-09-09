@@ -21,7 +21,7 @@
     :partial [{"candidates" [{"content" {"parts" [{"text" "partial"}]}}]}]
     :error {"error" {"code" 503 "status" "UNAVAILABLE" "message" "failed"}}
     :late [{"candidates" [{"content" {"parts" [{"text" "late"}]} "finishReason" "STOP"}]}]}
-   {:provider "ollama" :stream llm/openai-compatible-stream
+   {:provider "openai-compat" :stream llm/openai-compatible-stream
     :partial [{"choices" [{"delta" {"content" "partial"}}]}]
     :error {"error" {"code" "server_error" "message" "failed"}}
     :late [{"choices" [{"delta" {"content" "late"} "finish_reason" "stop"}]}]}])

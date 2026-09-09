@@ -73,7 +73,7 @@
     (try
       (await-ready base token worker)
       (let [results (mapv (fn [[provider kind]] (check-case base token provider kind))
-                         (for [provider ["openai" "anthropic" "gemini" "ollama"] kind ["auth" "context"]]
+                         (for [provider ["openai" "anthropic" "gemini" "openai-compat"] kind ["auth" "context"]]
                            [provider kind]))]
         (doseq [result results] (prn result))
         results)

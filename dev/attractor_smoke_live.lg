@@ -1,7 +1,7 @@
 (ns main
   "SCN-ATTR-SMOKE-LIVE: the §11.13 smoke pipeline through one real model.
    Opt-in: set ATTRACTOR_LIVE_MODEL to provider/name (for example
-   ollama/qwen3.8-27b with OLLAMA_BASE_URL pointing at llama.cpp). Without it
+   openai-compat/qwen3.8-27b with OPENAI_COMPAT_BASE_URL pointing at llama.cpp). Without it
    the run exits 3 and prints a skip record; a skip is never a pass."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
             [os :as os] [io :as io] [json :as json]

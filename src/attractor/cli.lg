@@ -101,8 +101,8 @@
                       (not (str/blank? (os/getenv "OPENAI_API_KEY")))
                       (not (str/blank? (os/getenv "GEMINI_API_KEY")))
                       (not (str/blank? (os/getenv "GOOGLE_API_KEY")))
-                      (not (str/blank? (os/getenv "OLLAMA_API_KEY")))
-                      (not (str/blank? (os/getenv "OLLAMA_BASE_URL"))))
+                      (not (str/blank? (os/getenv "OPENAI_COMPAT_API_KEY")))
+                      (not (str/blank? (os/getenv "OPENAI_COMPAT_BASE_URL"))))
         use-live-llm? (and (not force-mock?) (or (some #{"--llm"} args) has-keys?))
         override-model (find-arg-val args "--model")
         override-provider (find-arg-val args "--provider")]
@@ -138,7 +138,7 @@
        (or (some #{"--llm"} args)
            (some #(not (str/blank? (os/getenv %)))
                  ["ANTHROPIC_API_KEY" "OPENAI_API_KEY" "GEMINI_API_KEY" "GOOGLE_API_KEY"
-                  "OLLAMA_API_KEY" "OLLAMA_BASE_URL"]))))
+                  "OPENAI_COMPAT_API_KEY" "OPENAI_COMPAT_BASE_URL"]))))
 
 (defn- console-session-options [args]
   ;; Trusted startup configuration for hub-owned agent sessions, resolved the
@@ -395,9 +395,9 @@
 
 (defn cmd-models [args]
   (let [provider (or (find-arg-val args "--provider")
-                     (if-not (str/blank? (os/getenv "OLLAMA_API_KEY")) "ollama"
+                     (if-not (str/blank? (os/getenv "OPENAI_COMPAT_API_KEY")) "openai-compat"
                        (if-not (str/blank? (os/getenv "OPENAI_API_KEY")) "openai"
-                         (if-not (str/blank? (os/getenv "ANTHROPIC_API_KEY")) "anthropic" "ollama"))))
+                         (if-not (str/blank? (os/getenv "ANTHROPIC_API_KEY")) "anthropic" "openai-compat"))))
         base-url (find-arg-val args "--base-url")
         api-key (find-arg-val args "--api-key")]
     (println (str "Querying models from " (str/upper-case provider) " (" (llm/resolve-base-url provider base-url) ")..."))

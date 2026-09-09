@@ -37,7 +37,7 @@
                 (str/blank? (:provider parsed)))
         (throw (configuration-error
                  "Prompted fan-in requires non-empty LLM model and provider configuration")))
-      (when (and (contains? #{"mock" "ollama"} (:provider parsed))
+      (when (and (contains? #{"mock" "openai-compat"} (:provider parsed))
                  (not prefixed?)
                  (nil? explicit-provider)
                  (nil? client-provider))

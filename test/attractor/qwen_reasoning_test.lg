@@ -12,7 +12,7 @@
 
 (defn- stream-with [chunks]
   (vec (llm/openai-compatible-stream
-         {:provider "ollama" :model "qwen-test" :messages []
+         {:provider "openai-compat" :model "qwen-test" :messages []
           :transport (fn [_] {:status 200 :body (stream-body chunks)})})))
 
 (deftest streamed-reasoning-normalizes-strings-only
@@ -78,8 +78,8 @@
   (let [body (stream-body [(delta-chunk {:reasoning_content "Reason"})
                           {:choices [{:delta {:content "Answer"} :finish_reason "stop"}]}])
         client (llm/make-client
-                 {:default_provider "ollama"
-                  :providers {"ollama" (llm/make-provider-adapter "ollama"
+                 {:default_provider "openai-compat"
+                  :providers {"openai-compat" (llm/make-provider-adapter "openai-compat"
                                          {:transport (fn [_] {:status 200 :body body})})}})
         events (vec (llm/client-stream client {:model "qwen-test" :messages []}))
         accumulator (llm/make-stream-accumulator)
@@ -94,7 +94,7 @@
 
 (defn- complete-with [message]
   (llm/openai-compatible-complete
-   {:provider "ollama" :model "qwen-test" :messages []
+   {:provider "openai-compat" :model "qwen-test" :messages []
     :transport (fn [_]
                  {:status 200
                   :body (json/write-json
@@ -133,8 +133,8 @@
 
 (deftest reasoning-propagates-to-generation-and-step-results
   (let [client (llm/make-client
-                 {:default_provider "ollama"
-                  :providers {"ollama" (llm/make-provider-adapter "ollama"
+                 {:default_provider "openai-compat"
+                  :providers {"openai-compat" (llm/make-provider-adapter "openai-compat"
                     {:transport (fn [_]
                       {:status 200 :body (json/write-json
                         {:choices [{:finish_reason "stop" :message

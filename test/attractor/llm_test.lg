@@ -152,10 +152,10 @@
 
 (deftest test-litellm-provider-model-convention
   (testing "Parses provider/model format (LiteLLM convention)"
-    (is (= {:provider "ollama" :model "qwen3.5:397b"}
-           (llm/parse-model-spec "ollama/qwen3.5:397b")))
-    (is (= {:provider "ollama" :model "deepseek-v4-pro:0813"}
-           (llm/parse-model-spec "ollama/deepseek-v4-pro:0813")))
+    (is (= {:provider "openai-compat" :model "qwen3.5:397b"}
+           (llm/parse-model-spec "openai-compat/qwen3.5:397b")))
+    (is (= {:provider "openai-compat" :model "deepseek-v4-pro:0813"}
+           (llm/parse-model-spec "openai-compat/deepseek-v4-pro:0813")))
     (is (= {:provider "anthropic" :model "claude-3-7-sonnet"}
            (llm/parse-model-spec "anthropic/claude-3-7-sonnet")))
     (is (= {:provider "openai" :model "gpt-4o"}
@@ -168,8 +168,8 @@
            (llm/parse-model-spec "gpt-4o")))
     (is (= {:provider "anthropic" :model "claude-3-5-haiku"}
            (llm/parse-model-spec "claude-3-5-haiku")))
-    (is (= {:provider "ollama" :model "custom-llama"}
-           (llm/parse-model-spec "custom-llama" "ollama")))))
+    (is (= {:provider "openai-compat" :model "custom-llama"}
+           (llm/parse-model-spec "custom-llama" "openai-compat")))))
 
 (deftest test-request-omits-unspecified-generation-settings
   (let [request (llm/make-request "openai/gpt-test"
@@ -214,7 +214,7 @@
                                 :usageMetadata {}})}))
         _ (llm/openai-compatible-complete
             (merge settings
-                   {:provider "ollama" :model "local-test" :messages []
+                   {:provider "openai-compat" :model "local-test" :messages []
                     :transport
                     (transport :compatible
                                {:id "c" :model "local-test"
@@ -382,7 +382,7 @@
              (transport :gemini {:responseId "g" :candidates []
                                  :usageMetadata {}})})
         _ (llm/openai-compatible-complete
-            {:provider "ollama" :model "local-test" :messages []
+            {:provider "openai-compat" :model "local-test" :messages []
              :transport
              (transport :compatible
                         {:id "c" :choices [{:message {:content "ok"}
@@ -455,9 +455,9 @@
              (transport :gemini {:responseId "g" :candidates []
                                  :usageMetadata {}})})
         _ (llm/openai-compatible-complete
-            {:provider "ollama" :model "local-test" :messages []
+            {:provider "openai-compat" :model "local-test" :messages []
              :temperature 0.1
-             :provider_options {"ollama" {"temperature" 0.9}}
+             :provider_options {"openai-compat" {"temperature" 0.9}}
              :transport
              (transport :compatible
                         {:id "c" :choices [{:message {:content "ok"}
@@ -2210,7 +2210,7 @@
         events
         (vec
           (llm/stream
-            {:provider "ollama" :model "local-test" :messages []
+            {:provider "openai-compat" :model "local-test" :messages []
              :temperature 0.2 :top_p 0.6 :max_tokens 111
              :stop_sequences ["END"]
              :transport (fn [request]
@@ -2221,14 +2221,14 @@
         configured-captured (atom nil)
         adapter
         (llm/make-provider-adapter
-          "ollama"
+          "openai-compat"
           {:transport (fn [request]
                         (reset! configured-captured request)
                         {:status 200 :body sse})})
-        client (llm/make-client {:providers {"ollama" adapter}})
+        client (llm/make-client {:providers {"openai-compat" adapter}})
         configured-events
         (vec (llm/client-stream client
-                                {:provider "ollama" :model "local-test"
+                                {:provider "openai-compat" :model "local-test"
                                  :messages []}))]
     (is (= :stream (:as @captured)))
     (is (= true (get payload "stream")))
@@ -2257,7 +2257,7 @@
         events
         (vec
           (llm/openai-compatible-stream
-            {:provider "ollama" :model "local-test" :messages []
+            {:provider "openai-compat" :model "local-test" :messages []
              :transport (fn [_] {:status 200 :body sse})}))]
     (is (= [:stream_start :text_start :text_delta :error]
            (mapv :type events)))
@@ -2478,9 +2478,9 @@
                      (stream-body [tool-chunk tool-finish])
                      (stream-body [text-chunk]))})
           adapter (llm/make-provider-adapter
-                    "ollama" {:transport transport})
-          client (llm/make-client {:providers {"ollama" adapter}
-                                   :default_provider "ollama"})
+                    "openai-compat" {:transport transport})
+          client (llm/make-client {:providers {"openai-compat" adapter}
+                                   :default_provider "openai-compat"})
           result
           (llm/stream
             "local-test" "go"
@@ -2740,7 +2740,7 @@
     (is (= 3 (get-in response [:usage :cache_read_tokens])))
     (is (= :tool_calls (:finish_reason response)))))
 
-(deftest test-ollama-uses-openai-compatible-chat-completions
+(deftest test-openai-compat-uses-chat-completions
   (let [captured (atom nil)
         transport
         (fn [request]
@@ -2762,7 +2762,7 @@
                             :total_tokens 11}})})
         response
         (llm/complete
-          {:provider "ollama" :model "qwen-test"
+          {:provider "openai-compat" :model "qwen-test"
            :base_url "http://localhost:11434/v1"
            :transport transport
            :messages

@@ -140,7 +140,7 @@ func terminalFrames(provider string) ([]string, bool) {
 			`{"error":{"code":503,"status":"UNAVAILABLE","message":"fixture failure"}}`,
 			`{"candidates":[{"content":{"role":"model","parts":[{"text":"late"}]}}]}`,
 		}, true
-	case "ollama":
+	case "openai-compat":
 		return []string{
 			`{"id":"chat","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"}}]}`,
 			`{"error":{"code":"server_error","message":"fixture failure"}}`,

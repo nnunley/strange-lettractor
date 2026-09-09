@@ -4,7 +4,7 @@
 
 (defn- events-for [provider chunks]
   (let [body (str (apply str (map #(str "data: " (json/write-json %) "\n\n") chunks))
-                  (when (= provider "ollama") "data: [DONE]\n\n"))
+                  (when (= provider "openai-compat") "data: [DONE]\n\n"))
         client (llm/make-client
                  {:default_provider provider
                   :providers {provider (llm/make-provider-adapter provider
@@ -24,7 +24,7 @@
                {:type "content_block_stop" :index 1} {:type "message_stop"}])
           g (events-for "gemini" [{:candidates [{:content {:parts [{:text s} {:text s :thought true}]}
                                                :finishReason "STOP"}]}])
-          c (events-for "ollama" [{:choices [{:delta {:content s} :finish_reason "stop"}]}])]
+          c (events-for "openai-compat" [{:choices [{:delta {:content s} :finish_reason "stop"}]}])]
       (doseq [events [a g]]
         (is (= [s] (mapv :text (ends events :text_end))))
         (is (= [s] (mapv :reasoning (ends events :reasoning_end)))))

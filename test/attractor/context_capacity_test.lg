@@ -41,15 +41,15 @@
 
 (deftest native-client-discovery-owns-one-bounded-operation
   (let [calls (atom 0) bounded-call capacity/call!
-        client (llm/make-client {:providers {"ollama" (llm/make-provider-adapter
-                                                       "ollama" {:base_url "http://fixture.local/v1"})}})]
+        client (llm/make-client {:providers {"openai-compat" (llm/make-provider-adapter
+                                                       "openai-compat" {:base_url "http://fixture.local/v1"})}})]
     (with-redefs [capacity/call! (fn [f opts] (swap! calls inc) (bounded-call f opts))
                   http/request (fn [request]
                                  {:status 200
                                   :body (if (clojure.string/ends-with? (:url request) "/models")
                                           "{\"data\":[{\"id\":\"fixture\",\"owned_by\":\"llamacpp\"}]}"
                                           "{\"model_alias\":\"fixture\",\"default_generation_settings\":{\"n_ctx\":2048}}")})]
-      (let [result (llm/client-discover-context client {:provider "ollama" :model "fixture"})]
+      (let [result (llm/client-discover-context client {:provider "openai-compat" :model "fixture"})]
         (is (= 2048 (:context_window_size result)))
         (is (= 1 @calls))))))
 

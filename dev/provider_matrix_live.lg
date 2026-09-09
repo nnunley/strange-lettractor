@@ -1,7 +1,7 @@
 (ns main
   "SCN-PROVIDER-MATRIX: equivalent journeys against each configured real
    provider (OpenAI, Anthropic, Gemini), plus any OpenAI-compatible endpoint
-   named by ATTRACTOR_COMPAT_MODEL (provider/name, e.g. ollama/qwen3.8-27b).
+   named by ATTRACTOR_COMPAT_MODEL (provider/name, e.g. openai-compat/qwen3.8-27b).
    Credentials come only from the environment; a provider without one is
    recorded as :skipped, never as a pass. Exit 0 only when every provider that
    was configured passed every journey; exit 3 when nothing was configured.
@@ -29,8 +29,8 @@
         ;; OpenAI-compatible endpoint (§7.10) is configured explicitly.
         client (if compat
                  (llm/make-client {:providers {provider (llm/make-provider-adapter provider
-                                                          {:api_key (env (str (str/upper-case provider) "_API_KEY"))
-                                                           :base_url (env (str (str/upper-case provider) "_BASE_URL"))})}
+                                                          {:api_key (env (str (str/replace (str/upper-case provider) "-" "_") "_API_KEY"))
+                                                           :base_url (env (str (str/replace (str/upper-case provider) "-" "_") "_BASE_URL"))})}
                                    :default_provider provider})
                  (llm/client-from-env))
         opts {:client client :max_retries 1 :timeout {:total 120}}]

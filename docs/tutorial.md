@@ -204,7 +204,7 @@ Attractor supports the **LiteLLM convention** (`<provider>/<model_name>`), remov
 digraph StyledPipeline {
     graph [
         model_stylesheet="
-            * { llm_model: ollama/qwen3.5:397b; }
+            * { llm_model: openai-compat/qwen3.5:397b; }
             box { reasoning_effort: medium; }
             .heavy { llm_model: anthropic/claude-3-7-sonnet; reasoning_effort: high; }
             #critical_audit { llm_model: openai/o3-mini; }
@@ -223,7 +223,7 @@ digraph StyledPipeline {
 
 You can also pass this directly via CLI:
 ```bash
-./bin/attractor run pipeline.dot --model ollama/deepseek-v4-pro:0813 --auto-approve
+./bin/attractor run pipeline.dot --model openai-compat/deepseek-v4-pro:0813 --auto-approve
 ```
 
 #### Specificity Resolution Order:

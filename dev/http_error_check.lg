@@ -24,7 +24,7 @@
                       (= (= kind "rate") (:retryable error)) (= attempts n)
                       (= (if (= kind "rate") [0.02 0.02] []) @delays))]
         {:provider provider :case kind :error error :requests n :delays @delays :pass pass}))
-    (for [provider ["openai" "anthropic" "gemini" "ollama"]
+    (for [provider ["openai" "anthropic" "gemini" "openai-compat"]
           [kind category code attempts] [["quota" :quota-exceeded "insufficient_quota" 1]
                                          ["auth" :authentication "invalid_api_key" 1]
                                          ["rate" :rate-limit "rate_limit" 3]]]
