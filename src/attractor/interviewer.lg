@@ -1,5 +1,5 @@
 (ns attractor.interviewer
-  (:require [clojure.string :as str]
+  (:require [clojure.string :as str] [clojure.core :as core] [async :as async]
             [term :as term]))
 
 ;; Question types
@@ -158,43 +158,89 @@
      :recordings recs}))
 
 ;; ConsoleInterviewer (Section 6.4)
-(deftype ConsoleInterviewer []
+;;
+;; One owned reader future consumes the input stream line by line into a
+;; channel; every question takes from that channel with alts! against a
+;; timeout channel, so a question honors :timeout_seconds without an abandoned
+;; per-question reader (§6.5, ATTR-HUM-02). Lines that arrive while no
+;; question is pending (for example an answer typed after a timeout) are
+;; discarded when the next question is asked, so they can never answer it.
+;; EOF closes the channel and every later question is SKIPPED.
+
+(defn start-line-source!
+  "Start a reader future over `read-fn` (default core/read-line) and return
+   the channel it feeds: strings per line, closed at EOF."
+  [& [read-fn]]
+  (let [lines (async/chan 64) read (or read-fn (fn [] (read-line)))]
+    (core/future
+      (try
+        (loop []
+          (let [line (read)]
+            (if (nil? line)
+              (async/close! lines)
+              (do (async/>!! lines line) (recur)))))
+        (catch Object _ (async/close! lines))))
+    lines))
+
+(def ^:private stdin-lines (atom nil))
+(defn- shared-stdin-lines []
+  (or @stdin-lines (swap! stdin-lines (fn [existing] (or existing (start-line-source!))))))
+
+(defn- drain-stale! [lines]
+  (loop [] (when (some? (async/poll! lines)) (recur))))
+
+(defn- take-line
+  "One of {:line s}, {:eof true} or {:timeout true}."
+  [lines timeout-seconds]
+  (if timeout-seconds
+    (let [[value port] (async/alts! [lines (async/timeout (long (* 1000.0 (double timeout-seconds))))])]
+      (cond (not= port lines) {:timeout true}
+            (nil? value) {:eof true}
+            :else {:line value}))
+    (let [value (async/<!! lines)]
+      (if (nil? value) {:eof true} {:line value}))))
+
+(defn- console-answer [question input]
+  (let [line (str/trim (or (:line input) ""))]
+    (cond
+      (:timeout input) (or (:default question) {:value :timeout :text "timeout"})
+      (:eof input) {:value :skipped :text "eof"}
+      (= (:type question) :multiple_choice)
+      (let [choice (first (filter (fn [o] (or (= (str/lower-case (:key o)) (str/lower-case line))
+                                              (= (str/lower-case (:label o)) (str/lower-case line))))
+                                  (:options question)))]
+        (if choice
+          {:value (:key choice) :selected_option choice :text (:label choice)}
+          (if (seq (:options question))
+            (let [first-opt (first (:options question))]
+              {:value (:key first-opt) :selected_option first-opt :text (:label first-opt)})
+            {:value :skipped :text line})))
+      (#{:yes_no :confirmation} (:type question))
+      (let [l (str/lower-case line)]
+        (if (or (= l "y") (= l "yes")) {:value :yes :text "yes"} {:value :no :text "no"}))
+      :else {:value line :text line})))
+
+(deftype ConsoleInterviewer [lines timedout]
   IInterviewer
   (ask [_ question]
-    (println (str "\n[?] " (:text question)))
-    (cond
-      (= (:type question) :multiple_choice)
-      (do
-        (doseq [opt (:options question)]
-          (println (str "  [" (:key opt) "] " (:label opt))))
-        (print "Select option: ")
-        (term/flush)
-        (let [line (str/trim (or (read-line) ""))
-              choice (first (filter (fn [o] (or (= (str/lower-case (:key o)) (str/lower-case line))
-                                                (= (str/lower-case (:label o)) (str/lower-case line))))
-                                    (:options question)))]
-          (if choice
-            {:value (:key choice) :selected_option choice :text (:label choice)}
-            (if (seq (:options question))
-              (let [first-opt (first (:options question))]
-                {:value (:key first-opt) :selected_option first-opt :text (:label first-opt)})
-              {:value :skipped :text line}))))
-
-      (#{:yes_no :confirmation} (:type question))
-      (do
-        (print "[Y/N]: ")
-        (term/flush)
-        (let [line (str/lower-case (str/trim (or (read-line) "")))]
-          (if (or (= line "y") (= line "yes"))
-            {:value :yes :text "yes"}
-            {:value :no :text "no"})))
-
-      :else
-      (do
-        (print "> ")
-        (term/flush)
-        (let [line (str/trim (or (read-line) ""))]
-          {:value line :text line}))))
+    (let [source (or lines (shared-stdin-lines))]
+      (when (first (swap-vals! timedout (fn [_] false)))
+        (drain-stale! source))
+      (println (str "\n[?] " (:text question)))
+      (case (:type question)
+        :multiple_choice (do (doseq [opt (:options question)]
+                               (println (str "  [" (:key opt) "] " (:label opt))))
+                             (print "Select option: "))
+        (:yes_no :confirmation) (print "[Y/N]: ")
+        (print "> "))
+      (when (:timeout_seconds question)
+        (print (str "(" (:timeout_seconds question) "s) ")))
+      (term/flush)
+      (let [input (take-line source (:timeout_seconds question))]
+        (when (:timeout input)
+          (reset! timedout true)
+          (println "\n[timeout]"))
+        (console-answer question input))))
 
   (ask-multiple [this questions]
     (vec (map (fn [q] (ask this q)) questions)))
@@ -202,5 +248,8 @@
   (inform [_ message stage]
     (println (str "[" stage "] " message))))
 
-(defn make-console-interviewer []
-  (->ConsoleInterviewer))
+(defn make-console-interviewer
+  "Console interviewer over the shared stdin line source, or over an explicit
+   line channel (tests, embedded frontends that already own input)."
+  [& [lines]]
+  (->ConsoleInterviewer lines (atom false)))

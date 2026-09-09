@@ -1,0 +1,52 @@
+(ns attractor.console-interviewer-timeout-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core] [async :as async]
+            [attractor.interviewer :as interviewer]))
+
+;; SCN-HUMAN-TIMEOUT COMPLETE
+;; ATTR-HUM-02: the console interviewer honors timeout_seconds over one owned
+;; line source, never blocks indefinitely, discards answers that arrive after a
+;; timeout, and treats EOF as SKIPPED.
+
+(defn- scripted-source [steps]
+  ;; steps: strings (a line, delivered after :delay ms if given as [ms line]) or :eof
+  (let [lines (async/chan 16)]
+    (core/future
+      (doseq [step steps]
+        (cond
+          (= :eof step) (async/close! lines)
+          (vector? step) (do (core/sleep (first step)) (async/>!! lines (second step)))
+          :else (async/>!! lines step))))
+    lines))
+(def ^:private mc {:text "Pick" :type :multiple_choice :options [{:key "A" :label "Alpha"} {:key "B" :label "Beta"}] :stage "s"})
+(defn- ask-quietly [interviewer question] (with-out-str (interviewer/ask interviewer question)))
+(defn- ask [interviewer question] (let [result (atom nil)] (with-out-str (reset! result (interviewer/ask interviewer question))) @result))
+
+(deftest answers-before-the-deadline-and-times-out-without-input
+  (let [i (interviewer/make-console-interviewer (scripted-source [[50 "b"]]))
+        started (System/currentTimeMillis)
+        answer (ask i (assoc mc :timeout_seconds 2))]
+    (is (= "B" (:value answer)))
+    (is (< (- (System/currentTimeMillis) started) 1500)))
+  (let [i (interviewer/make-console-interviewer (scripted-source []))
+        started (System/currentTimeMillis)
+        answer (ask i (assoc mc :timeout_seconds 0.1))]
+    (is (= :timeout (:value answer)))
+    (is (< (- (System/currentTimeMillis) started) 1000) "returned at the deadline, not on input")))
+
+(deftest default-answer-applies-on-timeout-and-late-input-is-discarded
+  (let [source (scripted-source [[300 "a"]])
+        i (interviewer/make-console-interviewer source)
+        first-answer (ask i (assoc mc :timeout_seconds 0.1 :default {:value "B" :text "Beta"}))]
+    (is (= "B" (:value first-answer)) "§6.5: default answer on timeout")
+    (core/sleep 400)
+    ;; "a" arrived after the timeout; it must not answer the next question.
+    (let [second-answer (ask i (assoc mc :timeout_seconds 0.1))]
+      (is (= :timeout (:value second-answer)) "late input was discarded"))))
+
+(deftest consecutive-questions-mixed-timed-and-untimed-and-eof
+  (let [i (interviewer/make-console-interviewer (scripted-source ["y" [20 "hello"] "alpha" :eof]))]
+    (is (= :yes (:value (ask i {:text "Sure?" :type :yes_no}))))
+    (is (= "hello" (:text (ask i {:text "Say" :type :freeform :timeout_seconds 1}))))
+    (is (= "A" (:value (ask i mc))) "label matching, untimed")
+    (is (= :skipped (:value (ask i (assoc mc :timeout_seconds 1)))) "EOF is SKIPPED")
+    (is (= :skipped (:value (ask i mc))) "and stays SKIPPED")))

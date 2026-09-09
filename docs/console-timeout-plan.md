@@ -1,4 +1,18 @@
-# Console timeout — ATTR-HUM-02 discovery checkpoint
+# Console timeout — ATTR-HUM-02 (resolved 2026-09-08)
+
+Resolution: the standalone `ConsoleInterviewer` now reads from one owned line
+source (`attractor.interviewer/start-line-source!`: a reader future feeding a
+channel) and takes each answer with `alts!` against a timeout channel. This
+satisfies the design review's constraints below without a runtime change:
+there is no per-question reader to abandon, timed and untimed questions share
+one reader and buffer, type-ahead across answered questions is preserved,
+input arriving after a timeout is discarded before the next question, and EOF
+yields SKIPPED. The stdin reader future stays parked until the process exits,
+which the CLI accepts; embedded frontends pass their own line channel to
+`make-console-interviewer`. Evidence is recorded in the Attractor requirements
+ledger (`SCN-HUMAN-TIMEOUT`). nooga/let-go#822 remains a nicety, not a blocker.
+
+The original discovery notes follow for history.
 
 Source: vendored StrongDM Attractor spec §§6.2, 6.4–6.5. A question's
 `timeout_seconds` bounds input waiting; use the complete `default` answer when
