@@ -7,7 +7,7 @@
             [os :as os] [io :as io] [json :as json]
             [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer] [attractor.agent :as agent]
-            [attractor.context :as ctx]))
+            [attractor.execution :as execution] [attractor.context :as ctx]))
 
 (def ^:private dot
   (str/join "\n"
@@ -28,7 +28,11 @@
 (deftest live-smoke-routes-persists-and-completes
   (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) logs-root (str root "/logs")
         events (atom [])
-        backend (agent/make-agent-codergen-backend {:model model :max_tool_rounds 0})
+        ;; Confine the live agent's tools to the temporary root, never the repo.
+        workdir (str root "/work") _ (os/sh "/bin/mkdir" "-p" workdir)
+        backend (agent/make-agent-codergen-backend
+                  {:model model
+                   :execution_env (execution/make-local-environment {:working_dir workdir})})
         registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) backend)
         started (System/currentTimeMillis)
         outcome (pipeline/run dot {:logs-root logs-root :registry registry :on-event #(swap! events conj %)})]
@@ -47,6 +51,7 @@
         (is (= #{"start" "plan" "implement" "review" "done"} (set (:completed_nodes checkpoint)))))
       (is (= :pipeline.completed (:type (last @events))))
       (is (= 3 (count (filter #(and (= :stage.completed (:type %)) (contains? #{"plan" "implement" "review"} (:node_id %))) @events))))
+      (is (nil? (os/stat "hello_world.py")) "the agent did not write into the process working directory")
       (println (str "live smoke: model " model ", " (- (System/currentTimeMillis) started) "ms, "
                     (count @events) " events, logs " logs-root))
       (finally (os/sh "/bin/rm" "-rf" "--" root)))))
