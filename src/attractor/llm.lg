@@ -8,6 +8,7 @@
             [http :as http]
             [attractor.context-discovery :as capacity]
             [attractor.models :as models]
+            [attractor.providers :as providers]
             [attractor.operation-owner :as owner]))
 
 (defn- response-header [response header-name]
@@ -120,56 +121,25 @@
 (defn raise-provider-error! [provider response]
   (throw (provider-error provider response)))
 
-;; Resolve base URL for a given provider
+;; Resolve base URL for a given provider: explicit value, <ID>_BASE_URL,
+;; then the provider registry (built-ins, user and project attractor.edn).
 (defn resolve-base-url [provider & [custom-base]]
   (let [p (str/lower-case (or provider "openai"))]
-    (cond
-      (not (str/blank? custom-base))
-      (let [b (str/trim custom-base)]
-        (if (str/ends-with? b "/") (subs b 0 (dec (count b))) b))
+    (when (nil? (providers/protocol-of p))
+      (throw (ex-info (str "Unknown LLM provider: " p "; configure it under :providers in attractor.edn")
+                      {:category :configuration :provider p :retryable false})))
+    (or (providers/base-url p custom-base)
+        (throw (ex-info (str p " requires a base URL: set " (providers/env-name p "_BASE_URL")
+                             ", pass :base_url, or add :base_url under :providers in attractor.edn")
+                        {:category :configuration :provider p :retryable false})))))
 
-      ;; The OpenAI-compatible adapter (spec §7.10) has no canonical host:
-      ;; llama.cpp, Ollama, vLLM, Together and Groq all differ, so the base
-      ;; URL must be configured explicitly.
-      (= p "openai-compat")
-      (let [u (os/getenv "OPENAI_COMPAT_BASE_URL")]
-        (if-not (str/blank? u)
-          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
-          (throw (ex-info "openai-compat requires a base URL: set OPENAI_COMPAT_BASE_URL or pass :base_url"
-                          {:category :configuration :provider "openai-compat" :retryable false}))))
-
-      (= p "anthropic")
-      (let [u (os/getenv "ANTHROPIC_BASE_URL")]
-        (if-not (str/blank? u)
-          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
-          "https://api.anthropic.com/v1"))
-
-      (= p "gemini")
-      (let [u (os/getenv "GEMINI_BASE_URL")]
-        (if-not (str/blank? u)
-          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
-          "https://generativelanguage.googleapis.com/v1beta"))
-
-      :else
-      (let [u (os/getenv "OPENAI_BASE_URL")]
-        (if-not (str/blank? u)
-          (if (str/ends-with? (str/trim u) "/") (subs (str/trim u) 0 (dec (count (str/trim u)))) (str/trim u))
-          "https://api.openai.com/v1")))))
-
-;; Resolve API key for a given provider
+;; Resolve API key for a given provider: explicit value, <ID>_API_KEY, then
+;; the registry's :api_key_env. Chat-completions servers usually ignore the
+;; bearer token but the contract still sends one, so they get a placeholder.
 (defn resolve-api-key [provider & [custom-key]]
   (let [p (str/lower-case (or provider "openai"))]
-    (or (when-not (str/blank? custom-key) custom-key)
-        (case p
-          ;; Local OpenAI-compatible servers usually ignore the bearer token
-          ;; but the Chat Completions contract still sends one.
-          "openai-compat" (or (let [k (os/getenv "OPENAI_COMPAT_API_KEY")] (when-not (str/blank? k) k))
-                              "local")
-          "anthropic" (let [k (os/getenv "ANTHROPIC_API_KEY")] (when-not (str/blank? k) k))
-          "gemini" (or (let [k (os/getenv "GEMINI_API_KEY")] (when-not (str/blank? k) k))
-                       (let [k (os/getenv "GOOGLE_API_KEY")] (when-not (str/blank? k) k)))
-          "openai" (let [k (os/getenv "OPENAI_API_KEY")] (when-not (str/blank? k) k))
-          nil))))
+    (or (providers/api-key p custom-key)
+        (when (= :openai-chat-completions (providers/protocol-of p)) "local"))))
 
 ;; Cache for discovered provider models
 (defonce provider-models-cache (atom {}))
@@ -177,13 +147,19 @@
 ;; Query models list from provider API (GET /v1/models)
 (defn fetch-models [provider & [opts]]
   (let [p (str/lower-case (or provider "openai"))
+        protocol (providers/protocol-of p)
+        _ (when-not (providers/model-discovery? p)
+            (throw (ex-info (str p " does not support model discovery (:model_discovery false in attractor.edn)")
+                            {:category :configuration :provider p :retryable false})))
         base (resolve-base-url p (:base_url opts))
         key (resolve-api-key p (:api_key opts))
         url (str base "/models")
-        headers (case p
-                  "anthropic" (cond-> {"anthropic-version" "2023-06-01"}
-                                (seq key) (assoc "x-api-key" key))
-                  ;; openai and openai-compat
+        headers (case protocol
+                  :anthropic-messages (cond-> {"anthropic-version" "2023-06-01"}
+                                        (seq key) (assoc "x-api-key" key))
+                  :gemini-generate-content (cond-> {"Content-Type" "application/json"}
+                                             (seq key) (assoc "x-goog-api-key" key))
+                  ;; Responses and Chat Completions
                   (cond-> {"Content-Type" "application/json"}
                     (seq key) (assoc "Authorization" (str "Bearer " key))))]
     (try
@@ -194,9 +170,11 @@
           (let [body-map (json/read-json body-str)
                 data (or (get body-map "data") (get body-map "models") [])
                 models (mapv (fn [m]
-                               (if (map? m)
-                                 (or (get m "id") (get m "name") (str m))
-                                 (str m)))
+                               (let [id (if (map? m)
+                                          (or (get m "id") (get m "name") (str m))
+                                          (str m))]
+                                 ;; Gemini lists "models/<id>".
+                                 (if (str/starts-with? id "models/") (subs id 7) id)))
                              data)]
             (swap! provider-models-cache assoc p models)
             models)
@@ -247,12 +225,14 @@
       (str/starts-with? m "gemini-")
       "gemini"
 
-      (or (not (str/blank? (os/getenv "OPENAI_COMPAT_API_KEY")))
-          (not (str/blank? (os/getenv "OPENAI_COMPAT_BASE_URL"))))
-      "openai-compat"
-
+      ;; A configured Chat Completions endpoint with a base URL is the only
+      ;; provider whose model names carry no recognizable prefix.
       :else
-      "mock")))
+      (or (some (fn [id] (when (and (= :openai-chat-completions (providers/protocol-of id))
+                                    (providers/base-url id))
+                           id))
+                (providers/ids))
+          "mock"))))
 
 ;; Split string once by separator
 (defn- split-once [s sep]
@@ -1708,12 +1688,12 @@
         provider (:provider parsed)
         actual-model (:model parsed)
         req (assoc request :provider provider :model actual-model)]
-    (case provider
-      "openai" (openai-complete req (:api_key opts) (:base_url opts))
-      "openai-compat" (openai-compatible-complete req (:api_key opts) (:base_url opts))
-      "anthropic" (anthropic-complete req (:api_key opts) (:base_url opts))
-      "gemini" (gemini-complete req (:api_key opts) (:base_url opts))
-      "mock" (mock-complete req (:mock_handler opts))
+    (case (providers/protocol-of provider)
+      :openai-responses (openai-complete req (:api_key opts) (:base_url opts))
+      :openai-chat-completions (openai-compatible-complete req (:api_key opts) (:base_url opts))
+      :anthropic-messages (anthropic-complete req (:api_key opts) (:base_url opts))
+      :gemini-generate-content (gemini-complete req (:api_key opts) (:base_url opts))
+      :mock (mock-complete req (:mock_handler opts))
       (throw (ex-info (str "Unsupported LLM provider: " provider)
                       {:provider provider :category :configuration})))))
 
@@ -2451,11 +2431,11 @@
         parsed (parse-model-spec (:model request) (or (:provider request) (:provider opts)))
         provider (:provider parsed)
         req (assoc request :provider provider :model (:model parsed))]
-    (case provider
-      "openai" (openai-stream req (:api_key opts) (:base_url opts))
-      "openai-compat" (openai-compatible-stream req (:api_key opts) (:base_url opts))
-      "anthropic" (anthropic-stream req (:api_key opts) (:base_url opts))
-      "gemini" (gemini-stream req (:api_key opts) (:base_url opts))
+    (case (providers/protocol-of provider)
+      :openai-responses (openai-stream req (:api_key opts) (:base_url opts))
+      :openai-chat-completions (openai-compatible-stream req (:api_key opts) (:base_url opts))
+      :anthropic-messages (anthropic-stream req (:api_key opts) (:base_url opts))
+      :gemini-generate-content (gemini-stream req (:api_key opts) (:base_url opts))
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
                       {:provider provider :category :configuration})))))
 
@@ -2570,8 +2550,10 @@
 (defn- probe-context [request options]
   (let [opts (merge options request)
         provider (str/lower-case (or (:provider opts) "openai"))
-        base (resolve-base-url provider (:base_url opts))]
-    (if (or (not (contains? #{"openai" "openai-compat"} provider))
+        protocol (providers/protocol-of provider)
+        base (when (contains? #{:openai-responses :openai-chat-completions} protocol)
+               (providers/base-url provider (:base_url opts)))]
+    (if (or (nil? base)
             (= "https://api.openai.com/v1" base)
             (:transport opts))
       {:status :unsupported :reason :unsupported}
@@ -2597,25 +2579,36 @@
         (fn [request]
           (cond-> (merge options request)
             gemini-call-names (assoc :gemini_call_names gemini-call-names)))
+        protocol (providers/protocol-of name)
+        ;; Configured providers resolve their key and base URL from the
+        ;; registry once, so the protocol functions never fall back to the
+        ;; built-in provider's environment names for a custom id.
+        with-credentials
+        (fn [req]
+          (if (= :mock protocol)
+            req
+            (cond-> req
+              (not (contains? req :api_key)) (assoc :api_key (resolve-api-key name nil))
+              (not (contains? req :base_url)) (assoc :base_url (providers/base-url name nil)))))
         complete-fn
         (fn [request]
-          (let [req (request-with-options request)]
-            (case name
-              "openai" (openai-complete req (:api_key req) (:base_url req))
-              "openai-compat" (openai-compatible-complete req (:api_key req) (:base_url req))
-              "anthropic" (anthropic-complete req (:api_key req) (:base_url req))
-              "gemini" (gemini-complete req (:api_key req) (:base_url req))
-              "mock" (mock-complete req (:mock_handler req))
+          (let [req (with-credentials (request-with-options request))]
+            (case protocol
+              :openai-responses (openai-complete req (:api_key req) (:base_url req))
+              :openai-chat-completions (openai-compatible-complete req (:api_key req) (:base_url req))
+              :anthropic-messages (anthropic-complete req (:api_key req) (:base_url req))
+              :gemini-generate-content (gemini-complete req (:api_key req) (:base_url req))
+              :mock (mock-complete req (:mock_handler req))
               (throw (ex-info (str "Unsupported LLM provider: " name)
                               {:provider name :category :configuration})))))
         stream-fn
         (fn [request]
-          (let [req (request-with-options request)]
-            (case name
-              "openai" (openai-stream req (:api_key req) (:base_url req))
-              "openai-compat" (openai-compatible-stream req (:api_key req) (:base_url req))
-              "anthropic" (anthropic-stream req (:api_key req) (:base_url req))
-              "gemini" (gemini-stream req (:api_key req) (:base_url req))
+          (let [req (with-credentials (request-with-options request))]
+            (case protocol
+              :openai-responses (openai-stream req (:api_key req) (:base_url req))
+              :openai-chat-completions (openai-compatible-stream req (:api_key req) (:base_url req))
+              :anthropic-messages (anthropic-stream req (:api_key req) (:base_url req))
+              :gemini-generate-content (gemini-stream req (:api_key req) (:base_url req))
               (throw (ex-info (str "Streaming is not implemented for provider: " name)
                               {:provider name :category :configuration})))))]
     (make-adapter name complete-fn stream-fn
@@ -2707,35 +2700,29 @@
   (let [value (env-get environment key)]
     (when-not (str/blank? value) value)))
 
-(defn client-from-env [& [environment]]
+(defn client-from-env
+  "Register every configured provider whose key is present in the
+   environment (spec §2.2). Chat-completions providers also need a base URL.
+   The default provider is the first of openai, anthropic, gemini, then any
+   other configured id in sorted order."
+  [& [environment]]
   (let [env (or environment :process)
-        openai-key (present-env env "OPENAI_API_KEY")
-        anthropic-key (present-env env "ANTHROPIC_API_KEY")
-        gemini-key (or (present-env env "GEMINI_API_KEY")
-                       (present-env env "GOOGLE_API_KEY"))
+        get-env (fn [name] (env-get env name))
         providers
-        (cond-> {}
-          openai-key
-          (assoc "openai"
-                 (make-provider-adapter
-                   "openai" {:api_key openai-key
-                             :base_url (present-env env "OPENAI_BASE_URL")
-                             :org_id (present-env env "OPENAI_ORG_ID")
-                             :project_id (present-env env "OPENAI_PROJECT_ID")}))
-          anthropic-key
-          (assoc "anthropic"
-                 (make-provider-adapter
-                   "anthropic" {:api_key anthropic-key
-                                :base_url (present-env env "ANTHROPIC_BASE_URL")}))
-          gemini-key
-          (assoc "gemini"
-                 (make-provider-adapter
-                   "gemini" {:api_key gemini-key
-                             :base_url (present-env env "GEMINI_BASE_URL")})))
-        default-provider (cond openai-key "openai"
-                               anthropic-key "anthropic"
-                               gemini-key "gemini"
-                               :else nil)]
+        (into {}
+              (keep (fn [id]
+                      (let [key (providers/api-key id nil get-env)
+                            base (providers/base-url id nil get-env)
+                            protocol (providers/protocol-of id)]
+                        (when (and key (or base (not= :openai-chat-completions protocol)))
+                          [id (make-provider-adapter
+                                id (cond-> {:api_key key :base_url base}
+                                     (= "openai" id)
+                                     (assoc :org_id (present-env env "OPENAI_ORG_ID")
+                                            :project_id (present-env env "OPENAI_PROJECT_ID"))))])))
+                    (providers/ids)))
+        default-provider (some #(when (contains? providers %) %)
+                               (concat ["openai" "anthropic" "gemini"] (sort (keys providers))))]
     (make-client {:providers providers :default_provider default-provider})))
 
 (defonce default-client (atom nil))

@@ -1,0 +1,218 @@
+(ns attractor.providers
+  "Provider registry: which providers exist, which wire protocol each speaks,
+   its base URL, which environment variable holds its key, and whether its
+   `/models` endpoint can be queried.
+
+   Sources, lowest to highest precedence:
+   1. built-in definitions (openai, anthropic, gemini, openai-compat)
+   2. user file   $XDG_CONFIG_HOME/attractor/attractor.edn
+                  (default ~/.config/attractor/attractor.edn)
+   3. project file <cwd>/attractor.edn, or the path in ATTRACTOR_CONFIG
+   4. environment <ID>_BASE_URL and <ID>_API_KEY (or the entry's :api_key_env)
+   5. explicit values passed by the caller
+
+   Files are data only: read with clojure.edn in data mode, validated against
+   the keys below, and never allowed to carry a secret. A file may name the
+   environment variable that holds a key; it may not hold the key."
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]
+            [io :as io]
+            [os :as os]))
+
+(def protocols
+  #{:openai-responses :anthropic-messages :gemini-generate-content :openai-chat-completions})
+
+(def built-in
+  {"openai" {:protocol :openai-responses
+             :base_url "https://api.openai.com/v1"
+             :api_key_env "OPENAI_API_KEY"
+             :model_discovery true}
+   "anthropic" {:protocol :anthropic-messages
+                :base_url "https://api.anthropic.com/v1"
+                :api_key_env "ANTHROPIC_API_KEY"
+                :model_discovery true}
+   "gemini" {:protocol :gemini-generate-content
+             :base_url "https://generativelanguage.googleapis.com/v1beta"
+             :api_key_env ["GEMINI_API_KEY" "GOOGLE_API_KEY"]
+             :model_discovery true}
+   ;; Spec §7.10: no canonical host, so the base URL must be configured.
+   "openai-compat" {:protocol :openai-chat-completions
+                    :base_url nil
+                    :api_key_env "OPENAI_COMPAT_API_KEY"
+                    :model_discovery true}})
+
+(def entry-keys #{:protocol :base_url :api_key_env :model_discovery})
+(def secret-keys #{:api_key :key :token :secret :password :credential})
+
+(defn- configuration-error [message data]
+  (ex-info message (merge {:category :configuration :retryable false} data)))
+
+(defn env-name
+  "Environment variable name derived from a provider id: `openai-compat` and
+   `_BASE_URL` give `OPENAI_COMPAT_BASE_URL`."
+  [id suffix]
+  (str (str/replace (str/upper-case (str id)) "-" "_") suffix))
+
+(defn- present [value] (when (and (string? value) (not (str/blank? value))) (str/trim value)))
+
+(defn- strip-slash [url]
+  (let [u (str/trim url)]
+    (if (str/ends-with? u "/") (subs u 0 (dec (count u))) u)))
+
+(defn validate-entry
+  "Validate one provider entry from a file. Returns the normalized entry or
+   throws a :configuration error naming the file, provider and problem."
+  [source id entry]
+  (let [fail (fn [problem] (throw (configuration-error
+                                    (str "attractor.edn " source ": provider " (pr-str id) " " problem)
+                                    {:source source :provider id})))]
+    (when-not (and (string? id) (re-matches #"[a-z0-9][a-z0-9-]*" id))
+      (fail "id must be a lowercase string of letters, digits and dashes"))
+    (when-not (map? entry) (fail "must be a map"))
+    (doseq [k (keys entry)]
+      (when (contains? secret-keys k)
+        (fail (str "must not contain " k "; name the environment variable in :api_key_env instead")))
+      (when-not (contains? entry-keys k)
+        (fail (str "has unknown key " k "; allowed: " (str/join ", " (map name (sort-by name entry-keys)))))))
+    (when-not (contains? protocols (:protocol entry))
+      (fail (str ":protocol must be one of " (str/join ", " (map name (sort-by name protocols))))))
+    (when (and (contains? entry :base_url) (some? (:base_url entry)) (not (present (:base_url entry))))
+      (fail ":base_url must be a non-empty string or nil"))
+    (when (and (contains? entry :base_url) (some? (:base_url entry))
+               (not (re-find #"^https?://" (str/trim (:base_url entry)))))
+      (fail ":base_url must start with http:// or https://"))
+    (when (and (contains? entry :api_key_env)
+               (not (or (present (:api_key_env entry))
+                        (and (vector? (:api_key_env entry)) (seq (:api_key_env entry))
+                             (every? present (:api_key_env entry))))))
+      (fail ":api_key_env must be an environment variable name or a vector of names"))
+    (when (and (contains? entry :model_discovery) (not (boolean? (:model_discovery entry))))
+      (fail ":model_discovery must be true or false"))
+    (cond-> {:protocol (:protocol entry)
+             :base_url (when (present (:base_url entry)) (strip-slash (:base_url entry)))
+             :api_key_env (or (:api_key_env entry) (env-name id "_API_KEY"))
+             :model_discovery (if (contains? entry :model_discovery) (:model_discovery entry) true)
+             :source source}
+      true identity)))
+
+(defn parse-config
+  "Parse one attractor.edn text into {id entry}. Only the :providers key is
+   understood; anything else is an error so typos cannot silently disappear."
+  [source text]
+  (let [forms (try (edn/read-all-string (str text))
+                   (catch Object e (throw (configuration-error
+                                            (str "attractor.edn " source " is not readable EDN: " (ex-message e))
+                                            {:source source}))))
+        _ (when (not= 1 (count forms))
+            (throw (configuration-error (str "attractor.edn " source " must contain exactly one map") {:source source})))
+        config (first forms)]
+    (when-not (map? config)
+      (throw (configuration-error (str "attractor.edn " source " must be a map") {:source source})))
+    (doseq [k (keys config)]
+      (when-not (= :providers k)
+        (throw (configuration-error (str "attractor.edn " source " has unknown top-level key " k "; only :providers is supported")
+                                    {:source source}))))
+    (let [providers (get config :providers {})]
+      (when-not (map? providers)
+        (throw (configuration-error (str "attractor.edn " source ": :providers must be a map of id to entry") {:source source})))
+      (into {} (map (fn [[id entry]] [(str id) (validate-entry source (str id) entry)]) providers)))))
+
+(defn user-config-path []
+  (let [xdg (present (os/getenv "XDG_CONFIG_HOME"))
+        home (present (os/getenv "HOME"))]
+    (cond xdg (str (strip-slash xdg) "/attractor/attractor.edn")
+          home (str (strip-slash home) "/.config/attractor/attractor.edn")
+          :else nil)))
+
+(defn project-config-path []
+  (or (present (os/getenv "ATTRACTOR_CONFIG"))
+      (str (os/cwd) "/attractor.edn")))
+
+(defn- read-file [path]
+  (when (and path (os/stat path))
+    (parse-config path (io/slurp path))))
+
+(defn load-registry
+  "Merge built-ins, the user file and the project file (in that order). Pass
+   :paths to override the file list, e.g. in tests."
+  [& [{:keys [paths]}]]
+  (let [files (or paths [(user-config-path) (project-config-path)])
+        built (into {} (map (fn [[id e]] [id (assoc e :source :built-in)]) built-in))]
+    (reduce (fn [registry path]
+              (merge registry (or (read-file path) {})))
+            built
+            files)))
+
+(defonce ^:private registry (atom nil))
+
+(defn reload!
+  "Re-read configuration files. Returns the registry."
+  [& [options]]
+  (reset! registry (load-registry options)))
+
+(defn definitions []
+  (or @registry (reload!)))
+
+(defn definition [id]
+  (when id (get (definitions) (str/lower-case (str id)))))
+
+(defn protocol-of
+  "Wire protocol for a provider id; :mock for the mock provider; nil when the
+   id is not configured."
+  [id]
+  (let [p (str/lower-case (str id))]
+    (if (= p "mock") :mock (:protocol (definition p)))))
+
+(defn ids [] (vec (sort (keys (definitions)))))
+
+(defn- env-get [env-fn name] (present (env-fn name)))
+
+(defn base-url
+  "Effective base URL: explicit value, <ID>_BASE_URL, then the definition.
+   nil when nothing is configured."
+  [id & [explicit env-fn]]
+  (let [get-env (or env-fn os/getenv)
+        p (str/lower-case (str id))]
+    (or (when (present explicit) (strip-slash explicit))
+        (when-let [u (env-get get-env (env-name p "_BASE_URL"))] (strip-slash u))
+        (:base_url (definition p)))))
+
+(defn key-env-names
+  "Environment variable names consulted for a provider's key, in order."
+  [id]
+  (let [p (str/lower-case (str id))
+        configured (:api_key_env (definition p))
+        names (cond (nil? configured) []
+                    (string? configured) [configured]
+                    :else (vec configured))]
+    (vec (distinct (concat [(env-name p "_API_KEY")] names)))))
+
+(defn api-key
+  "Effective API key: explicit value, then the first present variable from
+   key-env-names. nil when none is set."
+  [id & [explicit env-fn]]
+  (let [get-env (or env-fn os/getenv)]
+    (or (present explicit)
+        (some (fn [name] (env-get get-env name)) (key-env-names id)))))
+
+(defn model-discovery? [id]
+  (boolean (:model_discovery (definition id))))
+
+(defn effective
+  "One row per configured provider with its effective values and sources,
+   for `attractor providers`. Keys are never printed, only their presence."
+  [& [env-fn]]
+  (let [get-env (or env-fn os/getenv)]
+    (mapv (fn [id]
+            (let [d (definition id)]
+              {:id id
+               :protocol (:protocol d)
+               :base_url (base-url id nil get-env)
+               :base_url_source (cond (env-get get-env (env-name id "_BASE_URL")) :environment
+                                      (:base_url d) (:source d)
+                                      :else :unset)
+               :api_key_env (key-env-names id)
+               :key_present (some? (api-key id nil get-env))
+               :model_discovery (:model_discovery d)
+               :source (:source d)}))
+          (ids))))

@@ -18,6 +18,13 @@ every invocation: `--model provider/name`, `--alias`, `--agent-cwd`,
 `--agent-model`, `--agent-sandbox`, `--agent-permission-mode`, the hub's
 per-agent commands, and the llama.cpp endpoint.
 
+Progress 2026-09-09: the provider layer exists (`src/attractor/providers.lg`,
+`attractor.edn` at the project root or `~/.config/attractor/`, data-only
+entries with protocol, base URL, key variable name and model-discovery
+toggle, precedence built-ins < user < project < environment < explicit,
+`attractor providers` to show effective values with sources). Everything
+below that is not about providers remains open.
+
 The design session should settle:
 
 - **Sources and precedence.** A `.edn` settings file read with the Clojure

@@ -1,0 +1,31 @@
+;; Strange Lettractor provider registry.
+;;   Project file:  ./attractor.edn   (or the path in ATTRACTOR_CONFIG)
+;;   User file:     ~/.config/attractor/attractor.edn  ($XDG_CONFIG_HOME/attractor/attractor.edn)
+;; Precedence: built-ins < user file < project file < environment
+;; (<ID>_BASE_URL, <ID>_API_KEY or :api_key_env) < explicit CLI/API values.
+;;
+;; Entries are data only. A file names the environment variable that holds a
+;; key; it never holds the key itself. Any other key in an entry is an error.
+;;
+;; Built-ins that need no entry: openai (Responses API), anthropic (Messages
+;; API), gemini (generateContent), openai-compat (Chat Completions, base URL
+;; required). Redefining one of those ids here overrides it.
+{:providers
+ {;; OpenRouter: Chat Completions, pay-per-use key, model list at /models.
+  "openrouter" {:protocol :openai-chat-completions
+                :base_url "https://openrouter.ai/api/v1"
+                :api_key_env "OPENROUTER_API_KEY"
+                :model_discovery true}
+
+  ;; A local llama.cpp server: no key needed, and its /models list is not
+  ;; worth querying, so discovery is off.
+  "llamacpp" {:protocol :openai-chat-completions
+              :base_url "http://localhost:8080/v1"
+              :model_discovery false}
+
+  ;; An enterprise gateway that speaks the Anthropic Messages API.
+  ;; Models are addressed as claude-gw/<name>.
+  "claude-gw" {:protocol :anthropic-messages
+               :base_url "https://gateway.example.com/anthropic/v1"
+               :api_key_env "CLAUDE_GW_API_KEY"
+               :model_discovery false}}}

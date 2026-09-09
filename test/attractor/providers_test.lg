@@ -1,0 +1,163 @@
+(ns attractor.providers-test
+  "Provider registry: attractor.edn parsing and validation, precedence of
+   built-ins, user file, project file and environment, and a configured
+   provider driving a real adapter through its declared protocol."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [json :as json]
+            [attractor.providers :as providers]
+            [attractor.llm :as llm]))
+
+(defn- temp-file [label text]
+  (let [path (str (str/replace (os/temp-dir) #"/+$" "") "/attractor-providers-" label "-"
+                  (System/currentTimeMillis) "-" (rand-int 100000) ".edn")]
+    (io/spit path text)
+    path))
+
+(defn- category-of [f]
+  (try (f) nil (catch Object e (:category (ex-data e)))))
+
+(defn- message-of [f]
+  (try (f) nil (catch Object e (ex-message e))))
+
+(deftest built-ins-cover-the-four-protocols
+  (is (= ["anthropic" "gemini" "openai" "openai-compat"] (sort (keys providers/built-in))))
+  (is (= :openai-responses (:protocol (get providers/built-in "openai"))))
+  (is (= :anthropic-messages (:protocol (get providers/built-in "anthropic"))))
+  (is (= :gemini-generate-content (:protocol (get providers/built-in "gemini"))))
+  (is (= :openai-chat-completions (:protocol (get providers/built-in "openai-compat"))))
+  (is (nil? (:base_url (get providers/built-in "openai-compat"))) "no canonical host per spec §7.10")
+  (is (every? :model_discovery (vals providers/built-in))))
+
+(deftest env-names-derive-from-the-id
+  (is (= "OPENAI_COMPAT_BASE_URL" (providers/env-name "openai-compat" "_BASE_URL")))
+  (is (= "OPENROUTER_API_KEY" (providers/env-name "openrouter" "_API_KEY"))))
+
+(deftest parse-config-accepts-a-full-entry-and-fills-defaults
+  (let [parsed (providers/parse-config "t"
+                 "{:providers {\"openrouter\" {:protocol :openai-chat-completions
+                                                :base_url \"https://openrouter.ai/api/v1/\"
+                                                :api_key_env \"OPENROUTER_API_KEY\"
+                                                :model_discovery true}
+                               \"local-llama\" {:protocol :openai-chat-completions
+                                                 :base_url \"http://localhost:8080/v1\"
+                                                 :model_discovery false}}}")]
+    (is (= #{"openrouter" "local-llama"} (set (keys parsed))))
+    (is (= "https://openrouter.ai/api/v1" (get-in parsed ["openrouter" :base_url])) "trailing slash removed")
+    (is (= "LOCAL_LLAMA_API_KEY" (get-in parsed ["local-llama" :api_key_env])) "default key variable from id")
+    (is (false? (get-in parsed ["local-llama" :model_discovery])))
+    (is (= "t" (get-in parsed ["openrouter" :source])))))
+
+(deftest parse-config-rejects-what-it-does-not-understand
+  (testing "unknown top-level key"
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:provider {}}")) "unknown top-level key")))
+  (testing "unknown entry key"
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :timeout 3}}}")) "unknown key")))
+  (testing "secrets never live in the file"
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :api_key \"sk-1\"}}}")) ":api_key_env instead")))
+  (testing "unknown protocol"
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :grpc}}}")) ":protocol must be one of")))
+  (testing "bad ids, urls, toggles and non-map files"
+    (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"Bad Id\" {:protocol :openai-responses}}}"))))
+    (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :base_url \"localhost:8080\"}}}"))))
+    (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :model_discovery \"yes\"}}}"))))
+    (is (= :configuration (category-of #(providers/parse-config "t" "[1 2 3]"))))
+    (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {}} {:providers {}}"))))
+    (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses"))))))
+
+(deftest files-layer-over-built-ins-in-order
+  (let [user (temp-file "user" "{:providers {\"openrouter\" {:protocol :openai-chat-completions :base_url \"https://user.example/v1\"}
+                                             \"openai\" {:protocol :openai-responses :base_url \"https://user-proxy.example/v1\" :model_discovery false}}}")
+        project (temp-file "project" "{:providers {\"openrouter\" {:protocol :openai-chat-completions :base_url \"https://project.example/v1\"}}}")
+        registry (providers/load-registry {:paths [user project]})]
+    (try
+      (is (= "https://project.example/v1" (get-in registry ["openrouter" :base_url])) "project wins over user")
+      (is (= project (get-in registry ["openrouter" :source])))
+      (is (= "https://user-proxy.example/v1" (get-in registry ["openai" :base_url])) "a file may override a built-in")
+      (is (false? (get-in registry ["openai" :model_discovery])))
+      (is (= :built-in (get-in registry ["anthropic" :source])) "untouched built-ins remain")
+      (is (= (providers/load-registry {:paths []})
+             (providers/load-registry {:paths ["/definitely/missing/attractor.edn"]}))
+          "a missing file contributes nothing")
+      (finally
+        (os/sh "/bin/rm" "-f" "--" user project)))))
+
+(deftest environment-overrides-files-and-explicit-values-override-environment
+  (let [project (temp-file "env" "{:providers {\"openrouter\" {:protocol :openai-chat-completions :base_url \"https://file.example/v1\" :api_key_env \"OR_KEY\"}}}")]
+    (try
+      (providers/reload! {:paths [project]})
+      (let [env {"OPENROUTER_BASE_URL" "https://env.example/v1/" "OR_KEY" "from-named-var"}
+            get-env (fn [name] (get env name))]
+        (is (= "https://env.example/v1" (providers/base-url "openrouter" nil get-env)))
+        (is (= "https://explicit.example/v1" (providers/base-url "openrouter" "https://explicit.example/v1/" get-env)))
+        (is (= "https://file.example/v1" (providers/base-url "openrouter" nil (fn [_] nil))))
+        (is (= ["OPENROUTER_API_KEY" "OR_KEY"] (providers/key-env-names "openrouter")))
+        (is (= "from-named-var" (providers/api-key "openrouter" nil get-env)))
+        (is (= "id-var-wins" (providers/api-key "openrouter" nil (fn [n] (get (assoc env "OPENROUTER_API_KEY" "id-var-wins") n)))))
+        (is (= "explicit" (providers/api-key "openrouter" "explicit" get-env)))
+        (is (nil? (providers/api-key "openrouter" nil (fn [_] nil))))
+        (is (= :openai-chat-completions (providers/protocol-of "openrouter")))
+        (is (= :mock (providers/protocol-of "mock")))
+        (is (nil? (providers/protocol-of "nowhere")))
+        (let [row (first (filter #(= "openrouter" (:id %)) (providers/effective get-env)))]
+          (is (= :environment (:base_url_source row)))
+          (is (true? (:key_present row)))
+          (is (= project (:source row)))))
+      (finally
+        (providers/reload! {:paths []})
+        (os/sh "/bin/rm" "-f" "--" project)))))
+
+(deftest a-configured-provider-drives-its-declared-protocol
+  (let [project (temp-file "wire" "{:providers {\"openrouter\" {:protocol :openai-chat-completions :base_url \"https://openrouter.test/api/v1\"}
+                                                \"claude-proxy\" {:protocol :anthropic-messages :base_url \"https://proxy.test/anthropic/v1\" :model_discovery false}}}")]
+    (try
+      (providers/reload! {:paths [project]})
+      (testing "chat completions on a custom id"
+        (let [captured (atom nil)
+              adapter (llm/make-provider-adapter
+                        "openrouter"
+                        {:api_key "or-key"
+                         :transport (fn [request]
+                                      (reset! captured request)
+                                      {:status 200
+                                       :body (json/write-json {:id "c" :choices [{:message {:role "assistant" :content "hi"} :finish_reason "stop"}]})})})
+              client (llm/make-client {:providers {"openrouter" adapter} :default_provider "openrouter"})
+              response (llm/client-complete client {:model "some-model" :messages [{:role :user :content "x"}]})]
+          (is (= "https://openrouter.test/api/v1/chat/completions" (:url @captured)))
+          (is (= "Bearer or-key" (get-in @captured [:headers "Authorization"])))
+          (is (= "some-model" (get (json/read-json (:body @captured)) "model")))
+          (is (= "hi" (llm/response-text response)))
+          (is (= "openrouter" (:provider response)))))
+      (testing "anthropic messages on a custom id"
+        (let [captured (atom nil)
+              adapter (llm/make-provider-adapter
+                        "claude-proxy"
+                        {:api_key "proxy-key"
+                         :transport (fn [request]
+                                      (reset! captured request)
+                                      {:status 200
+                                       :body (json/write-json {:id "m" :type "message" :role "assistant"
+                                                               :content [{:type "text" :text "hello"}]
+                                                               :stop_reason "end_turn"
+                                                               :usage {:input_tokens 1 :output_tokens 1}})})})
+              client (llm/make-client {:providers {"claude-proxy" adapter} :default_provider "claude-proxy"})
+              response (llm/client-complete client {:model "claude-test" :messages [{:role :user :content "x"}]})]
+          (is (= "https://proxy.test/anthropic/v1/messages" (:url @captured)))
+          (is (= "proxy-key" (get-in @captured [:headers "x-api-key"])))
+          (is (= "hello" (llm/response-text response)))))
+      (testing "discovery toggle and unknown ids are configuration errors"
+        (is (str/includes? (message-of #(llm/fetch-models "claude-proxy")) "model discovery"))
+        (is (= :configuration (category-of #(llm/resolve-base-url "nowhere")))))
+      (testing "client-from-env registers configured providers whose key is present"
+        (let [client (llm/client-from-env {"OPENROUTER_API_KEY" "k" "ANTHROPIC_API_KEY" "a"})]
+          (is (= #{"openrouter" "anthropic"} (set (keys (:providers client)))))
+          (is (= "anthropic" (:default_provider client))))
+        (let [client (llm/client-from-env {"OPENROUTER_API_KEY" "k"})]
+          (is (= "openrouter" (:default_provider client))))
+        (is (empty? (:providers (llm/client-from-env {"OPENAI_COMPAT_API_KEY" "k"})))
+            "a chat-completions provider without a base URL is not registered"))
+      (finally
+        (providers/reload! {:paths []})
+        (os/sh "/bin/rm" "-f" "--" project)))))

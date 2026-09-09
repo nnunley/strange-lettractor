@@ -2,7 +2,8 @@
   (:require [clojure.string :as str]
             [clojure.core :as core]
             [math :as math]
-            [attractor.llm :as llm]))
+            [attractor.llm :as llm]
+            [attractor.providers :as providers]))
 
 (def selection-schema
   {:type "object"
@@ -37,7 +38,7 @@
                 (str/blank? (:provider parsed)))
         (throw (configuration-error
                  "Prompted fan-in requires non-empty LLM model and provider configuration")))
-      (when (and (contains? #{"mock" "openai-compat"} (:provider parsed))
+      (when (and (contains? #{:mock :openai-chat-completions} (providers/protocol-of (:provider parsed)))
                  (not prefixed?)
                  (nil? explicit-provider)
                  (nil? client-provider))

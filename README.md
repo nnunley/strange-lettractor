@@ -113,6 +113,23 @@ See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and C
 See [deployment context discovery](docs/context-capacity.md) for live capacity,
 explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 
+## Providers
+
+Providers live in a registry: an id, the wire protocol it speaks
+(`:openai-responses`, `:anthropic-messages`, `:gemini-generate-content` or
+`:openai-chat-completions`), its base URL, the environment variable holding
+its key, and whether `/models` may be queried. `openai`, `anthropic`,
+`gemini` and `openai-compat` are built in; add or override entries in
+`./attractor.edn` (see `attractor.edn.sample`) or
+`~/.config/attractor/attractor.edn`. Files are data only and never hold a
+key. Any configured id can be used as a model prefix (`openrouter/<model>`)
+and with `models --provider <id>`.
+
+```sh
+bin/attractor providers          # effective registry with each value's source
+bin/attractor models --provider openrouter
+```
+
 ## One control plane: the hub
 
 Every command that does work (`run`, `resume`, `agent`, `console`) submits it
