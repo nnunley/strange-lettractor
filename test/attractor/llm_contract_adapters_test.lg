@@ -1,0 +1,252 @@
+(ns attractor.llm-contract-adapters-test
+  "SCN-ULLM-ADAPTERS / SCN-OPENAI-COMPAT: every native adapter is driven through
+   the unified client against a real loopback recording server
+   (`test/fixtures/provider_wire_server.lg`). Assertions cover the exact URL,
+   auth headers, request payload shape (roles, tools, provider-only fields) and
+   normalized complete/stream results, and that no provider's fields leak into
+   another's payload."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core]
+            [clojure.string :as str]
+            [http :as http]
+            [json :as json]
+            [os :as os]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]))
+
+(defn- quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+
+(defn with-wire-server [f]
+  (let [runtime (os/getenv "LGX_LG")
+        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
+        port (+ 30000 (rand-int 20000))
+        token (str "wire-" (rand-int 1000000000))
+        base (str "http://127.0.0.1:" port)
+        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
+                                               :max_command_timeout_ms 60000})
+        server (str (os/cwd) "/test/fixtures/provider_wire_server.lg")
+        command (str (quote-shell runtime) " " (quote-shell server) " " port " " token)
+        worker (core/future ((:exec_command env) command 60000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      (loop [remaining 150]
+        (let [response (try (http/request {:url (str base "/ready") :timeout_ms 200})
+                            (catch Object _ nil))]
+          (cond
+            (and response (= 200 (:status response)))
+            (when-not (= token (:body response)) (throw (ex-info "Fixture port collision" {})))
+            (or (zero? remaining) (realized? worker))
+            (throw (ex-info "Fixture not ready" {:worker (deref worker 100 :pending)}))
+            :else (do (core/sleep 20) (recur (dec remaining))))))
+      (f (str base "/" token))
+      (finally
+        ((:cleanup env))
+        (when (= :pending (deref worker 3000 :pending))
+          (throw (ex-info "Fixture process failed to join" {})))))))
+
+(defn- recorded [root]
+  (json/read-json (str (:body (http/request {:url (str root "/recorded")})))))
+
+(defn- client-for [root provider scenario]
+  (llm/make-client
+    {:default_provider provider
+     :providers {provider (llm/make-provider-adapter
+                            provider
+                            {:api_key (str "key-" provider)
+                             :base_url (str root "/" provider "/" scenario)})}}))
+
+(def tool {:name "get_weather" :description "Weather by city"
+           :parameters {:type "object" :properties {:city {:type "string"}} :required ["city"]}})
+
+(def conversation
+  [{:role :system :content "Be brief"}
+   {:role :user :content "Hi"}
+   {:role :assistant :content "Earlier answer"}
+   {:role :user :content "Weather?"}])
+
+(defn- header [request name]
+  (let [headers (get request "headers")]
+    (some (fn [[k v]] (when (= (str/lower-case k) (str/lower-case name)) v)) headers)))
+
+(defn- last-request [root]
+  (last (recorded root)))
+
+(defn- complete! [root provider scenario request]
+  (llm/client-complete (client-for root provider scenario)
+                       (assoc request :provider provider)))
+
+(defn- stream-events! [root provider scenario request]
+  (doall (llm/client-stream (client-for root provider scenario)
+                            (assoc request :provider provider))))
+
+(deftest openai-responses-wire-contract
+  (with-wire-server
+    (fn [root]
+      (let [response (complete! root "openai" "tools"
+                                {:model "gpt-test" :messages conversation :tools [tool]
+                                 :max_tokens 64 :reasoning_effort "low"})
+            request (last-request root)
+            body (get request "body")]
+        (testing "endpoint and auth"
+          (is (= "post" (get request "method")))
+          (is (str/ends-with? (get request "path") "/openai/tools/responses"))
+          (is (= "Bearer key-openai" (header request "authorization")))
+          (is (nil? (header request "x-api-key")))
+          (is (nil? (header request "anthropic-version"))))
+        (testing "payload: system becomes instructions, roles preserved, tools flattened"
+          (is (= "gpt-test" (get body "model")))
+          (is (= "Be brief" (get body "instructions")))
+          (is (= ["user" "assistant" "user"] (mapv #(get % "role") (get body "input"))))
+          (is (= "get_weather" (get-in body ["tools" 0 "name"])))
+          (is (= "function" (get-in body ["tools" 0 "type"])))
+          (is (= 64 (get body "max_output_tokens")))
+          (is (= "low" (get-in body ["reasoning" "effort"])))
+          (is (not (contains? body "max_tokens")) "anthropic field must not leak")
+          (is (not (contains? body "messages")) "chat-completions field must not leak")
+          (is (not (contains? body "contents")) "gemini field must not leak"))
+        (testing "normalized response"
+          (is (= "Hello world" (llm/response-text response)))
+          (is (= "get_weather" (get-in response [:tool_calls 0 :name])))
+          (is (= {"city" "Oslo"} (get-in response [:tool_calls 0 :arguments])))
+          (is (= "call-1" (get-in response [:tool_calls 0 :id])))
+          (is (= :tool_calls (:finish_reason response)))
+          (is (= 11 (get-in response [:usage :input_tokens])))
+          (is (= 7 (get-in response [:usage :output_tokens])))
+          (is (= 3 (get-in response [:usage :cache_read_tokens])))
+          (is (= 2 (get-in response [:usage :reasoning_tokens]))))))))
+
+(deftest anthropic-messages-wire-contract
+  (with-wire-server
+    (fn [root]
+      (let [response (complete! root "anthropic" "tools"
+                                {:model "claude-test" :messages conversation :tools [tool]
+                                 :max_tokens 64})
+            request (last-request root)
+            body (get request "body")]
+        (testing "endpoint and auth"
+          (is (str/ends-with? (get request "path") "/anthropic/tools/messages"))
+          (is (= "key-anthropic" (header request "x-api-key")))
+          (is (= "2023-06-01" (header request "anthropic-version")))
+          (is (nil? (header request "authorization"))))
+        (testing "payload: top-level system, alternating roles, input_schema tools, max_tokens required"
+          (is (= "claude-test" (get body "model")))
+          (is (= "Be brief" (let [s (get body "system")] (if (string? s) s (get-in s [0 "text"])))))
+          (is (= ["user" "assistant" "user"] (mapv #(get % "role") (get body "messages"))))
+          (is (= 64 (get body "max_tokens")))
+          (is (= "get_weather" (get-in body ["tools" 0 "name"])))
+          (is (map? (get-in body ["tools" 0 "input_schema"])))
+          (is (not (contains? body "instructions")) "openai field must not leak")
+          (is (not (contains? body "max_output_tokens")) "openai field must not leak")
+          (is (not (contains? body "contents")) "gemini field must not leak"))
+        (testing "normalized response"
+          (is (= "Hello world" (llm/response-text response)))
+          (is (= "get_weather" (get-in response [:tool_calls 0 :name])))
+          (is (= {"city" "Oslo"} (get-in response [:tool_calls 0 :arguments])))
+          (is (= :tool_calls (:finish_reason response)))
+          (is (= 11 (get-in response [:usage :input_tokens])))
+          (is (= 7 (get-in response [:usage :output_tokens])))
+          (is (= 3 (get-in response [:usage :cache_read_tokens]))))))))
+
+(deftest gemini-generate-content-wire-contract
+  (with-wire-server
+    (fn [root]
+      (let [response (complete! root "gemini" "tools"
+                                {:model "gemini-test" :messages conversation :tools [tool]
+                                 :max_tokens 64})
+            request (last-request root)
+            body (get request "body")]
+        (testing "endpoint and auth"
+          (is (str/ends-with? (get request "path") "/gemini/tools/models/gemini-test:generateContent"))
+          (is (= "key-gemini" (header request "x-goog-api-key")))
+          (is (nil? (header request "authorization"))))
+        (testing "payload: systemInstruction, user/model contents, functionDeclarations"
+          (is (= "Be brief" (get-in body ["systemInstruction" "parts" 0 "text"])))
+          (is (= ["user" "model" "user"] (mapv #(get % "role") (get body "contents"))))
+          (is (= "get_weather" (get-in body ["tools" 0 "functionDeclarations" 0 "name"])))
+          (is (= 64 (get-in body ["generationConfig" "maxOutputTokens"])))
+          (is (not (contains? body "messages")) "openai/anthropic field must not leak")
+          (is (not (contains? body "max_tokens")) "anthropic field must not leak"))
+        (testing "normalized response"
+          (is (= "Hello world" (llm/response-text response)))
+          (is (= "get_weather" (get-in response [:tool_calls 0 :name])))
+          (is (= {"city" "Oslo"} (get-in response [:tool_calls 0 :arguments])))
+          (is (= :tool_calls (:finish_reason response)))
+          (is (= 11 (get-in response [:usage :input_tokens])))
+          (is (= 7 (get-in response [:usage :output_tokens]))))))))
+
+(deftest openai-compat-chat-completions-wire-contract
+  (with-wire-server
+    (fn [root]
+      (let [response (complete! root "openai-compat" "tools"
+                                {:model "compat-test" :messages conversation :tools [tool]
+                                 :max_tokens 64})
+            request (last-request root)
+            body (get request "body")]
+        (testing "endpoint and auth follow the §7.10 extension contract"
+          (is (str/ends-with? (get request "path") "/openai-compat/tools/chat/completions"))
+          (is (= "Bearer key-openai-compat" (header request "authorization"))))
+        (testing "payload is chat-completions shaped"
+          (is (= "compat-test" (get body "model")))
+          (is (= ["system" "user" "assistant" "user"] (mapv #(get % "role") (get body "messages"))))
+          (is (= "function" (get-in body ["tools" 0 "type"])))
+          (is (= "get_weather" (get-in body ["tools" 0 "function" "name"])))
+          (is (not (contains? body "input")) "responses-api field must not leak")
+          (is (not (contains? body "instructions")) "responses-api field must not leak"))
+        (testing "normalized response"
+          (is (= "Hello world" (llm/response-text response)))
+          (is (= "get_weather" (get-in response [:tool_calls 0 :name])))
+          (is (= {"city" "Oslo"} (get-in response [:tool_calls 0 :arguments])))
+          (is (= :tool_calls (:finish_reason response)))
+          (is (= 11 (get-in response [:usage :input_tokens])))
+          (is (= 7 (get-in response [:usage :output_tokens]))))))))
+
+(deftest openai-compat-requires-an-explicit-base-url
+  (let [thrown (try (llm/client-complete
+                      (llm/make-client {:default_provider "openai-compat"
+                                        :providers {"openai-compat" (llm/make-provider-adapter "openai-compat" {:api_key "k"})}})
+                      {:model "m" :provider "openai-compat" :messages [{:role :user :content "hi"}]})
+                    nil
+                    (catch Object e e))]
+    (is (some? thrown))
+    (is (= :configuration (:category (ex-data thrown))))))
+
+(deftest every-native-stream-yields-deltas-then-one-finish
+  (with-wire-server
+    (fn [root]
+      (doseq [provider ["openai" "anthropic" "gemini" "openai-compat"]]
+        (let [events (stream-events! root provider "text"
+                                     {:model (str provider "-model") :messages conversation})
+              kinds (mapv :type events)
+              finish (last events)
+              request (last-request root)]
+          (testing (str provider " request declares streaming")
+            (if (= provider "gemini")
+              (is (str/includes? (get request "path") ":streamGenerateContent"))
+              (is (true? (get-in request ["body" "stream"])))))
+          (testing (str provider " events")
+            (is (= 1 (count (filter #(= :finish %) kinds))) (pr-str kinds))
+            (is (= :finish (:type finish)))
+            (is (zero? (count (filter #(= :error %) kinds))))
+            (is (= "Hello world"
+                   (apply str (map :delta (filter #(= :text_delta (:type %)) events)))))
+            (is (= :stop (:finish_reason finish)))
+            (is (= 11 (get-in finish [:usage :input_tokens])))
+            (is (= 7 (get-in finish [:usage :output_tokens])))
+            (is (= "Hello world" (llm/response-text (:response finish))))))))))
+
+(deftest authentication-failures-normalize-identically
+  (with-wire-server
+    (fn [root]
+      (doseq [provider ["openai" "anthropic" "gemini" "openai-compat"]]
+        (let [error (try (complete! root provider "auth"
+                                    {:model "m" :messages [{:role :user :content "hi"}] :max_retries 0})
+                         nil
+                         (catch Object e e))
+              data (ex-data error)]
+          (is (some? error) provider)
+          (is (= :authentication (:category data)) provider)
+          (is (= 401 (:status data)) provider)
+          (is (false? (:retryable data)) provider)
+          (is (= provider (:provider data))))))))
+
+;; SCN-ULLM-ADAPTERS COMPLETE
+;; SCN-OPENAI-COMPAT COMPLETE

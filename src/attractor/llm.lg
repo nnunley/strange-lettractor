@@ -92,6 +92,31 @@
        :retry_after (parse-retry-after response)
        :raw raw})))
 
+(defn malformed-body-error
+  "A 2xx response whose body is not the provider's JSON object contract is a
+   provider defect, not a transient transport signal: it is normalized to the
+   generic provider category and never retried."
+  [provider body-text cause]
+  (ex-info
+    (str provider " API returned a malformed response body")
+    {:category :provider
+     :provider provider
+     :retryable false
+     :malformed_body true
+     :body (subs (str body-text) 0 (min 256 (count (str body-text))))
+     :cause (when cause (ex-message cause))}))
+
+(defn parse-response-body
+  "Parse a provider's non-streaming success body, raising a normalized
+   malformed-body error unless it is a JSON object."
+  [provider body-text]
+  (let [parsed (try (json/read-json (str body-text))
+                    (catch Object e
+                      (throw (malformed-body-error provider body-text e))))]
+    (if (map? parsed)
+      parsed
+      (throw (malformed-body-error provider body-text nil)))))
+
 (defn raise-provider-error! [provider response]
   (throw (provider-error provider response)))
 
@@ -1111,7 +1136,7 @@
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
       (raise-provider-error! provider resp)
-      (let [body (json/read-json body-str)
+      (let [body (parse-response-body provider body-str)
             choice (first (get body "choices"))
             message (or (get choice "message") {})
             text (if (string? (get message "content"))
@@ -1221,7 +1246,7 @@
         body-str (str (:body resp))]
     (if (and (number? status) (not= status 200))
       (raise-provider-error! "openai" resp)
-      (normalize-openai-response request (json/read-json body-str)))))
+      (normalize-openai-response request (parse-response-body "openai" body-str)))))
 
 ;; Anthropic Adapter
 (defn- anthropic-request-data [request api-key base-url]
@@ -1430,7 +1455,7 @@
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
             (raise-provider-error! "anthropic" resp)
-            (normalize-anthropic-response request (json/read-json body-str))))
+            (normalize-anthropic-response request (parse-response-body "anthropic" body-str))))
         (catch Object e (throw e)))))
 
 ;; Gemini native generateContent adapter.
@@ -1672,7 +1697,7 @@
               body-str (str (:body resp))]
           (if (and (number? status) (not= status 200))
             (raise-provider-error! "gemini" resp)
-            (normalize-gemini-response request (json/read-json body-str))))
+            (normalize-gemini-response request (parse-response-body "gemini" body-str))))
         (catch Object e (throw e)))))
 
 ;; Unified Client Complete
@@ -1784,16 +1809,34 @@
                            :error_code (when (some? code) (str code))
                            :raw (or raw payload))))))
 
-(defn- terminal-stream-events [events provider close!]
-  (lazy-seq
-    (when-let [remaining (seq events)]
-      (let [event (first remaining)]
-        (if (= :error (:type event))
-          (do
-            (close!)
-            (list (assoc event :error (stream-error provider (:error event) (:raw event)))))
-          (cons event (lazy-seq
-                        (terminal-stream-events (rest remaining) provider close!))))))))
+(defn- stream-ended-early-error [provider]
+  (ex-info
+    (str provider " stream ended without a finish event")
+    {:category :provider
+     :provider provider
+     :retryable false
+     :malformed_body true}))
+
+(defn- terminal-stream-events
+  "Normalize the tail of a provider stream: the first :error is normalized and
+   closes the body; a stream that ends with no :finish (or :error) is a
+   malformed body, so exactly one synthesized :error terminates it."
+  ([events provider close!]
+   (terminal-stream-events events provider close! false))
+  ([events provider close! finished?]
+   (lazy-seq
+     (if-let [remaining (seq events)]
+       (let [event (first remaining)]
+         (if (= :error (:type event))
+           (do
+             (close!)
+             (list (assoc event :error (stream-error provider (:error event) (:raw event)))))
+           (cons event (lazy-seq
+                         (terminal-stream-events (rest remaining) provider close!
+                                                 (or finished? (= :finish (:type event))))))))
+       (when-not finished?
+         (close!)
+         (list {:type :error :error (stream-ended-early-error provider) :raw nil}))))))
 
 (defn- native-stream-events [request body provider normalize]
   ;; Register ownership before line-seq can read. Defer the next native frame

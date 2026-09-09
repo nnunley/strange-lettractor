@@ -1,0 +1,151 @@
+(ns provider-wire-server
+  (:require [http :as http] [json :as json] [clojure.string :as str]))
+
+;; Recording server for the native adapter wire contract (SCN-ULLM-ADAPTERS,
+;; SCN-OPENAI-COMPAT). Requests arrive as
+;;   /<token>/<provider>/<scenario>/<adapter-appended path>
+;; because a client's base URL is <base>/<token>/<provider>/<scenario>. Every
+;; request is recorded (method, path, headers, parsed JSON body) and answered
+;; with a minimal well-formed body for that provider and scenario; a body with
+;; "stream": true receives the provider's native SSE framing instead.
+;; GET /<token>/recorded returns the recordings as JSON.
+
+(defn parse-body [body]
+  (if (string? body)
+    (try (json/read-json body) (catch Object _ body))
+    body))
+
+(def usage-openai {:input_tokens 11 :output_tokens 7 :total_tokens 18
+                   :input_tokens_details {:cached_tokens 3}
+                   :output_tokens_details {:reasoning_tokens 2}})
+
+(defn complete-body [provider scenario]
+  (let [tools? (= scenario "tools")]
+    (case provider
+      "openai"
+      {:id "resp-1" :status "completed" :model "gpt-test"
+       :output (cond-> [{:id "msg-1" :type "message" :role "assistant"
+                         :content [{:type "output_text" :text "Hello world"}]}]
+                 tools? (conj {:id "fc-1" :type "function_call" :call_id "call-1"
+                               :name "get_weather" :arguments "{\"city\":\"Oslo\"}"}))
+       :usage usage-openai}
+      "anthropic"
+      {:id "msg-1" :type "message" :role "assistant" :model "claude-test"
+       :content (cond-> [{:type "text" :text "Hello world"}]
+                  tools? (conj {:type "tool_use" :id "toolu-1" :name "get_weather"
+                                :input {:city "Oslo"}}))
+       :stop_reason (if tools? "tool_use" "end_turn")
+       :usage {:input_tokens 11 :output_tokens 7
+               :cache_read_input_tokens 3 :cache_creation_input_tokens 0}}
+      "gemini"
+      {:responseId "gem-1"
+       :candidates [{:content {:role "model"
+                               :parts (cond-> [{:text "Hello world"}]
+                                        tools? (conj {:functionCall {:name "get_weather"
+                                                                     :args {:city "Oslo"}}}))}
+                     :finishReason "STOP"}]
+       :usageMetadata {:promptTokenCount 11 :candidatesTokenCount 7 :totalTokenCount 18}}
+      "openai-compat"
+      {:id "chatcmpl-1" :model "compat-test"
+       :choices [{:index 0
+                  :message (cond-> {:role "assistant" :content "Hello world"}
+                             tools? (assoc :tool_calls
+                                           [{:id "call-1" :type "function"
+                                             :function {:name "get_weather"
+                                                        :arguments "{\"city\":\"Oslo\"}"}}]))
+                  :finish_reason (if tools? "tool_calls" "stop")}]
+       :usage {:prompt_tokens 11 :completion_tokens 7 :total_tokens 18}}
+      nil)))
+
+(defn- sse [frames]
+  {:status 200 :headers {"Content-Type" "text/event-stream"}
+   :body (str/join (map (fn [[event data]]
+                          (str (when event (str "event: " event "\n"))
+                               "data: " (if (string? data) data (json/write-json data)) "\n\n"))
+                        frames))})
+
+(defn stream-body [provider scenario]
+  (let [final (complete-body provider scenario)]
+    (case provider
+      "openai"
+      (sse [[nil {:type "response.output_item.added"
+                  :item {:id "msg-1" :type "message" :role "assistant" :content []}}]
+            [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "Hello "}]
+            [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "world"}]
+            [nil {:type "response.completed" :response final}]])
+      "anthropic"
+      (sse [["message_start" {:type "message_start"
+                              :message {:id "msg-1" :type "message" :role "assistant" :model "claude-test"
+                                        :usage {:input_tokens 11 :output_tokens 0}}}]
+            ["content_block_start" {:type "content_block_start" :index 0
+                                    :content_block {:type "text" :text ""}}]
+            ["content_block_delta" {:type "content_block_delta" :index 0
+                                    :delta {:type "text_delta" :text "Hello "}}]
+            ["content_block_delta" {:type "content_block_delta" :index 0
+                                    :delta {:type "text_delta" :text "world"}}]
+            ["content_block_stop" {:type "content_block_stop" :index 0}]
+            ["message_delta" {:type "message_delta" :delta {:stop_reason "end_turn"}
+                              :usage {:output_tokens 7}}]
+            ["message_stop" {:type "message_stop"}]])
+      "gemini"
+      (sse [[nil {:candidates [{:content {:role "model" :parts [{:text "Hello "}]}}]}]
+            [nil {:candidates [{:content {:role "model" :parts [{:text "world"}]} :finishReason "STOP"}]
+                  :usageMetadata (:usageMetadata final)}]])
+      "openai-compat"
+      (sse [[nil {:id "chatcmpl-1" :model "compat-test"
+                  :choices [{:index 0 :delta {:role "assistant" :content "Hello "}}]}]
+            [nil {:id "chatcmpl-1" :model "compat-test"
+                  :choices [{:index 0 :delta {:content "world"} :finish_reason "stop"}]
+                  :usage {:prompt_tokens 11 :completion_tokens 7 :total_tokens 18}}]
+            [nil "[DONE]"]])
+      nil)))
+
+(defn keywordize
+  "let-go #817: write-json double-quotes string map keys, so recorded
+   request bodies and headers are re-keyed before serialization."
+  [value]
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [(if (string? k) (keyword k) k) (keywordize v)]) value))
+    (sequential? value) (mapv keywordize value)
+    :else value))
+
+(defn json-response [body]
+  {:status 200 :headers {"Content-Type" "application/json"} :body (json/write-json body)})
+
+(defn make-handler [token state]
+  (fn [request]
+    (let [path (:path request)
+          parts (str/split path #"/")
+          supplied (when (> (count parts) 1) (get parts 1))
+          provider (when (> (count parts) 2) (get parts 2))
+          scenario (when (> (count parts) 3) (get parts 3))]
+      (cond
+        (= path "/ready") {:status 200 :body token}
+        (not= token supplied) {:status 404 :body "unknown token"}
+        (= provider "recorded") (json-response (keywordize (or (:requests @state) [])))
+        :else
+        (let [body (parse-body (:body request))
+              method (or (:request-method request) (:method request))
+              recorded {:method (str/lower-case (if (keyword? method) (name method) (str method)))
+                        :path path
+                        :headers (:headers request)
+                        :body body}
+              streaming? (or (and (map? body) (true? (get body "stream")))
+                             (str/includes? path "streamGenerateContent"))]
+          (swap! state update :requests (fnil conj []) recorded)
+          (cond
+            (= scenario "auth") {:status 401
+                                 :headers {"Content-Type" "application/json"}
+                                 :body (json/write-json {:error {:message "bad key" :type "authentication_error"}})}
+            streaming? (or (stream-body provider scenario) {:status 404 :body "unknown provider"})
+            :else (if-let [reply (complete-body provider scenario)]
+                    (json-response reply)
+                    {:status 404 :body "unknown provider"})))))))
+
+(defn -main [port token]
+  (let [number (parse-long port)]
+    (when-not (and number (<= 1024 number 65535) (re-matches #"[a-zA-Z0-9-]+" token))
+      (throw (ex-info "Invalid fixture arguments" {})))
+    (http/serve (make-handler token (atom {})) (str "127.0.0.1:" number))))
+
+(when (= 2 (count *command-line-args*)) (apply -main *command-line-args*))

@@ -1,0 +1,87 @@
+(ns transport-matrix-server
+  (:require [http :as http] [json :as json] [clojure.string :as str]
+            [clojure.core :as core]))
+
+;; HTTP scenarios: scenario name -> spec with :status and optional :body, :retry-after, :special flags
+;; Bodies are generated on-demand in the handler
+(def scenario-names
+  #{"400-bad-request" "401-auth" "403-forbidden" "404-not-found" "408-request-timeout"
+    "409-conflict" "413-payload-too-large" "422-unprocessable"
+    "429-rate-limit-no-header" "429-rate-limit-seconds"
+    "500-server-error" "502-bad-gateway" "503-service-unavailable" "529-site-overloaded"
+    "200-malformed-json" "200-empty-body"
+    "held-headers" "held-body"
+    "fail-once-then-succeed" "fail-twice-then-succeed"})
+
+(defn error-body [message code]
+  (json/write-json {:error {:message message :code code}}))
+
+(defn scenario-response [scenario attempt]
+  (case scenario
+    "400-bad-request" {:status 400 :body (error-body "Invalid request" "invalid_request")}
+    "401-auth" {:status 401 :body (error-body "Authentication failed" "auth_error")}
+    "403-forbidden" {:status 403 :body (error-body "Access denied" "access_error")}
+    "404-not-found" {:status 404 :body (error-body "Not found" "not_found_error")}
+    "408-request-timeout" {:status 408 :body (error-body "Request timeout" "timeout_error")}
+    "409-conflict" {:status 409 :body (error-body "Conflict" "conflict_error")}
+    "413-payload-too-large" {:status 413 :body (error-body "Payload too large" "payload_error")}
+    "422-unprocessable" {:status 422 :body (error-body "Unprocessable" "unprocessable")}
+    "429-rate-limit-no-header" {:status 429 :body (error-body "Rate limited" "rate_limit")}
+    "429-rate-limit-seconds" {:status 429 :headers {"Retry-After" "5"} :body (error-body "Rate limited" "rate_limit")}
+    "500-server-error" {:status 500 :body (error-body "Server error" "server_error")}
+    "502-bad-gateway" {:status 502 :body (error-body "Bad gateway" "gateway_error")}
+    "503-service-unavailable" {:status 503 :headers {"Retry-After" "2"} :body (error-body "Service unavailable" "service_error")}
+    "529-site-overloaded" {:status 529 :body (error-body "Site overloaded" "overloaded")}
+    "200-malformed-json" {:status 200 :body "{invalid-json"}
+    "200-empty-body" {:status 200 :body ""}
+    "held-headers" (do (core/sleep 3000) {:status 200 :body (json/write-json {:id "r" :status "completed"})})
+    "held-body" {:status 200 :body (lazy-seq (core/sleep 3000) (list (json/write-json {:id "r" :status "completed"})))}
+    "fail-once-then-succeed" (if (= 1 attempt)
+                              {:status 500 :body (error-body "Server error" "server_error")}
+                              {:status 200 :body :success})
+    "fail-twice-then-succeed" (if (<= attempt 2)
+                               {:status 429 :headers {"Retry-After" "0.1"} :body (error-body "Rate limited" "rate_limit")}
+                               {:status 200 :body :success})
+    nil))
+
+(defn- sse-success
+  "A minimal well-formed stream for the provider addressed by the path: the
+   success scenarios must end with a real finish frame, because the client
+   treats a stream without one as a malformed body."
+  [path]
+  (let [frames (if (str/includes? path "/messages")
+                 ["event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+                  "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"]
+                 ["data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n"])]
+    {:status 200
+     :headers {"Content-Type" "text/event-stream"}
+     :body (str/join frames)}))
+
+(defn make-handler [token counts]
+  (fn [request]
+    (let [path (:path request)
+          parts (str/split path #"/")
+          supplied (when (> (count parts) 1) (get parts 1))
+          ;; A client may suffix the scenario with ".<provider>" so attempt
+          ;; counters stay separate per provider while sharing one response table.
+          segment (when (> (count parts) 2) (get parts 2))
+          scenario (when segment (first (str/split segment #"\.")))]
+      (cond
+        (= path "/ready") {:status 200 :body token}
+        (not= token supplied) {:status 404 :body "unknown fixture token"}
+        (= scenario "counts") {:status 200 :body (pr-str @counts)}
+        (not (contains? scenario-names scenario)) {:status 404 :body "unknown scenario"}
+        :else
+        (let [attempt (get (swap! counts update segment (fnil inc 0)) segment)
+              resp (scenario-response scenario attempt)
+              resp (if (= :success (:body resp)) (sse-success path) resp)]
+          (cond-> resp
+            (not (contains? resp :headers)) (assoc :headers {"Content-Type" "application/json"})))))))
+
+(defn -main [port token]
+  (let [number (parse-long port)]
+    (when-not (and number (<= 1024 number 65535) (re-matches #"[a-zA-Z0-9-]+" token))
+      (throw (ex-info "Invalid fixture arguments" {})))
+    (http/serve (make-handler token (atom {})) (str "127.0.0.1:" number))))
+
+(when (= 2 (count *command-line-args*)) (apply -main *command-line-args*))

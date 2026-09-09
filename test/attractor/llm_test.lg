@@ -1827,10 +1827,15 @@
               (if (= attempt 1)
                 (lazy-seq
                   (throw (ex-info "connect failed" {:retryable true})))
-                [{:type :stream_start}]))))
+                ;; A stream must end with :finish; without one the client
+                ;; appends a malformed-body error.
+                [{:type :stream_start}
+                 {:type :finish :finish_reason :stop
+                  :response {:message {:role :assistant :text "" :parts []}
+                             :finish_reason :stop :usage {}}}]))))
         client (llm/make-client {:providers {"mock" adapter}
                                  :default_provider "mock"})]
-    (is (= [:stream_start]
+    (is (= [:stream_start :finish]
            (mapv :type
                  (:events
                    (llm/stream

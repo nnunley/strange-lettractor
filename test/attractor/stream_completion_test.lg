@@ -153,5 +153,8 @@
                   {:summary [] :encrypted_content "opaque-ciphertext" :future_field "value"}]]
     (let [chunk {:type "response.output_item.done" :item (merge {:id "r" :type "reasoning"} opaque)}
           events (events-for "openai" [chunk])]
-      (is (= [:provider_event] (mapv :type events)))
+      ;; The fixture wire has no finish frame, so the normalized stream ends
+      ;; with exactly one synthesized malformed-body error after the item.
+      (is (= [:provider_event :error] (mapv :type events)))
+      (is (true? (:malformed_body (ex-data (:error (last events))))))
       (is (= (json/read-json (json/write-json chunk)) (:raw (first events)))))))

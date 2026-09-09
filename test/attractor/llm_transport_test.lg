@@ -1,0 +1,233 @@
+(ns attractor.llm-transport-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [http :as http]
+            [json :as json]
+            [io :as io]
+            [os :as os]
+            [attractor.llm :as llm]
+            [attractor.execution :as execution]
+            [clojure.string :as str]))
+
+;; SCN-ULLM-HTTP-ERRORS: Mechanical evidence for HTTP error handling.
+;; Tests verify error classification, retry behavior, and attempt counts
+;; against real loopback HTTP fixture server.
+
+;; Fixture launcher for transport matrix server
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+
+(defn run-transport-matrix-fixture [f]
+  (let [runtime (os/getenv "LGX_LG")
+        _ (when (str/blank? runtime) (throw (ex-info "Set LGX_LG to the fixed local runtime" {})))
+        port (+ 30000 (rand-int 20000))
+        token (str "transport-" (rand-int 1000000000))
+        base (str "http://127.0.0.1:" port)
+        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
+                                                :max_command_timeout_ms 30000})
+        server-path (str (os/cwd) "/test/fixtures/transport_matrix_server.lg")
+        command (str (quote-shell runtime) " " (quote-shell server-path)
+                     " " port " " token)
+        worker (future ((:exec_command env) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      (loop [remaining 100]
+        (let [response (try (http/request {:url (str base "/ready") :timeout_ms 100})
+                            (catch Object _ nil))]
+          (cond
+            (and response (= 200 (:status response)))
+            (when-not (= token (:body response)) (throw (ex-info "Fixture port collision" {})))
+            (or (zero? remaining) (realized? worker)) (throw (ex-info "Fixture not ready" {}))
+            :else (do (core/sleep 20) (recur (dec remaining))))))
+      (f (str base "/" token))
+      (finally
+        ((:cleanup env))
+        (when (= ::pending (deref worker 3000 ::pending))
+          (throw (ex-info "Fixture process failed to join" {})))))))
+
+(def test-scenarios
+  {:non-retryable
+   [{:name "400-bad-request" :expect-retries 0 :expect-category :invalid-request}
+    {:name "401-auth" :expect-retries 0 :expect-category :authentication}
+    {:name "403-forbidden" :expect-retries 0 :expect-category :access-denied}
+    {:name "404-not-found" :expect-retries 0 :expect-category :not-found}
+    {:name "413-payload-too-large" :expect-retries 0 :expect-category :context-length}
+    {:name "422-unprocessable" :expect-retries 0 :expect-category :invalid-request}
+    {:name "408-request-timeout" :expect-retries 0 :expect-category :request-timeout}]
+
+   :rate-limited
+   [{:name "429-rate-limit-no-header" :expect-retries 2 :expect-category :rate-limit}]
+
+   :server-errors
+   [{:name "500-server-error" :expect-retries 2 :expect-category :server}
+    {:name "502-bad-gateway" :expect-retries 2 :expect-category :server}
+    {:name "503-service-unavailable" :expect-retries 2 :expect-category :server}
+    {:name "529-site-overloaded" :expect-retries 2 :expect-category :server}
+    ;; §"Unknown errors default to retryable": 409 has no specified mapping, so it
+    ;; normalizes to the generic provider category and is retried.
+    {:name "409-conflict" :expect-retries 2 :expect-category :provider}]
+
+   :retry-after-seconds
+   [{:name "429-rate-limit-seconds" :expect-retries 2 :expect-category :rate-limit
+     :expect-retry-after 5.0}]
+
+   :malformed-responses
+   [{:name "200-malformed-json" :expect-retries 0 :expect-category :provider}
+    {:name "200-empty-body" :expect-retries 0 :expect-category :provider}]
+
+   :success-after-retries
+   [{:name "fail-once-then-succeed" :expect-retries 1 :expect-success true}
+    {:name "fail-twice-then-succeed" :expect-retries 2 :expect-success true}]})
+
+;; Helper to run a fixture test with all providers
+(defn run-transport-test [test-fn]
+  (run-transport-matrix-fixture
+    (fn [base-url]
+      (test-fn base-url))))
+
+;; Extract attempt count from server
+(defn get-scenario-attempts [base scenario]
+  (try
+    (let [response (http/request {:url (str base "/counts")})]
+      (if (= 200 (:status response))
+        (let [counts (read-string (:body response))]
+          (or (get counts scenario) 0))
+        0))
+    (catch Object _ 0)))
+
+;; Client maker for a scenario
+(defn scenario-client [base scenario provider]
+  (llm/make-client
+    {:default_provider provider
+     :providers {provider (llm/make-provider-adapter
+                           provider
+                           {:api_key "test-token"
+                            :base_url (str base "/" scenario)})}}))
+
+;; Test helper: run a scenario and capture results
+(defn test-scenario [base scenario provider {:keys [expect-retries expect-category expect-success expect-retry-after]}]
+  (let [scenario (str scenario "." provider)
+        attempts-before (get-scenario-attempts base scenario)
+        sleep-calls (atom [])
+        retry-count (atom 0)
+        error (atom nil)
+        success (atom false)
+        retry-after-observed (atom nil)]
+    (try
+      (let [client (scenario-client base scenario provider)
+            result
+            (llm/stream
+              provider
+              "test message"
+              {:client client
+               :max_retries (or expect-retries 2)
+               :retry_policy
+               {:sleep_fn (fn [delay] (swap! sleep-calls conj delay))
+                :on_retry (fn [err attempt delay]
+                            (reset! retry-after-observed (:retry_after (ex-data err)))
+                            (swap! retry-count inc))}})]
+        (try
+          ;; Streams surface terminal failures as one :error event value rather
+          ;; than by throwing; treat that event as the normalized error.
+          (let [events (doall (:events result))
+                failure (first (filter #(= :error (:type %)) events))]
+            (if failure
+              (reset! error (ex-data (:error failure)))
+              (reset! success true)))
+          (catch Object e
+            (reset! error (ex-data e)))))
+      (catch Object e
+        (reset! error (ex-data e))))
+
+    ;; Collect result
+    {:scenario scenario
+     :provider provider
+     :attempts-before attempts-before
+     :attempts-after (get-scenario-attempts base scenario)
+     :total-attempts (- (get-scenario-attempts base scenario) attempts-before)
+     :error @error
+     :success @success
+     :category (when @error (:category @error))
+     :error-summary (when @error (select-keys @error [:category :status :message :retryable]))
+     :retries @retry-count
+     :sleep-calls @sleep-calls
+     :retry-after-observed @retry-after-observed}))
+
+;; Main test: non-retryable client errors
+(deftest non-retryable-client-errors
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-category]} (:non-retryable test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries 0})]
+            (is (= expect-category (:category result))
+                (str provider " " name " should have category " expect-category " but got " result))
+            (is (= 1 (:total-attempts result))
+                (str provider " " name " should attempt exactly once but got " result))))))))
+
+;; Test: rate-limited responses (retryable)
+(deftest rate-limited-responses
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-retries expect-category]} (:rate-limited test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries expect-retries})]
+            (is (= expect-category (:category result))
+                (str provider " " name " category should be " expect-category " but got " result))
+            (is (= (inc expect-retries) (:total-attempts result))
+                (str provider " " name " should attempt " (inc expect-retries) " times but got " result))
+            (is (= expect-retries (:retries result))
+                (str provider " " name " should retry " expect-retries " times but got " result))))))))
+
+;; Test: server errors (retryable)
+(deftest server-errors-retryable
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-retries expect-category]} (:server-errors test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries expect-retries})]
+            (is (= expect-category (:category result))
+                (str provider " " name " category should be " expect-category " but got " result))
+            (is (= (inc expect-retries) (:total-attempts result))
+                (str provider " " name " should attempt " (inc expect-retries) " times but got " result))))))))
+
+;; Test: Retry-After header with seconds
+(deftest retry-after-seconds
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-retries expect-retry-after]} (:retry-after-seconds test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries expect-retries
+                                                          :expect-retry-after expect-retry-after})]
+            (is (= :rate-limit (:category result))
+                (str provider " " name " category check"))
+            (is (= (inc expect-retries) (:total-attempts result))
+                (str provider " " name " should attempt " (inc expect-retries) " times"))
+            ;; Check that retry-after was observed
+            (is (some? (:retry-after-observed result))
+                (str provider " " name " should have observed retry-after"))))))))
+
+;; Test: malformed responses
+(deftest malformed-responses-not-retried
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-category]} (:malformed-responses test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries 0})]
+            (is (= expect-category (:category result))
+                (str provider " " name " should be " expect-category " got " (pr-str (:error-summary result))))
+            (is (= 1 (:total-attempts result))
+                (str provider " " name " should attempt exactly once"))))))))
+
+;; Test: success after retries
+(deftest success-after-retries
+  (run-transport-test
+    (fn [base]
+      (doseq [provider ["openai" "anthropic"]]
+        (doseq [{:keys [name expect-retries expect-success]} (:success-after-retries test-scenarios)]
+          (let [result (test-scenario base name provider {:expect-retries expect-retries})]
+            (is (:success result)
+                (str provider " " name " should succeed"))
+            (is (= (inc expect-retries) (:total-attempts result))
+                (str provider " " name " should attempt " (inc expect-retries) " times, got " (:total-attempts result)))))))))
+
+;; MARKER for completion
+;; SCN-ULLM-HTTP-ERRORS COMPLETE

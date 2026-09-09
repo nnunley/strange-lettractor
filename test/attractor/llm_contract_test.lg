@@ -1,0 +1,554 @@
+(ns attractor.llm-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.core :as core]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+;; ============================================================================
+;; SCN-ULLM-CLIENT: Client Construction, Configuration, Routing, Middleware
+;; ============================================================================
+
+;; SCN-ULLM-CLIENT SCENARIO: Programmatic provider registration and defaults
+(deftest client-construction-with-programmatic-providers-and-default
+  (testing "make-client registers providers and routes to default"
+    (let [adapter1 (llm/make-adapter "test1" (fn [_] {:text "1"}) (fn [_] []))
+          adapter2 (llm/make-adapter "test2" (fn [_] {:text "2"}) (fn [_] []))
+          client (llm/make-client
+                   {:providers {"test1" adapter1 "test2" adapter2}
+                    :default_provider "test1"})]
+      (is (= "test1" (:default_provider client)))
+      (is (= 2 (count (:providers client))))
+      (is (contains? (:providers client) "test1"))
+      (is (contains? (:providers client) "test2"))))
+  (testing "Missing default provider throws configuration error"
+    (let [adapter (llm/make-adapter "test" (fn [_] {:text "x"}) (fn [_] []))]
+      (is (thrown? Object
+                   (llm/make-client
+                     {:providers {"test" adapter}
+                      :default_provider "nonexistent"}))))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Environment-based construction
+(deftest client-from-env-with-mock-environment
+  (testing "client-from-env finds providers from environment variables"
+    (let [env {"OPENAI_API_KEY" "key-openai"
+               "ANTHROPIC_API_KEY" "key-anthropic"
+               "GEMINI_API_KEY" "key-gemini"}
+          client (llm/client-from-env env)]
+      ;; First registered is default (OpenAI when present)
+      (is (= "openai" (:default_provider client)))
+      ;; All keys present are registered
+      (is (= 3 (count (:providers client))))
+      (is (contains? (:providers client) "openai"))
+      (is (contains? (:providers client) "anthropic"))
+      (is (contains? (:providers client) "gemini"))))
+  (testing "client-from-env only registers providers with keys present"
+    (let [env {"ANTHROPIC_API_KEY" "key-anthropic"}
+          client (llm/client-from-env env)]
+      (is (= "anthropic" (:default_provider client)))
+      (is (= 1 (count (:providers client))))
+      (is (contains? (:providers client) "anthropic"))))
+  (testing "client-from-env with no keys produces client with no default"
+    (let [env {}
+          client (llm/client-from-env env)]
+      (is (nil? (:default_provider client)))
+      (is (zero? (count (:providers client)))))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Provider routing by explicit :provider
+(deftest client-routes-by-explicit-provider-field
+  (testing "Request with explicit provider routes to that provider"
+    (let [calls (atom [])
+          adapter1 (llm/make-adapter "p1"
+                     (fn [req] (swap! calls conj :p1) {:text "p1"})
+                     (fn [_] []))
+          adapter2 (llm/make-adapter "p2"
+                     (fn [req] (swap! calls conj :p2) {:text "p2"})
+                     (fn [_] []))
+          client (llm/make-client
+                   {:providers {"p1" adapter1 "p2" adapter2}
+                    :default_provider "p1"})]
+      ;; Explicit provider overrides default
+      (llm/client-complete client {:model "m" :messages [] :provider "p2"})
+      (is (= [:p2] @calls))
+      ;; Default used when not specified
+      (reset! calls [])
+      (llm/client-complete client {:model "m" :messages []})
+      (is (= [:p1] @calls)))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Module-level default client
+(deftest module-default-client-lifecycle
+  (testing "set-default-client! and get-default-client"
+    (let [adapter (llm/make-adapter "test" (fn [_] {:text "ok"}) (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          _ (llm/set-default-client! client)
+          retrieved (llm/get-default-client)]
+      (is (= "test" (:default_provider retrieved)))
+      (is (= client retrieved))))
+  (testing "generate uses default client when not specified"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_] {:text "response text" :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          _ (llm/set-default-client! client)
+          result (llm/generate "test" "prompt")]
+      (is (= "response text" (:text result))))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Middleware onion order for complete
+(deftest middleware-onion-order-for-complete
+  (testing "Middleware executes in registration order (request) and reverse (response)"
+    (let [order (atom [])
+          mw1 (fn [req next] (swap! order conj :mw1-enter)
+                              (let [resp (next req)]
+                                (swap! order conj :mw1-exit)
+                                resp))
+          mw2 (fn [req next] (swap! order conj :mw2-enter)
+                              (let [resp (next req)]
+                                (swap! order conj :mw2-exit)
+                                resp))
+          mw3 (fn [req next] (swap! order conj :mw3-enter)
+                              (let [resp (next req)]
+                                (swap! order conj :mw3-exit)
+                                resp))
+          adapter (llm/make-adapter "test"
+                    (fn [_] (swap! order conj :adapter) {:text "x" :usage {}})
+                    (fn [_] []))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"
+                    :middleware [mw1 mw2 mw3]})]
+      (llm/client-complete client {:model "m" :messages []})
+      ;; Request phase: first-to-last (mw1, mw2, mw3, adapter)
+      ;; Response phase: last-to-first (mw3 exit, mw2 exit, mw1 exit)
+      (is (= [:mw1-enter :mw2-enter :mw3-enter :adapter :mw3-exit :mw2-exit :mw1-exit]
+             @order)))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Middleware observes stream events in order
+(deftest middleware-observes-stream-events-in-order
+  (testing "Middleware wrapping stream observes events in order"
+    (let [event-log (atom [])
+          mw (fn [req next]
+               (let [stream (next req)]
+                 (map (fn [evt]
+                        (swap! event-log conj (:type evt))
+                        evt)
+                      stream)))
+          adapter (llm/make-adapter "test"
+                    (fn [_] (throw (ex-info "unused" {})))
+                    (fn [_]
+                      [{:type :text_delta :delta "hello"}
+                       {:type :text_delta :delta " world"}
+                       {:type :finish :usage {:input_tokens 1 :output_tokens 2}}]))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"
+                    :middleware [mw]})]
+      (doall (llm/client-stream client {:model "m" :messages []}))
+      (is (= [:text_delta :text_delta :finish] @event-log)))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Concurrency isolation with 8 concurrent calls
+(deftest concurrent-generate-isolation
+  (testing "8 concurrent generates with distinct prompts each get correct response"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [req]
+                      ;; Echo back the prompt text we received
+                      (let [msg (first (:messages req))
+                            content (:content msg)]
+                        {:text (str "response-to-" content)
+                         :usage {:input_tokens 1 :output_tokens 1}}))
+                    (fn [_] []))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"})
+          prompts (vec (range 8))
+          futures (mapv (fn [i]
+                          (core/future
+                            (let [result (llm/generate "test" (str "prompt-" i) {:client client})]
+                              {i result})))
+                        prompts)
+          results (mapv deref futures)]
+      ;; Each result should correspond to its own prompt
+      (doseq [idx-result results
+              [idx result] idx-result]
+        (is (str/includes? (:text result) (str "prompt-" idx)))))))
+
+;; SCN-ULLM-CLIENT SCENARIO: Model catalog lookup and listing
+(deftest model-catalog-operations
+  (testing "get-model-info retrieves model by ID"
+    (let [info (llm/get-model-info "claude-opus-4-6")]
+      (is (= "claude-opus-4-6" (:id info)))
+      (is (= "anthropic" (:provider info)))
+      (is (true? (:supports_tools info)))))
+  (testing "get-model-info retrieves model by alias"
+    (let [info (llm/get-model-info "opus")]
+      (is (= "claude-opus-4-6" (:id info)))))
+  (testing "list-models without filter returns all models"
+    (let [all (llm/list-models)]
+      (is (> (count all) 5))))
+  (testing "list-models with provider filter returns only that provider"
+    (let [gemini-models (llm/list-models "gemini")]
+      (is (every? #(= "gemini" (:provider %)) gemini-models))
+      (is (> (count gemini-models) 0))))
+  (testing "get-model-info returns nil for unknown model"
+    (let [info (llm/get-model-info "future-model-not-yet-cataloged")]
+      (is (nil? info))))
+  (testing "get-latest-model returns newest for provider"
+    (let [latest (llm/get-latest-model "anthropic")]
+      (is (= "claude-opus-4-6" (:id latest)))))
+  (testing "get-latest-model filters by capability"
+    (let [reasoning (llm/get-latest-model "openai" "reasoning")]
+      (is (true? (:supports_reasoning reasoning))))))
+
+;; ============================================================================
+;; SCN-ULLM-HIGHLEVEL: High-level API equivalence and structured output
+;; ============================================================================
+
+;; SCN-ULLM-HIGHLEVEL SCENARIO: generate vs client-complete equivalence
+(deftest generate-vs-client_complete_equivalence
+  (testing "generate and client-complete produce equivalent text/usage/finish_reason"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_]
+                      {:text "The answer is forty-two"
+                       :usage {:input_tokens 10 :output_tokens 5}
+                       :finish_reason :stop})
+                    (fn [_] []))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"})
+          ;; Low-level complete
+          response (llm/client-complete client {:model "test" :messages [{:role :user :content "What is the answer?"}]})
+          ;; High-level generate
+          result (llm/generate "test" "What is the answer?" {:client client})]
+      (is (= (:text response) (:text result)))
+      (is (= (:input_tokens (:usage response)) (:input_tokens (:usage result))))
+      (is (= (:output_tokens (:usage response)) (:output_tokens (:usage result)))))))
+
+;; SCN-ULLM-HIGHLEVEL SCENARIO: stream accumulated equals generate
+(deftest stream_accumulated_equals_generate
+  (testing "Accumulating stream events equals generate result"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_] (throw (ex-info "use stream" {})))
+                    (fn [_]
+                      [{:type :text_delta :delta "Hello"}
+                       {:type :text_delta :delta " "}
+                       {:type :text_delta :delta "world"}
+                       {:type :finish
+                        :usage {:input_tokens 2 :output_tokens 3}
+                        :finish_reason :stop
+                        :response {:text "Hello world"
+                                   :usage {:input_tokens 2 :output_tokens 3}
+                                   :finish_reason :stop}}]))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"})
+          ;; Accumulate stream
+          accumulator (llm/make-stream-accumulator)
+          _ (doseq [evt (llm/client-stream client {:model "test" :messages []})]
+              (llm/stream-accumulator-process! accumulator evt))
+          stream-response (llm/stream-accumulator-response accumulator)]
+      ;; The accumulated response should have complete text
+      (is (str/includes? (:text stream-response) "Hello"))))
+  (testing "stream high-level function works similarly"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_] (throw (ex-info "use stream" {})))
+                    (fn [_]
+                      [{:type :text_delta :delta "The"}
+                       {:type :text_delta :delta " answer"}
+                       {:type :finish
+                        :usage {:input_tokens 1 :output_tokens 2}
+                        :response {:text "The answer"}}]))
+          client (llm/make-client
+                   {:providers {"test" adapter}
+                    :default_provider "test"})]
+      (let [text-parts (atom [])]
+        (let [stream-result (llm/stream "test" "prompt" {:client client})]
+          (doseq [evt (:events stream-result)]
+            (when (= :text_delta (:type evt))
+              (swap! text-parts conj (:delta evt)))))
+        (is (= ["The" " answer"] @text-parts))))))
+
+;; SCN-ULLM-HIGHLEVEL SCENARIO: prompt-vs-messages exclusivity
+(deftest prompt_vs_messages_exclusivity_errors
+  (testing "generate raises error when both prompt and messages given"
+    (is (thrown? Object
+                 (llm/generate "test" "prompt" {:messages [{:role :user :content "x"}]
+                                                :mock_handler (fn [_] {:text "x" :usage {}})}))))
+  (testing "generate raises error when neither prompt nor messages given"
+    (is (thrown? Object
+                 (llm/generate "test" nil {:mock_handler (fn [_] {:text "x" :usage {}})}))))
+  (testing "stream raises similar errors"
+    (is (thrown? Object
+                 (llm/stream "test" "prompt" {:messages [{:role :user :content "x"}]
+                                              :mock_handler (fn [_] [])})))))
+
+;; SCN-ULLM-HIGHLEVEL SCENARIO: generate-object with schema validation
+(deftest generate_object_with_schema_validation
+  (testing "generate-object parses valid JSON and validates against schema"
+    (let [schema {:type "object"
+                  :properties {:name {:type "string"}
+                               :age {:type "integer"}}
+                  :required ["name" "age"]}
+          adapter (llm/make-adapter "test"
+                    (fn [_]
+                      {:text "{\"name\": \"Alice\", \"age\": 30}"
+                       :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          result (llm/generate-object "test" "Extract person info" schema {:client client})]
+      (is (= "Alice" (get (:output result) "name")))
+      (is (= 30 (get (:output result) "age")))))
+  (testing "generate-object raises error on invalid JSON"
+    (let [schema {:type "object" :properties {:x {:type "string"}}}
+          adapter (llm/make-adapter "test"
+                    (fn [_] {:text "not valid json {" :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})]
+      (is (thrown? Object
+                   (llm/generate-object "test" "prompt" schema {:client client})))))
+  (testing "generate-object raises error on schema-invalid output"
+    (let [schema {:type "object"
+                  :properties {:age {:type "integer"}}
+                  :required ["age"]}
+          adapter (llm/make-adapter "test"
+                    (fn [_] {:text "{\"age\": \"not-an-int\"}" :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})]
+      (is (thrown? Object
+                   (llm/generate-object "test" "prompt" schema {:client client}))))))
+
+;; ============================================================================
+;; SCN-ULLM-TOOLS: Tool calling, execution, and choice modes
+;; ============================================================================
+
+;; SCN-ULLM-TOOLS SCENARIO: Passive tools return to caller without execution
+(deftest passive_tools_no_automatic_execution
+  (testing "Tools without execute handler are not executed by generate"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_]
+                      {:text "assistant response"
+                       :tool_calls [{:id "call1" :name "passive_tool" :arguments {}}]
+                       :finish_reason :tool_calls
+                       :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          passive-tool {:name "passive_tool" :parameters {:type "object"}}
+          result (llm/generate "test" "prompt" {:client client :tools [passive-tool]})]
+      ;; Tool call should be returned but not executed
+      (is (= 1 (count (:tool_calls result))))
+      (is (= "passive_tool" (:name (first (:tool_calls result)))))
+      ;; No tool_results since it's passive
+      (is (empty? (:tool_results result))))))
+
+;; SCN-ULLM-TOOLS SCENARIO: Active tools execute and loop
+(deftest active_tools_execute_and_continue
+  (testing "Tools with execute handler are automatically executed"
+    (let [tool-executed (atom false)
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      ;; Check if we have tool messages (second call after execution)
+                      (if (seq (filter #(= :tool (:role %)) (:messages req)))
+                        ;; Second call (after tool execution)
+                        {:text "Final response" :tool_calls [] :usage {} :finish_reason :stop}
+                        ;; First call
+                        {:text "Found a tool to call"
+                         :tool_calls [{:id "c1" :name "active_tool" :arguments {}}]
+                         :finish_reason :tool_calls :usage {}}))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          active-tool {:name "active_tool"
+                       :parameters {:type "object"}
+                       :execute (fn [_] (reset! tool-executed true) "tool result")}
+          result (llm/generate "test" "prompt" {:client client :tools [active-tool]})]
+      (is (true? @tool-executed))
+      (is (= "Final response" (:text result))))))
+
+;; SCN-ULLM-TOOLS SCENARIO: Invalid tool arguments produce error results
+(deftest invalid_tool_arguments_produce_errors
+  (testing "Invalid JSON arguments trigger validation error sent back to model"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [req]
+                      ;; First call returns tool call with invalid args
+                      (if (empty? (filter #(= :tool (:role %)) (:messages req)))
+                        {:text "calling tool"
+                         :tool_calls [{:id "c1" :name "typed_tool" :arguments "invalid"}]
+                         :finish_reason :tool_calls :usage {}}
+                        ;; Second call (with error result) should continue
+                        {:text "handled error" :tool_calls [] :finish_reason :stop :usage {}}))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "typed_tool"
+                :parameters {:type "object" :properties {:x {:type "integer"}}}
+                :execute (fn [_] "should not execute")}
+          result (llm/generate "test" "prompt" {:client client :tools [tool]})]
+      ;; Tool should not have executed
+      (is (= "handled error" (:text result))))))
+
+;; SCN-ULLM-TOOLS SCENARIO: Parallel tool calls execute concurrently
+(deftest parallel_tool_calls_ordered_execution
+  (testing "Multiple tool calls execute and return in order"
+    (let [execution-order (atom [])
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      ;; Return 3 tool calls
+                      (if (empty? (filter #(= :tool (:role %)) (:messages req)))
+                        {:text "calling tools"
+                         :tool_calls [{:id "c1" :name "tool1" :arguments {}}
+                                      {:id "c2" :name "tool2" :arguments {}}
+                                      {:id "c3" :name "tool3" :arguments {}}]
+                         :finish_reason :tool_calls :usage {}}
+                        {:text "all tools done" :tool_calls [] :finish_reason :stop :usage {}}))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          make-tool (fn [n]
+                      {:name (str "tool" n)
+                       :parameters {:type "object"}
+                       :execute (fn [_]
+                                  (swap! execution-order conj n)
+                                  (str "result" n))})
+          result (llm/generate "test" "prompt"
+                              {:client client :tools (mapv make-tool [1 2 3])})]
+      ;; All tools should have executed
+      (is (= 3 (count @execution-order)))
+      ;; First step should have tool_calls and tool_results
+      (is (> (count (:tool_calls (first (:steps result)))) 0))
+      (is (> (count (:tool_results (first (:steps result)))) 0)))))
+
+;; SCN-ULLM-TOOLS SCENARIO: max_tool_rounds bounds loop iterations
+(deftest max_tool_rounds_bounds_continuation
+  (testing "max_tool_rounds=0 prevents tool execution"
+    (let [tool-executed (atom false)
+          adapter (llm/make-adapter "test"
+                    (fn [_]
+                      {:text "response"
+                       :tool_calls [{:id "c1" :name "tool" :arguments {}}]
+                       :finish_reason :tool_calls :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "tool"
+                :parameters {:type "object"}
+                :execute (fn [_] (reset! tool-executed true) "result")}
+          result (llm/generate "test" "prompt"
+                              {:client client :tools [tool] :max_tool_rounds 0})]
+      ;; Tool should not execute when max_tool_rounds=0
+      (is (false? @tool-executed))))
+  (testing "max_tool_rounds=1 allows one tool execution round"
+    (let [rounds (atom 0)
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      (let [has-tool-results (seq (filter #(= :tool (:role %)) (:messages req)))]
+                        (if has-tool-results
+                          {:text "done" :tool_calls [] :finish_reason :stop :usage {}}
+                          (do (swap! rounds inc)
+                              {:text "calling"
+                               :tool_calls [{:id "c1" :name "tool" :arguments {}}]
+                               :finish_reason :tool_calls :usage {}}))))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "tool"
+                :parameters {:type "object"}
+                :execute (fn [_] "result")}
+          result (llm/generate "test" "prompt"
+                              {:client client :tools [tool] :max_tool_rounds 1})]
+      ;; Only one tool execution round should happen
+      (is (= 1 @rounds)))))
+
+;; SCN-ULLM-TOOLS SCENARIO: stop_when predicate stops loop
+(deftest stop_when_predicate_stops_continuation
+  (testing "stop_when returning true terminates tool loop early"
+    (let [rounds (atom 0)
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      (swap! rounds inc)
+                      ;; Always return tool calls until told to stop
+                      {:text (str "round " @rounds)
+                       :tool_calls [{:id (str "c" @rounds) :name "tool" :arguments {}}]
+                       :finish_reason :tool_calls :usage {}})
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "tool"
+                :parameters {:type "object"}
+                :execute (fn [_] "result")}
+          result (llm/generate "test" "prompt"
+                              {:client client :tools [tool]
+                               :max_tool_rounds 10
+                               :stop_when (fn [steps]
+                                            ;; Stop after 2 steps
+                                            (>= (count steps) 2))})]
+      ;; Should stop after 2 steps even though max_tool_rounds=10
+      (is (= 2 @rounds))
+      (is (= 2 (count (:steps result)))))))
+
+;; SCN-ULLM-TOOLS SCENARIO: Provider continuation messages have correct format
+(deftest provider_continuation_messages_format
+  (testing "Tool results are sent as tool-role messages in next request"
+    (let [requests-received (atom [])
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      (swap! requests-received conj req)
+                      (let [has-tool-messages (seq (filter #(= :tool (:role %)) (:messages req)))]
+                        (if has-tool-messages
+                          {:text "handled tools" :tool_calls [] :finish_reason :stop :usage {}}
+                          {:text "calling tool"
+                           :tool_calls [{:id "c1" :name "work" :arguments {}}]
+                           :finish_reason :tool_calls :usage {}})))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "work"
+                :parameters {:type "object"}
+                :execute (fn [_] "result value")}
+          _ (llm/generate "test" "prompt" {:client client :tools [tool]})]
+      ;; Should have made 2 requests
+      (is (= 2 (count @requests-received)))
+      ;; Second request should have tool messages
+      (let [second-req (second @requests-received)
+            tool-msgs (filter #(= :tool (:role %)) (:messages second-req))]
+        (is (seq tool-msgs))
+        ;; Tool message should have the result
+        (is (some #(str/includes? (str %) "result value") tool-msgs)))))
+  (testing "Assistant message with tool_calls appears before tool results"
+    (let [requests-received (atom [])
+          adapter (llm/make-adapter "test"
+                    (fn [req]
+                      (swap! requests-received conj req)
+                      (if (seq (filter #(= :tool (:role %)) (:messages req)))
+                        {:text "done" :tool_calls [] :finish_reason :stop :usage {}}
+                        {:text "assistant says"
+                         :message {:role :assistant :content "msg"}
+                         :tool_calls [{:id "c1" :name "work" :arguments {}}]
+                         :finish_reason :tool_calls :usage {}}))
+                    (fn [_] []))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          tool {:name "work"
+                :parameters {:type "object"}
+                :execute (fn [_] "done")}
+          _ (llm/generate "test" "prompt" {:client client :tools [tool]})]
+      (let [second-req (second @requests-received)
+            messages (:messages second-req)
+            assistant-idx (first (keep-indexed #(when (= :assistant (:role %2)) %1) messages))
+            tool-idx (first (keep-indexed #(when (= :tool (:role %2)) %1) messages))]
+        ;; Assistant message should come before tool messages
+        (is (< assistant-idx tool-idx))))))
+
+;; SCN-ULLM-TOOLS SCENARIO: Streaming tool calls produce events
+(deftest streaming_tool_calls_produce_events
+  (testing "Stream emits tool_call_start/delta/end events and step_finish"
+    (let [adapter (llm/make-adapter "test"
+                    (fn [_] (throw (ex-info "use stream" {})))
+                    (fn [_]
+                      [{:type :tool_call_start :tool_call {:id "c1" :name "work"}}
+                       {:type :tool_call_delta :tool_call {:id "c1" :arguments_delta "{"}}
+                       {:type :tool_call_delta :tool_call {:id "c1" :arguments_delta "}"}}
+                       {:type :tool_call_end :tool_call {:id "c1" :arguments "{}"}}
+                       {:type :finish :usage {} :finish_reason :tool_calls}]))
+          client (llm/make-client {:providers {"test" adapter} :default_provider "test"})
+          events (vec (llm/client-stream client {:model "test" :messages []}))]
+      (is (some #(= :tool_call_start (:type %)) events))
+      (is (some #(= :tool_call_delta (:type %)) events))
+      (is (some #(= :tool_call_end (:type %)) events)))))
+
+;; ============================================================================
+;; Marker comments for scenario completion
+;; ============================================================================
+
+;; SCN-ULLM-CLIENT COMPLETE
+;; SCN-ULLM-HIGHLEVEL COMPLETE
+;; SCN-ULLM-TOOLS COMPLETE
