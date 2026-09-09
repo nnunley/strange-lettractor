@@ -105,7 +105,9 @@
     (is (= 1 (count @calls)))
     (is (= checkpoint (get-in @calls [0 0])))
     (is (= removed-source (get-in @calls [0 1 :current-source-path])))
-    (is (= #{:registry :current-source-path}
+    ;; The hub adds its event emitter and cancellation predicate; nothing
+    ;; else (no parsed source, no transforms) reaches public recovery.
+    (is (= #{:registry :current-source-path :on-event :cancelled?}
            (set (keys (get-in @calls [0 1])))))
     (is (= [0] @exits))))
 
@@ -127,7 +129,7 @@
     (is (str/includes? usage "resume [dotfile] --checkpoint <path>"))
     (is (= 1 (count @calls)))
     (is (= checkpoint (get-in @calls [0 0])))
-    (is (= #{:registry} (set (keys (get-in @calls [0 1])))))
+    (is (= #{:registry :on-event :cancelled?} (set (keys (get-in @calls [0 1])))))
     (is (not (str/includes? @output "workflow_drift")))
     (is (= [0] @exits))))
 
@@ -188,7 +190,7 @@
       (is (= 1 (count @resume-calls)))
       (is (= checkpoint-path (get-in @resume-calls [0 0])))
       (is (= dot-path (get-in @resume-calls [0 1 :current-source-path])))
-      (is (= #{:registry :current-source-path}
+      (is (= #{:registry :current-source-path :on-event :cancelled?}
              (set (keys (get-in @resume-calls [0 1])))))
       (is (str/includes? (get-in @resume-result [:diagnostics 0 :message])
                          (str ":state " expected-state)))

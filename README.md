@@ -113,6 +113,17 @@ See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and C
 See [deployment context discovery](docs/context-capacity.md) for live capacity,
 explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 
+## One control plane: the hub
+
+Every command that does work (`run`, `resume`, `agent`, `console`) submits it
+to a hub (`src/attractor/hub.lg`) and renders the hub's event log. Human
+gates are hub questions: the console answers them with `/answer`, while `run`
+and `resume` answer them on the process's stdin and hand the answer back to
+the hub. Tools still execute locally inside the session that owns them; the
+hub only owns submission, events, questions and cancellation. Today each CLI
+process embeds its own hub. Attaching to a running hub over a socket is
+recorded in [future work](docs/future_work.md).
+
 ## External agents
 
 An agent is anything that runs its own tool loop against a model. Attractor's

@@ -10,7 +10,10 @@
 (defn- fail! [category] (throw (ex-info (name category) {:category category})))
 (defn- fresh-id [prefix] (ids/prefixed prefix))
 (defn- error-data [error]
-  {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)})
+  ;; Worker diagnostics (stderr, exit code) travel with the category so a
+  ;; client can report an agent failure as fully as a direct call could.
+  (merge (select-keys (ex-data error) [:stderr :exit_code :retryable])
+         {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)}))
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
 (defn- append-envelope! [hub envelope]
   ;; Every source (session, eval, workflow, agent) shares one bounded log and
@@ -119,6 +122,36 @@
                              :event {:type :answered :answer result}})
       result)))
 
+(declare ->HubInterviewer)
+
+(defn- start-workflow!
+  "Register and launch one workflow run or resume. `runner` receives the
+   hub-bound registry, the event emitter and the cancellation predicate and
+   returns the pipeline outcome."
+  [hub request runner]
+  (when-not (:workflow_registry_fn hub) (fail! :workflows-unavailable))
+  (let [run-id (fresh-id "run") cancelled (atom false) completion (promise)
+        base {:source :workflow :run_id run-id}
+        emit (fn [event] (append-envelope! hub (assoc base :event event)))
+        ;; The registry factory receives a hub-backed interviewer bound to
+        ;; this run; it may still choose auto-approve.
+        registry ((:workflow_registry_fn hub)
+                  (assoc request :interviewer (->HubInterviewer hub run-id (fn [] @cancelled))))
+        ;; Register before launching so a fast failure cannot publish
+        ;; :done ahead of the entry and be overwritten.
+        _ (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
+                                                :source_path (:source_path request) :done false})]
+    (launch! (fn []
+               (let [outcome (runner registry emit (fn [] @cancelled))]
+                 (if @cancelled (assoc outcome :cancelled true) outcome)))
+             (fn [done result]
+               (finish-under-lock! hub
+                 (fn []
+                   (swap! (:workflows hub) assoc-in [run-id :done] true)
+                   (deliver done result))))
+             completion)
+    {:run_id run-id :completion completion}))
+
 (deftype HubInterviewer [hub runid cancelled]
   ;; let-go's deftype rewrites field references in call forms but not inside
   ;; map literals, so each method binds the fields it needs first.
@@ -165,30 +198,20 @@
     :workflow/run
     (let [source (:dot_source request)]
       (when-not (string? source) (fail! :invalid-request))
-      (when-not (:workflow_registry_fn hub) (fail! :workflows-unavailable))
-      (let [run-id (fresh-id "run") cancelled (atom false) completion (promise)
-            base {:source :workflow :run_id run-id}
-            emit (fn [event] (append-envelope! hub (assoc base :event event)))
-            ;; The registry factory receives a hub-backed interviewer bound to
-            ;; this run; it may still choose auto-approve.
-            registry ((:workflow_registry_fn hub)
-                      (assoc request :interviewer (->HubInterviewer hub run-id (fn [] @cancelled))))
-            ;; Register before launching so a fast failure cannot publish
-            ;; :done ahead of the entry and be overwritten.
-            _ (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
-                                                    :source_path (:source_path request) :done false})]
-        (launch! (fn []
-                       (let [outcome (pipeline/run source
-                                       {:logs-root (:logs_root request) :source-path (:source_path request)
-                                        :registry registry :on-event emit :cancelled? (fn [] @cancelled)})]
-                         (if @cancelled (assoc outcome :cancelled true) outcome)))
-                     (fn [done result]
-                       (finish-under-lock! hub
-                         (fn []
-                           (swap! (:workflows hub) assoc-in [run-id :done] true)
-                           (deliver done result))))
-                 completion)
-        {:run_id run-id :completion completion}))
+      (start-workflow! hub request
+        (fn [registry emit cancelled?]
+          (pipeline/run source
+            {:logs-root (:logs_root request) :source-path (:source_path request)
+             :registry registry :on-event emit :cancelled? cancelled?}))))
+    :workflow/resume
+    (let [checkpoint (:checkpoint_path request)]
+      (when-not (string? checkpoint) (fail! :invalid-request))
+      (start-workflow! hub (assoc request :source_path (or (:current_source_path request) checkpoint))
+        (fn [registry emit cancelled?]
+          (pipeline/resume checkpoint
+            (cond-> {:registry registry :on-event emit :cancelled? cancelled?}
+              (string? (:current_source_path request))
+              (assoc :current-source-path (:current_source_path request)))))))
     :workflow/cancel
     (let [entry (workflow-entry! hub (:run_id request))]
       (reset! (:cancelled entry) true)

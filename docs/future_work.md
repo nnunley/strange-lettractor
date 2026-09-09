@@ -50,6 +50,22 @@ The design session should settle:
   only a file and no flags, and `attractor config` output matching the values
   actually used by a run.
 
+## Shared hub transport (requested 2026-09-09)
+
+Since 2026-09-09 every CLI command (`run`, `resume`, `agent`, `console`)
+submits its work to an in-process hub and renders the hub's event log, so all
+commands share one event, question and cancellation contract. The hub has no
+network face yet: a CLI cannot attach to a hub owned by another process, and
+`serve` is still a separate HTTP server rather than the hub's HTTP view.
+
+Next step: give the hub a socket transport (unix socket, JSON-RPC framing of
+the existing request/reply and event-cursor contract, the same shape as the
+Codex app-server the codex agent already speaks) and a `--hub <path>` flag so
+a CLI attaches instead of embedding. Open decisions: who starts the daemon
+and when it exits, how a hub is discovered (`.attractor/hub.sock` under the
+repository root is the obvious default), whether `serve` becomes the hub's
+HTTP face, and how to authorise clients on a shared machine.
+
 ## Self-improving harness (requested 2026-09-08)
 
 The premise: Attractor now drives external agents and its own native loop

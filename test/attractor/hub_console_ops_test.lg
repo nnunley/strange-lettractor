@@ -80,6 +80,26 @@
                (mapv #(select-keys % [:run_id :done]) (:value (req h :workflow/list {}))))))
       (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
 
+(deftest workflow-resume-replays-a-published-run-through-the-hub
+  (let [h (hub/start! (options)) root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+    (try
+      (let [run (:value (req h :workflow/run {:dot_source dot :source_path (dot-file root) :logs_root (str root "/logs")}))
+            _ (deref (:completion run) 10000 nil)
+            client (:value (req h :client/attach {}))
+            resumed (:value (req h :workflow/resume {:checkpoint_path (str root "/logs/checkpoint.edn")
+                                                     :current_source_path (dot-file root)}))
+            outcome (deref (:completion resumed) 10000 {:error {:category :test-timeout}})]
+        (is (string? (:run_id resumed)))
+        (is (not= (:run_id run) (:run_id resumed)))
+        (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
+        ;; The engine emits nothing for a checkpoint that already represents
+        ;; a completed run, so only the absence of foreign events is checked.
+        (is (every? #(= :workflow (:source %)) (events h client)))
+        (is (= 2 (count (:value (req h :workflow/list {})))))
+        (is (every? :done (:value (req h :workflow/list {}))))
+        (is (= :invalid-request (get-in (req h :workflow/resume {}) [:error :category]))))
+      (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
+
 (deftest workflow-cancel-stops-the-run-and-keeps-the-hub
   (let [entered (promise) release (promise)
         opts (assoc (options) :workflow_registry_fn

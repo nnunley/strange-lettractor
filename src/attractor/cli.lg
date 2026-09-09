@@ -17,7 +17,9 @@
             [attractor.console.session :as session]
             [attractor.console.line :as line]
             [attractor.console.tui :as tui]
-            [attractor.dotenv :as dotenv]))
+            [attractor.dotenv :as dotenv]
+            [attractor.ids :as ids]
+            [clojure.core :as core]))
 
 (defn- find-arg-val [args flag]
   (loop [rem args]
@@ -59,6 +61,79 @@
      :permission_mode mode :sandbox sandbox :approval_policy approval :timeout_ms timeout
      :on_event (fn [event] (prn event))}))
 
+(defn- hub-call!
+  "Submit one hub request from the CLI and unwrap its reply."
+  [hub op fields]
+  (let [reply (deref (hub/request! hub (merge {:id (ids/uuid-text) :op op} fields))
+                     30000 {:error {:category :request-timeout :message (str (name op) " timed out")}})]
+    (if-let [error (:error reply)]
+      (throw (ex-info (or (:message error) (str (name op) " failed"))
+                      (assoc error :category (or (:category error) :hub-error))))
+      (:value reply))))
+
+(defn- pump-events!
+  "Attach to the hub log and deliver every envelope to `on-envelope` in
+   emission order until `completion` is realized, draining once more after
+   it so trailing events are not lost. Returns the completion value."
+  [hub completion on-envelope]
+  (let [client (hub-call! hub :client/attach {})]
+    (try
+      (loop [cursor (:cursor client) final? false]
+        (let [{:keys [events] next-cursor :cursor}
+              (hub/events-since hub (:client_id client) cursor)]
+          (doseq [envelope events] (on-envelope envelope))
+          (cond
+            final? (deref completion)
+            (realized? completion) (recur next-cursor true)
+            :else (do (core/sleep 20) (recur next-cursor false)))))
+      (finally
+        (try (hub-call! hub :client/detach {:client_id (:client_id client)})
+             (catch Object _ nil))))))
+
+(declare make-codergen-backend-from-args make-fan-in-ranker-from-args console-session-options)
+
+(defn- workflow-hub
+  "Every CLI command owns an in-process hub built the same way: workflow
+   handler registries come from the hub's request (auto-approve or the
+   hub-bound interviewer), the codergen backend and fan-in ranker from args."
+  [args]
+  (hub/start! {:session_options (console-session-options args)
+               :workflow_registry_fn
+               (fn [request]
+                 (handlers/make-handler-registry
+                   (if (:auto_approve request)
+                     (interviewer/make-auto-approve-interviewer)
+                     (:interviewer request))
+                   (make-codergen-backend-from-args args)
+                   {:fan-in-ranker (make-fan-in-ranker-from-args args)}))}))
+
+(defn- with-hub
+  "Run `f` with a hub started from `args` (a function of args, or nil for a
+   bare hub) and stop the hub afterwards."
+  [args f]
+  (let [hub (if (fn? args) (hub/start! {}) (workflow-hub args))]
+    (try
+      (f hub)
+      (finally
+        (deref (hub/request! hub {:id "cli-stop" :op :hub/stop}) 10000 nil)))))
+
+(defn- answer-questions-from-stdin!
+  "Hub questions for a CLI-owned run are answered on this process's stdin
+   through the console interviewer, then delivered back to the hub. Answer
+   values are sent as text, the same contract the console uses."
+  [hub stdin-interviewer]
+  (fn [envelope]
+    (when (= :question (:source envelope))
+      (let [event (:event envelope)]
+        (case (:type event)
+          :question
+          (let [answer (interviewer/ask stdin-interviewer (:question event))
+                value (:value answer)
+                text (if (keyword? value) (name value) (str (or (:text answer) value)))]
+            (hub-call! hub :question/answer {:question_id (:question_id envelope) :value text :text text}))
+          :inform (println (str "[" (:stage event) "] " (:message event)))
+          nil)))))
+
 (defn cmd-agent
   "agent <name> --prompt-file <file> [options]"
   [args]
@@ -78,8 +153,19 @@
             (let [opts (agent-options agent-name options) path (find-arg-val options "--prompt-file")]
               (when (str/blank? path)
                 (throw (ex-info "--prompt-file is required" {:category :configuration_error})))
-              (registry/run! (:agent opts) (assoc (dissoc opts :agent) :prompt (io/slurp path)))
-              0))
+              ;; The job is submitted to an in-process hub like every other
+              ;; command; its events are the hub's agent envelopes, printed as
+              ;; EDN in emission order.
+              (with-hub (fn [_] nil)
+                (fn [hub]
+                  (let [started (hub-call! hub :agent/run
+                                  (assoc (dissoc opts :agent :on_event) :agent (:agent opts) :prompt (io/slurp path)))
+                        result (pump-events! hub (:completion started)
+                                 (fn [envelope]
+                                   (when (= :agent (:source envelope)) (prn (:event envelope)))))]
+                    (when-let [error (:error result)]
+                      (throw (ex-info (:message error) (dissoc error :message))))
+                    0)))))
           (catch Object error
             (prn {:source :agent :type :error
                   :error (merge (select-keys (ex-data error) [:stderr :exit_code])
@@ -157,24 +243,15 @@
             (map #(str (name (or (:agent %) :agent)) " job " (:agent_id %)) (remove :done (ask :agent/list))))))
 
 (defn cmd-console [args]
-  (let [session-options (console-session-options args)
-        agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
+  (let [agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
                          (find-arg-val args "--agent-model") (assoc :model (find-arg-val args "--agent-model"))
                          (find-arg-val args "--agent-tools") (assoc :tools (str/split (find-arg-val args "--agent-tools") #","))
                          (find-arg-val args "--agent-permission-mode") (assoc :permission_mode (find-arg-val args "--agent-permission-mode"))
                          (find-arg-val args "--agent-sandbox") (assoc :sandbox (find-arg-val args "--agent-sandbox"))
                          (find-arg-val args "--agent-timeout-ms") (assoc :timeout_ms (parse-long (find-arg-val args "--agent-timeout-ms"))))
-        hub (hub/start! {:session_options session-options
-                         :workflow_registry_fn
-                         (fn [request]
-                           ;; Human gates are hub questions answered from the
-                           ;; console; the stdin interviewer is never used here.
-                           (handlers/make-handler-registry
-                             (if (:auto_approve request)
-                               (interviewer/make-auto-approve-interviewer)
-                               (:interviewer request))
-                             (make-codergen-backend-from-args args)
-                             {:fan-in-ranker (make-fan-in-ranker-from-args args)}))})
+        ;; Human gates are hub questions answered from the console; the stdin
+        ;; interviewer is never used here.
+        hub (workflow-hub args)
         aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")
                                                      (let [[name expansion] (str/split (str value) #"=" 2)]
                                                        (when (and (seq name) (seq expansion)) [name expansion]))))
@@ -297,23 +374,36 @@
                         (when (seq (:label e)) (str " [label=\"" (:label e) "\"]"))
                         (when (> (:weight e) 0) (str " [weight=" (:weight e) "]")))))))))
 
+(defn- run-through-hub!
+  "Submit a workflow run or resume to a CLI-owned hub, render its workflow
+   events with `on-event`, answer its questions on stdin and return the
+   pipeline outcome. An error raised by the pipeline is rethrown with its
+   category and retryable flag, exactly as a direct call would have thrown."
+  [args op request on-event]
+  (with-hub args
+    (fn [hub]
+      (let [stdin (interviewer/make-console-interviewer)
+            questions (answer-questions-from-stdin! hub stdin)
+            started (hub-call! hub op request)
+            result (pump-events! hub (:completion started)
+                     (fn [envelope]
+                       (case (:source envelope)
+                         :workflow (on-event (:event envelope))
+                         :question (questions envelope)
+                         nil)))]
+        (if-let [error (:error result)]
+          (throw (ex-info (or (:message error) "workflow failed") (dissoc error :message)))
+          (:value result))))))
+
 (defn cmd-run [args]
   (let [dot-file (first args)]
     (if (or (str/blank? dot-file) (not (os/stat dot-file)))
       (do
         (println "Error: Valid DOT file required.")
         (os/exit 1))
-      (let [auto-approve? (some #{"--auto-approve"} args)
+      (let [auto-approve? (boolean (some #{"--auto-approve"} args))
             custom-root (find-arg-val args "--logs-root")
             logs-root (or custom-root (str "attractor_runs/run_" (System/currentTimeMillis)))
-            interviewer (if auto-approve?
-                          (interviewer/make-auto-approve-interviewer)
-                          (interviewer/make-console-interviewer))
-            codergen-backend (make-codergen-backend-from-args args)
-            fan-in-ranker (make-fan-in-ranker-from-args args)
-            registry (handlers/make-handler-registry
-                       interviewer codergen-backend
-                       {:fan-in-ranker fan-in-ranker})
             on-event (fn [ev]
                        (case (:type ev)
                          :pipeline.started
@@ -335,11 +425,10 @@
                          :pipeline.failed
                          (println (str "✖ Pipeline failed: " (:error ev)))
                          nil))
-            outcome (pipeline/run (io/slurp dot-file)
-                                  {:logs-root logs-root
-                                   :source-path dot-file
-                                   :registry registry
-                                   :on-event on-event})]
+            outcome (run-through-hub! args :workflow/run
+                      {:dot_source (io/slurp dot-file) :logs_root logs-root
+                       :source_path dot-file :auto_approve auto-approve?}
+                      on-event)]
         (println (str "\nExecution finished with status: " (:status outcome)))
         (println (str "Artifacts and checkpoints saved in: " logs-root))
         (if (= (:status outcome) :success)
@@ -356,16 +445,10 @@
       (do
         (println "Error: Valid --checkpoint path required.")
         (os/exit 1))
-      (let [interviewer (interviewer/make-console-interviewer)
-            codergen-backend (make-codergen-backend-from-args args)
-            fan-in-ranker (make-fan-in-ranker-from-args args)
-            registry (handlers/make-handler-registry
-                       interviewer codergen-backend
-                       {:fan-in-ranker fan-in-ranker})
-            resume-options (cond-> {:registry registry}
-                             (not (str/blank? dot-file))
-                             (assoc :current-source-path dot-file))
-            outcome (pipeline/resume cp-path resume-options)]
+      (let [outcome (run-through-hub! args :workflow/resume
+                      (cond-> {:checkpoint_path cp-path :auto_approve false}
+                        (not (str/blank? dot-file)) (assoc :current_source_path dot-file))
+                      (fn [_] nil))]
         (doseq [diagnostic (:diagnostics outcome)]
           (println (format-validation-diagnostic diagnostic)))
         (println (str "Resumed execution finished with status: " (:status outcome)))
