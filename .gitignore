@@ -10,3 +10,6 @@ bin/
 # Keep project plans and specifications tracked despite global ignores.
 !docs/superpowers/
 !docs/superpowers/**
+
+# local provider registry (see attractor.edn.sample)
+attractor.edn
