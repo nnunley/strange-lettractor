@@ -48,7 +48,7 @@ Commands are run from the repository root with the configured local compiler at 
 | SCN-ULLM-TOOLS | client/tool integration | impacted | `rg -q 'SCN-ULLM-TOOLS' test/attractor/llm_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0011 |
 | SCN-ULLM-ADAPTERS | recording-server contract | impacted | `rg -q 'SCN-ULLM-ADAPTERS' test/attractor/llm_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0011 |
 | SCN-OPENAI-COMPAT | local HTTP integration | impacted | `rg -q 'SCN-OPENAI-COMPAT' test/attractor/llm_contract_test.lg && LGX_LG=/Users/ndn/development/let-go/lg lgx test` | pending ITER-0011 |
-| SCN-ATTR-SMOKE-LIVE | end to end | release/manual residual | `test -x scripts/test-live-providers && LIVE_LLM_TESTS=1 scripts/test-live-providers attractor-smoke` | pending ITER-0012; requires credentials |
+| SCN-ATTR-SMOKE-LIVE | end to end | release/manual residual | `ATTRACTOR_LIVE_MODEL=provider/name LGX_LG=/Users/ndn/development/attractor/.worktrees/let-go-http-cancellation/build/lg /Users/ndn/development/attractor/.worktrees/let-go-http-cancellation/build/lg -source-paths src:test dev/attractor_smoke_live.lg run` (exit 3 with a skip record when unset) | passing 2026-09-08 against llama.cpp: 1 test / 19 assertions, three runs; requires a reachable model |
 | SCN-PROVIDER-MATRIX | live provider contract | release/manual residual | `test -x scripts/test-live-providers && LIVE_LLM_TESTS=1 scripts/test-live-providers provider-matrix` | pending ITER-0012; requires credentials |
 
 Additional full-goal residual gates from the ITER-0005 audit:
