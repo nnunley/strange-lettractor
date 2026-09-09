@@ -11,9 +11,11 @@
    4. environment <ID>_BASE_URL and <ID>_API_KEY (or the entry's :api_key_env)
    5. explicit values passed by the caller
 
-   Files are data only: read with clojure.edn in data mode, validated against
-   the keys below, and never allowed to carry a secret. A file may name the
-   environment variable that holds a key; it may not hold the key."
+   Files are data only: read with clojure.edn in data mode and validated
+   against the keys below. An entry may name the environment variable that
+   holds its key (:api_key_env) or hold the key or bearer token itself
+   (:api_key). A file that holds a key must be readable by its owner only;
+   otherwise it is refused with a chmod hint."
   (:require [clojure.string :as str]
             [clojure.edn :as edn]
             [io :as io]
@@ -41,8 +43,10 @@
                     :api_key_env "OPENAI_COMPAT_API_KEY"
                     :model_discovery true}})
 
-(def entry-keys #{:protocol :base_url :api_key_env :model_discovery})
-(def secret-keys #{:api_key :key :token :secret :password :credential})
+(def entry-keys #{:protocol :base_url :api_key :api_key_env :model_discovery})
+;; Other secret-shaped keys are rejected by name so a typo cannot hide a key
+;; under an ignored field.
+(def secret-keys #{:key :token :bearer :secret :password :credential})
 
 (defn- configuration-error [message data]
   (ex-info message (merge {:category :configuration :retryable false} data)))
@@ -59,11 +63,16 @@
   (let [u (str/trim url)]
     (if (str/ends-with? u "/") (subs u 0 (dec (count u))) u)))
 
+(defn- env-var-name? [value]
+  (and (string? value) (some? (re-matches #"[A-Z][A-Z0-9_]*" value))))
+
 (defn validate-entry
   "Validate one provider entry from a file. Returns the normalized entry or
-   throws a :configuration error naming the file, provider and problem."
+   throws a :configuration error naming the file, provider and problem. The
+   error messages never repeat a value."
   [source id entry]
-  (let [fail (fn [problem] (throw (configuration-error
+  (let [allowed entry-keys
+        fail (fn [problem] (throw (configuration-error
                                     (str "attractor.edn " source ": provider " (pr-str id) " " problem)
                                     {:source source :provider id})))]
     (when-not (and (string? id) (re-matches #"[a-z0-9][a-z0-9-]*" id))
@@ -71,9 +80,9 @@
     (when-not (map? entry) (fail "must be a map"))
     (doseq [k (keys entry)]
       (when (contains? secret-keys k)
-        (fail (str "must not contain " k "; name the environment variable in :api_key_env instead")))
-      (when-not (contains? entry-keys k)
-        (fail (str "has unknown key " k "; allowed: " (str/join ", " (map name (sort-by name entry-keys)))))))
+        (fail (str "must not contain " k "; hold the key or bearer token in :api_key")))
+      (when-not (contains? allowed k)
+        (fail (str "has unknown key " k "; allowed: " (str/join ", " (map name (sort-by name allowed)))))))
     (when-not (contains? protocols (:protocol entry))
       (fail (str ":protocol must be one of " (str/join ", " (map name (sort-by name protocols))))))
     (when (and (contains? entry :base_url) (some? (:base_url entry)) (not (present (:base_url entry))))
@@ -82,10 +91,13 @@
                (not (re-find #"^https?://" (str/trim (:base_url entry)))))
       (fail ":base_url must start with http:// or https://"))
     (when (and (contains? entry :api_key_env)
-               (not (or (present (:api_key_env entry))
+               (not (or (env-var-name? (:api_key_env entry))
                         (and (vector? (:api_key_env entry)) (seq (:api_key_env entry))
-                             (every? present (:api_key_env entry))))))
-      (fail ":api_key_env must be an environment variable name or a vector of names"))
+                             (every? env-var-name? (:api_key_env entry))))))
+      (fail (str ":api_key_env must be an environment variable NAME such as " (env-name id "_API_KEY")
+                 " (a vector of names is allowed); a key value itself belongs in :api_key")))
+    (when (and (contains? entry :api_key) (not (present (:api_key entry))))
+      (fail ":api_key must be a non-empty string"))
     (when (and (contains? entry :model_discovery) (not (boolean? (:model_discovery entry))))
       (fail ":model_discovery must be true or false"))
     (cond-> {:protocol (:protocol entry)
@@ -93,7 +105,15 @@
              :api_key_env (or (:api_key_env entry) (env-name id "_API_KEY"))
              :model_discovery (if (contains? entry :model_discovery) (:model_discovery entry) true)
              :source source}
-      true identity)))
+      (present (:api_key entry)) (assoc :api_key (str/trim (:api_key entry))))))
+
+(defn- reader-position
+  "Line and column from a reader error, without the offending token: a
+   configuration file may contain a key, and it must never be echoed."
+  [message]
+  (if-let [[_ line col] (re-find #":(\d+):(\d+)\)" (str message))]
+    (str "line " line ", column " col)
+    "unknown position"))
 
 (defn parse-config
   "Parse one attractor.edn text into {id entry}. Only the :providers key is
@@ -101,7 +121,9 @@
   [source text]
   (let [forms (try (edn/read-all-string (str text))
                    (catch Object e (throw (configuration-error
-                                            (str "attractor.edn " source " is not readable EDN: " (ex-message e))
+                                            (str "attractor.edn " source " is not readable EDN at "
+                                                 (reader-position (ex-message e))
+                                                 " (check quotes and brackets near there)")
                                             {:source source}))))
         _ (when (not= 1 (count forms))
             (throw (configuration-error (str "attractor.edn " source " must contain exactly one map") {:source source})))
@@ -117,6 +139,24 @@
         (throw (configuration-error (str "attractor.edn " source ": :providers must be a map of id to entry") {:source source})))
       (into {} (map (fn [[id entry]] [(str id) (validate-entry source (str id) entry)]) providers)))))
 
+(defn- file-mode
+  "Octal permission string of a file, or nil when it cannot be determined."
+  [path]
+  (let [attempt (fn [& args] (let [r (try (apply os/sh args) (catch Object _ nil))]
+                               (when (and r (= 0 (:exit r))) (str/trim (:out r)))))]
+    (or (attempt "/usr/bin/stat" "-f" "%Lp" path)
+        (attempt "/usr/bin/stat" "-c" "%a" path)
+        (attempt "stat" "-c" "%a" path))))
+
+(defn- require-private! [path]
+  (when-let [mode (file-mode path)]
+    ;; Octal text: the last two digits are the group and other bits.
+    (let [shared (take-last 2 mode)]
+      (when (some #(not= \0 %) shared)
+        (throw (configuration-error
+                 (str "attractor.edn " path " holds keys but is readable by others (mode " mode "); run: chmod 600 " path)
+                 {:source path}))))))
+
 (defn user-config-path []
   (let [xdg (present (os/getenv "XDG_CONFIG_HOME"))
         home (present (os/getenv "HOME"))]
@@ -128,9 +168,15 @@
   (or (present (os/getenv "ATTRACTOR_CONFIG"))
       (str (os/cwd) "/attractor.edn")))
 
-(defn- read-file [path]
+(defn- read-file
+  "Read one file. A file that holds :api_key values must be private to its
+   owner."
+  [path]
   (when (and path (os/stat path))
-    (parse-config path (io/slurp path))))
+    (let [parsed (parse-config path (io/slurp path))]
+      (when (some :api_key (vals parsed))
+        (require-private! path))
+      parsed)))
 
 (defn load-registry
   "Merge built-ins, the user file and the project file (in that order). Pass
@@ -188,12 +234,21 @@
     (vec (distinct (concat [(env-name p "_API_KEY")] names)))))
 
 (defn api-key
-  "Effective API key: explicit value, then the first present variable from
-   key-env-names. nil when none is set."
+  "Effective API key: explicit value, the first present variable from
+   key-env-names, then a key held in a config file. nil when none is set."
   [id & [explicit env-fn]]
   (let [get-env (or env-fn os/getenv)]
     (or (present explicit)
-        (some (fn [name] (env-get get-env name)) (key-env-names id)))))
+        (some (fn [name] (env-get get-env name)) (key-env-names id))
+        (:api_key (definition id)))))
+
+(defn key-source
+  "Where the effective key comes from: :environment, :file or nil."
+  [id & [env-fn]]
+  (let [get-env (or env-fn os/getenv)]
+    (cond (some (fn [name] (env-get get-env name)) (key-env-names id)) :environment
+          (:api_key (definition id)) :file
+          :else nil)))
 
 (defn model-discovery? [id]
   (boolean (:model_discovery (definition id))))
@@ -213,6 +268,7 @@
                                       :else :unset)
                :api_key_env (key-env-names id)
                :key_present (some? (api-key id nil get-env))
+               :key_source (key-source id get-env)
                :model_discovery (:model_discovery d)
                :source (:source d)}))
           (ids))))

@@ -55,8 +55,14 @@
     (is (str/includes? (message-of #(providers/parse-config "t" "{:provider {}}")) "unknown top-level key")))
   (testing "unknown entry key"
     (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :timeout 3}}}")) "unknown key")))
-  (testing "secrets never live in the file"
-    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :api_key \"sk-1\"}}}")) ":api_key_env instead")))
+  (testing "keys live in :api_key; other secret-shaped names are rejected"
+    (is (= "sk-1" (get-in (providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :api_key \"sk-1\"}}}") ["x" :api_key])))
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :token \"sk-1\"}}}")) ":api_key"))
+    (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :api_key_env \"sk-live-value\"}}}")) "environment variable NAME")))
+  (testing "reader errors never echo file content"
+    (let [message (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :api_key_env \"a\"\"secret-token-value\"}}}"))]
+      (is (str/includes? message "not readable EDN at line"))
+      (is (not (str/includes? message "secret-token-value")))))
   (testing "unknown protocol"
     (is (str/includes? (message-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :grpc}}}")) ":protocol must be one of")))
   (testing "bad ids, urls, toggles and non-map files"
@@ -83,6 +89,22 @@
           "a missing file contributes nothing")
       (finally
         (os/sh "/bin/rm" "-f" "--" user project)))))
+
+(deftest a-file-holding-keys-must-be-private
+  (let [path (temp-file "secret" "{:providers {\"x\" {:protocol :openai-responses :api_key \"sk-file\"}}}")]
+    (try
+      (os/sh "/bin/chmod" "644" path)
+      (is (str/includes? (message-of #(providers/load-registry {:paths [path]})) "chmod 600"))
+      (os/sh "/bin/chmod" "600" path)
+      (let [registry (providers/load-registry {:paths [path]})]
+        (is (= "sk-file" (get-in registry ["x" :api_key]))))
+      (providers/reload! {:paths [path]})
+      (is (= "sk-file" (providers/api-key "x" nil (fn [_] nil))) "file key is used when no variable is set")
+      (is (= "env-wins" (providers/api-key "x" nil (fn [n] (when (= n "X_API_KEY") "env-wins")))))
+      (is (= :file (providers/key-source "x" (fn [_] nil))))
+      (finally
+        (providers/reload! {:paths []})
+        (os/sh "/bin/rm" "-f" "--" path)))))
 
 (deftest environment-overrides-files-and-explicit-values-override-environment
   (let [project (temp-file "env" "{:providers {\"openrouter\" {:protocol :openai-chat-completions :base_url \"https://file.example/v1\" :api_key_env \"OR_KEY\"}}}")]

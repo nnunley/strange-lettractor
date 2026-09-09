@@ -121,9 +121,10 @@ Providers live in a registry: an id, the wire protocol it speaks
 its key, and whether `/models` may be queried. `openai`, `anthropic`,
 `gemini` and `openai-compat` are built in; add or override entries in
 `./attractor.edn` (see `attractor.edn.sample`) or
-`~/.config/attractor/attractor.edn`. Files are data only and never hold a
-key. Any configured id can be used as a model prefix (`openrouter/<model>`)
-and with `models --provider <id>`.
+`~/.config/attractor/attractor.edn`. Files are data only; an entry holds its
+key or bearer token in `:api_key` (the file must then be `chmod 600`) or
+names the environment variable in `:api_key_env`. Any configured id can be
+used as a model prefix (`openrouter/<model>`) and with `models --provider <id>`.
 
 ```sh
 bin/attractor providers          # effective registry with each value's source

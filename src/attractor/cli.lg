@@ -483,13 +483,20 @@
   "providers: show the effective provider registry with each value's source."
   [_]
   (println "Providers (built-ins, then ~/.config/attractor/attractor.edn, then ./attractor.edn or ATTRACTOR_CONFIG):")
-  (doseq [row (providers/effective)]
+  (doseq [row (try (providers/effective)
+                   (catch Object error
+                     (if (= :configuration (:category (ex-data error)))
+                       (do (println (str "Error: " (ex-message error))) (os/exit 1))
+                       (throw error))))]
     (println (str "  " (:id row)))
     (println (str "    protocol:        " (name (:protocol row)) "  [" (if (keyword? (:source row)) (name (:source row)) (:source row)) "]"))
     (println (str "    base_url:        " (or (:base_url row) "(unset)")
                   "  [" (name (:base_url_source row)) "]"))
     (println (str "    api_key_env:     " (str/join ", " (:api_key_env row))
-                  (if (:key_present row) "  [present]" "  [absent]")))
+                  (case (:key_source row)
+                    :environment "  [key present in environment]"
+                    :file "  [key held in config file]"
+                    "  [no key]")))
     (println (str "    model_discovery: " (:model_discovery row))))
   (os/exit 0))
 

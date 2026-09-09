@@ -4,8 +4,9 @@
 ;; Precedence: built-ins < user file < project file < environment
 ;; (<ID>_BASE_URL, <ID>_API_KEY or :api_key_env) < explicit CLI/API values.
 ;;
-;; Entries are data only. A file names the environment variable that holds a
-;; key; it never holds the key itself. Any other key in an entry is an error.
+;; Entries are data only. A key or bearer token may be held directly in
+;; :api_key, in which case the file must be chmod 600, or named indirectly by
+;; the environment variable in :api_key_env. Other keys are errors.
 ;;
 ;; Built-ins that need no entry: openai (Responses API), anthropic (Messages
 ;; API), gemini (generateContent), openai-compat (Chat Completions, base URL
@@ -14,7 +15,7 @@
  {;; OpenRouter: Chat Completions, pay-per-use key, model list at /models.
   "openrouter" {:protocol :openai-chat-completions
                 :base_url "https://openrouter.ai/api/v1"
-                :api_key_env "OPENROUTER_API_KEY"
+                :api_key "sk-or-..."            ; or :api_key_env "OPENROUTER_API_KEY"
                 :model_discovery true}
 
   ;; A local llama.cpp server: no key needed, and its /models list is not
