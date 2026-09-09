@@ -3,6 +3,7 @@
 These files are verbatim snapshots from
 [`strongdm/attractor`](https://github.com/strongdm/attractor):
 
+- `README.md` (retrieved 2026-09-08 from `main`)
 - `attractor-spec.md`
 - `coding-agent-loop-spec.md`
 - `unified-llm-spec.md`

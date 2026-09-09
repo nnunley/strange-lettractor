@@ -6,7 +6,28 @@ Strange Lettractor is a unified agentic framework for building provider-independ
 - [Coding agent runtime](docs/upstream/strongdm-attractor/coding-agent-loop-spec.md): stateful agent sessions that combine model calls, tools, and execution environments.
 - [Workflow orchestration](docs/upstream/strongdm-attractor/attractor-spec.md): composable Graphviz DOT pipelines with branching, parallel execution, human interaction, and checkpoint recovery.
 
-Applications can use the LLM client and agent runtime directly, without a DOT workflow. Workflow orchestration builds on those foundations; it does not define the framework's entire scope. Implementation is in progress; full specification conformance is not yet claimed.
+Applications can use the LLM client and agent runtime directly, without a DOT workflow. Workflow orchestration builds on those foundations; it does not define the framework's entire scope.
+
+## Conformance to the upstream README
+
+The upstream [README](docs/upstream/strongdm-attractor/README.md) asks for an
+implementation of its three NLSpecs and recommends bringing your own agentic
+loop and unified LLM SDK rather than wrapping a vendor's. Strange Lettractor
+does both, in let-go:
+
+| Upstream README item | Where it lives here | Evidence |
+|---|---|---|
+| Attractor Specification | `src/attractor/{parser,engine,handlers,server,...}.lg` | all 33 stories done or proved: [ledger](docs/superpowers/iterations/requirements/attractor.md) |
+| Coding Agent Loop Specification | `src/attractor/{agent,profiles,execution,subagent}.lg` (own loop, no external agent SDK) | 8 of 13 stories done at component level, 5 partial with named residuals: [ledger](docs/superpowers/iterations/requirements/coding-agent-loop.md) |
+| Unified LLM Client Specification | `src/attractor/llm.lg` (own SDK: native OpenAI, Anthropic, Gemini adapters plus `openai-compat`) | 10 of 12 stories done at component level; release gate credential-gated: [ledger](docs/superpowers/iterations/requirements/unified-llm.md) |
+| "Build your own software factory" | `bin/attractor run`, `console`, `agent`, `serve` | [tutorial](docs/tutorial.md), [behavior corpus](docs/superpowers/iterations/behavior-corpus.md) |
+
+Every claim in the ledgers is backed by a runnable check in the behavior
+corpus; the full suite is `lgx test`. What is not closed is stated in the
+ledgers rather than implied: live OpenAI/Anthropic/Gemini parity needs real
+API keys for `dev/provider_matrix_live.lg`, and the partial coding-loop rows
+list their residuals. Full specification conformance is therefore claimed at
+component level, not as a live release.
 
 It is built with [lgx](https://github.com/abogoyavlensky/lgx) and requires let-go 1.12.2 or newer.
 
