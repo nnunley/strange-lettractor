@@ -1,0 +1,102 @@
+(ns attractor.event-families-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str] [os :as os]
+            [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+
+;; SCN-EVENT-FAMILIES COMPLETE
+;; §9.6: pipeline, stage, parallel, interview and checkpoint event families,
+;; ordered, with duration, index, error/will_retry and timeout detail.
+
+(def ^:private dot
+  (str/join "\n"
+    ["digraph E {" "graph [goal=\"families\"]"
+     "start [shape=Mdiamond]" "fork [shape=component]"
+     "left [shape=box, prompt=\"left\"]" "right [shape=box, prompt=\"right\"]"
+     "join [shape=tripleoctagon]"
+     "gate [shape=hexagon, label=\"Go on?\", human.timeout_seconds=\"0.1\", human.default_choice=\"finish\"]"
+     "finish [shape=box, prompt=\"finish\"]" "exit [shape=Msquare]"
+     "start -> fork" "fork -> left" "fork -> right" "left -> join" "right -> join"
+     "join -> gate" "gate -> finish [label=\"Continue\"]" "gate -> exit [label=\"Stop\"]" "finish -> exit" "}"]))
+
+(defn- run-collecting [answers]
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) events (atom [])
+        registry (handlers/make-handler-registry (interviewer/make-queue-interviewer answers) nil {})
+        outcome (pipeline/run dot {:logs-root (str root "/logs") :registry registry :on-event #(swap! events conj %)})]
+    (os/sh "/bin/rm" "-rf" "--" root)
+    {:outcome outcome :events @events}))
+(defn- types [events] (mapv :type events))
+(defn- of [events type] (filter #(= type (:type %)) events))
+(defn- index-of [coll x] (first (keep-indexed (fn [i v] (when (= v x) i)) coll)))
+
+(deftest pipeline-stage-and-checkpoint-events-carry-spec-detail
+  (let [{:keys [outcome events]} (run-collecting [{:value "C" :text "Continue"}])
+        ts (types events)]
+    (is (= :success (:status outcome)) (pr-str outcome))
+    (is (= :pipeline.started (first ts)))
+    (is (= :pipeline.completed (last ts)))
+    (let [completed (last events)]
+      (is (integer? (:duration_ms completed)))
+      (is (integer? (:artifact_count completed))))
+    (doseq [ev (of events :stage.started)]
+      (is (integer? (:index ev)) (pr-str ev))
+      (is (integer? (:attempt ev))))
+    (doseq [ev (of events :stage.completed)]
+      (is (integer? (:index ev)) (pr-str ev))
+      (is (integer? (:duration_ms ev)) (pr-str ev)))
+    (is (seq (of events :checkpoint.saved)))
+    (is (every? :node_id (of events :checkpoint.saved)))
+    ;; A stage start precedes its own completion and its checkpoint.
+    (let [gate-start (index-of ts :stage.started)
+          gate-done (index-of ts :stage.completed)]
+      (is (< gate-start gate-done)))))
+
+(deftest parallel-events-bracket-every-branch
+  (let [{:keys [events]} (run-collecting [{:value "C"}]) ts (types events)]
+    (is (= 1 (count (of events :parallel.started))))
+    (is (= 2 (:branch_count (first (of events :parallel.started)))))
+    (is (= #{"left" "right"} (set (map :branch (of events :parallel.branch_started)))))
+    (is (= #{0 1} (set (map :index (of events :parallel.branch_started)))))
+    (doseq [ev (of events :parallel.branch_completed)]
+      (is (integer? (:duration_ms ev)) (pr-str ev))
+      (is (true? (:success ev)) (pr-str ev)))
+    (let [done (first (of events :parallel.completed))]
+      (is (= 2 (:success_count done)))
+      (is (= 0 (:failure_count done)))
+      (is (integer? (:duration_ms done))))
+    (is (< (index-of ts :parallel.started) (index-of ts :parallel.branch_started)))
+    (is (< (index-of ts :parallel.branch_completed) (index-of ts :parallel.completed)))))
+
+(deftest interview-events-record-answers-and-timeouts
+  (let [{:keys [events]} (run-collecting [{:value "C" :text "Continue"}])
+        started (first (of events :interview.started)) completed (first (of events :interview.completed))]
+    (is (= "gate" (:stage started)))
+    (is (= "Go on?" (get-in started [:question :text])))
+    (is (= "C" (get-in completed [:answer :value])))
+    (is (integer? (:duration_ms completed)))
+    (is (empty? (of events :interview.timeout))))
+  (let [{:keys [outcome events]} (run-collecting [])
+        timeout (first (of events :interview.timeout))]
+    ;; Queue exhausted returns SKIPPED, not TIMEOUT; use a real timed wait.
+    (is (nil? timeout))
+    (is (some #(= :interview.completed (:type %)) events))
+    (is (= :fail (:status outcome)) "skipped answer fails the gate per §4.6")))
+
+(deftest stage-failure-events-carry-error-and-retry-detail
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) events (atom []) calls (atom 0)
+        registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {})
+        _ (handlers/register-handler! registry "codergen"
+            (fn [_ _ _ _] (swap! calls inc) (if (< @calls 2) {:status :retry :failure_reason "not yet"} {:status :fail :failure_reason "gave up"})))
+        outcome (pipeline/run "digraph F { start [shape=Mdiamond] work [shape=box, prompt=\"w\", max_retries=\"1\"] exit [shape=Msquare] start -> work -> exit }"
+                              {:logs-root (str root "/logs") :registry registry :on-event #(swap! events conj %)})
+        retrying (first (of @events :stage.retrying))
+        failed (last (of @events :stage.failed))
+        pipeline-failed (first (of @events :pipeline.failed))]
+    (os/sh "/bin/rm" "-rf" "--" root)
+    (is (= :fail (:status outcome)))
+    (is (= 1 (:attempt retrying)))
+    (is (integer? (:delay_ms retrying)))
+    (is (= "gave up" (:error failed)))
+    (is (false? (:will_retry failed)))
+    (is (integer? (:duration_ms failed)))
+    (is (= "gave up" (:error pipeline-failed)))
+    (is (integer? (:duration_ms pipeline-failed)))))

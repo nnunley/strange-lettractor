@@ -416,6 +416,9 @@
           (recur))))))))
 
 ;; Execute node with retry logic (Section 3.5 & 3.6)
+(defn- stage-event [index duration-ms event]
+  (cond-> (assoc event :duration_ms duration-ms) index (assoc :index index)))
+
 (defn execute-with-retry
   ([handler node ctx graph logs-root on-event]
    (execute-with-retry handler node ctx graph logs-root on-event {}))
@@ -427,7 +430,11 @@
          runtime {:retry-counts retry-counts
                   :sleep-fn (or (:sleep-fn options) core/sleep)
                   :random-fn (or (:random-fn options) rand)}
-         handler-node (assoc node :attractor.engine/status-managed true)
+         ;; §9.6: handlers emit their own event families (parallel, interview)
+         ;; through the same observer; :index is the stage's position.
+         handler-node (assoc node :attractor.engine/status-managed true
+                             :emit-event (fn [event] (on-event (assoc event :node_id (or (:node_id event) node-id)))))
+         stage-index (:stage-index options)
          pipeline-cancelled? (or (:cancelled? options) (fn [] false))
          timeout-config (resolve-node-timeout node)
          prior-retries (or (get @retry-counts node-id)
@@ -437,8 +444,11 @@
     (loop [attempt (inc prior-retries)]
       (if (pipeline-cancelled?)
         {:status :cancelled :failure_reason "Pipeline cancelled"}
-        (let [_ (on-event {:type :stage.started :node_id node-id
-                           :attempt attempt :max_attempts max-attempts})
+        (let [attempt-started (System/currentTimeMillis)
+              elapsed (fn [] (- (System/currentTimeMillis) attempt-started))
+              _ (on-event (cond-> {:type :stage.started :node_id node-id
+                                   :attempt attempt :max_attempts max-attempts}
+                            stage-index (assoc :index stage-index)))
             cleanup-failure (clear-attempt-status! logs-root node)
             execution (if cleanup-failure
                         {:resolved-outcome cleanup-failure}
@@ -485,16 +495,16 @@
           (if (and ((:should_retry policy) error)
                    (< attempt max-attempts))
             (do
-              (on-event {:type :stage.failed :node_id node-id
-                         :outcome outcome :will_retry true})
+              (on-event (stage-event stage-index (elapsed) {:type :stage.failed :node_id node-id
+                                                              :outcome outcome :error (:failure_reason outcome) :will_retry true}))
               (if (pipeline-cancelled?)
                 {:status :cancelled :failure_reason "Pipeline cancelled"}
                 (do
                   (schedule-retry! runtime policy node-id attempt on-event)
                   (recur (inc attempt)))))
             (do
-              (on-event {:type :stage.failed :node_id node-id
-                         :outcome outcome :will_retry false})
+              (on-event (stage-event stage-index (elapsed) {:type :stage.failed :node_id node-id
+                                                              :outcome outcome :error (:failure_reason outcome) :will_retry false}))
               outcome))
 
           ;; Success or Partial Success
@@ -502,7 +512,7 @@
           (do
             (swap! retry-counts assoc node-id 0)
             (context/ctx-set! ctx (str "internal.retry_count." node-id) 0)
-            (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
+            (on-event (stage-event stage-index (elapsed) {:type :stage.completed :node_id node-id :status st :outcome outcome}))
             outcome)
 
           ;; Retry requested
@@ -516,21 +526,21 @@
               (let [res {:status :partial_success :notes "retries exhausted, partial accepted"}]
                 (swap! retry-counts assoc node-id 0)
                 (context/ctx-set! ctx (str "internal.retry_count." node-id) 0)
-                (on-event {:type :stage.completed :node_id node-id :status :partial_success :outcome res})
+                (on-event (stage-event stage-index (elapsed) {:type :stage.completed :node_id node-id :status :partial_success :outcome res}))
                 res)
               (let [res {:status :fail :failure_reason (or (:failure_reason outcome) "max retries exceeded")}]
-                (on-event {:type :stage.failed :node_id node-id :outcome res :will_retry false})
+                (on-event (stage-event stage-index (elapsed) {:type :stage.failed :node_id node-id :outcome res :error (:failure_reason res) :will_retry false}))
                 res)))
 
           ;; Permanent Failure
           (= st :fail)
           (do
-            (on-event {:type :stage.failed :node_id node-id :outcome outcome :will_retry false})
+            (on-event (stage-event stage-index (elapsed) {:type :stage.failed :node_id node-id :outcome outcome :error (:failure_reason outcome) :will_retry false}))
             outcome)
 
           :else
           (do
-            (on-event {:type :stage.completed :node_id node-id :status st :outcome outcome})
+            (on-event (stage-event stage-index (elapsed) {:type :stage.completed :node_id node-id :status st :outcome outcome}))
             outcome))))))))
 
 (defn- incoming-edge-for [graph completed-nodes node-id]
@@ -605,7 +615,7 @@
                                                           (branch-cancelled?)))))
             handler (handlers/resolve-handler registry prepared-node)
             outcome (execute-with-retry handler prepared-node ctx graph logs-root
-                                        on-event retry-options)
+                                        on-event (assoc retry-options :stage-index step-count))
             node-id (:id current-node)
             next-completed (conj completed-nodes node-id)
             next-outcomes (assoc node-outcomes node-id outcome)]
@@ -793,12 +803,12 @@
            (core/sleep chunk)
            (recur (- remaining chunk))))))})
 
-(defn- step-limit-failure [max-steps completed-nodes on-event]
+(defn- step-limit-failure [max-steps completed-nodes on-event & [duration-ms]]
   (let [reason (str "Pipeline step limit exceeded (" max-steps " steps)")
         result {:status :fail
                 :failure_reason reason
                 :completed_nodes completed-nodes}]
-    (on-event {:type :pipeline.failed :error reason})
+    (on-event (cond-> {:type :pipeline.failed :error reason} duration-ms (assoc :duration_ms duration-ms)))
     result))
 
 (defn- with-checkpoint-identity [checkpoint options current-fidelity]
@@ -842,6 +852,9 @@
          step-counter (or (:step-counter options) (atom 0))
          max-steps (or (:max-steps options) default-max-steps)
          retry-options (assoc options :retry-counts retry-counts)
+         pipeline-started-at (System/currentTimeMillis)
+         pipeline-elapsed (fn [] (- (System/currentTimeMillis) pipeline-started-at))
+         artifact-count (fn [outcomes] (reduce + 0 (map (fn [o] (count (:artifacts o))) (vals (or outcomes {})))))
          parallel-executor (get @registry handlers/parallel-executor-key)
          manager-runtime (get @registry handlers/manager-runtime-key)
          _parallel-init (when parallel-executor
@@ -916,7 +929,7 @@
          ;; A satisfied terminal is free; nonterminal handler execution is not.
          (and (>= @step-counter max-steps)
               (not (terminal-node? current-node)))
-         (step-limit-failure max-steps completed-nodes on-event)
+         (step-limit-failure max-steps completed-nodes on-event (pipeline-elapsed))
 
          :else
          (let [node-id (:id current-node)]
@@ -927,7 +940,7 @@
              (let [[gates-ok? failed-gate] (check-goal-gates graph node-outcomes)]
                (if (not gates-ok?)
                  (if (>= @step-counter max-steps)
-                   (step-limit-failure max-steps completed-nodes on-event)
+                   (step-limit-failure max-steps completed-nodes on-event (pipeline-elapsed))
                    (let [retry-id (resolve-retry-target failed-gate graph)]
                      (if (and retry-id (parser/find-node graph retry-id))
                        (do
@@ -943,7 +956,7 @@
                                        :failure_reason "Goal gate unsatisfied and no retry target"
                                        :unsatisfied_gate (:id failed-gate)
                                        :completed_nodes completed-nodes}]
-                         (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                         (on-event {:type :pipeline.failed :error (:failure_reason fail-res) :duration_ms (pipeline-elapsed)})
                          fail-res))))
                  ;; Terminal node reached, goal gates satisfied!
                  (let [success-res {:status :success
@@ -964,7 +977,9 @@
                            (context/resolve-fidelity
                              incoming-edge current-node graph))]
                      (context/save-checkpoint cp (str logs-root "/checkpoint.edn")))
-                   (on-event {:type :pipeline.completed :duration_steps step-count :completed_nodes (:completed_nodes success-res)})
+                   (on-event {:type :pipeline.completed :duration_steps step-count :duration_ms (pipeline-elapsed)
+                              :artifact_count (artifact-count node-outcomes)
+                              :completed_nodes (:completed_nodes success-res)})
                    success-res)))
 
              ;; Step 2: Execute node handler with retry policy
@@ -979,7 +994,7 @@
                    prepared-node (assoc prepared-node :cancelled? cancelled?)
                    handler (handlers/resolve-handler registry prepared-node)
                    outcome (execute-with-retry handler prepared-node ctx graph logs-root
-                                               on-event retry-options)
+                                               on-event (assoc retry-options :stage-index step-count))
                    st (:status outcome)]
 
                ;; The engine owns the status-file contract for every handler,
@@ -1047,7 +1062,7 @@
                                           {:status :fail
                                            :failure_reason (or (:failure_reason outcome) "Stage failed and no route found")
                                            :completed_nodes new-completed})]
-                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res) :duration_ms (pipeline-elapsed)})
                              fail-res)))
                        ;; Succeeded with no outgoing edges
                        (let [succ-res {:status :success
@@ -1070,7 +1085,7 @@
                            (let [fail-res {:status :fail
                                            :failure_reason (str "Target node '" (:to next-edge) "' does not exist")
                                            :completed_nodes new-completed}]
-                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res)})
+                             (on-event {:type :pipeline.failed :error (:failure_reason fail-res) :duration_ms (pipeline-elapsed)})
                              fail-res)
                            (recur next-node
                                   new-completed

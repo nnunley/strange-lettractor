@@ -111,6 +111,10 @@
       :stage.retrying [(str tag " retrying " (:node_id ev) " after " (:delay_ms ev) "ms")]
       :pipeline.completed [(str tag " completed in " (:duration_steps ev) " steps")]
       :pipeline.failed [(str tag " failed: " (:error ev))]
+      :parallel.started [(str tag " parallel: " (:branch_count ev) " branches")]
+      :parallel.branch_completed [(str tag " branch " (:branch ev) (if (:success ev) " ok" " failed") " (" (:duration_ms ev) "ms)")]
+      :parallel.completed [(str tag " parallel done: " (:success_count ev) " ok, " (:failure_count ev) " failed")]
+      :interview.timeout [(str tag " gate " (:stage ev) " timed out after " (:duration_ms ev) "ms")]
       [])))
 
 (defn- agent-lines [console envelope]

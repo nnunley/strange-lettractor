@@ -234,7 +234,14 @@
                                 :options opts
                                 :stage (:id node)}
                          timeout-seconds (assoc :timeout_seconds timeout-seconds))
-              answer (interviewer/ask interviewer question)]
+              emit (or (:emit-event node) (fn [_] nil))
+              asked-at (System/currentTimeMillis)
+              _ (emit {:type :interview.started :question question :stage (:id node)})
+              answer (interviewer/ask interviewer question)
+              duration (- (System/currentTimeMillis) asked-at)
+              _ (if (= (:value answer) :timeout)
+                  (emit {:type :interview.timeout :question question :stage (:id node) :duration_ms duration})
+                  (emit {:type :interview.completed :question question :answer answer :stage (:id node) :duration_ms duration}))]
 
           (cond
             (= (:value answer) :timeout)
@@ -334,7 +341,10 @@
                          (if (and (number? mp) (> mp 0)) mp 4))]
       (if (empty? branches)
         {:status :fail :failure_reason "Parallel node has no outgoing branches"}
-        (let [results
+        (let [emit (or (:emit-event node) (fn [_] nil))
+              parallel-started (System/currentTimeMillis)
+              _ (emit {:type :parallel.started :branch_count (count branches)})
+              results
               (coordinate-parallel
                 branches max-parallel (= join-policy "first_success") cancelled?
                 (fn [index branch-edge branch-cancelled?]
@@ -346,16 +356,27 @@
                       ;; UPSTREAM nooga/let-go#805: futures swallow exceptions.
                       ;; Keep explicit transport until verified native error
                       ;; propagation; restoration: docs/let-go-followups.md.
-                      (try
-                        (let [result (if cancellation-aware?
-                                       (execute-branch-fn branch-start branch-ctx graph branch-logs branch-cancelled?)
-                                       (execute-branch-fn branch-start branch-ctx graph branch-logs))]
-                          {:index index :result (assoc result :id target-id :node_id target-id)})
-                        (catch Object e {:index index :error e}))))))
+                      (let [branch-started (System/currentTimeMillis)]
+                        (emit {:type :parallel.branch_started :branch target-id :index index})
+                        (try
+                          (let [result (if cancellation-aware?
+                                         (execute-branch-fn branch-start branch-ctx graph branch-logs branch-cancelled?)
+                                         (execute-branch-fn branch-start branch-ctx graph branch-logs))]
+                            (emit {:type :parallel.branch_completed :branch target-id :index index
+                                   :duration_ms (- (System/currentTimeMillis) branch-started)
+                                   :success (contains? #{:success :partial_success} (:status result))})
+                            {:index index :result (assoc result :id target-id :node_id target-id)})
+                          (catch Object e
+                            (emit {:type :parallel.branch_completed :branch target-id :index index
+                                   :duration_ms (- (System/currentTimeMillis) branch-started)
+                                   :success false :error (str e)})
+                            {:index index :error e})))))))
               boundary-ids (vec (distinct (keep :boundary_node_id results)))
               next-node-id (when (= 1 (count boundary-ids)) (first boundary-ids))
               success-count (count (filter (fn [r] (= (:status r) :success)) results))
               fail-count (count (filter (fn [r] (= (:status r) :fail)) results))
+              _ (emit {:type :parallel.completed :duration_ms (- (System/currentTimeMillis) parallel-started)
+                       :success_count success-count :failure_count fail-count})
               base {:context_updates {"parallel.results" (vec results)}}
               base (if next-node-id (assoc base :next_node_id next-node-id) base)]
           (if (cancelled?)

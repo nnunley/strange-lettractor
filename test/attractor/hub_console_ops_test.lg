@@ -232,7 +232,9 @@
         (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
         (is (< (- (System/currentTimeMillis) started) 5000))
         (is (contains? (started-nodes evs) "hold"))
-        (is (some #(and (= :question (:source %)) (= :timeout (get-in % [:event :answer :value]))) evs)))
+        (is (some #(and (= :question (:source %)) (= :timeout (get-in % [:event :answer :value]))) evs))
+        (is (some #(and (= :workflow (:source %)) (= :interview.timeout (get-in % [:event :type]))
+                        (= "gate" (get-in % [:event :stage]))) evs) "§9.6 InterviewTimeout"))
       (finally (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
 
 (deftest human-gate-timeout-without-default-retries-and-cancel-releases-the-wait

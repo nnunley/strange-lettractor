@@ -1,4 +1,4 @@
-(ns attractor.operation-owner (:require [clojure.core :as core]))
+(ns attractor.operation-owner (:require [clojure.core :as core] [async :as async]))
 
 (def ^:dynamic *current-owner* nil)
 (defn- closed-error [] (ex-info "operation is closed" {:category :operation-closed}))
@@ -85,9 +85,9 @@
                 :finish (terminal! o nil)
                 :attempt (let [err (drain! o)]
                            (deliver (:reply cmd) (if err {:err err} {:ok nil}))))
-              ;; Idle between demanded jobs: control latency of a few
-              ;; milliseconds is enough for deadlines and aborts.
-              (core/sleep 5))))
+              ;; Idle between demanded jobs: wake immediately on submission,
+              ;; otherwise re-check control every few milliseconds.
+              (async/alts! [(:wake o) (async/timeout 5)]))))
         (recur)))
     (catch Object e (terminal! o e))))
 
@@ -96,7 +96,7 @@
    Only the coordinator opens/closes child scopes; successful jobs retain them."
   [opts]
   (let [o {:identity (atom nil) :state (atom {:status :running :queue [] :close? false})
-           :scope (atom nil) :done (promise)
+           :scope (atom nil) :done (promise) :wake (async/chan 1)
            :check! (:check! opts) :cleanup! (:cleanup! opts)}]
     (core/future (coordinator! o))
     o))
@@ -111,8 +111,10 @@
     (loop []
       (let [s @(:state o)]
         (if (= :running (:status s))
-          (when-not (compare-and-set! (:state o) s
-                     (update s :queue conj {:type type :fn job :reply reply})) (recur))
+          (if (compare-and-set! (:state o) s
+                                (update s :queue conj {:type type :fn job :reply reply}))
+            (async/offer! (:wake o) true)
+            (recur))
           nil)))
     (loop []
       (cond
@@ -140,5 +142,6 @@
    return to let the coordinator join them, so they only request closure."
   [o]
   (swap! (:state o) assoc :close? true)
+  (async/offer! (:wake o) true)
   (when-not (owned? o) (unwrap @(:done o))))
 (defn closed? [o] (= :closed (:status @(:state o))))

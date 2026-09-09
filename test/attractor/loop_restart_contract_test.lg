@@ -216,8 +216,9 @@
     (is (= reason (:failure_reason result)))
     (is (= limit @handler-count))
     (is (= [{:type :pipeline.failed :error reason}]
-           (filterv (fn [event] (= :pipeline.failed (:type event)))
-                    @events)))
+           (mapv #(select-keys % [:type :error])
+                 (filterv (fn [event] (= :pipeline.failed (:type event)))
+                          @events))))
     (is (= limit
            (count (filter (fn [event]
                             (= :pipeline.restarting (:type event)))
@@ -322,8 +323,9 @@
     (is (= 1 (count (filter (fn [event] (= :stage.started (:type event)))
                             @over-events))))
     (is (= [{:type :pipeline.failed :error reason}]
-           (filterv (fn [event] (= :pipeline.failed (:type event)))
-                    @over-events)))))
+           (mapv #(select-keys % [:type :error])
+                 (filterv (fn [event] (= :pipeline.failed (:type event)))
+                          @over-events))))))
 
 (deftest goal-gate-reroutes-consume-the-shared-step-budget
   (let [graph
@@ -368,8 +370,9 @@
                         (:events at-limit))))
     (is (= [{:type :pipeline.failed
              :error "Pipeline step limit exceeded (1 steps)"}]
-           (filterv (fn [event] (= :pipeline.failed (:type event)))
-                    (:events at-limit))))
+           (mapv #(select-keys % [:type :error])
+                 (filterv (fn [event] (= :pipeline.failed (:type event)))
+                          (:events at-limit)))))
     (is (= "Pipeline step limit exceeded (2 steps)"
            (get-in with-reroute [:result :failure_reason])))
     (is (= ["start"] (:handler-nodes with-reroute)))
