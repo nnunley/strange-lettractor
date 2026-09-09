@@ -56,6 +56,7 @@ below reads the runtime from `LGX_LG`; the `lg` on your `PATH` may be older,
 so always set it:
 
 ```sh
+# or use the Makefile: make build, make test, make run-providers, make models
 export LGX_LG=/path/to/let-go/build/lg   # the fixed local build
 lgx install                              # fetches tiny-tui (pinned in lgx.edn)
 lgx build                                # bin/attractor
