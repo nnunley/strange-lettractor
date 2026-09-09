@@ -338,12 +338,14 @@ coverage, a bounded live implementer trial, pruning of finished entries.
 
 ## Component checkpoint — Attractor spec conformance sweep (2026-09-08, evening)
 
-**Completed:** ATTR-HUM-02 at the hub seam, ATTR-ENG-04, ATTR-SERVER-01,
-ATTR-OBS-01, ATTR-SMOKE-01 (live opt-in). Every `ATTR-*` story is now proved
-or done as a component except ATTR-ART-02 (adopted project extension awaiting
-a discovery/recovery design) and ATTR-READ-01 (deferred on upstream reader
-compatibility); ATTR-HUM-02's standalone stdin path still depends on
-nooga/let-go#822.
+**Completed:** ATTR-HUM-02 (hub seam, then the standalone stdin path over an
+owned line source), ATTR-ENG-04, ATTR-SERVER-01, ATTR-OBS-01, ATTR-SMOKE-01
+(live opt-in), ATTR-ART-02 (persistent artifact index, discovery from run
+state, preservation across resume) and ATTR-READ-01 (native data reader for
+mappings and artifacts on the local runtime's data-reading mode). Every
+`ATTR-*` story in `requirements/attractor.md` is now proved or done as a
+component; the local runtime dependencies are listed in
+`docs/let-go-followups.md`.
 **Defects found and fixed on the way:** quoted integer/boolean DOT attributes
 stayed strings and crashed the retry policy; run directories and ids carried
 the `#uuid` reader tag (now `attractor.ids`); real HTTP requests never routed
@@ -353,5 +355,7 @@ submission).
 
 Evidence: hub console ops 12/69/0; console session 7/73/0; FAIL contract
 3/12/0; SSE live over real HTTP 1/13/0 (three runs); event families 4/65/0;
-live smoke against llama.cpp 1/19/0 (three runs); full suite 834/7757/0; CLI
-build/help and PTY check pass; runtime `aeb44ef4`.
+live smoke against llama.cpp 1/20/0; interviewer timeout 3/11 plus PTY 3/12;
+artifact discovery 3/22/0; composition acceptance 7/169/0; full suite
+840/7796/0; CLI build/help and PTY checks pass; runtime `425d8461` with
+pkg/compiler, pkg/rt, pkg/vm, pkg/api, jank suite and e2e passing.
