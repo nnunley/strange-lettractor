@@ -1,5 +1,5 @@
-(ns session-error-http-fixture-test
-  (:require [clojure.test :refer [deftest is]] [session-error-http-server :as fixture]))
+(ns attractor.session-error-http-fixture-test
+  (:require [clojure.test :refer [deftest is]] [fixtures.session-error-http-server :as fixture]))
 (deftest fixture-counts-and-native-recovery
   (let [counts (atom {}) handler (fixture/make-handler "secret" counts)]
     (is (= "secret" (:body (handler {:path "/ready"}))))

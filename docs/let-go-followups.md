@@ -82,14 +82,14 @@ loopback evidence, tracked as [nooga/let-go #816](https://github.com/nooga/let-g
 active after scope close; public Attractor generation returns `:abort` while its
 HTTP worker remains live. Both probes explicitly release/drain during cleanup.
 
-After the runtime fix, rerun both `dev/http_scope_cancellation_check.lg` and
-`dev/http_llm_cancellation_check.lg` against fresh instances of the bounded
-`dev/http_cancellation_server.go` fixture. Require server-observed cancellation
+After the runtime fix, rerun both `test/probes/http_scope_cancellation_check.lg` and
+`test/probes/http_llm_cancellation_check.lg` against fresh instances of the bounded
+`test/probes/http_cancellation_server.go` fixture. Require server-observed cancellation
 and zero live workers before fixture release, not just a caller-side error.
 Attractor's `controlled-invoke` and stream-monitor ownership were repaired on
 2026-09-08 (`src/attractor/operation_owner.lg`; evidence in
 [LLM operation ownership](llm-operation-ownership.md)), with held-body and
-stream coverage in `dev/llm_ownership_http_check.lg`. The owner joins provider
+stream coverage in `test/probes/llm_ownership_http_check.lg`. The owner joins provider
 work indefinitely, which is only safe because native HTTP is now cancellable.
 
 ## JSON string keys: #817
@@ -115,11 +115,11 @@ main thread mutates the root context's scope field in place. Closing an unrelate
 sibling scope therefore cancels blocking natives (sleep, channel ops, scoped HTTP)
 inside a lazy seq owned by a different, still-live scope. Tracked in
 [nooga/let-go #829](https://github.com/nooga/let-go/issues/829).
-Reproducer: `dev/lazy_scope_isolation_check.lg` (exits 1 while the bug is present).
+Reproducer: `test/probes/lazy_scope_isolation_check.lg` (exits 1 while the bug is present).
 
 Application impact: bounded discovery (`capacity/call!`) opens a child scope per
 probe, and that close interrupted lazy stream HTTP work in the native ownership
-check. Only diagnostic state polls in `dev/llm_ownership_http_check.lg` were
+check. Only diagnostic state polls in `test/probes/llm_ownership_http_check.lg` were
 switched to direct `http/request`; production discovery was NOT removed. After the
 runtime fix, rerun the reproducer (expect exit 0) and the native ownership check,
 then reassess whether stream consumers still need the owner coordinator to hold
@@ -142,7 +142,7 @@ heuristic: `System/nanoTime` is wall-clock here.
 
 The same local runtime streams channel and lazy-seq response bodies with a flush
 per element ([nooga/let-go #831](https://github.com/nooga/let-go/issues/831)).
-`dev/context_discovery_server.lg` relies on it for `held-body`, `held-json`,
+`test/fixtures/context_discovery_server.lg` relies on it for `held-body`, `held-json`,
 `sse` and `tool` scenarios; the released runtime would buffer those bodies and
 the held scenarios would degrade into held headers. Handlers still cannot observe
 client disconnect, so native checks witness cleanup client-side (transport exit,
@@ -170,7 +170,7 @@ output with `with-out-str` inside the evaluation future; with the released
 runtime that output would leak to the hub process's stdout. Note also that
 `*ns*` is process-global and `binding` does not restore it, so the hub switches
 namespaces explicitly with `in-ns` and restores in `finally`; evaluations are
-serialized. After the upstream fix, rerun `dev/hub_console_ops_tests.lg`.
+serialized. After the upstream fix, rerun `test/runner.lg attractor.hub-console-ops-test`.
 
 ## Codex subprocess interop: #813, #814, #815
 

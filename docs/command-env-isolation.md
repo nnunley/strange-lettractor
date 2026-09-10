@@ -26,7 +26,7 @@ is cleaned up in finally. No real secrets or broad filesystem operations used.
   three tests cover all four policies was overbroad; coverage is specified above.
   Explicitly supplied environment values remain intentional child authority.
 
-Focused entrypoint: `dev/execution_env_collision_tests.lg run` with local let-go
+Focused entrypoint: `test/runner.lg attractor.execution-env-collision-test` with local let-go
 and `-source-paths src:test`.
 
 ## Remaining work and build observation

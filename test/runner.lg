@@ -1,0 +1,21 @@
+(ns main
+  "Run one or more test namespaces in isolation:
+     lg -source-paths src:test test/runner.lg attractor.providers-test [more...]
+   Prints the counters map, then the full report only when something failed,
+   and exits 1 on failure. The full suite is `lgx test`."
+  (:require [os :as os]))
+
+(defn -main [& names]
+  (when (empty? names)
+    (println "usage: test/runner.lg <namespace> [namespace...]   e.g. attractor.providers-test")
+    (os/exit 2))
+  ;; Probes required by a test run their own -main when *command-line-args*
+  ;; is non-empty; the runner's arguments are not theirs.
+  (binding [*command-line-args* nil]
+    (doseq [n names] (require (symbol n))))
+  (let [output (with-out-str (clojure.test/run-tests))]
+    (prn clojure.test/*report-counters*)
+    (when-not clojure.test/*test-result* (println output))
+    (os/exit (if clojure.test/*test-result* 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

@@ -39,7 +39,7 @@ contract tests against the snapshot's section 6.5; reran natively and from a
 standalone bundle outside the checkout: 6 tests / 30 assertions / zero failures
 or errors in each, exit 0. The persistent focused runner is now:
 
-`/Users/ndn/development/let-go/lg -source-paths src:test dev/project_docs_tests.lg run`
+`/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.project-docs-test`
 
 Only the evidence index and runner changed; no production behavior or test
 assertions changed in this reconciliation. Complete environment/git metadata and

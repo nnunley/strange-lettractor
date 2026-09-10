@@ -7,7 +7,7 @@ backend cleanup. Queued follow-ups retain ownership; stale callers cannot close
 or evict a successor. Explicit public session abort/close remains session-wide.
 
 Permanent evidence: `test/attractor/turn_ownership_test.lg`, run with
-`/Users/ndn/development/let-go/lg -source-paths src:test dev/turn_ownership_tests.lg run`.
+`/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.turn-ownership-test`.
 Five tests / 85 assertions pass, including stale cancellation/error, direct
 successors, reverse successor-abort isolation, follow-up cancellation cleanup,
 and adoption of a newly published but unadmitted session. Impacted tests pass

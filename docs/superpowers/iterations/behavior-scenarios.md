@@ -267,8 +267,8 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
   events appear, resources/history/queues remain usable, and a later explicit input succeeds
 - Warning-triggered abort/close cannot reopen the session or emit post-terminal events
 - Seam: public agent session plus native loopback HTTP through all four adapters
-- Local proof: `dev/session_error_contract_tests.lg run` — 5 tests / 177 assertions
-- Native proof: `dev/session_error_http_bounded.lg run` — 8 cases with exact request counts
+- Local proof: `test/runner.lg attractor.session-error-contract-test` — 5 tests / 177 assertions
+- Native proof: `test/probes/session_error_http_bounded.lg run` — 8 cases with exact request counts
 - Component only: no incremental SSE or general cancellation/retry conformance claim
 
 ### SCN-HANDLER-MATRIX — Registry-to-engine dispatch
@@ -344,8 +344,8 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
   text-only batch representation and legacy SDK raw-image behavior stay compatible.
 - Seams: native filesystem integration; actual agent-to-provider encoded request
   continuation with recording transports, not live vision/model acceptance.
-- Command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_tests.lg run`
-- Impacted command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_impacted_tests.lg run`
+- Command: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.read-file-test`
+- Impacted command: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.read-file-impacted-test`
 - Status: verified implemented-format component: focused/bundled 14/439,
   impacted 217/1667, default suite 667/6507, zero failures; CLI build/help pass.
   Paired component audit clean. Other image formats, live model acceptance,
@@ -371,7 +371,7 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
   waits after later acknowledged runs see those runs. Closing from a child
   callback cannot self-join; blocked provider work must actually return before
   its completion wait resolves.
-- Command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/subagent_lifecycle_tests.lg run`.
+- Command: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.subagent-lifecycle-test`.
   Focused and external-directory bundle: 12 tests / 106 assertions; impacted
   166/1044, full default suite 679/6613, zero failures; CLI build/help pass.
   Paired spec and quality reviews approve; paired final audit is clean.
@@ -400,7 +400,7 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Given repository instructions larger than 32 KB plus platform, working-directory, and git metadata
 - When the layered system prompt is built
 - Then required metadata is present and instructions are deterministically bounded with an explicit truncation marker
-- Seam: prompt-builder integration. Discovery/budget component implemented in `a38e37a`; `project_docs_contract_test.lg` has 6 tests / 30 assertions, passing natively and bundled. `prompt_metadata_test.lg` adds 3/66 native/bundle proof for two-turn runtime/git snapshots, model labels/cutoff fallbacks and unchanged request model IDs; full suite 722/6992/0. Focused entrypoints: `dev/project_docs_tests.lg run` and `dev/prompt_metadata_tests.lg run`. Sourced catalog cutoff coverage remains pending: `unknown` is an honest fallback, not a verified date. See `docs/prompt-model-metadata.md`.
+- Seam: prompt-builder integration. Discovery/budget component implemented in `a38e37a`; `project_docs_contract_test.lg` has 6 tests / 30 assertions, passing natively and bundled. `prompt_metadata_test.lg` adds 3/66 native/bundle proof for two-turn runtime/git snapshots, model labels/cutoff fallbacks and unchanged request model IDs; full suite 722/6992/0. Focused entrypoints: `test/runner.lg attractor.project-docs-test` and `test/runner.lg attractor.prompt-metadata-test`. Sourced catalog cutoff coverage remains pending: `unknown` is an honest fallback, not a verified date. See `docs/prompt-model-metadata.md`.
 
 ### SCN-FAIL-RETRY-CONTRACT — Returned failure semantics
 
@@ -465,7 +465,7 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Story: CONSOLE-INPUT-01, user-requested console extension.
 - Contract and transcript: `docs/console-requirements.md#scn-console-input`.
 - Seam: pure public reducer, never native reader/evaluator or RPC execution.
-- Evidence: `dev/console_input_tests.lg`, 7 tests / 92 assertions / zero failures.
+- Evidence: `test/runner.lg attractor.console-input-test`, 7 tests / 92 assertions / zero failures.
 - Hub, terminal lifecycle and actual evaluation require separate integration tests.
 
 ## Credential-gated residual scenarios

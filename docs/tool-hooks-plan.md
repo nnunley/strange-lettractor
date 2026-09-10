@@ -105,7 +105,7 @@ Mechanical evidence (local let-go compiler, candidate based on `c373771`):
 Focused reproduction:
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test dev/execution_stdin_tests.lg run
+/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.execution-stdin-test
 ```
 
 For standalone verification, compile that runner with `-b <output>` and execute
@@ -137,7 +137,7 @@ Focused evidence: initial RED 2 tests / 4 pass / 11 fail; final 12 tests / 85
 assertions / zero failures. Impacted agent, loop, truncation and session-error
 checks: 64 tests / 654 assertions / zero failures. Native shell, actual EDN forms,
 eight concurrent sessions, timeouts and running-hook cancellation are included.
-Run `/Users/ndn/development/let-go/lg -source-paths src:test dev/tool_hook_tests.lg run`.
+Run `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.tool-hook-test`.
 The test count includes the final native-cancellation test; a development syntax
 error briefly triggered known let-go #807 silent trailing-form truncation and was
 corrected before these counts. Workflow inheritance, admission and recovery are

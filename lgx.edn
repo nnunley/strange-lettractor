@@ -6,12 +6,11 @@
  :targets {:bin {:out "bin/attractor"}}
 
  :contexts
- {:dev  {:extra-paths ["dev"]}
-  :test {:extra-paths ["test"]}}
+ {:test {:extra-paths ["test"]}}
 
  :tasks
  {suite {:doc "Run Attractor test suite"
-         :do  {:run "test/attractor/runner.lg"}}
+         :do  {:run "test/runner.lg"}}
   validate {:doc "Validate a DOT pipeline"
             :args [{:name :file :type :string}]
             :do  {:run ["main.lg" "validate" :arg/file]}}

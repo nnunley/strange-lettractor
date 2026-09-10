@@ -20,11 +20,11 @@ tiny-tui remains the presentation library for the later TUI.
 ## Chunk 1: framing contract
 
 Files: create `src/attractor/console/input.lg`,
-`test/attractor/console_input_test.lg`, `dev/console_input_tests.lg`.
+`test/attractor/console_input_test.lg`, `test/runner.lg attractor.console-input-test`.
 
 - [x] Write failing tests for plain text, column-zero prefixes, escaped literals,
   known/unknown commands, and blank input.
-- [x] Run `/Users/ndn/development/let-go/lg -source-paths src:test dev/console_input_tests.lg run`;
+- [x] Run `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.console-input-test`;
   verify missing implementation, then assertion failures against a minimal stub.
 - [x] Implement `accept [state event selection]`; events are `{:type :line :text s}`,
   `{:type :interrupt}`, or `{:type :eof}`. Initial state is `{}`. Actions use

@@ -1,4 +1,4 @@
-(ns session-error-http-bounded
+(ns probes.session-error-http-bounded
   (:require [attractor.execution :as execution] [os :as os]))
 
 (defn command [args]
@@ -7,7 +7,7 @@
         port (when raw (when (re-matches #"[0-9]+" raw) (parse-long raw)))]
     (when (and raw (not (and port (<= 1024 port 65535))))
       (throw (ex-info "Expected nonprivileged port in 1024..65535" {})))
-    (str "/Users/ndn/development/let-go/lg -source-paths src:test:dev dev/session_error_http_check.lg run"
+    (str "/Users/ndn/development/let-go/lg -source-paths src:test test/probes/session_error_http_check.lg run"
          (when port (str " " port)))))
 
 (defn -main [& args]

@@ -25,7 +25,7 @@ does both, in let-go:
 Every claim in the ledgers is backed by a runnable check in the behavior
 corpus; the full suite is `lgx test`. What is not closed is stated in the
 ledgers rather than implied: live OpenAI/Anthropic/Gemini parity needs real
-API keys for `dev/provider_matrix_live.lg`, and the partial coding-loop rows
+API keys for `test/live/provider_matrix.lg`, and the partial coding-loop rows
 list their residuals. Full specification conformance is therefore claimed at
 component level, not as a live release.
 
@@ -57,6 +57,9 @@ so always set it:
 
 ```sh
 # or use the Makefile: make build, make test, make run-providers, make models
+# Layout: src/ code; test/attractor/ suites; test/fixtures/ loopback servers;
+# test/live/ credential-gated gates; test/probes/ manual checks and let-go
+# issue reproducers; test/runner.lg runs one namespace in isolation.
 export LGX_LG=/path/to/let-go/build/lg   # the fixed local build
 lgx install                              # fetches tiny-tui (pinned in lgx.edn)
 lgx build                                # bin/attractor

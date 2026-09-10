@@ -18,6 +18,6 @@ This does not claim isolation for all inherited wrapper-name collisions.
 - [x] Run focused native/bundle tests, full suite, CLI build/help and diff review.
 - [x] Record residuals, commit named files and push public checkpoint.
 
-Focused command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/execution_env_collision_tests.lg run`.
+Focused command: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.execution-env-collision-test`.
 No secrets, runtime edits, Go/Python helper, server configuration change, or
 weakened default secret filter is needed.

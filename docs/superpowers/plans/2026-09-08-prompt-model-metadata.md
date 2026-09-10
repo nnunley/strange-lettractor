@@ -24,8 +24,8 @@ honest fallback, not evidence that the catalog metadata requirement is complete.
   profile overrides, alias lookup, unknown model and mismatched-provider fallback;
   request model identity remains unchanged. Use controlled environment inspection,
   not live shell/model calls. Close every session in finally.
-- [x] Add `dev/prompt_metadata_tests.lg` following existing focused runner pattern.
-  Run `/Users/ndn/development/let-go/lg -source-paths src:test dev/prompt_metadata_tests.lg run`;
+- [x] Add `test/runner.lg attractor.prompt-metadata-test` following existing focused runner pattern.
+  Run `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.prompt-metadata-test`;
   require intended metadata assertion failures, no fixture errors.
 - [x] In `src/attractor/agent.lg` only, pass profile into environment snapshot,
   resolve nonblank strings using existing `llm/get-model-info`, constrain catalog
@@ -33,7 +33,7 @@ honest fallback, not evidence that the catalog metadata requirement is complete.
   Conceptually: display = profile display OR catalog display OR raw model;
   cutoff = profile cutoff OR catalog cutoff OR `unknown`.
 - [x] Rerun focused tests; inspect diff for unrelated changes. Bundle focused
-  runner with `lg -source-paths src:test -b <temporary-path> dev/prompt_metadata_tests.lg`
+  runner with `lg -source-paths src:test -b <temporary-path> test/runner.lg attractor.prompt-metadata-test`
   and run outside checkout. Run full local-lg `lgx test`, build and help.
 - [x] Record exact results and limits in conformance evidence, commit only named
   files, fast-forward root and push public main/console. Never touch private notes.

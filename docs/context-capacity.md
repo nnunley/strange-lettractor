@@ -51,10 +51,10 @@ runtimes report `:runtime-prerequisite` without starting an HTTP request.
 With `LGX_LG` set to the fixed runtime, run:
 
 ```sh
-"$LGX_LG" -source-paths src:test dev/context_discovery_tests.lg run
-"$LGX_LG" -source-paths src:test dev/context_transport_tests.lg run
-"$LGX_LG" -source-paths src:test dev/context_discovery_http_check.lg run
-"$LGX_LG" -source-paths src dev/context_capacity_check.lg http://model-host/v1 deployed-model
+"$LGX_LG" -source-paths src:test test/runner.lg attractor.context-discovery-test
+"$LGX_LG" -source-paths src:test test/runner.lg attractor.context-transport-test
+"$LGX_LG" -source-paths src:test test/probes/context_discovery_http_check.lg run
+"$LGX_LG" -source-paths src test/probes/context_capacity_check.lg http://model-host/v1 deployed-model
 ```
 
 Loopback tests require permitted local sockets and OpenBSD-compatible `nc` for

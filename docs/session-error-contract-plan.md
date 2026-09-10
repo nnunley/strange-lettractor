@@ -56,7 +56,7 @@ separate pending requirements; this slice must not claim they are solved.
 
 Files: modify `src/attractor/agent.lg`; create
 `test/attractor/session_error_contract_test.lg` and
-`dev/session_error_contract_tests.lg` (standalone focused/bundle runner).
+`test/runner.lg attractor.session-error-contract-test` (standalone focused/bundle runner).
 
 - [x] Add RED public tests for typed stream auth and context failures, plus
   complete_fn and thrown-stream context failures. Assert original SDK data,
@@ -69,7 +69,7 @@ Files: modify `src/attractor/agent.lg`; create
 - [x] Add callback-triggered abort/close during the context warning: no reopened
   session, no duplicate session end or post-terminal events.
 - [x] Run `/Users/ndn/development/let-go/lg -source-paths src:test
-  dev/session_error_contract_tests.lg run`; record expected lifecycle/category
+  test/runner.lg attractor.session-error-contract-test`; record expected lifecycle/category
   assertion failures before production changes.
 - [x] In `stream-response!`, throw an error unchanged when its `ex-data` has an
   SDK category; keep the existing untyped custom-event wrapper otherwise.
@@ -81,7 +81,7 @@ Files: modify `src/attractor/agent.lg`; create
 
 ## Chunk 2: Real HTTP and delivery evidence
 
-Parent owns `dev/session_error_http_check.lg`, the let-go-authored fixture server,
+Parent owns `test/probes/session_error_http_check.lg`, the let-go-authored fixture server,
 and `docs/session-error-contract.md`. Do not extend the handwritten Go server;
 replace its use with let-go source, using AOT/gogen if appropriate. Report concrete
 tooling gaps instead of silently falling back to handwritten Go.

@@ -62,7 +62,7 @@ roadmap, progress and iteration log with exact component boundaries.
 Runtime for commands:
 `/Users/ndn/development/attractor/.worktrees/let-go-http-cancellation/build/lg`.
 Focused RED command:
-`RUNTIME -source-paths src:test dev/llm_cancellation_ownership_tests.lg run`.
+`RUNTIME -source-paths src:test test/runner.lg attractor.llm-cancellation-ownership-test`.
 Full command: `LGX_LG=RUNTIME lgx test` (substitute the exact executable above).
 
 ## Audit notes

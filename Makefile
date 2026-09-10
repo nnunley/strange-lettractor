@@ -19,10 +19,11 @@ LGX_LG ?= $(firstword $(wildcard $(CANDIDATES)))
 LG := $(LGX_LG)
 LGX := lgx
 TINY_TUI := $(firstword $(wildcard $(HOME)/.lgx/gitlibs/github.com/abogoyavlensky/tiny-tui/*/src))
-SOURCE_PATHS := src:test:dev$(if $(TINY_TUI),:$(TINY_TUI))
+SOURCE_PATHS := src:test$(if $(TINY_TUI),:$(TINY_TUI))
+RUNNER := test/runner.lg
 TIMEOUT ?= 1500
 
-RUNNERS := $(wildcard dev/*_tests.lg)
+TEST_FILES := $(wildcard test/attractor/*_test.lg)
 
 .PHONY: help check-runtime install build test suite runners live-matrix live-smoke \
         providers models clean distclean
@@ -30,7 +31,7 @@ RUNNERS := $(wildcard dev/*_tests.lg)
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "Targets (runtime: %s)\n", "$(LG)"} \
 	     /^[a-zA-Z_-]+:.*?##/ { printf "  %-14s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@printf "  %-14s %s\n" "run-<name>" "One focused runner: make run-providers runs dev/providers_tests.lg"
+	@printf "  %-14s %s\n" "run-<name>" "One test namespace: make run-providers runs attractor.providers-test"
 
 check-runtime: ## Fail unless LGX_LG names an executable let-go runtime
 	@test -x "$(LG)" || { echo "LGX_LG is not an executable runtime: '$(LG)'"; \
@@ -49,23 +50,23 @@ test: check-runtime ## Full suite through lgx (about two minutes)
 
 suite: test ## Alias for test
 
-runners: check-runtime ## Every focused dev/*_tests.lg runner, one line each
-	@fail=0; for r in $(RUNNERS); do \
-	  printf '%-44s ' "$$r"; \
-	  out=$$(perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) "$$r" run 2>&1 \
-	        | grep -E -m1 '^\{:error|^Finished running tests'); \
+runners: check-runtime ## Every test namespace in its own process, one summary line each
+	@fail=0; for f in $(TEST_FILES); do \
+	  ns=attractor.$$(basename "$$f" .lg | tr _ -); printf '%-52s ' "$$ns"; \
+	  out=$$(perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) "$$ns" 2>&1 \
+	        | grep -E -m1 '^\{:error'); \
 	  echo "$${out:-no summary line (load or runtime error)}"; \
-	  case "$$out" in *":error 0,"*":fail 0}"*|*"Fail: 0 Error: 0"*) ;; *) fail=1;; esac; \
+	  case "$$out" in *":error 0,"*":fail 0}"*) ;; *) fail=1;; esac; \
 	done; exit $$fail
 
-run-%: check-runtime ## One focused runner, e.g. make run-providers (dev/providers_tests.lg)
-	perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) dev/$*_tests.lg run
+run-%: check-runtime ## One test namespace, e.g. make run-providers (attractor.providers-test)
+	perl -e 'alarm 600; exec @ARGV' "$(LG)" -source-paths $(SOURCE_PATHS) $(RUNNER) attractor.$(subst _,-,$*)-test
 
 live-matrix: check-runtime ## Credential-gated provider matrix (registry keys; ATTRACTOR_MATRIX_PROVIDERS=a,b to restrict)
-	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test dev/provider_matrix_live.lg run
+	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/provider_matrix.lg run
 
 live-smoke: check-runtime ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
-	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test dev/attractor_smoke_live.lg run
+	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
 
 providers: build ## Show the effective provider registry
 	bin/attractor providers

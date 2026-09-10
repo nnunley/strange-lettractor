@@ -27,7 +27,7 @@ override/catalog/alias/provider-mismatch cases, blank/nonstring fallback, unchan
 request model IDs and final user override. Synthetic cutoff dates are fixture
 data only. All sessions close in finally; no model credentials are needed.
 
-Run: `/Users/ndn/development/let-go/lg -source-paths src:test dev/prompt_metadata_tests.lg run`.
+Run: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.prompt-metadata-test`.
 
 - RED: 3 tests / 26 passing / 40 failing assertions / zero errors.
 - Native GREEN and outside-checkout bundle: each 3 tests / 66 assertions /

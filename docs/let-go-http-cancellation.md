@@ -63,13 +63,13 @@ or `:timeout` options; forwarding them is not proof of native support.
 
 ## Real socket reproduction
 
-Run `go run dev/http_cancellation_server.go` from this worktree. It prints a
+Run `go run test/probes/http_cancellation_server.go` from this worktree. It prints a
 loopback URL. In another shell run one of the following, replacing URL with that
 address. Use a fresh fixture server for each check.
 
 ```sh
-/Users/ndn/development/let-go/lg dev/http_scope_cancellation_check.lg URL
-/Users/ndn/development/let-go/lg -source-paths src dev/http_llm_cancellation_check.lg URL
+/Users/ndn/development/let-go/lg test/probes/http_scope_cancellation_check.lg URL
+/Users/ndn/development/let-go/lg -source-paths src test/probes/http_llm_cancellation_check.lg URL
 ```
 
 The server confirms receipt of a held request before the caller cancels. It

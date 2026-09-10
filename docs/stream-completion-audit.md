@@ -13,7 +13,7 @@ Use `:text` analogously for completed text.
 Run from the repository root with the local Go-based runtime:
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src dev/stream_completion_check.lg run
+/Users/ndn/development/let-go/lg -source-paths src test/probes/stream_completion_check.lg run
 ```
 
 This calls the public `llm/stream` API with an injected, offline SSE transport.
@@ -86,7 +86,7 @@ continue to append only delta events.
 
 The permanent `attractor.stream-completion-test` namespace covers this contract
 through the public high-level streaming API with offline provider transports.
-`dev/stream_completion_tests.lg` is a direct/bundled entrypoint for the same tests.
+`test/runner.lg attractor.stream-completion-test` is a direct/bundled entrypoint for the same tests.
 Native duplicate transport-packet handling and OpenAI reasoning-summary event
 normalization remain separate streaming work; this change does not establish
 full streaming conformance, live provider parity, or complete Attractor support.
@@ -110,7 +110,7 @@ full streaming conformance, live provider parity, or complete Attractor support.
 Bundle verification commands (choose an existing temporary destination):
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test -b /tmp/stream-completion-check dev/stream_completion_tests.lg
+/Users/ndn/development/let-go/lg -source-paths src:test -b /tmp/stream-completion-check test/runner.lg attractor.stream-completion-test
 ```
 
 Run that binary with `run` from outside the checkout. The explicit entrypoint

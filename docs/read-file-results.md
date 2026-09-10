@@ -42,8 +42,8 @@ or omitted. Omitted content retains each provider's prior wire representation.
 ## Mechanical evidence
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_tests.lg run
-/Users/ndn/development/let-go/lg -source-paths src:test dev/read_file_impacted_tests.lg run
+/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.read-file-test
+/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.read-file-impacted-test
 ```
 
 Focused and bundled evidence: 14 tests / 439 assertions. Impacted evidence:

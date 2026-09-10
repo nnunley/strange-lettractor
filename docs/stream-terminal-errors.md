@@ -47,10 +47,10 @@ bytecode, not native Go AOT lowering. Independent spec and quality reviews passe
 Real HTTP verification uses the bounded, loopback-only fixture:
 
 ```sh
-go run dev/http_error_server.go
+go run test/probes/http_error_server.go
 # In another terminal, substitute its printed loopback URL:
 /Users/ndn/development/let-go/lg -source-paths src \
-  dev/stream_terminal_http_check.lg http://127.0.0.1:PORT
+  test/probes/stream_terminal_http_check.lg http://127.0.0.1:PORT
 ```
 
 All **four cases passed**. Each provider sent `partial`, an error, then late text
@@ -63,7 +63,7 @@ An initial checker run used the wrong partial-response field (`:text` rather tha
 `[:message :text]`); it was corrected before this passing run and is not RED
 implementation evidence.
 
-The existing `dev/http_error_check.lg` was also rerun against the extended
+The existing `test/probes/http_error_check.lg` was also rerun against the extended
 fixture: all **13 HTTP-error cases passed**, including the held-body abort case.
 
 ## Remaining boundaries

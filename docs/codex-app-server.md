@@ -27,10 +27,10 @@ conversation or a second workflow engine.
 - Selected as `bin/attractor agent codex`, `--agent codex` (DOT runs) or
   `/agent codex` (console).
 
-Evidence: `dev/codex_transport_tests.lg` 4 tests / 41 assertions (duplex
+Evidence: `test/runner.lg attractor.codex-transport-test` 4 tests / 41 assertions (duplex
 exchange, split/coalesced/delayed frames, malformed/partial-EOF/stderr-flood
 failures reported once, ignore-EOF child killed by exact PID);
-`dev/codex_agent_tests.lg` 3 / 15 (completed turn with deltas, failed turn,
+`test/runner.lg attractor.codex-agent-test` 3 / 15 (completed turn with deltas, failed turn,
 refused approval, invalid options, interrupt on cancel). The live server's
 rejection of an object-shaped `sandbox` during development is what fixed the
 wire format (`SandboxMode` strings, not `SandboxPolicy` objects).
@@ -97,7 +97,7 @@ not JVM-shaped replacements; retain the shutdown gate while resolving #814.
 Run from the Codex worktree root:
 
 ```sh
-/Users/ndn/development/let-go/lg dev/codex_fixture_smoke.lg
+/Users/ndn/development/let-go/lg test/probes/codex_fixture_smoke.lg
 /Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
 ```
 
@@ -132,8 +132,8 @@ failure. The missing-transport contract remains deliberately failing; this is
 not a green release checkpoint.
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test dev/codex_framing_check.lg run
-/Users/ndn/development/let-go/lg -source-paths src:test -b <temporary-output>/framing-check dev/codex_framing_check.lg
+/Users/ndn/development/let-go/lg -source-paths src:test test/probes/codex_framing_check.lg run
+/Users/ndn/development/let-go/lg -source-paths src:test -b <temporary-output>/framing-check test/probes/codex_framing_check.lg
 # From outside the repository:
 <temporary-output>/framing-check run
 ```

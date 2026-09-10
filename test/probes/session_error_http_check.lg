@@ -67,7 +67,7 @@
   (let [token (str "session-" (rand-int 1000000000))
         base (str "http://127.0.0.1:" port)
         env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none :max_command_timeout_ms 30000})
-        command (str "/Users/ndn/development/let-go/lg " (quote-shell (str (os/cwd) "/dev/session_error_http_server.lg"))
+        command (str "/Users/ndn/development/let-go/lg " (quote-shell (str (os/cwd) "/test/fixtures/session_error_http_server.lg"))
                      " " port " " token)
         worker (future ((:exec_command env) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
     (try

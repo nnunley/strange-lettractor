@@ -56,7 +56,7 @@
   (let [runtime (os/getenv "LGX_LG") port (+ 30000 (rand-int 20000))
         env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none
                                                 :max_command_timeout_ms 15000})
-        command (str (quote-shell runtime) " " (quote-shell (str (os/cwd) "/dev/context_held_body.lg"))
+        command (str (quote-shell runtime) " " (quote-shell (str (os/cwd) "/test/fixtures/context_held_body.lg"))
                      " | nc -l 127.0.0.1 " port)
         worker (future ((:exec_command env) command 15000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
     (try

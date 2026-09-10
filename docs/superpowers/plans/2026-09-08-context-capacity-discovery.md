@@ -81,7 +81,7 @@ runtime rt/vm/api package tests and vet pass; these fixes are not yet upstream.
 ## Chunk 1: Native discovery and adapter capability
 
 Files: `src/attractor/context_discovery.lg`, `src/attractor/llm.lg`,
-`test/attractor/context_discovery_test.lg`, `dev/context_discovery_tests.lg`.
+`test/attractor/context_discovery_test.lg`, `test/runner.lg attractor.context-discovery-test`.
 
 - [x] Add tests through existing `llm/make-adapter` proving the optional
   `:discover_context` callback is preserved. Demonstrate failure before editing.
@@ -127,7 +127,7 @@ Files: `src/attractor/agent.lg`, `test/attractor/context_capacity_test.lg`.
   held headers/body, timeout/abort cleanup and same-runtime capability checks.
   Keep server/helper process lifetime owned and bounded.
 - [x] Run focused native tests with the fixed local runtime, then bundle the
-  runner using `lg -source-paths src:test -b TEMP/runner dev/context_discovery_tests.lg`
+  runner using `lg -source-paths src:test -b TEMP/runner test/runner.lg attractor.context-discovery-test`
   and run it outside the checkout.
 - [x] Read live ndn.local capacity through the actual discovery implementation;
   do not hardcode the observed number or modify server configuration.

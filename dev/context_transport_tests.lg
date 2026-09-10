@@ -1,7 +1,0 @@
-(ns main (:require [attractor.context-discovery-test] [os :as os]))
-(defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
-(when *command-line-args* (apply -main *command-line-args*))

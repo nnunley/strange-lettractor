@@ -19,13 +19,13 @@ Run from the checkout with `/Users/ndn/development/let-go/lg` (tested dev bdd826
 
 ```sh
 /Users/ndn/development/let-go/lg -source-paths src:test \
-  dev/session_error_contract_tests.lg run
-/Users/ndn/development/let-go/lg -source-paths src:test:dev \
-  dev/session_error_http_fixture_tests.lg run
-/Users/ndn/development/let-go/lg -source-paths src:test:dev \
-  dev/session_error_http_bounded_test.lg
-/Users/ndn/development/let-go/lg -source-paths src:test:dev \
-  dev/session_error_http_bounded.lg run
+  test/runner.lg attractor.session-error-contract-test
+/Users/ndn/development/let-go/lg -source-paths src:test \
+  test/runner.lg attractor.session-error-http-fixture-test
+/Users/ndn/development/let-go/lg -source-paths src:test \
+  test/attractor/session_error_http_bounded_test.lg
+/Users/ndn/development/let-go/lg -source-paths src:test \
+  test/probes/session_error_http_bounded.lg run
 ```
 
 - Core baseline RED: 5 tests, 113 passing / 64 failing assertions on main 699f26b.

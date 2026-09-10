@@ -30,12 +30,12 @@ Final worktree full suite: 596 tests, 5,131 assertions, zero failures, exit 0.
 Fresh main verification after integrating `9543aaa` passes the same 596/5,131/0;
 the rebuilt main CLI's `help` also exits 0.
 
-Real socket checks use `dev/http_error_server.go` and `dev/http_error_check.lg`:
+Real socket checks use `test/probes/http_error_server.go` and `test/probes/http_error_check.lg`:
 
 ```sh
-go run dev/http_error_server.go
+go run test/probes/http_error_server.go
 # In another shell, replace URL with the loopback address it prints:
-/Users/ndn/development/let-go/lg -source-paths src dev/http_error_check.lg URL
+/Users/ndn/development/let-go/lg -source-paths src test/probes/http_error_check.lg URL
 ```
 
 All 13 cases pass, exit 0, with independent server request counts:

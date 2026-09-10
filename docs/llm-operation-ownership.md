@@ -73,8 +73,8 @@ below as a residual limitation instead.
   unconsumed stream drained by parent scope close, silent close after abort,
   stale registration rejection, bounded tool dispatch and no coordinator leak
   on invalid options: 9 tests / 35 assertions.
-- Native OpenAI loopback `dev/llm_ownership_http_check.lg` against the let-go
-  fixture `dev/context_discovery_server.lg`: held headers, held SSE body with
+- Native OpenAI loopback `test/probes/llm_ownership_http_check.lg` against the let-go
+  fixture `test/fixtures/context_discovery_server.lg`: held headers, held SSE body with
   partial output preserved, held JSON body, each × abort/total/per-step; normal
   paced multi-chunk stream and tool continuation with every body closed exactly
   once and zero surviving workers. 3 tests / 67 assertions, run twice.
@@ -89,7 +89,7 @@ below as a residual limitation instead.
 - nooga/let-go#829: lazy-seq thunks realize under the root execution context.
   Work inside a thunk is not cancelled by closing the owned scope; cancellation
   reaches it only through registered body closers and the combined signal.
-  Reproducer `dev/lazy_scope_isolation_check.lg` exits 1 until fixed.
+  Reproducer `test/probes/lazy_scope_isolation_check.lg` exits 1 until fixed.
 - nooga/let-go#830: `scope-cancelled?` is local; `sleep` returns silently on
   cancellation, so without it an idle coordinator spins.
 - nooga/let-go#831: streamed `http/serve` bodies are local; without them the

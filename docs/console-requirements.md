@@ -58,7 +58,7 @@ namespace with interned `hub`, `request!`, `events-since`, `*session*`,
 errors rendered), `:workflow/run|cancel|list` (hub-owned pipeline runs with
 cooperative cancellation) and `:agent/run|cancel|list` (owned external
 agent jobs through the registered connectors). Every source shares the
-bounded event log. Evidence 2026-09-08: `dev/hub_console_ops_tests.lg` 6 tests /
+bounded event log. Evidence 2026-09-08: `test/runner.lg attractor.hub-console-ops-test` 6 tests /
 33 assertions with the fixture provider, a mock DOT workflow and the let-go
 worker fixture, including busy, cancel-leaves-hub-alive and failure paths.
 Requires the local runtime's context-aware `eval` (nooga/let-go#833).
@@ -70,10 +70,10 @@ Stories: CONSOLE-CONTROL-01, CONSOLE-EVAL-01 (client side), CONSOLE-INPUT-02
 dispatcher (attachment, focus, reducer state, rendering of identified events);
 `attractor.console.line` is the streaming line frontend; `attractor console`
 starts an in-process hub with the run/resume model, worker and interviewer
-configuration. Evidence: `dev/console_session_tests.lg` 4 / 39 (agent text,
+configuration. Evidence: `test/runner.lg attractor.console-session-test` 4 / 39 (agent text,
 eval values/errors/multiline/selection binding, /run + /claude + /agents +
 /focus + /cancel + escapes, interrupt routing, quit detaches without stopping
-the hub); `dev/console_line_tests.lg` 2 / 12 (scripted transcript, EOF).
+the hub); `test/runner.lg attractor.console-line-test` 2 / 12 (scripted transcript, EOF).
 Live: a Qwen turn through `attractor console --model qwen3.8-27b --provider
 openai-compat` (the provider was then still named `ollama`) against llama.cpp returned `console connected` and `turn complete`.
 
@@ -83,8 +83,8 @@ Story: CONSOLE-TUI-01, CONSOLE-INPUT-02 (TUI part). `attractor.console.tui`
 runs the same dispatcher on tiny-tui (pinned `v0.1.3`, `3d2aeaa6`) with an
 app-owned reader merging keys and hub-event ticks; Ctrl-C discards a draft,
 cancels busy focused work, or quits when idle. Evidence:
-`dev/console_tui_tests.lg` 2 / 13 headless (scripted keys, captured frames);
-`dev/console_pty_check.lg` 2 / 11 drives the built CLI under a real
+`test/runner.lg attractor.console-tui-test` 2 / 13 headless (scripted keys, captured frames);
+`test/probes/console_pty_check.lg` 2 / 11 drives the built CLI under a real
 pseudo-terminal through script(1): alternate screen entered and restored,
 status line, echoed input, mock reply, evaluation, exit 0, and the line
 frontend quitting on EOF. Resize and exception-restoration cases are not yet
@@ -117,8 +117,8 @@ Human gates no longer read stdin under the console. The hub publishes each
 `timeout_seconds`; the console renders `[run id] ? text` with `[key] label`
 lines and answers through `/answer <key or text>` (focused run first, or the
 only waiting run). `/list` marks runs "waiting for an answer"; `--auto-approve`
-now merely selects the first option. Evidence: `dev/hub_console_ops_tests.lg`
-12 tests / 68 assertions and `dev/console_session_tests.lg` 7 / 73. This
+now merely selects the first option. Evidence: `test/runner.lg attractor.hub-console-ops-test`
+12 tests / 68 assertions and `test/runner.lg attractor.console-session-test` 7 / 73. This
 closes the console's "cannot answer human gates" limitation and proves
 ATTR-HUM-02 at the hub seam; the standalone stdin interviewer is unchanged.
 
@@ -134,7 +134,7 @@ including code-looking literals, unknown commands, multiline character literals,
 delimiter near misses, draft-only cancellation and selection changes before/after
 submission. No models, shell processes or reader evaluation belong at this seam.
 
-Command: `/Users/ndn/development/let-go/lg -source-paths src:test dev/console_input_tests.lg run`.
+Command: `/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.console-input-test`.
 
 ## Baseline
 

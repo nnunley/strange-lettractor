@@ -1,4 +1,4 @@
-(ns session-error-http-server
+(ns fixtures.session-error-http-server
   (:require [http :as http] [json :as json] [clojure.string :as str]))
 
 (defn frame [event body]

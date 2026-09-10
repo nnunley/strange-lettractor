@@ -100,7 +100,7 @@ integration. Do not imply exactly-once execution.
 
 Story component CONSOLE-HUB-01A; scenario SCN-HUB-AGENT-OWNERSHIP. Public integration
 tests in `test/attractor/hub_session_test.lg`, focused runner
-`dev/hub_session_tests.lg`. Native let-go fixtures; no handwritten Go/Python server.
+`test/runner.lg attractor.hub-session-test`. Native let-go fixtures; no handwritten Go/Python server.
 
 1. Actual fixture-provider agent session completes a tool-free turn and a follow-up
    with preserved history. Observe session/turn-tagged events before final completion.
@@ -125,7 +125,7 @@ saturation and requests already admitted behind stop, not just sequential stop.
 
 Use bounded promises/barriers, not timing-only sleeps. Record failing assertions
 before implementation. Focused command:
-`/Users/ndn/development/let-go/lg -source-paths src:test dev/hub_session_tests.lg run`.
+`/Users/ndn/development/let-go/lg -source-paths src:test test/runner.lg attractor.hub-session-test`.
 After code freezes, run impacted agent/lifecycle tests, full local-lg `lgx test`,
 outside-checkout focused bundle and CLI build/help. Paired spec/quality/audit gates
 precede commit and public push. Baseline before this component: 686/6705/0.

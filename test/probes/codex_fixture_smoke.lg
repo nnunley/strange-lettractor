@@ -1,4 +1,4 @@
-;; Run from repository root: lg dev/codex_fixture_smoke.lg
+;; Run from repository root: lg test/probes/codex_fixture_smoke.lg
 ;; Independent Go interop evidence; does not load the unfinished transport.
 (require '[os :as os] '[io :as io] '[json :as json]
          '[clojure.core :as core] '[clojure.string :as str])

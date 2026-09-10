@@ -4,7 +4,7 @@ Source: coding-agent-loop spec §7.2–7.3, §9.1, §9.9 and §9.11; CAL-SUBAGEN
 SCN-CAL-SUBAGENTS. This component does not close the full story or iteration.
 
 Baseline at `39338c4`: full suite 667 tests / 6507 assertions / zero failures.
-The native public-API probe `dev/subagent_lifecycle_probe.lg run` reproduces:
+The native public-API probe `test/probes/subagent_lifecycle_probe.lg run` reproduces:
 close returns `:closed`, then provider completion changes the handle to
 `:completed` with `:success true`, despite the child remaining closed.
 Root cause: unconditionally publishing completion after `process-input!` returns;

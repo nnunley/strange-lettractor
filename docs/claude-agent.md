@@ -89,8 +89,8 @@ authenticated Claude trial:
 
 ```sh
 export LGX_LG="$HOME/development/let-go/lg"
-"$LGX_LG" -source-paths src:test dev/claude_agent_tests.lg run
-"$LGX_LG" -source-paths src:test dev/claude_cli_tests.lg run
+"$LGX_LG" -source-paths src:test test/runner.lg attractor.claude-agent-test
+"$LGX_LG" -source-paths src:test test/runner.lg attractor.claude-cli-test
 ```
 
 The fixture subprocess also uses `LGX_LG`; without it, it resolves `lg` from PATH,
