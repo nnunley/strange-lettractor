@@ -13,3 +13,6 @@ bin/
 
 # local provider registry (see attractor.edn.sample)
 attractor.edn
+
+# private notes, never committed
+docs/notes.md
