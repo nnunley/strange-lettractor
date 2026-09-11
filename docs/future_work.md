@@ -79,6 +79,40 @@ refresh cache. It makes a provider's effective definition depend on a
 network fetch and cache age. A read-only capability catalogue kept apart
 from auth would be a separate, smaller change.
 
+## Kilroy's text-to-DOT ingestion and CXDB (requested 2026-09-10)
+
+[Kilroy](https://github.com/danshapiro/kilroy), the Go Attractor
+implementation evener was forked from, has two capabilities worth studying.
+
+**Text to DOT (`attractor ingest`).** Kilroy turns English requirements into
+a Graphviz pipeline (`kilroy attractor ingest -o pipeline.dot "Solitaire
+plz"`) by running the Claude CLI with a `create-dotfile` skill, then feeding
+the result to `attractor validate`. Its docs carry a StrongDM
+`ingestor-spec.md` that is not in our upstream snapshot; read it first.
+Relevant code: `cmd/kilroy/ingest.go`, `internal/attractor/ingest/`, the
+skill under `skills/create-dotfile/` (also `.gemini/skills/english-to-dotfile`),
+and demo pipelines under `demo/`. Here the pieces already exist: the
+`claude` and `codex` agents, the hub's `:agent/run`, and `bin/attractor
+validate`. Exploration should settle whether ingestion is a CLI command, a
+console command, or itself an Attractor pipeline (draft, validate, repair
+until valid), and how validation diagnostics are fed back to the drafting
+agent.
+
+**CXDB integration.** CXDB is Kilroy's execution database: typed run events
+(run started, stage finished, checkpoint saved, run completed or failed), a
+blob store for logs, outputs and archives, and run metadata such as the logs
+root and checkpoint pointers written into the same timeline, so a run can
+resume from CXDB alone. Kilroy talks to it over a binary msgpack protocol and
+HTTP (`internal/cxdb/`, `internal/attractor/engine/cxdb_*.go`,
+`scripts/start-cxdb.sh`). Ours keeps the same information in three places:
+the hub's in-memory event log, `artifacts/index.edn` on disk, and
+`checkpoint.edn`. Exploration should decide whether CXDB becomes an optional
+event sink and artifact backend behind the existing event families and
+artifact store, whether resume can read a CXDB timeline, and whether an
+HTTP-only client in let-go is enough before the binary protocol. It would
+also give the shared hub transport, below, a durable event history across
+processes.
+
 ## Shared hub transport (requested 2026-09-09)
 
 Since 2026-09-09 every CLI command (`run`, `resume`, `agent`, `console`)
