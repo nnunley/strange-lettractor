@@ -206,7 +206,9 @@ The local runtime's `http/request` honours `:timeout {:connect s :request s
 :stream_read s}` (a bare number or `:timeout_ms` is the request scope): a
 pooled transport per dial timeout, a context deadline for the whole cycle
 (headers only for `:as :stream`), and a per-read gap timer on the streamed
-body that cancels the request when a chunk is late. Errors are
+body that cancels the request when a chunk is late (the first chunk is
+bounded by the request scope, since a model may process a long prompt before
+its first token). Errors are
 `http <scope> timeout after <d>`
 ([nooga/let-go #844](https://github.com/nooga/let-go/issues/844)).
 `io/line-seq` now ends a sequence only on `io.EOF`; any other read error is

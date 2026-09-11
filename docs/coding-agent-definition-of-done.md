@@ -18,6 +18,6 @@ Verified 2026-09-10, full suite 916 tests / 8733 assertions / 0 failures.
 | 9.9 Subagents | `subagent_lifecycle_test.lg`, `agent_subagent_wire_test.lg` |
 | 9.10 Event system | `event_families_test.lg`, `agent_loop_wire_test.lg`, `agent_error_wire_test.lg` (terminal order) |
 | 9.11 Error handling | `agent_error_wire_test.lg` (429/503 retried, auth fatal), `session_error_contract_test.lg` (context overflow warning), `turn_ownership_test.lg` (shutdown sequence) |
-| 9.12 Parity matrix | `agent_parity_matrix_wire_test.lg`: every row for openai, anthropic and gemini with a scripted model through the real adapters; live models via `make live-matrix` (`test/live/provider_matrix.lg`), passing on OpenRouter and Ollama Cloud, blocked on funded native keys |
+| 9.12 Parity matrix | `agent_parity_matrix_wire_test.lg`: every row for openai, anthropic and gemini with a scripted model through the real adapters; live rows via `make live-parity` (`test/live/parity_matrix.lg`): 8/8 on `llamacpp/qwen3.8-27b`; native OpenAI/Anthropic/Gemini cells await funded keys |
 
 Focused run of any row: `make run-<namespace>`, e.g. `make run-agent_parity_matrix_wire`.

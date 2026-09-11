@@ -278,3 +278,17 @@
             (is (true? (:retryable error)))
             (is (= :connect (:scope error)))
             (is (< (- (System/currentTimeMillis) started) 3000))))))))
+
+(deftest a-stall-before-the-first-chunk-is-a-typed-request-timeout
+  (run-transport-matrix-fixture
+    (fn [base]
+      (let [c (llm/make-client
+                {:default_provider "openai"
+                 :providers {"openai" (llm/make-provider-adapter
+                                        "openai" {:api_key "k" :base_url (str base "/held-body")
+                                                  :adapter_timeout {:request 0.3 :stream_read 5}})}})
+            error (try (doall (:events (llm/stream "openai/m" "hi" {:client c :max_retries 0}))) nil
+                       (catch Object e (ex-data e)))]
+        (is (= :request-timeout (:category error)) (pr-str error))
+        (is (= :request (:scope error)))
+        (is (false? (:retryable error)))))))

@@ -65,6 +65,9 @@ run-%: check-runtime ## One test namespace, e.g. make run-providers (attractor.p
 live-matrix: check-runtime ## Credential-gated provider matrix (registry keys; ATTRACTOR_MATRIX_PROVIDERS=a,b to restrict)
 	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/provider_matrix.lg run
 
+live-parity: check-runtime ## Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL (provider/name)
+	perl -e 'alarm 1800; exec @ARGV' "$(LG)" -source-paths src:test test/live/parity_matrix.lg run
+
 live-smoke: check-runtime ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
 	perl -e 'alarm 900; exec @ARGV' "$(LG)" -source-paths src:test test/live/attractor_smoke.lg run
 

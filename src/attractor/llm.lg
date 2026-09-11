@@ -36,7 +36,7 @@
    (retryable); a request-scope timeout is a request timeout (not retried);
    a cancelled context is an abort. Typed errors are returned unchanged."
   [e]
-  (if (some? (:category (ex-data e)))
+  (if (or (some? (:category (ex-data e))) (contains? (or (ex-data e) {}) :retryable))
     e
     (let [message (str (ex-message e))
           lower (str/lower-case message)]
@@ -1856,7 +1856,10 @@
                                  ;; propagates so the opener can retry.
                                  (close!)
                                  (list {:type :error :error (transport-failure e) :raw nil :read_failure true})))
-                          (seq events))]
+                          ;; Before delivery the failure still throws, typed, so
+                          ;; the opener's retry policy can decide.
+                          (try (seq events)
+                               (catch Object e (throw (transport-failure e)))))]
        (let [event (first remaining)]
          (if (= :error (:type event))
            (do
