@@ -107,7 +107,8 @@
                         :model spec :rows results}]
           (io/mkdir "docs/parity-matrix-evidence")
           (io/spit (str "docs/parity-matrix-evidence/" (str/replace spec #"[^A-Za-z0-9._-]+" "-") ".edn")
-                   (pr-str evidence))
+                   ;; Evidence never carries a credential, even inside an error message.
+                   (pr-str (providers/redact evidence)))
           (prn {:model spec :rows (count results) :passed (- (count results) (count failed)) :failed (count failed)})
           (os/exit (if (seq failed) 1 0)))))))
 

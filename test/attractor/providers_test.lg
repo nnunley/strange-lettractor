@@ -215,3 +215,104 @@
       (finally
         (providers/reload! {:paths []})
         (os/sh "/bin/rm" "-f" "--" project)))))
+
+(defn- capture-request [id request-fn]
+  (let [captured (atom nil)
+        adapter (llm/make-provider-adapter
+                  id {:transport (fn [request]
+                                   (reset! captured request)
+                                   {:status 200 :body (request-fn)})})]
+    [captured adapter]))
+
+(def ^:private responses-body
+  (json/write-json {:id "r" :status "completed" :output [{:id "m" :type "message" :role "assistant"
+                                                           :content [{:type "output_text" :text "ok"}]}]
+                    :usage {:input_tokens 1 :output_tokens 1}}))
+
+(def ^:private chat-body
+  (json/write-json {:id "c" :choices [{:message {:role "assistant" :content "ok"} :finish_reason "stop"}]}))
+
+(deftest protocol-default-auth-schemes
+  (providers/reload! {:paths []})
+  (is (= {"Authorization" "Bearer k"} (providers/auth-headers "openai" "k")))
+  (is (= {"x-api-key" "k"} (providers/auth-headers "anthropic" "k")))
+  (is (= {"x-goog-api-key" "k"} (providers/auth-headers "gemini" "k")))
+  (is (= {"Authorization" "Bearer k"} (providers/auth-headers "openai-compat" "k")))
+  (is (= {} (providers/auth-headers "openai-compat" nil)) "optional bearer omits the header without a key")
+  (is (true? (providers/credential-required? "openai")))
+  (is (false? (providers/credential-required? "openai-compat"))))
+
+(deftest entries-choose-a-scheme-a-header-name-and-credential-headers
+  (let [path (temp-file "auth" (str "{:providers {"
+                                    "\"azure\" {:protocol :openai-responses :base_url \"https://res.openai.azure.com/openai/v1\" :auth :header :auth_header \"api-key\" :api_key \"az-key\"}"
+                                    "\"gw\" {:protocol :openai-chat-completions :base_url \"https://gw.test/v1\" :api_key \"gw-key\" :credential_headers {\"Authorization\" \"Token gw-token\" \"X-Tenant\" \"t1\"}}"
+                                    "\"open\" {:protocol :openai-responses :base_url \"https://open.test/v1\" :auth :none}"
+                                    "\"strict\" {:protocol :openai-chat-completions :base_url \"https://strict.test/v1\" :auth :bearer}}}"))]
+    (try
+      (os/sh "/bin/chmod" "600" path)
+      (providers/reload! {:paths [path]})
+      (testing "a header scheme sends the key under the configured name and nothing else"
+        (let [[captured adapter] (capture-request "azure" (constantly responses-body))
+              client (llm/make-client {:providers {"azure" adapter} :default_provider "azure"})]
+          (llm/client-complete client {:model "gpt-test" :messages [{:role :user :content "x"}]})
+          (is (= "https://res.openai.azure.com/openai/v1/responses" (:url @captured)))
+          (is (= "az-key" (get-in @captured [:headers "api-key"])))
+          (is (nil? (get-in @captured [:headers "Authorization"])))))
+      (testing "credential_headers win over the derived bearer"
+        (is (= {"Authorization" "Token gw-token" "X-Tenant" "t1"} (providers/auth-headers "gw" "gw-key")))
+        (let [[captured adapter] (capture-request "gw" (constantly chat-body))
+              client (llm/make-client {:providers {"gw" adapter} :default_provider "gw"})]
+          (llm/client-complete client {:model "m" :messages [{:role :user :content "x"}]})
+          (is (= "Token gw-token" (get-in @captured [:headers "Authorization"])))
+          (is (= "t1" (get-in @captured [:headers "X-Tenant"])))))
+      (testing ":none sends no credential and needs no key"
+        (is (false? (providers/credential-required? "open")))
+        (let [[captured adapter] (capture-request "open" (constantly responses-body))
+              client (llm/make-client {:providers {"open" adapter} :default_provider "open"})]
+          (is (= "ok" (llm/response-text (llm/client-complete client {:model "m" :messages [{:role :user :content "x"}]}))))
+          (is (nil? (get-in @captured [:headers "Authorization"])))))
+      (testing "a required scheme without a key fails before any request, naming where to put it"
+        (let [[captured adapter] (capture-request "strict" (constantly chat-body))
+              client (llm/make-client {:providers {"strict" adapter} :default_provider "strict"})
+              message (message-of #(llm/client-complete client {:model "m" :messages [{:role :user :content "x"}]}))]
+          (is (str/includes? (str message) "STRICT_API_KEY"))
+          (is (nil? @captured))))
+      (testing "invalid auth settings are configuration errors"
+        (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :auth :sigv4}}}"))))
+        (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :auth :header :auth_header \"bad header\"}}}"))))
+        (is (= :configuration (category-of #(providers/parse-config "t" "{:providers {\"x\" {:protocol :openai-responses :credential_headers {\"X\" 1}}}}")))))
+      (testing "resolving and listing never require a credential"
+        (let [rows (providers/effective (fn [_] nil))]
+          (is (some #(= "strict" (:id %)) rows))
+          (is (false? (:key_present (first (filter #(= "strict" (:id %)) rows)))))))
+      (finally
+        (providers/reload! {:paths []})
+        (os/sh "/bin/rm" "-f" "--" path)))))
+
+(deftest redaction-removes-every-configured-credential
+  (let [path (temp-file "redact" (str "{:providers {"
+                                      "\"gw\" {:protocol :openai-chat-completions :base_url \"https://gw.test/v1\" :api_key \"sk-file-secret-123\" :credential_headers {\"X-Gw-Token\" \"gw-header-secret\"}}"
+                                      "\"azure\" {:protocol :openai-responses :base_url \"https://a.test/v1\" :auth :header :auth_header \"api-key\" :api_key \"az-secret-456\"}}}"))]
+    (try
+      (os/sh "/bin/chmod" "600" path)
+      (providers/reload! {:paths [path]})
+      (let [captured {:url "https://gw.test/v1/chat/completions"
+                      :headers {"Authorization" "Bearer sk-file-secret-123" "X-Gw-Token" "gw-header-secret"
+                                "api-key" "az-secret-456" "Content-Type" "application/json"}
+                      :error "provider said: invalid key sk-file-secret-123"
+                      :nested [{:message "echo az-secret-456 back"} "plain"]}
+            redacted (providers/redact captured ["extra-secret-789"])
+            text (pr-str redacted)]
+        (doseq [secret ["sk-file-secret-123" "gw-header-secret" "az-secret-456"]]
+          (is (not (str/includes? text secret)) secret))
+        (is (= "Bearer <credential>" (get-in redacted [:headers "Authorization"])))
+        (is (= "<credential>" (get-in redacted [:headers "X-Gw-Token"])))
+        (is (= "<credential>" (get-in redacted [:headers "api-key"])))
+        (is (= "application/json" (get-in redacted [:headers "Content-Type"])))
+        (is (= "provider said: invalid key <credential>" (:error redacted)))
+        (is (= "echo <credential> back" (get-in redacted [:nested 0 :message])))
+        (is (= "keep extra <credential>" (providers/redact "keep extra extra-secret-789" ["extra-secret-789"]))))
+      (finally
+        (providers/reload! {:paths []})
+        (os/sh "/bin/rm" "-f" "--" path)))))
+

@@ -5,8 +5,10 @@
 ;; (<ID>_BASE_URL, <ID>_API_KEY or :api_key_env) < explicit CLI/API values.
 ;;
 ;; Entries are data only. A key or bearer token may be held directly in
-;; :api_key, in which case the file must be chmod 600, or named indirectly by
-;; the environment variable in :api_key_env. Other keys are errors.
+;; :api_key, in which case the file must be chmod 600, named by the
+;; environment variable in :api_key_env, or borrowed with :api_key_from.
+;; :auth picks how it is sent (:bearer, :optional-bearer, :header with
+;; :auth_header, :none); each protocol has a default. Other keys are errors.
 ;;
 ;; Built-ins that need no entry: openai (Responses API), anthropic (Messages
 ;; API), gemini (generateContent), openai-compat (Chat Completions, base URL
@@ -31,6 +33,20 @@
                   :base_url "https://openrouter.ai/api/v1"
                   :api_key_from "openrouter"
                   :model_discovery false}
+
+  ;; Azure OpenAI (v1 API): the Responses protocol with the key in an api-key
+  ;; header instead of a bearer token. Not verified against a live resource.
+  ;; "azure" {:protocol :openai-responses
+  ;;          :base_url "https://<resource>.openai.azure.com/openai/v1"
+  ;;          :auth :header :auth_header "api-key"
+  ;;          :api_key_env "AZURE_OPENAI_API_KEY"
+  ;;          :model_discovery false}
+
+  ;; A gateway that authenticates with its own headers: :credential_headers
+  ;; always win over the header derived from the key.
+  ;; "corp-gw" {:protocol :openai-chat-completions
+  ;;            :base_url "https://llm.corp.example/v1"
+  ;;            :credential_headers {"Authorization" "Token ..." "X-Tenant" "eng"}}
 
   ;; A local llama.cpp server: no key needed, and its /models list is not
   ;; worth querying, so discovery is off.

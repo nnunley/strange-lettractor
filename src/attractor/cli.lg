@@ -498,6 +498,11 @@
                     :file "  [key held in config file]"
                     :borrowed "  [key borrowed via :api_key_from]"
                     "  [no key]")))
+    (let [{:keys [auth auth_header]} (providers/auth-scheme (:id row))]
+      (println (str "    auth:            " (name auth)
+                    (when (= auth :header) (str " (" auth_header ")"))
+                    (when (seq (:credential_headers (providers/definition (:id row))))
+                      "  + credential_headers"))))
     (println (str "    model_discovery: " (:model_discovery row))))
   (os/exit 0))
 

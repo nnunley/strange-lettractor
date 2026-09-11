@@ -57,6 +57,28 @@ The design session should settle:
   only a file and no flags, and `attractor config` output matching the values
   actually used by a run.
 
+## Provider connection patterns from evener (surveyed 2026-09-10)
+
+Adopted: per-entry auth schemes with protocol defaults, `:auth_header`,
+`:credential_headers` that win over the derived header, redaction of
+configured credentials from anything written or printed, and resolution
+that never requires a credential. Still worth taking, in order:
+
+- A rate-limit wall-clock budget distinct from attempt counting, with a
+  shutdown reserve held back from the caller's deadline, so a 429 storm
+  waits a bounded time instead of a fixed number of tries.
+- A provider-unhealthy short-circuit: repeated stream stalls or hard-cap
+  truncations raise a distinct error instead of spending the retry budget.
+- Token-minting schemes: Google application-default credentials for Vertex
+  and the Codex OAuth record with refresh, each cached per entry and keyed by
+  a hash of the credential's identity so a rotated file is noticed. The Codex
+  record must never be satisfied by an environment key.
+
+Not adopted: a downloaded model catalogue layered under the registry with a
+refresh cache. It makes a provider's effective definition depend on a
+network fetch and cache age. A read-only capability catalogue kept apart
+from auth would be a separate, smaller change.
+
 ## Shared hub transport (requested 2026-09-09)
 
 Since 2026-09-09 every CLI command (`run`, `resume`, `agent`, `console`)

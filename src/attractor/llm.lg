@@ -177,8 +177,7 @@
 ;; bearer token but the contract still sends one, so they get a placeholder.
 (defn resolve-api-key [provider & [custom-key]]
   (let [p (str/lower-case (or provider "openai"))]
-    (or (providers/api-key p custom-key)
-        (when (= :openai-chat-completions (providers/protocol-of p)) "local"))))
+    (providers/api-key p custom-key)))
 
 ;; Cache for discovered provider models
 (defonce provider-models-cache (atom {}))
@@ -193,14 +192,10 @@
         base (resolve-base-url p (:base_url opts))
         key (resolve-api-key p (:api_key opts))
         url (str base "/models")
-        headers (case protocol
-                  :anthropic-messages (cond-> {"anthropic-version" "2023-06-01"}
-                                        (seq key) (assoc "x-api-key" key))
-                  :gemini-generate-content (cond-> {"Content-Type" "application/json"}
-                                             (seq key) (assoc "x-goog-api-key" key))
-                  ;; Responses and Chat Completions
-                  (cond-> {"Content-Type" "application/json"}
-                    (seq key) (assoc "Authorization" (str "Bearer " key))))]
+        headers (merge (if (= protocol :anthropic-messages)
+                         {"anthropic-version" "2023-06-01"}
+                         {"Content-Type" "application/json"})
+                       (providers/auth-headers p key protocol))]
     (try
       (let [resp (http/request {:method :get :url url :headers headers})
             status (:status resp)
@@ -405,11 +400,20 @@
     (:api_key request)
     (or positional-key (os/getenv env-name) "")))
 
-(defn- require-api-key! [provider key]
-  (when (str/blank? key)
-    (throw (ex-info (str "Missing API key for provider: " provider)
-                    {:provider provider :category :configuration})))
+(defn- require-api-key! [provider key & [protocol]]
+  (when (and (str/blank? key) (providers/credential-required? provider protocol))
+    (throw (ex-info (str "Missing API key for provider: " provider
+                         " (set " (str/join " or " (providers/key-env-names provider))
+                         ", :api_key in attractor.edn, or an :auth scheme that needs none)")
+                    {:provider provider :category :configuration :retryable false})))
   key)
+
+(defn- request-headers
+  "Base headers plus the provider's credential presentation for `request`,
+   which carries the registry id in :provider; `protocol` gives the default
+   scheme for ids the registry does not know."
+  [request key protocol base-headers]
+  (merge base-headers (providers/auth-headers (or (:provider request) (name protocol)) key protocol)))
 
 (defn- content-kind [part]
   (let [kind (or (:kind part) (:type part) (get part "kind") (get part "type"))]
@@ -1133,9 +1137,8 @@
                     (some? (:stop_sequences request))
                     (assoc :stop (:stop_sequences request)))
                   (provider-options request provider))
-        headers (cond-> {"Content-Type" "application/json"}
-                  (not (str/blank? key))
-                  (assoc "Authorization" (str "Bearer " key)))]
+        headers (request-headers request key :openai-chat-completions {"Content-Type" "application/json"})]
+    (require-api-key! provider key :openai-chat-completions)
     {:provider provider :url url :headers headers :payload payload}))
 
 (defn- openai-compatible-usage [usage]
@@ -1226,9 +1229,8 @@
                     (assoc :reasoning {:effort effort}))
                   (openai-format request)
                   (provider-options request "openai"))
-        headers {"Authorization" (str "Bearer " key)
-                 "Content-Type" "application/json"}]
-    (require-api-key! "openai" key)
+        headers (request-headers request key :openai-responses {"Content-Type" "application/json"})]
+    (require-api-key! (or (:provider request) "openai") key :openai-responses)
     {:url url :headers headers :payload payload}))
 
 (defn- normalize-openai-response [request body]
@@ -1376,12 +1378,12 @@
               {:category :invalid-request
                :max_tokens final-max-tokens
                :reasoning_budget final-thinking-budget})))
-        headers (cond-> {"x-api-key" key
-                         "anthropic-version" "2023-06-01"
-                         "Content-Type" "application/json"}
-                  (seq effective-beta-headers)
-                  (assoc "anthropic-beta" (str/join "," effective-beta-headers)))]
-    (require-api-key! "anthropic" key)
+        headers (request-headers request key :anthropic-messages
+                                 (cond-> {"anthropic-version" "2023-06-01"
+                                          "Content-Type" "application/json"}
+                                   (seq effective-beta-headers)
+                                   (assoc "anthropic-beta" (str/join "," effective-beta-headers))))]
+    (require-api-key! (or (:provider request) "anthropic") key :anthropic-messages)
     {:url url :headers headers :payload payload}))
 
 (defn- anthropic-usage [usage]
@@ -1617,8 +1619,8 @@
             (some? tool-choice) (assoc :toolConfig tool-choice)
             (seq generation-config) (assoc :generationConfig generation-config))
           (provider-options request "gemini"))
-        headers {"x-goog-api-key" key "Content-Type" "application/json"}]
-    (require-api-key! "gemini" key)
+        headers (request-headers request key :gemini-generate-content {"Content-Type" "application/json"})]
+    (require-api-key! (or (:provider request) "gemini") key :gemini-generate-content)
     {:url url :headers headers :payload payload}))
 
 (defn- gemini-usage [usage]
@@ -2620,8 +2622,8 @@
       (let [key (resolve-api-key provider (:api_key opts))]
         (capacity/probe!
           {:base_url base :model (:model opts)
-           :headers (cond-> {"Content-Type" "application/json"}
-                      (seq key) (assoc "Authorization" (str "Bearer " key)))
+           :headers (merge {"Content-Type" "application/json"}
+                           (providers/auth-headers provider key protocol))
            :timeout_ms (or (:context_discovery_timeout_ms opts) 1000)
            :aborted? (:context_discovery_aborted? opts)})))))
 

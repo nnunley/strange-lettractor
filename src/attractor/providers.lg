@@ -44,7 +44,22 @@
                     :api_key_env "OPENAI_COMPAT_API_KEY"
                     :model_discovery true}})
 
-(def entry-keys #{:protocol :base_url :api_key :api_key_env :api_key_from :model_discovery})
+(def entry-keys #{:protocol :base_url :api_key :api_key_env :api_key_from :model_discovery
+                  :auth :auth_header :credential_headers})
+
+;; How a key is presented on the wire. :bearer sends Authorization: Bearer;
+;; :optional-bearer does the same but omits the header when no key is set
+;; (local servers); :header sends the key in the header named by
+;; :auth_header; :none sends nothing. Each protocol has a default, so an
+;; entry names a scheme only when the server differs from the vendor (Azure's
+;; api-key header on the Responses protocol, a gateway's custom header).
+(def auth-schemes #{:bearer :optional-bearer :header :none})
+
+(def protocol-default-auth
+  {:openai-responses {:auth :bearer}
+   :openai-chat-completions {:auth :optional-bearer}
+   :anthropic-messages {:auth :header :auth_header "x-api-key"}
+   :gemini-generate-content {:auth :header :auth_header "x-goog-api-key"}})
 ;; Other secret-shaped keys are rejected by name so a typo cannot hide a key
 ;; under an ignored field.
 (def secret-keys #{:key :token :bearer :secret :password :credential})
@@ -104,13 +119,26 @@
       (fail ":api_key_from must name another provider id whose key this entry borrows"))
     (when (and (contains? entry :model_discovery) (not (boolean? (:model_discovery entry))))
       (fail ":model_discovery must be true or false"))
+    (when (and (contains? entry :auth) (not (contains? auth-schemes (:auth entry))))
+      (fail (str ":auth must be one of " (str/join ", " (map name (sort-by name auth-schemes))))))
+    (when (and (contains? entry :auth_header)
+               (not (and (string? (:auth_header entry)) (re-matches #"[A-Za-z][A-Za-z0-9-]*" (:auth_header entry)))))
+      (fail ":auth_header must be an HTTP header name"))
+    (when (and (contains? entry :credential_headers)
+               (not (and (map? (:credential_headers entry))
+                         (every? (fn [[k v]] (and (string? k) (re-matches #"[A-Za-z][A-Za-z0-9-]*" k) (string? v)))
+                                 (:credential_headers entry)))))
+      (fail ":credential_headers must map header names to string values"))
     (cond-> {:protocol (:protocol entry)
              :base_url (when (present (:base_url entry)) (strip-slash (:base_url entry)))
              :api_key_env (or (:api_key_env entry) (env-name id "_API_KEY"))
              :model_discovery (if (contains? entry :model_discovery) (:model_discovery entry) true)
              :source source}
       (present (:api_key entry)) (assoc :api_key (str/trim (:api_key entry)))
-      (string? (:api_key_from entry)) (assoc :api_key_from (:api_key_from entry)))))
+      (string? (:api_key_from entry)) (assoc :api_key_from (:api_key_from entry))
+      (contains? entry :auth) (assoc :auth (:auth entry))
+      (contains? entry :auth_header) (assoc :auth_header (:auth_header entry))
+      (seq (:credential_headers entry)) (assoc :credential_headers (:credential_headers entry)))))
 
 (defn- reader-position
   "Line and column from a reader error, without the offending token: a
@@ -286,3 +314,80 @@
                :model_discovery (:model_discovery d)
                :source (:source d)}))
           (ids))))
+
+(defn auth-scheme
+  "The scheme and header name for a provider: the entry's :auth/:auth_header
+   over the protocol default. Unknown ids get the protocol's default when a
+   protocol is given, else :bearer."
+  [id & [protocol]]
+  (let [d (definition id)
+        base (get protocol-default-auth (or (:protocol d) protocol) {:auth :bearer})]
+    {:auth (or (:auth d) (:auth base))
+     :auth_header (or (:auth_header d) (:auth_header base) "Authorization")}))
+
+(defn auth-headers
+  "Headers that present the credential for a provider. :credential_headers
+   from the entry always win over the derived header, so a gateway's own
+   header is never shadowed. Returns {} for :none, and for :optional-bearer
+   without a key."
+  [id key & [protocol]]
+  (let [{:keys [auth auth_header]} (auth-scheme id protocol)
+        key (present key)
+        derived (case auth
+                  :bearer (when key {"Authorization" (str "Bearer " key)})
+                  :optional-bearer (when key {"Authorization" (str "Bearer " key)})
+                  :header (when key {auth_header key})
+                  :none nil
+                  nil)
+        configured (:credential_headers (definition id))]
+    (merge (or derived {}) (or configured {}))))
+
+(defn credential-required?
+  "Whether a request may go out without a key: :optional-bearer and :none
+   never need one, and an entry with :credential_headers carries its own."
+  [id & [protocol]]
+  (let [{:keys [auth]} (auth-scheme id protocol)]
+    (and (contains? #{:bearer :header} auth)
+         (empty? (:credential_headers (definition id))))))
+
+(def credential-header-names
+  "Header names whose values are credentials wherever they appear."
+  #{"authorization" "x-api-key" "x-goog-api-key" "api-key" "proxy-authorization"})
+
+(defn configured-secrets
+  "Every credential value the registry can currently resolve: keys from the
+   environment or config files and :credential_headers values. Used only to
+   scrub them out of anything written or printed."
+  [& [env-fn]]
+  (let [get-env (or env-fn os/getenv)]
+    (vec (distinct
+           (remove str/blank?
+                   (concat (keep (fn [id] (api-key id nil get-env)) (ids))
+                           (mapcat (fn [id] (vals (:credential_headers (definition id)))) (ids))))))))
+
+(defn redact
+  "Replace credentials in `value` with the literal <credential>: values of
+   credential-named headers (keeping a Bearer/Token scheme word), values of
+   any header a registry entry uses for its key, and any occurrence of a
+   configured secret or of `extra-secrets` inside a string. Walks maps,
+   vectors and sequences; other values are returned unchanged."
+  [value & [extra-secrets]]
+  (let [secrets (sort-by count > (distinct (remove str/blank? (concat (configured-secrets) extra-secrets))))
+        entry-headers (set (map str/lower-case
+                                (concat (keep (fn [id] (:auth_header (auth-scheme id))) (ids))
+                                        (mapcat (fn [id] (keys (:credential_headers (definition id)))) (ids)))))
+        header? (fn [k] (let [n (str/lower-case (if (keyword? k) (name k) (str k)))]
+                          (or (contains? credential-header-names n) (contains? entry-headers n))))
+        scrub (fn [text] (reduce (fn [t secret] (str/replace t secret "<credential>")) text secrets))
+        mask-header (fn [v] (let [v (str v)]
+                              (if-let [[_ scheme] (re-matches #"(?i)(bearer|token|basic)\s+.+" v)]
+                                (str scheme " <credential>")
+                                "<credential>")))]
+    (letfn [(walk [v]
+              (cond
+                (map? v) (into (empty v) (map (fn [[k x]] [k (if (and (header? k) (string? x)) (mask-header x) (walk x))]) v))
+                (vector? v) (mapv walk v)
+                (sequential? v) (map walk v)
+                (string? v) (scrub v)
+                :else v))]
+      (walk value))))

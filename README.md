@@ -129,7 +129,11 @@ its key, and whether `/models` may be queried. `openai`, `anthropic`,
 `~/.config/attractor/attractor.edn`. Files are data only; an entry holds its
 key or bearer token in `:api_key` (the file must then be `chmod 600`), names
 the environment variable in `:api_key_env`, or borrows another entry's key
-with `:api_key_from`. Any configured id can be
+with `:api_key_from`. `:auth` chooses how the key is sent (`:bearer`,
+`:optional-bearer`, `:header` with `:auth_header`, or `:none`), and
+`:credential_headers` always win over the derived header. Evidence and live
+runner output pass through a redactor that replaces every configured
+credential with `<credential>`. Any configured id can be
 used as a model prefix (`openrouter/<model>`) and with `models --provider <id>`.
 
 ```sh

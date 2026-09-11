@@ -110,7 +110,7 @@
       (let [rows (vec (for [t targets j (journeys t)] (run-journey t j)))
             evidence {:scenario "SCN-PROVIDER-MATRIX" :recorded_at (str (System/currentTimeMillis))
                       :providers (mapv #(select-keys % [:provider :model]) targets) :rows rows}]
-        (io/spit "docs/provider-matrix-evidence.edn" (pr-str evidence))
+        (io/spit "docs/provider-matrix-evidence.edn" (pr-str (providers/redact evidence)))
         (doseq [r rows] (prn (dissoc r :detail)))
         (let [failed (filter #(= :fail (:status %)) rows)]
           (prn {:providers (count targets) :journeys (count rows) :passed (count (filter #(= :pass (:status %)) rows))
