@@ -1,5 +1,5 @@
 (ns attractor.llm-transport-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.core :as core]
             [http :as http]
             [json :as json]
@@ -231,3 +231,50 @@
 
 ;; MARKER for completion
 ;; SCN-ULLM-HTTP-ERRORS COMPLETE
+
+;; Adapter timeout scopes (connect, request, stream_read) through the real
+;; runtime transport against the loopback fixture.
+(deftest adapter-timeout-scopes-are-distinguished
+  (run-transport-matrix-fixture
+    (fn [base]
+      (let [client (fn [scenario timeouts]
+                     (llm/make-client
+                       {:default_provider "openai"
+                        :providers {"openai" (llm/make-provider-adapter
+                                               "openai" {:api_key "k" :base_url (str base "/" scenario)
+                                                         :adapter_timeout timeouts})}}))
+            failure (fn [f] (try (f) nil (catch Object e (ex-data e))))]
+        (testing "request scope: headers held past the deadline; not retried"
+          (let [attempts (atom 0)
+                c (client "held-headers" {:request 0.2})
+                started (System/currentTimeMillis)
+                error (failure #(llm/generate "openai/m" "hi"
+                                              {:client c :max_retries 2
+                                               :retry_policy {:sleep_fn (fn [_] nil)
+                                                              :on_retry (fn [& _] (swap! attempts inc))}}))]
+            (is (= :request-timeout (:category error)) (pr-str error))
+            (is (false? (:retryable error)))
+            (is (= :request (:scope error)))
+            (is (zero? @attempts))
+            (is (< (- (System/currentTimeMillis) started) 2500))))
+        (testing "stream_read scope: a stalled stream ends with one network error event after partial output"
+          (let [c (client "stalled-stream" {:request 5 :stream_read 0.2})
+                s (llm/stream "openai/m" "hi" {:client c :max_retries 0})
+                events (doall (:events s))
+                terminal (last events)]
+            (is (some #(= :text_delta (:type %)) events) "the first chunk was delivered")
+            (is (= :error (:type terminal)) (pr-str (mapv :type events)))
+            (is (= :network (:category (ex-data (:error terminal)))))
+            (is (= :stream_read (:scope (ex-data (:error terminal)))))))
+        (testing "connect scope: an unreachable host fails fast as a retryable network error"
+          (let [c (llm/make-client
+                    {:default_provider "openai"
+                     :providers {"openai" (llm/make-provider-adapter
+                                            "openai" {:api_key "k" :base_url "http://10.255.255.1:9/v1"
+                                                      :adapter_timeout {:connect 0.2 :request 5}})}})
+                started (System/currentTimeMillis)
+                error (failure #(llm/generate "openai/m" "hi" {:client c :max_retries 0}))]
+            (is (= :network (:category error)) (pr-str error))
+            (is (true? (:retryable error)))
+            (is (= :connect (:scope error)))
+            (is (< (- (System/currentTimeMillis) started) 3000))))))))

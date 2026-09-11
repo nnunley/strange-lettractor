@@ -40,7 +40,7 @@
                  "Git branch: feature-before" "Git changed files: 2"
                  "Recent commits:\ncommit one\ncommit two" "Platform: fixture-platform"
                  "OS version: fixture-os" "Today's date: 2026-09-08"
-                 "Model: GPT-5.2 Codex" "Knowledge cutoff: unknown"]]
+                 "Model: GPT-5.2 Codex" "Knowledge cutoff: 2025-08-31"]]
       (is (str/includes? (or block "") line) line))
     (is (= "gpt-5.2-codex" (:model snapshot)))
     (is (= ["gpt-5.2-codex" "gpt-5.2-codex"] (mapv :model requests)))
@@ -49,12 +49,13 @@
 
 (deftest profile-metadata-and-safe-fallbacks-do-not-change-model-routing
   (doseq [[provider model metadata display cutoff]
-          [["openai" "codex" {} "GPT-5.2 Codex" "unknown"]
+          [["openai" "codex" {} "GPT-5.2 Codex" "2025-08-31"]
            ["custom" "local-model" {:display_name "Local Model" :knowledge_cutoff "2025-01"} "Local Model" "2025-01"]
            ["openai" "gpt-5.2-codex" {:display_name "Configured Model" :knowledge_cutoff "2025-02"} "Configured Model" "2025-02"]
            ["custom" "codex" {} "codex" "unknown"]
            ["custom" "unlisted" {:display_name "  " :knowledge_cutoff false} "unlisted" "unknown"]
-           ["openai" "gpt-5.2-codex" {:display_name 7 :knowledge_cutoff ""} "GPT-5.2 Codex" "unknown"]]]
+           ["openai" "gpt-5.2-codex" {:display_name 7 :knowledge_cutoff ""} "GPT-5.2 Codex" "2025-08-31"]
+           ["gemini" "gemini-3-flash-preview" {} "Gemini 3 Flash Preview" "unknown"]]]
     (let [{:keys [prompts requests snapshot]} (capture (profiles/make-profile (merge {:id provider :model model} metadata)))]
       (doseq [prompt prompts]
         (is (str/includes? prompt (str "Model: " display "\n")))
@@ -73,3 +74,16 @@
       (let [{:keys [snapshot]} (capture (profiles/make-profile (merge {:id "custom" :model "fixture-alias"} metadata)))]
         (is (= display (:model_display_name snapshot)))
         (is (= cutoff (:knowledge_cutoff snapshot)))))))
+
+(deftest catalog-cutoffs-are-sourced-or-unknown
+  ;; Every recorded cutoff must be traceable to docs/model-catalog-sources.md;
+  ;; unlisted models stay "unknown" rather than estimated.
+  (let [sources (io/slurp "docs/model-catalog-sources.md")]
+    (doseq [entry models/catalog]
+      (if-let [cutoff (:knowledge_cutoff entry)]
+        (is (str/includes? sources (str "| " (:id entry) " | " cutoff))
+            (str (:id entry) " cutoff must be listed with its source"))
+        (is (str/includes? sources (:id entry))
+            (str (:id entry) " must be listed as not recorded"))))
+    (is (= "2025-08-31" (:knowledge_cutoff (models/get-model-info "gpt-5.2-codex"))))
+    (is (nil? (:knowledge_cutoff (models/get-model-info "gemini-3-flash-preview"))))))

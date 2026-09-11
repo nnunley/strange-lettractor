@@ -19,12 +19,48 @@
         (get headers (keyword header-name))
         (get headers (keyword lower-name)))))
 
+(def default-adapter-timeout
+  "Seconds. :connect bounds establishing the connection, :request the time
+   to a complete response (to the headers, for streams), :stream_read the
+   longest silence between stream chunks."
+  {:connect 10.0 :request 120.0 :stream_read 30.0})
+
 (defn- transport-request-options [request options]
-  (cond-> options
+  (cond-> (assoc options :timeout (merge default-adapter-timeout (:adapter_timeout request)))
     (some? (:abort_signal request))
-    (assoc :abort_signal (:abort_signal request))
-    (some? (:adapter_timeout request))
-    (assoc :timeout (:adapter_timeout request))))
+    (assoc :abort_signal (:abort_signal request))))
+
+(defn transport-failure
+  "Normalize a raw transport failure into a typed error: a connect or
+   stream-read timeout and other socket failures are network errors
+   (retryable); a request-scope timeout is a request timeout (not retried);
+   a cancelled context is an abort. Typed errors are returned unchanged."
+  [e]
+  (if (some? (:category (ex-data e)))
+    e
+    (let [message (str (ex-message e))
+          lower (str/lower-case message)]
+      (ex-info message
+               (cond
+                 (str/includes? lower "http request timeout")
+                 {:category :request-timeout :retryable false :scope :request :cause e}
+                 (str/includes? lower "http connect timeout")
+                 {:category :network :retryable true :scope :connect :cause e}
+                 (str/includes? lower "http stream_read timeout")
+                 {:category :network :retryable true :scope :stream_read :cause e}
+                 (or (str/includes? lower "context canceled")
+                     (str/includes? lower "cancelled")
+                     (str/includes? lower "canceled"))
+                 {:category :abort :retryable false :cause e}
+                 :else
+                 {:category :network :retryable true :cause e})))))
+
+(defn- invoke-transport
+  "Call the HTTP transport, normalizing raw failures with transport-failure."
+  [transport options]
+  (try
+    (transport options)
+    (catch Object e (throw (transport-failure e)))))
 
 (defn- parse-retry-after [response]
   (when-let [value (response-header response "Retry-After")]
@@ -1111,7 +1147,7 @@
   (let [{:keys [provider url headers payload]}
         (openai-compatible-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url url :headers headers
@@ -1221,7 +1257,7 @@
 (defn openai-complete [request & [api-key base-url]]
   (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url url :headers headers
@@ -1428,7 +1464,7 @@
         (anthropic-request-data request api-key base-url)]
     (try
         (let [transport (or (:transport request) http/request)
-              resp (transport
+              resp (invoke-transport transport
                      (transport-request-options
                        request
                        {:method :post
@@ -1672,7 +1708,7 @@
         (gemini-request-data request api-key base-url)]
     (try
         (let [transport (or (:transport request) http/request)
-              resp (transport
+              resp (invoke-transport transport
                      (transport-request-options
                        request
                        {:method :post :url url :headers headers
@@ -1808,8 +1844,19 @@
   ([events provider close!]
    (terminal-stream-events events provider close! false))
   ([events provider close! finished?]
+   (terminal-stream-events events provider close! finished? false))
+  ([events provider close! finished? delivered?]
    (lazy-seq
-     (if-let [remaining (seq events)]
+     (if-let [remaining (if delivered?
+                          (try (seq events)
+                               (catch Object e
+                                 ;; A failure while reading later frames (stream-read
+                                 ;; timeout, reset) is the stream's terminal error.
+                                 ;; Before any event is delivered the failure
+                                 ;; propagates so the opener can retry.
+                                 (close!)
+                                 (list {:type :error :error (transport-failure e) :raw nil :read_failure true})))
+                          (seq events))]
        (let [event (first remaining)]
          (if (= :error (:type event))
            (do
@@ -1817,7 +1864,8 @@
              (list (assoc event :error (stream-error provider (:error event) (:raw event)))))
            (cons event (lazy-seq
                          (terminal-stream-events (rest remaining) provider close!
-                                                 (or finished? (= :finish (:type event))))))))
+                                                 (or finished? (= :finish (:type event)))
+                                                 true)))))
        (when-not finished?
          (close!)
          (list {:type :error :error (stream-ended-early-error provider) :raw nil}))))))
@@ -1993,7 +2041,7 @@
 (defn openai-stream [request & [api-key base-url]]
   (let [{:keys [url headers payload]} (openai-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url url :headers headers :as :stream
@@ -2165,7 +2213,7 @@
                               (merge {:include_usage true}
                                      (canonical-option-map
                                        (:stream_options payload))))
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url url :headers headers :as :stream
@@ -2293,7 +2341,7 @@
   (let [{:keys [url headers payload]}
         (anthropic-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url url :headers headers :as :stream
@@ -2414,7 +2462,7 @@
   (let [{:keys [url headers payload]}
         (gemini-request-data request api-key base-url)
         transport (or (:transport request) http/request)
-        resp (transport
+        resp (invoke-transport transport
                (transport-request-options
                  request
                  {:method :post :url (gemini-stream-url url)

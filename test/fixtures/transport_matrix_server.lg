@@ -10,7 +10,7 @@
     "429-rate-limit-no-header" "429-rate-limit-seconds"
     "500-server-error" "502-bad-gateway" "503-service-unavailable" "529-site-overloaded"
     "200-malformed-json" "200-empty-body"
-    "held-headers" "held-body"
+    "held-headers" "held-body" "stalled-stream"
     "fail-once-then-succeed" "fail-twice-then-succeed"})
 
 (defn error-body [message code]
@@ -36,6 +36,11 @@
     "200-empty-body" {:status 200 :body ""}
     "held-headers" (do (core/sleep 3000) {:status 200 :body (json/write-json {:id "r" :status "completed"})})
     "held-body" {:status 200 :body (lazy-seq (core/sleep 3000) (list (json/write-json {:id "r" :status "completed"})))}
+    ;; A stream whose first frame arrives at once and whose second stalls.
+    "stalled-stream" {:status 200 :headers {"Content-Type" "text/event-stream"}
+                      :body (lazy-seq (cons "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"hi\"}\n\n"
+                                            (lazy-seq (core/sleep 3000)
+                                                      (list "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))))}
     "fail-once-then-succeed" (if (= 1 attempt)
                               {:status 500 :body (error-body "Server error" "server_error")}
                               {:status 200 :body :success})
@@ -74,7 +79,8 @@
         :else
         (let [attempt (get (swap! counts update segment (fnil inc 0)) segment)
               resp (scenario-response scenario attempt)
-              resp (if (= :success (:body resp)) (sse-success path) resp)]
+              ;; Keyword check without = : equality would realize a lazy body.
+              resp (if (keyword? (:body resp)) (sse-success path) resp)]
           (cond-> resp
             (not (contains? resp :headers)) (assoc :headers {"Content-Type" "application/json"})))))))
 

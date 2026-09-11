@@ -199,3 +199,23 @@ compiler's `(with-meta ...)` and `(hash-set ...)` forms. An approach note was
 left on #801. `attractor.composition/read-mapping` and the artifact store's
 round-trip validation depend on it; a released runtime without the mode would
 reject metadata and discards in mappings and set-valued artifacts again.
+
+## HTTP client timeouts and line-seq errors: #844, #845
+
+The local runtime's `http/request` honours `:timeout {:connect s :request s
+:stream_read s}` (a bare number or `:timeout_ms` is the request scope): a
+pooled transport per dial timeout, a context deadline for the whole cycle
+(headers only for `:as :stream`), and a per-read gap timer on the streamed
+body that cancels the request when a chunk is late. Errors are
+`http <scope> timeout after <d>`
+([nooga/let-go #844](https://github.com/nooga/let-go/issues/844)).
+`io/line-seq` now ends a sequence only on `io.EOF`; any other read error is
+thrown when the sequence is realized
+([nooga/let-go #845](https://github.com/nooga/let-go/issues/845)).
+`attractor.llm/transport-failure` classifies those messages (connect and
+stream_read: `:network`, retryable; request: `:request-timeout`), the
+adapters send `default-adapter-timeout` (10s / 120s / 30s) unless a request
+carries `:adapter_timeout`, and `llm_transport_test.lg` proves the three
+scopes against the loopback fixture. A released runtime without #844 would
+silently ignore the timeouts again; without #845 a stalled stream would look
+like a clean end and be reported as a malformed body.

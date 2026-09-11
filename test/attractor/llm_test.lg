@@ -1789,7 +1789,8 @@
                     (reset! captured request)
                     {:status 200 :body response})})
     (is (= signal (:abort_signal @captured)))
-    (is (= {:connect 1.0 :request 2.0} (:timeout @captured)))))
+    (is (= {:connect 1.0 :request 2.0 :stream_read 30.0} (:timeout @captured))
+        "explicit scopes override the defaults, the rest keep them")))
 
 (deftest test-stream-closes-late-registration-after-timeout
   (let [closed (atom false)

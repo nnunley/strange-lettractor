@@ -39,7 +39,8 @@ Prerequisites:
 - A let-go 1.12.2+ executable with local runtime fixes that upstream has not
   released yet (nooga/let-go [#816](https://github.com/nooga/let-go/issues/816),
   [#830](https://github.com/nooga/let-go/issues/830), [#831](https://github.com/nooga/let-go/issues/831),
-  [#832](https://github.com/nooga/let-go/issues/832), [#833](https://github.com/nooga/let-go/issues/833)).
+  [#832](https://github.com/nooga/let-go/issues/832), [#833](https://github.com/nooga/let-go/issues/833),
+  [#844](https://github.com/nooga/let-go/issues/844), [#845](https://github.com/nooga/let-go/issues/845)).
   Build it from the `fix/http-scope-cancellation` bookmark of the local let-go
   workspace with `go build -o build/lg .` and point `LGX_LG` at the result. A
   stock release runs most of the suite, but the console's evaluation capture
