@@ -222,13 +222,29 @@ scopes against the loopback fixture. A released runtime without #844 would
 silently ignore the timeouts again; without #845 a stalled stream would look
 like a clean end and be reported as a malformed body.
 
-## Upstream pull request: #847
+## Upstream pull requests: #848 to #856
 
-All the local runtime fixes above that live on the fork branch
-`fix/http-scope-cancellation` (#816, #830, #831, #832, #833, #801/#823, #844,
-#845) are proposed upstream as
-[nooga/let-go #847](https://github.com/nooga/let-go/pull/847), opened
-2026-09-10 from `nnunley:fix/http-scope-cancellation` at `46244c4f`. The branch
-is behind upstream `main`, so the PR needs a rebase and a fresh
-`make generate` before it can merge. Until it merges, build the runtime from
-the fork branch as the README describes.
+The runtime fixes on the fork branch `fix/http-scope-cancellation` were first
+proposed together as nooga/let-go #847. That PR was closed on 2026-09-11 in
+favour of one PR per issue, each branched from current upstream `main` with
+its own test and its own `make generate` commit:
+
+| PR | Issue | Change |
+|---|---|---|
+| [#848](https://github.com/nooga/let-go/pull/848) | #816 | http clients inherit the caller's scope cancellation |
+| [#849](https://github.com/nooga/let-go/pull/849) | #828 | http clients accept an empty `:headers` map |
+| [#850](https://github.com/nooga/let-go/pull/850) | #830 | `scope-cancelled?` |
+| [#851](https://github.com/nooga/let-go/pull/851) | #831 | streamed `http/serve` bodies |
+| [#852](https://github.com/nooga/let-go/pull/852) | #832 | `bound-fn*` keeps the invoking scope |
+| [#853](https://github.com/nooga/let-go/pull/853) | #833 | `eval` in the caller's context |
+| [#854](https://github.com/nooga/let-go/pull/854) | #801, #823 | EDN data reading |
+| [#855](https://github.com/nooga/let-go/pull/855) | #845 | `line-seq` surfaces read errors |
+| [#856](https://github.com/nooga/let-go/pull/856) | #844 | HTTP timeouts, stacked on #848 |
+
+Each new test fails on `main` without its change and passes with it. Every
+branch passes `go test ./...` except `TestCustomMain`'s "versioned fork
+replace is reproduced, offline" subtest, which fails identically on untouched
+upstream `main` in this environment. Merging one PR changes the generated
+manifests the others also regenerate, so each later merge needs a fresh
+`make generate`. Until they merge, build the runtime from the fork branch as
+the README describes.
