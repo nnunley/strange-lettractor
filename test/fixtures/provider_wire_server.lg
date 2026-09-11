@@ -19,21 +19,28 @@
                    :input_tokens_details {:cached_tokens 3}
                    :output_tokens_details {:reasoning_tokens 2}})
 
-(defn complete-body [provider scenario]
-  (let [tools? (= scenario "tools")]
+(def default-call {:id "call-1" :tool-id "toolu-1" :name "get_weather" :args {:city "Oslo"}})
+
+(defn complete-body
+  "The provider's success body. `call` (default get_weather/Oslo when the
+   scenario is \"tools\") adds one tool call in the provider's shape."
+  [provider scenario & [call]]
+  (let [call (or call (when (= scenario "tools") default-call))
+        tools? (some? call)
+        args-json (when call (json/write-json (:args call)))]
     (case provider
       "openai"
       {:id "resp-1" :status "completed" :model "gpt-test"
        :output (cond-> [{:id "msg-1" :type "message" :role "assistant"
                          :content [{:type "output_text" :text "Hello world"}]}]
-                 tools? (conj {:id "fc-1" :type "function_call" :call_id "call-1"
-                               :name "get_weather" :arguments "{\"city\":\"Oslo\"}"}))
+                 tools? (conj {:id "fc-1" :type "function_call" :call_id (:id call)
+                               :name (:name call) :arguments args-json}))
        :usage usage-openai}
       "anthropic"
       {:id "msg-1" :type "message" :role "assistant" :model "claude-test"
        :content (cond-> [{:type "text" :text "Hello world"}]
-                  tools? (conj {:type "tool_use" :id "toolu-1" :name "get_weather"
-                                :input {:city "Oslo"}}))
+                  tools? (conj {:type "tool_use" :id (:tool-id call) :name (:name call)
+                                :input (:args call)}))
        :stop_reason (if tools? "tool_use" "end_turn")
        :usage {:input_tokens 11 :output_tokens 7
                :cache_read_input_tokens 3 :cache_creation_input_tokens 0}}
@@ -41,8 +48,8 @@
       {:responseId "gem-1"
        :candidates [{:content {:role "model"
                                :parts (cond-> [{:text "Hello world"}]
-                                        tools? (conj {:functionCall {:name "get_weather"
-                                                                     :args {:city "Oslo"}}}))}
+                                        tools? (conj {:functionCall {:name (:name call)
+                                                                     :args (:args call)}}))}
                      :finishReason "STOP"}]
        :usageMetadata {:promptTokenCount 11 :candidatesTokenCount 7 :totalTokenCount 18}}
       "openai-compat"
@@ -50,9 +57,9 @@
        :choices [{:index 0
                   :message (cond-> {:role "assistant" :content "Hello world"}
                              tools? (assoc :tool_calls
-                                           [{:id "call-1" :type "function"
-                                             :function {:name "get_weather"
-                                                        :arguments "{\"city\":\"Oslo\"}"}}]))
+                                           [{:id (:id call) :type "function"
+                                             :function {:name (:name call)
+                                                        :arguments args-json}}]))
                   :finish_reason (if tools? "tool_calls" "stop")}]
        :usage {:prompt_tokens 11 :completion_tokens 7 :total_tokens 18}}
       nil)))
@@ -64,9 +71,11 @@
                                "data: " (if (string? data) data (json/write-json data)) "\n\n"))
                         frames))})
 
-(defn stream-body [provider scenario]
-  (let [final (complete-body provider scenario)
-        tools? (= scenario "tools")]
+(defn stream-body [provider scenario & [call]]
+  (let [call (or call (when (= scenario "tools") default-call))
+        final (complete-body provider scenario call)
+        tools? (some? call)
+        args-json (when call (json/write-json (:args call)))]
     (case provider
       "openai"
       (sse (concat
@@ -76,11 +85,10 @@
               [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "world"}]]
              (when tools?
                [[nil {:type "response.output_item.added"
-                      :item {:id "fc-1" :type "function_call" :call_id "call-1" :name "get_weather" :arguments ""}}]
-                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta "{\"city\":"}]
-                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta "\"Oslo\"}"}]
+                      :item {:id "fc-1" :type "function_call" :call_id (:id call) :name (:name call) :arguments ""}}]
+                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta args-json}]
                 [nil {:type "response.output_item.done"
-                      :item {:id "fc-1" :type "function_call" :call_id "call-1" :name "get_weather" :arguments "{\"city\":\"Oslo\"}"}}]])
+                      :item {:id "fc-1" :type "function_call" :call_id (:id call) :name (:name call) :arguments args-json}}]])
              [[nil {:type "response.completed" :response final}]]))
       "anthropic"
       (sse (concat
@@ -96,11 +104,9 @@
             ["content_block_stop" {:type "content_block_stop" :index 0}]]
            (when tools?
              [["content_block_start" {:type "content_block_start" :index 1
-                                      :content_block {:type "tool_use" :id "toolu-1" :name "get_weather" :input {}}}]
+                                      :content_block {:type "tool_use" :id (:tool-id call) :name (:name call) :input {}}}]
               ["content_block_delta" {:type "content_block_delta" :index 1
-                                      :delta {:type "input_json_delta" :partial_json "{\"city\":"}}]
-              ["content_block_delta" {:type "content_block_delta" :index 1
-                                      :delta {:type "input_json_delta" :partial_json "\"Oslo\"}"}}]
+                                      :delta {:type "input_json_delta" :partial_json args-json}}]
               ["content_block_stop" {:type "content_block_stop" :index 1}]])
            [["message_delta" {:type "message_delta" :delta {:stop_reason (if tools? "tool_use" "end_turn")}
                               :usage {:output_tokens 7}}]
@@ -110,7 +116,7 @@
              [[nil {:candidates [{:content {:role "model" :parts [{:text "Hello "}]}}]}]]
              (when tools?
                [[nil {:candidates [{:content {:role "model"
-                                              :parts [{:functionCall {:name "get_weather" :args {:city "Oslo"}}}]}}]}]])
+                                              :parts [{:functionCall {:name (:name call) :args (:args call)}}]}}]}]])
              [[nil {:candidates [{:content {:role "model" :parts [{:text "world"}]} :finishReason "STOP"}]
                     :usageMetadata (:usageMetadata final)}]]))
       "openai-compat"
@@ -130,6 +136,34 @@
     (map? value) (into {} (map (fn [[k v]] [(if (string? k) (keyword k) k) (keywordize v)]) value))
     (sequential? value) (mapv keywordize value)
     :else value))
+
+(defn matrix-script
+  "Scripted tool calls for the cross-provider parity matrix, one per model
+   call; after the script the model answers with text. OpenAI edits through
+   apply_patch, the others through edit_file."
+  [provider]
+  (let [edit (if (= provider "openai")
+               {:name "apply_patch"
+                :args {:patch "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+HELLO\n*** End Patch"}}
+               {:name "edit_file" :args {:file_path "hello.txt" :old_string "hello" :new_string "HELLO"}})
+        edit2 (if (= provider "openai")
+                {:name "apply_patch"
+                 :args {:patch "*** Begin Patch\n*** Update File: second.txt\n@@\n-two\n+TWO\n*** End Patch"}}
+                {:name "edit_file" :args {:file_path "second.txt" :old_string "two" :new_string "TWO"}})]
+    [{:name "write_file" :args {:file_path "hello.txt" :content "hello"}}
+     {:name "read_file" :args {:file_path "hello.txt"}}
+     edit
+     {:name "write_file" :args {:file_path "second.txt" :content "two"}}
+     edit2
+     {:name "shell" :args {:command "printf done"}}
+     {:name "shell" :args {:command "sleep 5" :timeout_ms 100}}
+     {:name "grep" :args {:pattern "HELLO"}}
+     {:name "glob" :args {:pattern "*.txt"}}
+     {:name "read_file" :args {:file_path "big.txt"}}]))
+
+(defn scripted-call [provider attempt]
+  (when-let [step (get (matrix-script provider) (dec attempt))]
+    (assoc step :id (str "call-" attempt) :tool-id (str "toolu-" attempt))))
 
 (defn json-response [body]
   {:status 200 :headers {"Content-Type" "application/json"} :body (json/write-json body)})
@@ -162,7 +196,9 @@
                           (get-in (swap! state update-in [:attempts counter] (fnil inc 0)) [:attempts counter])
                           ;; Bodyless probes (context discovery) do not consume a turn.
                           0)
+                call (when (= scenario "matrix") (scripted-call provider attempt))
                 scenario (cond (= scenario "loop") (if (= attempt 1) "tools" "text")
+                               (= scenario "matrix") (if call "tools" "text")
                                ;; "loop-error": a tool call whose execution the test makes fail.
                                (= scenario "loop-error") (if (= attempt 1) "tools" "text")
                                (contains? #{"flaky429" "flaky503"} scenario) (if (= attempt 1) scenario "text")
@@ -179,8 +215,8 @@
             (= scenario "auth") {:status 401
                                  :headers {"Content-Type" "application/json"}
                                  :body (json/write-json {:error {:message "bad key" :type "authentication_error"}})}
-            streaming? (or (stream-body provider scenario) {:status 404 :body "unknown provider"})
-            :else (if-let [reply (complete-body provider scenario)]
+            streaming? (or (stream-body provider scenario call) {:status 404 :body "unknown provider"})
+            :else (if-let [reply (complete-body provider scenario call)]
                     (json-response reply)
                     {:status 404 :body "unknown provider"}))))))))
 

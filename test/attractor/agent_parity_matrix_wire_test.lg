@@ -1,0 +1,100 @@
+(ns attractor.agent-parity-matrix-wire-test
+  "The cross-provider parity matrix of the coding-agent definition of done,
+   run deterministically: a scripted model on the loopback recording server
+   drives a real session through each native profile's actual adapter and
+   tools in a temporary directory. Each matrix row is checked by its effect
+   on disk, the tool result the model received and the events emitted:
+   file creation, read then edit, multi-file edit, shell execution, shell
+   timeout, grep and glob, a multi-step read-analyze-edit sequence, and
+   truncation of a large read. Live-model runs of the same matrix remain the
+   provider-matrix gate."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.llm-contract-adapters-test :as wire]))
+
+(def providers ["openai" "anthropic" "gemini"])
+
+(defn- fresh-dir []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-matrix-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- session-for [root provider events dir]
+  (let [client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter
+                                         provider {:api_key (str "key-" provider)
+                                                   :base_url (str root "/" provider "/matrix")})}})]
+    (agent/make-session
+      {:model (str provider "/" provider "-model")
+       :llm_client client
+       :execution_env (execution/make-local-environment {:working_dir dir})
+       :project_docs []
+       :max_subagent_depth 0
+       :max_tool_rounds_per_input 20
+       :on_event #(swap! events conj %)})))
+
+(defn- tool-results [session]
+  (vec (mapcat :results (filter #(= :tool_results (:type %)) (:history @session)))))
+
+(deftest parity-matrix-rows-pass-for-every-native-profile
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider providers]
+        (let [dir (fresh-dir) events (atom []) session (session-for root provider events dir)]
+          ;; 1500 lines of 60 characters: within read_file's 2000-line window,
+          ;; well past its 50k character limit.
+          (io/spit (str dir "/big.txt") (apply str (repeat 1500 (str (apply str (repeat 6 "0123456789")) "\n"))))
+          (try
+            (let [answer (agent/process-input! session "Do the scripted work.")
+                  results (tool-results session)
+                  by-name (group-by :tool_name results)
+                  result-of (fn [name n] (nth (get by-name name) n))
+                  ends (vec (filter #(= :tool_call_end (:type %)) @events))]
+              (testing (str provider ": the loop ran the whole script and ended on text")
+                (is (= "Hello world" answer))
+                (is (= 10 (count results)) (pr-str (mapv :tool_name results)))
+                (is (= 10 (count ends)))
+                (is (= :idle (:state @session))))
+              (testing (str provider ": simple file creation")
+                (is (str/includes? (:content (result-of "write_file" 0)) "5 bytes"))
+                (is (true? ((:file_exists (:execution_env @session)) "hello.txt"))))
+              (testing (str provider ": read file, then edit it")
+                (is (= "1 | hello" (:content (result-of "read_file" 0))))
+                (is (= "HELLO" (io/slurp (str dir "/hello.txt")))))
+              (testing (str provider ": multi-file edit in one session")
+                (is (= "TWO" (io/slurp (str dir "/second.txt")))))
+              (testing (str provider ": shell command execution")
+                (let [result (:content (result-of "shell" 0))]
+                  (is (str/includes? result "done"))
+                  (is (false? (:is_error (result-of "shell" 0))))))
+              (testing (str provider ": shell command timeout handling")
+                (let [result (:content (result-of "shell" 1))]
+                  (is (str/includes? result "timed out after 100ms"))
+                  (is (str/includes? result "timeout_ms"))))
+              (testing (str provider ": grep and glob find files")
+                (is (= "hello.txt:1:HELLO" (:content (result-of "grep" 0))))
+                (let [listed (:content (result-of "glob" 0))]
+                  (doseq [name ["big.txt" "hello.txt" "second.txt"]]
+                    (is (str/includes? listed name) (pr-str listed)))))
+              (testing (str provider ": multi-step read -> analyze -> edit kept order on the wire")
+                (is (= ["write_file" "read_file" (if (= provider "openai") "apply_patch" "edit_file")
+                        "write_file" (if (= provider "openai") "apply_patch" "edit_file")
+                        "shell" "shell" "grep" "glob" "read_file"]
+                       (mapv :tool_name results))))
+              (testing (str provider ": large tool output is truncated for the model, complete in the event")
+                (let [model-view (:content (result-of "read_file" 1))
+                      event-view (:output (last ends))]
+                  (is (str/includes? model-view "Tool output was truncated"))
+                  (is (< (count model-view) 60000))
+                  (is (> (count event-view) 60000))
+                  (is (not (str/includes? event-view "Tool output was truncated"))))))
+            (finally (agent/close-session! session))))))))
+
+;; SCN-CAL-PARITY-MATRIX COMPONENT COMPLETE
