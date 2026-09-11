@@ -961,19 +961,33 @@
         profile (:provider_profile @session)
         environment (:execution_env @session)
         client (:llm_client @session)
+        ;; Transient provider failures (rate limits, 5xx, network) are retried
+        ;; with backoff around the client call; non-retryable ones surface at
+        ;; once. A stream that fails at open is retried the same way, since
+        ;; no event has been delivered yet. Session config :retry_policy
+        ;; overrides the defaults (2 retries, capped delay).
+        retry-policy (merge {:max_retries 2 :base_delay 0.5 :max_delay 8.0}
+                            (:retry_policy config))
+        with-retry (fn [call]
+                     (llm/retry call
+                                (assoc retry-policy
+                                       :on_retry (fn [error attempt delay]
+                                                   (event-fn {:type :llm_retry :attempt attempt
+                                                              :delay_seconds delay
+                                                              :category (:category (ex-data error))})))))
         stream-fn
         (cond
           (:stream_fn config) (:stream_fn config)
           (:complete_fn config) nil
           (or (= "mock" (:id profile))
               (not (:supports_streaming profile))) nil
-          client (fn [request] (llm/client-stream client request))
+          client (fn [request] (with-retry #(llm/client-stream client request)))
           :else (fn [request] (llm/stream request)))
         complete-fn
         (when-not stream-fn
           (or (:complete_fn config)
               (when client
-                (fn [request] (llm/client-complete client request)))
+                (fn [request] (with-retry #(llm/client-complete client request))))
               (fn [request] (llm/complete request))))
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)]

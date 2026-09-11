@@ -1,0 +1,136 @@
+(ns attractor.agent-error-wire-test
+  "Session-level error handling on the wire: a real `agent/make-session` with
+   each built-in profile against the loopback recording server. Retryable
+   provider failures (429, 503) are retried with backoff and the turn
+   completes; an authentication failure surfaces once, untried, and closes
+   the session; a failing tool is returned to the model as an error result
+   and the turn continues. Events are checked in order after each case."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]
+            [attractor.llm-contract-adapters-test :as wire]))
+
+(def providers ["openai" "anthropic" "gemini"])
+
+(defn- fresh-dir []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-wire-error-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- session-for [root provider scenario events & [tool-executor]]
+  (let [client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter
+                                         provider {:api_key (str "key-" provider)
+                                                   :base_url (str root "/" provider "/" scenario)})}})
+        session (agent/make-session
+                  {:model (str provider "/" provider "-model")
+                   :llm_client client
+                   :execution_env (execution/make-local-environment {:working_dir (fresh-dir)})
+                   :project_docs []
+                   :max_subagent_depth 0
+                   :retry_policy {:max_retries 2 :base_delay 0.01 :max_delay 0.05 :jitter false}
+                   :on_event #(swap! events conj %)})]
+    (when tool-executor
+      (profiles/register-tool!
+        (:tool_registry (:provider_profile @session))
+        {:definition {:name "get_weather" :description "Weather by city"
+                      :parameters {:type "object" :properties {:city {:type "string"}}}}
+         :executor tool-executor}))
+    session))
+
+(defn- model-calls [root provider scenario]
+  (filterv #(and (str/includes? (get % "path") (str "/" provider "/" scenario "/"))
+                 (map? (get % "body")))
+           (wire/recorded root)))
+
+(defn- kinds [events]
+  (mapv :type (remove #(= :assistant_text_delta (:type %)) events)))
+
+(defn- caught [f] (try (f) nil (catch Object e e)))
+
+(deftest retryable-provider-failures-are-retried-and-the-turn-completes
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider providers scenario ["flaky429" "flaky503"]]
+        (let [events (atom []) session (session-for root provider scenario events)]
+          (try
+            (testing (str provider " " scenario)
+              (is (= "Hello world" (agent/process-input! session "hi")))
+              (is (= 2 (count (model-calls root provider scenario))) "one failed call, one retry")
+              (let [retry (first (filter #(= :llm_retry (:type %)) @events))]
+                (is (= 1 (:attempt retry)))
+                (is (= (if (= scenario "flaky429") :rate-limit :server) (:category retry))))
+              (is (= [:session_start :user_input :llm_retry :assistant_text_start
+                      :assistant_text_end :processing_end]
+                     (kinds @events)))
+              (is (= :idle (:state @session)))
+              (is (= [:user :assistant] (mapv :type (:history @session)))))
+            (finally (agent/close-session! session))))))))
+
+(deftest authentication-failures-surface-once-and-close-the-session
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider providers]
+        (let [events (atom []) session (session-for root provider "auth" events)
+              failure (caught #(agent/process-input! session "hi"))]
+          (testing provider
+            (is (some? failure))
+            (is (= :authentication (:category (ex-data failure))))
+            (is (false? (:retryable (ex-data failure))))
+            (is (= 1 (count (model-calls root provider "auth"))) "never retried")
+            (let [error-event (first (filter #(= :error (:type %)) @events))]
+              (is (= :authentication (:category error-event)))
+              (is (string? (:error error-event))))
+            ;; The failure happens at stream open, before any assistant text; the
+            ;; context-capacity probe may add a warning first. The terminal
+            ;; order is fixed: the typed error, then session end, nothing after.
+            (is (= [:error :session_end] (take-last 2 (kinds @events))) (pr-str (kinds @events)))
+            (is (= [:session_start :user_input] (take 2 (kinds @events))))
+            (is (empty? (filter #(contains? #{:assistant_text_end :processing_end} (:type %)) @events)))
+            (doseq [warning (filter #(= :warning (:type %)) @events)]
+              (is (= :context_discovery (:category warning))
+                  "the only warning is the capacity probe falling back to the profile estimate"))
+            (is (= :closed (:state @session)))
+            (is (= :session-closed
+                   (:category (ex-data (caught #(agent/process-input! session "again"))))))))))))
+
+(deftest tool-failures-return-an-error-result-and-the-turn-continues
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider providers]
+        (let [events (atom [])
+              session (session-for root provider "loop-error" events
+                                   (fn [_ _] (throw (ex-info "weather service down" {:category :tool-failed}))))]
+          (try
+            (testing provider
+              (is (= "Hello world" (agent/process-input! session "weather?")))
+              (let [calls (model-calls root provider "loop-error")
+                    second-body (get (second calls) "body")
+                    wire-text (pr-str second-body)]
+                (is (= 2 (count calls)))
+                (is (str/includes? wire-text "weather service down") "the error text reaches the model")
+                (case provider
+                  "anthropic" (is (true? (some #(and (= "tool_result" (get % "type")) (true? (get % "is_error")))
+                                              (mapcat #(let [c (get % "content")] (if (sequential? c) c []))
+                                                      (get second-body "messages")))))
+                  nil))
+              (let [end (first (filter #(= :tool_call_end (:type %)) @events))]
+                (is (string? (:error end)))
+                (is (str/includes? (:error end) "weather service down")))
+              (is (= [:session_start :user_input :assistant_text_start :assistant_text_end
+                      :tool_call_start :tool_call_end :assistant_text_start :assistant_text_end
+                      :processing_end]
+                     (kinds @events)))
+              (is (true? (get-in (first (filter #(= :tool_results (:type %)) (:history @session)))
+                                 [:results 0 :is_error])))
+              (is (= :idle (:state @session))))
+            (finally (agent/close-session! session))))))))
+
+;; SCN-CAL-ERRORS WIRE COMPLETE

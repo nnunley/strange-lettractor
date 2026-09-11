@@ -162,8 +162,20 @@
                           (get-in (swap! state update-in [:attempts counter] (fnil inc 0)) [:attempts counter])
                           ;; Bodyless probes (context discovery) do not consume a turn.
                           0)
-                scenario (if (= scenario "loop") (if (= attempt 1) "tools" "text") scenario)]
+                scenario (cond (= scenario "loop") (if (= attempt 1) "tools" "text")
+                               ;; "loop-error": a tool call whose execution the test makes fail.
+                               (= scenario "loop-error") (if (= attempt 1) "tools" "text")
+                               (contains? #{"flaky429" "flaky503"} scenario) (if (= attempt 1) scenario "text")
+                               :else scenario)]
           (cond
+            ;; "flaky429" / "flaky503": the first model call per provider fails
+            ;; with a retryable status, later calls answer normally.
+            (and (= scenario "flaky429") (= attempt 1))
+            {:status 429 :headers {"Content-Type" "application/json" "Retry-After" "0"}
+             :body (json/write-json {:error {:message "slow down" :type "rate_limit_error"}})}
+            (and (= scenario "flaky503") (= attempt 1))
+            {:status 503 :headers {"Content-Type" "application/json"}
+             :body (json/write-json {:error {:message "overloaded" :type "overloaded_error"}})}
             (= scenario "auth") {:status 401
                                  :headers {"Content-Type" "application/json"}
                                  :body (json/write-json {:error {:message "bad key" :type "authentication_error"}})}
