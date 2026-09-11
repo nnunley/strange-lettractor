@@ -241,6 +241,16 @@ its own test and its own `make generate` commit:
 | [#855](https://github.com/nooga/let-go/pull/855) | #845 | `line-seq` surfaces read errors |
 | [#856](https://github.com/nooga/let-go/pull/856) | #844 | HTTP timeouts, stacked on #848 |
 
+On 2026-09-11 the maintainer approved #848 to #855 and requested changes
+on #856 for two timeout bugs, filed with two lower-priority items as
+[nooga/let-go #857](https://github.com/nooga/let-go/issues/857). The two bugs
+were a slow dial reported as a connect timeout when the request deadline had
+fired, and a sticky `gapReader` flag that turned a later end of stream into
+"stream_read timeout after 0s". Both are fixed on #856 with regression tests.
+Items 3 and 4 of #857 (`:stream_read` alone leaving the first chunk
+unbounded; `http/get` and `http/post` ignoring `:timeout`) await the
+maintainer's decision.
+
 Each new test fails on `main` without its change and passes with it. Every
 branch passes `go test ./...` except `TestCustomMain`'s "versioned fork
 replace is reproduced, offline" subtest, which fails identically on untouched
