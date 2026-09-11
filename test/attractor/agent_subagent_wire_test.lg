@@ -1,0 +1,102 @@
+(ns attractor.agent-subagent-wire-test
+  "Subagents on the wire: a real parent session with each native profile
+   spawns a child against the loopback recording server. The child has its
+   own history and working directory, may run a different model, reports
+   its events through the parent, accepts further input, is bounded by the
+   depth limit, and is closed when the parent closes."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.llm-contract-adapters-test :as wire]))
+
+(def providers ["openai" "anthropic" "gemini"])
+
+(defn- fresh-dir []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-wire-sub-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    (io/mkdir (str root "/child"))
+    root))
+
+(defn- parent-for [root provider events]
+  (let [client (llm/make-client
+                 {:default_provider provider
+                  :providers {provider (llm/make-provider-adapter
+                                         provider {:api_key (str "key-" provider)
+                                                   :base_url (str root "/" provider "/text")})}})]
+    (agent/make-session
+      {:model (str provider "/parent-model")
+       :llm_client client
+       :execution_env (execution/make-local-environment {:working_dir (fresh-dir)})
+       :project_docs []
+       :max_subagent_depth 2
+       :on_event #(swap! events conj %)})))
+
+(defn- model-calls [root provider]
+  (filterv #(and (str/includes? (get % "path") (str "/" provider "/text/"))
+                 (map? (get % "body")))
+           (wire/recorded root)))
+
+(defn- wire-model [provider call]
+  (let [body (get call "body")]
+    (case provider
+      "gemini" (second (re-find #"/models/([^:]+):" (get call "path")))
+      (get body "model"))))
+
+(deftest subagents-run-scoped-turns-through-the-parent-client
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider providers]
+        (let [events (atom []) parent (parent-for root provider events)
+              parent-dir ((:working_directory (:execution_env @parent)))
+              before (count (model-calls root provider))]
+          (try
+            (testing (str provider ": spawn with its own directory and model")
+              (let [spawned (agent/spawn-subagent! parent {"task" "summarise" "working_dir" "child" "model" "child-model"})
+                    agent-id (:agent_id spawned)
+                    result (agent/wait-subagent! parent agent-id)
+                    child (get-in @parent [:subagents agent-id :session])
+                    calls (drop before (model-calls root provider))]
+                (is (string? agent-id))
+                (is (true? (:success result)))
+                (is (= "Hello world" (:output result)))
+                (is (= 1 (count calls)))
+                (is (= "child-model" (wire-model provider (first calls))) "the child's model is on the wire")
+                (is (= (str parent-dir "/child") ((:working_directory (:execution_env @child)))))
+                (is (= [:user :assistant] (mapv :type (:history @child))) "independent history")
+                (is (empty? (:history @parent)) "the parent's history is untouched")
+                (is (= 1 (:subagent_depth @child)))
+                (is (= :completed (get-in @parent [:subagents agent-id :status])))
+                (testing "events reach the parent tagged with the child id"
+                  (let [forwarded (filter #(= :subagent_event (:type %)) @events)]
+                    (is (seq forwarded))
+                    (is (every? #(= agent-id (:agent_id %)) forwarded))
+                    (is (some #(= :processing_end (get-in % [:event :type])) forwarded))))
+                (testing "send_input runs another turn on the same child"
+                  (let [sent (agent/send-subagent-input! parent agent-id "and again")
+                        again (agent/wait-subagent! parent agent-id)]
+                    (is (= agent-id (:agent_id sent)))
+                    (is (true? (:success again)))
+                    (is (= [:user :assistant :user :assistant] (mapv :type (:history @child))))
+                    (is (= 2 (count (drop before (model-calls root provider)))))))
+                (testing "depth is bounded: the grandchild can spawn nothing"
+                  (let [grandchild-handle (agent/spawn-subagent! child {"task" "deeper"})
+                        grandchild (get-in @child [:subagents (:agent_id grandchild-handle) :session])]
+                    (agent/wait-subagent! child (:agent_id grandchild-handle))
+                    (is (= 2 (:subagent_depth @grandchild)))
+                    (is (nil? (get @(:tool_registry (:provider_profile @grandchild)) "spawn_agent"))
+                        "no subagent tools at the depth limit")
+                    (is (= :subagent-depth-limit
+                           (:category (ex-data (try (agent/spawn-subagent! grandchild {"task" "too deep"}) nil
+                                                    (catch Object e e))))))))
+                (testing "closing the parent closes the child"
+                  (agent/close-session! parent)
+                  (is (= :closed (:state @child)))
+                  (is (= :closed (:state @parent))))))
+            (finally (agent/close-session! parent))))))))
+
+;; SCN-CAL-SUBAGENTS WIRE COMPLETE
