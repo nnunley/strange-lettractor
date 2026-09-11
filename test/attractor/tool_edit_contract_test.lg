@@ -4,7 +4,7 @@
             [attractor.execution :as execution]
             [attractor.profiles :as profiles]))
 
-;; Coding Agent Loop §3.3: whitespace is exact text, not an empty old_string.
+;; Edit targets are exact text: whitespace is exact text, not an empty old_string.
 ;; Exercise the actual Anthropic/Gemini tool executors and local file environment.
 (defn- edit-result [executor environment old-text new-text replace-all]
   (try

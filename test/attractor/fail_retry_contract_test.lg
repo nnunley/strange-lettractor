@@ -3,9 +3,9 @@
             [attractor.engine :as e] [attractor.context :as c]))
 
 ;; SCN-FAIL-RETRY-CONTRACT COMPLETE
-;; ATTR-ENG-04 decision: the normative text wins over the §11.5 checklist.
-;; §3.5 returns a FAIL outcome immediately, §5.2 calls FAIL "failed permanently"
-;; and routes it through fail edges or retry_target (§3.7), and RETRY exists to
+;; ATTR-ENG-04 decision: the normative text wins over the checklist.
+;; A handler that returns FAIL fails immediately; FAIL means "failed permanently"
+;; and routes through fail edges or retry_target, and RETRY exists to
 ;; request re-execution. So: a returned FAIL never re-executes the node no
 ;; matter max_retries; RETRY re-executes up to the limit; a thrown exception
 ;; re-executes while should_retry accepts it. The checklist's "retried on RETRY

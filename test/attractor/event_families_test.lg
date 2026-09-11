@@ -4,7 +4,7 @@
             [attractor.interviewer :as interviewer]))
 
 ;; SCN-EVENT-FAMILIES COMPLETE
-;; §9.6: pipeline, stage, parallel, interview and checkpoint event families,
+;; Pipeline, stage, parallel, interview and checkpoint event families,
 ;; ordered, with duration, index, error/will_retry and timeout detail.
 
 (def ^:private dot
@@ -79,7 +79,7 @@
     ;; Queue exhausted returns SKIPPED, not TIMEOUT; use a real timed wait.
     (is (nil? timeout))
     (is (some #(= :interview.completed (:type %)) events))
-    (is (= :fail (:status outcome)) "skipped answer fails the gate per §4.6")))
+    (is (= :fail (:status outcome)) "a skipped answer fails the gate")))
 
 (deftest stage-failure-events-carry-error-and-retry-detail
   (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) events (atom []) calls (atom 0)

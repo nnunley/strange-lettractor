@@ -116,7 +116,7 @@ digraph Chaining {
     (is (false? (:auto_status (p/find-node graph "disabled"))))))
 
 (deftest quoted-integer-and-boolean-attributes-keep-their-spec-types
-  ;; §2.5/§2.6 type max_retries and default_max_retries as Integer and
+  ;; The upstream attribute tables type max_retries and default_max_retries as Integer and
   ;; goal_gate as Boolean; the spec's examples quote attribute values.
   (let [g (p/parse-dot "digraph Q { graph [default_max_retries=\"3\"] start [shape=Mdiamond] work [prompt=\"w\", max_retries=\"2\", goal_gate=\"true\"] exit [shape=Msquare] start -> work -> exit }")
         work (get-in g [:nodes "work"])]

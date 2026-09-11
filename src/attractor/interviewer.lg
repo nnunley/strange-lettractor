@@ -162,7 +162,7 @@
 ;; One owned reader future consumes the input stream line by line into a
 ;; channel; every question takes from that channel with alts! against a
 ;; timeout channel, so a question honors :timeout_seconds without an abandoned
-;; per-question reader (§6.5, ATTR-HUM-02). Lines that arrive while no
+;; per-question reader (ATTR-HUM-02). Lines that arrive while no
 ;; question is pending (for example an answer typed after a timeout) are
 ;; discarded when the next question is asked, so they can never answer it.
 ;; EOF closes the channel and every later question is SKIPPED.

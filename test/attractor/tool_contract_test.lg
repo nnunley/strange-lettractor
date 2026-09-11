@@ -1,0 +1,163 @@
+(ns attractor.tool-contract-test
+  "SCN-CAL-TOOLS: the built-in tools of every provider profile executed for
+   real against a local execution environment in a temporary directory,
+   checked against the documented tool contracts: read_file numbering and
+   offset/limit, write_file creating parents, edit_file uniqueness and
+   replace_all, apply_patch (v4a) add and update, shell output/exit/duration
+   and timeout, grep options, glob ordering, Gemini's list_dir and
+   read_many_files, and the documented error cases."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+(defn- fresh-root []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-tools-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- run-tool [profile environment tool args]
+  (let [registered (profiles/registry-get (:tool_registry profile) tool)]
+    (when (nil? registered) (throw (ex-info (str "profile lacks tool " tool) {})))
+    ((:executor registered) args environment)))
+
+(defn- failure [f]
+  (try (f) nil (catch Object e {:message (ex-message e) :data (ex-data e)})))
+
+(def profiles-under-test
+  [["openai" #(profiles/create-openai-profile "gpt-test")]
+   ["anthropic" #(profiles/create-anthropic-profile "claude-test")]
+   ["gemini" #(profiles/create-gemini-profile "gemini-test")]])
+
+(defmacro with-each-profile [[profile-sym env-sym root-sym name-sym] & body]
+  `(doseq [[~name-sym make#] profiles-under-test]
+     (let [~root-sym (fresh-root)
+           ~profile-sym (make#)
+           ~env-sym (execution/make-local-environment {:working_dir ~root-sym})]
+       (try ~@body (finally ((:cleanup ~env-sym)))))))
+
+(deftest read-file-numbers-lines-and-honours-offset-and-limit
+  (with-each-profile [profile env root name]
+    (io/spit (str root "/a.txt") "alpha\nbeta\ngamma\ndelta\n")
+    (testing name
+      (is (= "1 | alpha\n2 | beta\n3 | gamma\n4 | delta"
+             (run-tool profile env "read_file" {"file_path" (str root "/a.txt")})))
+      (is (= "2 | beta\n3 | gamma"
+             (run-tool profile env "read_file" {"file_path" (str root "/a.txt") "offset" 2 "limit" 2})))
+      (is (= "1 | alpha" (run-tool profile env "read_file" {"file_path" "a.txt" "limit" 1}))
+          "relative paths resolve against the working directory")
+      (let [error (failure #(run-tool profile env "read_file" {"file_path" (str root "/missing.txt")}))]
+        (is (some? error))
+        (is (str/includes? (:message error) "missing.txt"))))))
+
+(deftest write-file-creates-parents-and-reports-bytes
+  (with-each-profile [profile env root name]
+    (testing name
+      (is (= "File written: 5 bytes"
+             (run-tool profile env "write_file" {"file_path" (str root "/sub/dir/b.txt") "content" "hello"})))
+      (is (= "hello" (io/slurp (str root "/sub/dir/b.txt"))))
+      (is (= "File written: 0 bytes"
+             (run-tool profile env "write_file" {"file_path" "empty.txt" "content" ""})))
+      (is (true? ((:file_exists env) "empty.txt"))))))
+
+(deftest edit-file-requires-a-unique-match-unless-replace-all
+  (doseq [[name make] (rest profiles-under-test)]
+    (let [root (fresh-root) profile (make) env (execution/make-local-environment {:working_dir root})]
+      (try
+        (io/spit (str root "/a.txt") "alpha\nbeta\ngamma\nbeta\n")
+        (testing name
+          (is (= 1 (run-tool profile env "edit_file"
+                             {"file_path" "a.txt" "old_string" "gamma" "new_string" "GAMMA"})))
+          (is (= "alpha\nbeta\nGAMMA\nbeta\n" (io/slurp (str root "/a.txt"))))
+          (let [error (failure #(run-tool profile env "edit_file"
+                                          {"file_path" "a.txt" "old_string" "beta" "new_string" "x"}))]
+            (is (= :edit-not-unique (get-in error [:data :category])))
+            (is (= 2 (get-in error [:data :matches]))))
+          (is (= 2 (run-tool profile env "edit_file"
+                             {"file_path" "a.txt" "old_string" "beta" "new_string" "B" "replace_all" true})))
+          (is (= "alpha\nB\nGAMMA\nB\n" (io/slurp (str root "/a.txt"))))
+          (let [error (failure #(run-tool profile env "edit_file"
+                                          {"file_path" "a.txt" "old_string" "absent" "new_string" "x"}))]
+            (is (some? error))))
+        (finally ((:cleanup env)))))))
+
+(deftest apply-patch-adds-and-updates-files-relative-to-the-working-directory
+  (let [root (fresh-root) profile (profiles/create-openai-profile "gpt-test")
+        env (execution/make-local-environment {:working_dir root})]
+    (try
+      (io/spit (str root "/a.txt") "alpha\nbeta\ngamma\n")
+      (let [patch (str "*** Begin Patch\n"
+                       "*** Add File: notes/new.txt\n+first\n+second\n"
+                       "*** Update File: a.txt\n@@\n alpha\n-beta\n+BETA\n gamma\n"
+                       "*** End Patch")
+            result (run-tool profile env "apply_patch" {"patch" patch})]
+        (is (string? result))
+        (is (= "first\nsecond\n" (io/slurp (str root "/notes/new.txt"))))
+        (is (= "alpha\nBETA\ngamma\n" (io/slurp (str root "/a.txt")))))
+      (let [error (failure #(run-tool profile env "apply_patch"
+                                      {"patch" "*** Begin Patch\n*** Add File: ../escape.txt\n+x\n*** End Patch"}))]
+        (is (= :invalid-patch (get-in error [:data :category])) "paths may not leave the working directory"))
+      (is (nil? (profiles/registry-get (:tool_registry (profiles/create-anthropic-profile "c")) "apply_patch"))
+          "apply_patch is OpenAI-specific")
+      (finally ((:cleanup env))))))
+
+(deftest shell-returns-output-status-duration-and-timeout-message
+  (with-each-profile [profile env root name]
+    (testing name
+      (let [result (run-tool profile env "shell" {"command" "printf out; printf err >&2; exit 3"})]
+        (is (= "out" (:stdout result)))
+        (is (= "err" (:stderr result)))
+        (is (= 3 (:exit_code result)))
+        (is (false? (:timed_out result)))
+        (is (integer? (:duration_ms result))))
+      (let [result (run-tool profile env "shell" {"command" "printf partial; sleep 2" "timeout_ms" 100})]
+        (is (= "partial" (:stdout result)))
+        (is (true? (:timed_out result)))
+        (is (= 124 (:exit_code result)))
+        (is (str/includes? (:stderr result) "timed out after 100ms")))
+      (is (= root (str/trim (:stdout (run-tool profile env "shell" {"command" "pwd"}))))
+          "commands run in the working directory"))))
+
+(deftest grep-supports-regex-case-glob-filter-and-max-results
+  (with-each-profile [profile env root name]
+    (io/spit (str root "/a.txt") "Alpha\nbeta\ngamma\n")
+    (io/mkdir (str root "/src"))
+    (io/spit (str root "/src/code.py") "alpha = 1\nALPHA = 2\n")
+    (testing name
+      (is (= "a.txt:3:gamma" (run-tool profile env "grep" {"pattern" "gam+a"})))
+      (is (= "" (run-tool profile env "grep" {"pattern" "alpha" "path" "a.txt"})) "case-sensitive by default")
+      (is (= "a.txt:1:Alpha" (run-tool profile env "grep" {"pattern" "alpha" "path" "a.txt" "case_insensitive" true})))
+      (is (= "src/code.py:1:alpha = 1" (run-tool profile env "grep" {"pattern" "alpha" "glob_filter" "*.py"})))
+      (is (= 1 (count (str/split (run-tool profile env "grep" {"pattern" "alpha" "case_insensitive" true "max_results" 1}) #"\n"))))
+      (is (some? (failure #(run-tool profile env "grep" {"pattern" "("}))) "invalid regex is an error"))))
+
+(deftest glob-lists-relative-matches-newest-first
+  (with-each-profile [profile env root name]
+    (io/mkdir (str root "/src"))
+    (io/spit (str root "/old.txt") "1")
+    (os/sh "/usr/bin/touch" "-t" "202001010000" (str root "/old.txt"))
+    (io/spit (str root "/src/new.txt") "2")
+    (io/spit (str root "/skip.md") "3")
+    (testing name
+      (is (= ["src/new.txt" "old.txt"] (run-tool profile env "glob" {"pattern" "**/*.txt"})))
+      (is (= ["src/new.txt"] (run-tool profile env "glob" {"pattern" "*.txt" "path" "src"}))))))
+
+(deftest gemini-list-dir-and-read-many-files
+  (let [root (fresh-root) profile (profiles/create-gemini-profile "gemini-test")
+        env (execution/make-local-environment {:working_dir root})]
+    (try
+      (io/mkdir (str root "/src"))
+      (io/spit (str root "/a.txt") "one\n")
+      (io/spit (str root "/src/b.txt") "two\n")
+      (is (= [{:is_dir false :name "a.txt" :size 4} {:is_dir true :name "src" :size 96}]
+             (mapv #(update % :size (fn [s] (if (:is_dir %) 96 s)))
+                   (run-tool profile env "list_dir" {"path" "."}))))
+      (let [many (run-tool profile env "read_many_files" {"paths" ["a.txt" "src/b.txt"]})]
+        (is (str/includes? (str many) "one"))
+        (is (str/includes? (str many) "two")))
+      (finally ((:cleanup env))))))
+
+;; SCN-CAL-TOOLS COMPLETE

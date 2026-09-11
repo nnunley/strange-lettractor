@@ -37,7 +37,7 @@
   (let [source (scripted-source [[300 "a"]])
         i (interviewer/make-console-interviewer source)
         first-answer (ask i (assoc mc :timeout_seconds 0.1 :default {:value "B" :text "Beta"}))]
-    (is (= "B" (:value first-answer)) "§6.5: default answer on timeout")
+    (is (= "B" (:value first-answer)) "default answer on timeout")
     (core/sleep 400)
     ;; "a" arrived after the timeout; it must not answer the next question.
     (let [second-answer (ask i (assoc mc :timeout_seconds 0.1))]

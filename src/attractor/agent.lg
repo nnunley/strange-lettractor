@@ -10,7 +10,8 @@
             [attractor.tool-images :as tool-images]
             [attractor.profiles :as profiles]))
 
-;; Provider-profile tool output limits from Coding Agent Loop §5.
+;; Provider-profile tool output limits (raw events keep everything; the
+;; model sees bounded head/tail content).
 (def default-tool-output-limits
   {"read_file" 50000
    "shell" 30000

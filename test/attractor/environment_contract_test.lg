@@ -1,6 +1,6 @@
 (ns attractor.environment-contract-test
-  "SCN-CAL-ENV: exact ExecutionEnvironment result contract (coding-agent-loop
-   spec §4.1/§4.2). Every assertion runs real local subprocesses through
+  "SCN-CAL-ENV: exact ExecutionEnvironment result contract (the ExecutionEnvironment
+   interface and its local implementation). Every assertion runs real local subprocesses through
    `make-local-environment`; nothing in `attractor.execution` is replaced."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]

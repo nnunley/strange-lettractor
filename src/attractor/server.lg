@@ -328,7 +328,7 @@
                             :completed_nodes (or (:completed_nodes (:outcome pipe)) [])
                             :event_count (count @(:events pipe))})
 
-            ;; GET /pipelines/:id/events — a maintained SSE stream (§9.5):
+            ;; GET /pipelines/:id/events — a maintained SSE stream:
             ;; replay from Last-Event-ID, then hold the connection and deliver
             ;; later events until the pipeline reaches a terminal status.
             (and (= method :get) (= sub-route "events"))

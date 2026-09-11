@@ -37,7 +37,8 @@
              :base_url "https://generativelanguage.googleapis.com/v1beta"
              :api_key_env ["GEMINI_API_KEY" "GOOGLE_API_KEY"]
              :model_discovery true}
-   ;; Spec §7.10: no canonical host, so the base URL must be configured.
+   ;; No canonical host exists for OpenAI-compatible servers, so the base
+   ;; URL must be configured.
    "openai-compat" {:protocol :openai-chat-completions
                     :base_url nil
                     :api_key_env "OPENAI_COMPAT_API_KEY"

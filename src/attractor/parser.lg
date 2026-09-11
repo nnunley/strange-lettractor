@@ -166,7 +166,7 @@
         (re-matches #"^-?[0-9]*\.[0-9]+$" v) (parse-double v)
         :else v))))
 
-;; Integer-typed attributes (spec §2.5/§2.6) keep their type even when the DOT
+;; Integer-typed attributes keep their type even when the DOT
 ;; author quotes the value, which the spec's own examples do.
 (defn- typed-integer [v]
   (if (and (string? v) (re-matches #"^-?[0-9]+$" v)) (parse-long v) v))

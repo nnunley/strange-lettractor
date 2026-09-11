@@ -28,7 +28,7 @@
   (is (= :anthropic-messages (:protocol (get providers/built-in "anthropic"))))
   (is (= :gemini-generate-content (:protocol (get providers/built-in "gemini"))))
   (is (= :openai-chat-completions (:protocol (get providers/built-in "openai-compat"))))
-  (is (nil? (:base_url (get providers/built-in "openai-compat"))) "no canonical host per spec §7.10")
+  (is (nil? (:base_url (get providers/built-in "openai-compat"))) "no canonical host for OpenAI-compatible servers")
   (is (every? :model_discovery (vals providers/built-in))))
 
 (deftest env-names-derive-from-the-id

@@ -434,7 +434,7 @@
          runtime {:retry-counts retry-counts
                   :sleep-fn (or (:sleep-fn options) core/sleep)
                   :random-fn (or (:random-fn options) rand)}
-         ;; §9.6: handlers emit their own event families (parallel, interview)
+         ;; Handlers emit their own event families (parallel, interview)
          ;; through the same observer; :index is the stage's position.
          handler-node (assoc node :attractor.engine/status-managed true
                              :emit-event (fn [event] (on-event (assoc event :node_id (or (:node_id event) node-id)))))

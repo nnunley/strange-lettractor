@@ -8,7 +8,7 @@
             [attractor.pipeline :as pipeline]
             [os :as os]))
 
-;; Evidence for §§4.6 and 6, including ready console input, not actual timers.
+;; Evidence for human gates and the interviewer contract, including ready console input, not actual timers.
 (def first-option {:key "A" :label "Approve" :metadata {:scope "review"}})
 (def second-option {:key "R" :label "Revise"})
 (def default-answer {:value "R" :text "Revise" :selected_option second-option})
@@ -74,7 +74,7 @@
     (is (= answers (interview/ask-multiple queue questions)))
     (is (= {:value :skipped :text "queue exhausted"}
            (interview/ask queue (dissoc complete-question :default))))
-    ;; Local extension: exhausted queues use Question.default. Upstream §6.4
+    ;; Local extension: exhausted queues use Question.default. Upstream
     ;; queue pseudocode always returns SKIPPED on exhaustion.
     (is (= default-answer (interview/ask queue complete-question)))
     (is (= :skipped (:value (interview/ask queue {:type :freeform}))))

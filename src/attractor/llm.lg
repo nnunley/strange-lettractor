@@ -2719,7 +2719,7 @@
     (when-not (str/blank? value) value)))
 
 (defn client-from-env
-  "Register every configured provider whose key is present (spec §2.2):
+  "Register every configured provider whose key is present:
    from the process environment or a config file, or, when an explicit
    environment map is given, from that map only. Chat-completions providers
    also need a base URL. The default provider is the first of openai,

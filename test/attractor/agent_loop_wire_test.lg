@@ -95,7 +95,7 @@
                                "gemini" (get-in first-body ["systemInstruction" "parts" 0 "text"]))
                       names (set (tool-names provider first-body))]
                   (is (string? system) provider)
-                  (is (str/includes? system (str "Platform: " (os/os-name))) "environment context §2.6")
+                  (is (str/includes? system (str "Platform: " (os/os-name))) "environment context is in the system prompt")
                   (is (contains? names "get_weather"))
                   (is (< 1 (count names)) "built-in profile tools are offered alongside the custom tool")
                   (is (= "What is the weather in Oslo?"

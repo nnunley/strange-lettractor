@@ -39,8 +39,8 @@
 
 (defn- journeys [{:keys [provider model compat]}]
   (let [spec (str provider "/" model)
-        ;; §2.2: the environment client registers only native providers; an
-        ;; OpenAI-compatible endpoint (§7.10) is configured explicitly.
+        ;; The environment client registers only native providers; an
+        ;; OpenAI-compatible endpoint is configured explicitly.
         ;; One client per provider, credentials and base URL from the registry.
         client (llm/make-client {:providers {provider (llm/make-provider-adapter provider {})}
                                  :default_provider provider})

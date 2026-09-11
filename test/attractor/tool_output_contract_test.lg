@@ -49,7 +49,7 @@
 (defn- repeated [text n] (apply str (repeat n text)))
 
 (deftest specified-default-character-limits-and-modes-reach-the-model
-  ;; Independent §5.2 oracle, not generated from implementation constants.
+  ;; Independent oracle of the documented limits, not generated from implementation constants.
   (doseq [[tool-name limit head-tail?]
           [["read_file" 50000 true] ["shell" 30000 true]
            ["grep" 20000 false] ["glob" 20000 false]

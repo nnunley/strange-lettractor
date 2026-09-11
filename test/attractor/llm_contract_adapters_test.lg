@@ -181,7 +181,7 @@
                                  :max_tokens 64})
             request (last-request root)
             body (get request "body")]
-        (testing "endpoint and auth follow the §7.10 extension contract"
+        (testing "endpoint and auth follow the OpenAI-compatible extension contract"
           (is (str/ends-with? (get request "path") "/openai-compat/tools/chat/completions"))
           (is (= "Bearer key-openai-compat" (header request "authorization"))))
         (testing "payload is chat-completions shaped"

@@ -4,7 +4,7 @@
             [attractor.handlers :as handlers] [attractor.interviewer :as interviewer]))
 
 ;; SCN-ARTIFACT-DISCOVERY COMPLETE
-;; ATTR-ART-02 (project extension beyond §5.5): artifacts a handler stores are
+;; ATTR-ART-02 (project extension beyond the upstream artifact store): artifacts a handler stores are
 ;; discoverable from run state without the storing process's store object,
 ;; correctly inline or file backed, and preserved across checkpoint resume,
 ;; where a later handler retrieves them through a fresh store.

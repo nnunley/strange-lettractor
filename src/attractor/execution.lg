@@ -29,7 +29,12 @@
       (subs path 0 index))))
 
 (defn- numbered-lines [content offset limit]
-  (let [lines (vec (str/split content #"\n"))
+  ;; A trailing newline terminates the last line; it does not start an
+  ;; empty line after it.
+  (let [lines (let [all (vec (str/split content #"\n"))]
+                (if (and (seq all) (str/ends-with? content "\n") (= "" (peek all)))
+                  (pop all)
+                  all))
         start (max 0 (dec (or offset 1)))
         end (min (count lines) (+ start (or limit 2000)))]
     (if (>= start (count lines))

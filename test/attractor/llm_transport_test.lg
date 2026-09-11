@@ -61,7 +61,7 @@
     {:name "502-bad-gateway" :expect-retries 2 :expect-category :server}
     {:name "503-service-unavailable" :expect-retries 2 :expect-category :server}
     {:name "529-site-overloaded" :expect-retries 2 :expect-category :server}
-    ;; §"Unknown errors default to retryable": 409 has no specified mapping, so it
+    ;; Unknown statuses default to retryable: 409 has no specified mapping, so it
     ;; normalizes to the generic provider category and is retried.
     {:name "409-conflict" :expect-retries 2 :expect-category :provider}]
 

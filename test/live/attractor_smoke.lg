@@ -1,5 +1,5 @@
 (ns main
-  "SCN-ATTR-SMOKE-LIVE: the §11.13 smoke pipeline through one real model.
+  "SCN-ATTR-SMOKE-LIVE: the upstream smoke pipeline through one real model.
    Opt-in: set ATTRACTOR_LIVE_MODEL to provider/name (for example
    openai-compat/qwen3.8-27b with OPENAI_COMPAT_BASE_URL pointing at llama.cpp). Without it
    the run exits 3 and prints a skip record; a skip is never a pass."
