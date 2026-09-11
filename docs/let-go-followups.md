@@ -221,3 +221,14 @@ carries `:adapter_timeout`, and `llm_transport_test.lg` proves the three
 scopes against the loopback fixture. A released runtime without #844 would
 silently ignore the timeouts again; without #845 a stalled stream would look
 like a clean end and be reported as a malformed body.
+
+## Upstream pull request: #847
+
+All the local runtime fixes above that live on the fork branch
+`fix/http-scope-cancellation` (#816, #830, #831, #832, #833, #801/#823, #844,
+#845) are proposed upstream as
+[nooga/let-go #847](https://github.com/nooga/let-go/pull/847), opened
+2026-09-10 from `nnunley:fix/http-scope-cancellation` at `46244c4f`. The branch
+is behind upstream `main`, so the PR needs a rebase and a fresh
+`make generate` before it can merge. Until it merges, build the runtime from
+the fork branch as the README describes.
