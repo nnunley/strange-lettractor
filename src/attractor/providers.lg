@@ -44,7 +44,7 @@
                     :api_key_env "OPENAI_COMPAT_API_KEY"
                     :model_discovery true}})
 
-(def entry-keys #{:protocol :base_url :api_key :api_key_env :model_discovery})
+(def entry-keys #{:protocol :base_url :api_key :api_key_env :api_key_from :model_discovery})
 ;; Other secret-shaped keys are rejected by name so a typo cannot hide a key
 ;; under an ignored field.
 (def secret-keys #{:key :token :bearer :secret :password :credential})
@@ -99,6 +99,9 @@
                  " (a vector of names is allowed); a key value itself belongs in :api_key")))
     (when (and (contains? entry :api_key) (not (present (:api_key entry))))
       (fail ":api_key must be a non-empty string"))
+    (when (and (contains? entry :api_key_from)
+               (not (and (string? (:api_key_from entry)) (re-matches #"[a-z0-9][a-z0-9-]*" (:api_key_from entry)))))
+      (fail ":api_key_from must name another provider id whose key this entry borrows"))
     (when (and (contains? entry :model_discovery) (not (boolean? (:model_discovery entry))))
       (fail ":model_discovery must be true or false"))
     (cond-> {:protocol (:protocol entry)
@@ -106,7 +109,8 @@
              :api_key_env (or (:api_key_env entry) (env-name id "_API_KEY"))
              :model_discovery (if (contains? entry :model_discovery) (:model_discovery entry) true)
              :source source}
-      (present (:api_key entry)) (assoc :api_key (str/trim (:api_key entry))))))
+      (present (:api_key entry)) (assoc :api_key (str/trim (:api_key entry)))
+      (string? (:api_key_from entry)) (assoc :api_key_from (:api_key_from entry)))))
 
 (defn- reader-position
   "Line and column from a reader error, without the offending token: a
@@ -238,10 +242,18 @@
   "Effective API key: explicit value, the first present variable from
    key-env-names, then a key held in a config file. nil when none is set."
   [id & [explicit env-fn]]
-  (let [get-env (or env-fn os/getenv)]
+  (let [get-env (or env-fn os/getenv)
+        d (definition id)]
     (or (present explicit)
         (some (fn [name] (env-get get-env name)) (key-env-names id))
-        (:api_key (definition id)))))
+        (:api_key d)
+        ;; :api_key_from borrows another entry's key, e.g. a gateway reached
+        ;; through several protocols; one level only.
+        (when-let [from (:api_key_from d)]
+          (when (not= (str/lower-case from) (str/lower-case (str id)))
+            (let [fd (definition from)]
+              (or (some (fn [name] (env-get get-env name)) (key-env-names from))
+                  (:api_key fd))))))))
 
 (defn key-source
   "Where the effective key comes from: :environment, :file or nil."
@@ -249,6 +261,7 @@
   (let [get-env (or env-fn os/getenv)]
     (cond (some (fn [name] (env-get get-env name)) (key-env-names id)) :environment
           (:api_key (definition id)) :file
+          (and (:api_key_from (definition id)) (api-key id nil get-env)) :borrowed
           :else nil)))
 
 (defn model-discovery? [id]

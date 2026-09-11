@@ -4,7 +4,7 @@
    provider, e.g. llamacpp/qwen3.8-27b). Each row is a natural-language task
    given to a real session in a fresh temporary directory; the row passes on
    the observable outcome (files on disk, tool results, events), never on the
-   model's wording. Records go to docs/parity-matrix-evidence.edn. Exit 0 when
+   model's wording. Records go to docs/parity-matrix-evidence/<model>.edn. Exit 0 when
    every row passed, 1 otherwise, 3 when no model is configured."
   (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io]
             [attractor.agent :as agent] [attractor.execution :as execution]
@@ -105,7 +105,9 @@
               failed (filter #(= :fail (:status %)) results)
               evidence {:scenario "SCN-CAL-PARITY-LIVE" :recorded_at (str (System/currentTimeMillis))
                         :model spec :rows results}]
-          (io/spit "docs/parity-matrix-evidence.edn" (pr-str evidence))
+          (io/mkdir "docs/parity-matrix-evidence")
+          (io/spit (str "docs/parity-matrix-evidence/" (str/replace spec #"[^A-Za-z0-9._-]+" "-") ".edn")
+                   (pr-str evidence))
           (prn {:model spec :rows (count results) :passed (- (count results) (count failed)) :failed (count failed)})
           (os/exit (if (seq failed) 1 0)))))))
 

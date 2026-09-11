@@ -18,6 +18,20 @@
                 :api_key "sk-or-..."            ; or :api_key_env "OPENROUTER_API_KEY"
                 :model_discovery true}
 
+  ;; The same gateway reached through the native wire protocols. OpenRouter
+  ;; also serves the Anthropic Messages API at /v1/messages and the OpenAI
+  ;; Responses API at /v1/responses, so the native adapters can be exercised
+  ;; against a real server. :api_key_from borrows the entry above's key.
+  ;; Models: or-messages/anthropic/claude-haiku-4.5, or-responses/openai/gpt-4.1-mini
+  "or-messages" {:protocol :anthropic-messages
+                 :base_url "https://openrouter.ai/api/v1"
+                 :api_key_from "openrouter"
+                 :model_discovery false}
+  "or-responses" {:protocol :openai-responses
+                  :base_url "https://openrouter.ai/api/v1"
+                  :api_key_from "openrouter"
+                  :model_discovery false}
+
   ;; A local llama.cpp server: no key needed, and its /models list is not
   ;; worth querying, so discovery is off.
   "llamacpp" {:protocol :openai-chat-completions

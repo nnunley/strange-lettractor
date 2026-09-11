@@ -496,6 +496,7 @@
                   (case (:key_source row)
                     :environment "  [key present in environment]"
                     :file "  [key held in config file]"
+                    :borrowed "  [key borrowed via :api_key_from]"
                     "  [no key]")))
     (println (str "    model_discovery: " (:model_discovery row))))
   (os/exit 0))

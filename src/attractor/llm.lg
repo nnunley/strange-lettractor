@@ -1196,12 +1196,15 @@
                                               (or (= (:role m) :system)
                                                   (= (:role m) :developer)))
                                             messages)))
+        ;; strict is the tool definition's own flag (default false): OpenAI's
+        ;; strict mode rejects schemas whose optional properties are not all
+        ;; listed as required, which is how profile tools are declared.
         openai-tools (mapv (fn [tool]
                              {:type "function"
                               :name (:name tool)
                               :description (:description tool)
                               :parameters (:parameters tool)
-                              :strict true})
+                              :strict (boolean (:strict tool))})
                            (or (:tools request) []))
         tool-choice (openai-tool-choice request)
         payload (merge
@@ -2230,8 +2233,11 @@
                               #(compatible-stream-events request state %))))))
 
 (defn- anthropic-stream-event [request state event]
-  (let [body (json/read-json (:data event))
-        event-type (or (get body "type") (:event event))]
+  ;; Some Messages-compatible gateways (OpenRouter) append a Chat Completions
+  ;; style "[DONE]" sentinel after message_stop; it carries no event.
+  (when-not (= "[DONE]" (str/trim (str (:data event))))
+   (let [body (json/read-json (:data event))
+         event-type (or (get body "type") (:event event))]
     (case event-type
       "message_start"
       (let [message (or (get body "message") {})]
@@ -2339,7 +2345,7 @@
 
       "error" {:type :error :error (or (get body "error") body) :raw body}
       {:type :provider_event :raw body})))
-
+)
 (defn anthropic-stream [request & [api-key base-url]]
   (let [{:keys [url headers payload]}
         (anthropic-request-data request api-key base-url)
@@ -2389,7 +2395,7 @@
      :raw raw}))
 
 (defn- gemini-stream-events [request state event]
-  (let [body (json/read-json (:data event))]
+  (let [body (if (= "[DONE]" (str/trim (str (:data event)))) {} (json/read-json (:data event)))]
     (if-let [error (get body "error")]
       [{:type :error :error error :raw body}]
       (let [candidate (first (or (get body "candidates") []))
