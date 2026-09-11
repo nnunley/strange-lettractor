@@ -41,8 +41,17 @@ Prerequisites:
   [#830](https://github.com/nooga/let-go/issues/830), [#831](https://github.com/nooga/let-go/issues/831),
   [#832](https://github.com/nooga/let-go/issues/832), [#833](https://github.com/nooga/let-go/issues/833),
   [#844](https://github.com/nooga/let-go/issues/844), [#845](https://github.com/nooga/let-go/issues/845)).
-  Build it from the `fix/http-scope-cancellation` bookmark of the local let-go
-  workspace with `go build -o build/lg .` and point `LGX_LG` at the result. A
+  Build it from the
+  [`fix/http-scope-cancellation`](https://github.com/nnunley/let-go/tree/fix/http-scope-cancellation)
+  branch of the let-go fork and point `LGX_LG` at the result:
+
+  ```sh
+  git clone -b fix/http-scope-cancellation https://github.com/nnunley/let-go.git
+  cd let-go && go build -o build/lg .
+  export LGX_LG=$PWD/build/lg
+  ```
+
+  A
   stock release runs most of the suite, but the console's evaluation capture
   and held-stream cancellation depend on those fixes; see
   [let-go follow-ups](docs/let-go-followups.md).
