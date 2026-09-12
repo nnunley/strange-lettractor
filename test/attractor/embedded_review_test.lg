@@ -1,0 +1,86 @@
+(ns attractor.embedded-review-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.embedded-review :as review]
+            [attractor.context :as context]
+            [attractor.pipeline :as pipeline]
+            [attractor.handlers :as handlers] [os :as os] [io :as io]))
+
+(def approved {:verdict :approve :findings [] :evidence ["Checked the task and diff"]})
+(def revise {:verdict :revise :findings ["Missing acceptance case"] :evidence ["Inspected tests"]})
+(defn result [id report] {:id id :node_id id :status :success :context_updates {"review.report" report}})
+(defn gate [results decision]
+  ((review/make-pair-gate ["a" "b"] (fn [_] decision)) {}
+   (context/make-context {"parallel.results" results}) {} "unused"))
+
+(deftest approval-requires-both-reviews-and-adjudication
+  (is (= :success (:status (gate [(result "a" approved) (result "b" approved)] approved))))
+  (is (= :fail (:status (gate [(result "a" revise) (result "b" approved)] approved))))
+  (is (= :fail (:status (gate [(result "a" approved) (result "b" approved)] revise)))))
+
+(deftest invalid-branch-evidence-never-reaches-adjudication
+  (doseq [results [nil [] [(result "a" approved)]
+                   [(result "a" approved) (result "a" approved)]
+                   [(result "a" approved) (result "unexpected" approved)]
+                   [(assoc (result "a" approved) :status :fail) (result "b" approved)]
+                   [(result "a" {}) (result "b" approved)]]]
+    (let [calls (atom 0)
+          outcome ((review/make-pair-gate ["a" "b"] (fn [_] (swap! calls inc) approved)) {}
+                   (context/make-context {"parallel.results" results}) {} "unused")]
+      (is (= :fail (:status outcome)))
+      (is (= 0 @calls)))))
+
+(deftest reviewer-validates-reports-and-honors-cancellation
+  (let [invoke (review/make-reviewer (fn [& _] approved))]
+    (is (= approved (get-in (invoke {} nil {} "unused") [:context_updates "review.report"])))
+    (is (= :cancelled (:status (invoke {:cancelled? (fn [] true)} nil {} "unused")))))
+  (doseq [report [nil {:verdict :approve :findings [] :evidence []}
+                  (assoc approved :verdict :maybe) (assoc revise :findings [])
+                  (assoc approved :findings [42])]]
+    (is (= :fail (:status ((review/make-reviewer (fn [& _] report)) {} nil {} "unused"))))))
+
+(deftest callback-completion-does-not-override-cancellation
+  (let [cancelled (atom false)
+        handler (review/make-reviewer (fn [& _] (reset! cancelled true) approved))]
+    (is (= :cancelled (:status (handler {:cancelled? #(deref cancelled)} nil {} "unused"))))))
+
+(def dot (io/slurp "examples/embedded-review.dot"))
+
+(deftest bound-functions-consume-real-parallel-outcomes
+  (doseq [report [approved revise {}]]
+    (let [registry (handlers/make-handler-registry) seen (atom [])]
+      (handlers/register-handler! registry "review.correctness" (review/make-reviewer (fn [& _] approved)))
+      (handlers/register-handler! registry "review.requirements" (review/make-reviewer (fn [& _] report)))
+      (handlers/register-handler! registry "review.adjudicate"
+        (review/make-pair-gate ["correctness" "requirements"] (fn [reports] (reset! seen reports) approved)))
+      (let [outcome (pipeline/execute-prepared (pipeline/prepare dot)
+                      {:registry registry :max-steps 10
+                       :logs-root (str (os/temp-dir) "/embedded-review-" (random-uuid))})]
+        (is (= (if (= report approved) :success :fail) (:status outcome)))
+        (is (= (if (= report {}) 0 2) (count @seen)))))))
+
+(deftest invalid-gate-output-clears-prior-approval
+  (doseq [decision [nil (assoc approved :evidence [(apply str (repeat 17000 "x"))])]]
+    (let [outcome (gate [(result "a" approved) (result "b" approved)] decision)]
+      (is (= :fail (:status outcome)))
+      (is (= false (get-in outcome [:context_updates "review.approved"]))))))
+
+(deftest adjudication-order-and-cancellation-are-controller-owned
+  (let [seen (atom []) cancelled (atom false)
+        handler (review/make-pair-gate ["a" "b"]
+                  (fn [reports] (reset! seen (mapv :reviewer reports))
+                    (reset! cancelled true) approved))
+        outcome (handler {:cancelled? #(deref cancelled)}
+                  (context/make-context {"parallel.results" [(result "b" approved) (result "a" approved)]})
+                  {} "unused")]
+    (is (= ["a" "b"] @seen))
+    (is (= :cancelled (:status outcome)))
+    (is (= false (get-in outcome [:context_updates "review.approved"])))))
+
+(deftest missing-gate-binding-cannot-default-to-approval
+  (let [registry (handlers/make-handler-registry)]
+    (doseq [type ["review.correctness" "review.requirements"]]
+      (handlers/register-handler! registry type (review/make-reviewer (fn [& _] approved))))
+    (let [outcome (pipeline/execute-prepared (pipeline/prepare dot)
+                    {:registry registry :max-steps 10
+                     :logs-root (str (os/temp-dir) "/unbound-review-" (random-uuid))})]
+      (is (= :fail (:status outcome))))))

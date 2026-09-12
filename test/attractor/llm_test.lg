@@ -7,7 +7,7 @@
 
 (deftest test-model-catalog-supports-provider-capability-and-alias-lookups
   (is (= "claude-opus-4-6" (:id (llm/get-model-info "opus"))))
-  (is (= "gpt-5.2" (:id (llm/get-latest-model "openai" "reasoning"))))
+  (is (= "gpt-6-astra" (:id (llm/get-latest-model "openai" "reasoning"))))
   (is (every? #(= "gemini" (:provider %)) (llm/list-models "gemini")))
   (is (> (count (llm/list-models)) 5))
   (is (nil? (llm/get-model-info "future-model-not-yet-cataloged"))))
@@ -1620,22 +1620,22 @@
     (is (= 0 @calls))))
 
 (deftest test-total-timeout-closes-an-idle-stream
-  (let [closed (atom false)
+  (let [closed (promise)
         adapter
         (llm/make-adapter
           "mock" (fn [_] nil)
           (fn [request]
             ((:register_stream_close request)
-             (fn [] (reset! closed true)))
+             (fn [] (deliver closed :closed)))
             [{:type :stream_start} {:type :text_delta :delta "later"}]))
         client (llm/make-client {:providers {"mock" adapter}
                                  :default_provider "mock"})
         events (:events
                  (llm/stream "mock/model" "go"
-                             {:client client :timeout 0.01}))]
+                             {:client client :timeout 0.5}))]
     (is (= :stream_start (:type (first events))))
-    (core/sleep 25)
-    (is (true? @closed))
+    ;; Leave the stream idle: demanding its tail could itself trigger cleanup.
+    (is (= :closed (deref closed 2000 :cleanup-missing)))
     (is (= :request-timeout
            (try
              (do (doall (rest events)) nil)
@@ -1723,24 +1723,29 @@
     (is (= :request-timeout (:category (ex-data error))))
     (is (= :total (:scope (ex-data error))))
     (is (< (- (System/currentTimeMillis) started) 80)))
-  (let [attempts (atom 0)
+  (let [retry-scheduled (promise)
         adapter
         (llm/make-adapter
           "mock"
           (fn [_]
-            (swap! attempts inc)
-            (throw (ex-info "again" {:retryable true})))
+            (throw (ex-info "again" {:retryable true :category :rate-limit})))
           (fn [_] []))
         client (llm/make-client {:providers {"mock" adapter}
-                                 :default_provider "mock"})]
+                                 :default_provider "mock"})
+        started (System/currentTimeMillis)]
     (is (= :request-timeout
            (try
              (do (llm/generate "mock/model" "go"
-                               {:client client :timeout {:total 0.01}
-                                :retry_policy {:base_delay 1.0 :jitter false}})
+                               {:client client :timeout {:total 0.5}
+                                :retry_policy
+                                {:base_delay 5.0 :jitter false
+                                 :on_retry (fn [error _ delay]
+                                             (deliver retry-scheduled
+                                               [(:category (ex-data error)) delay]))}})
                  nil)
              (catch Object error (:category (ex-data error))))))
-    (is (= 1 @attempts))))
+    (is (= [:rate-limit 5.0] (deref retry-scheduled 0 :retry-not-reached)))
+    (is (< (- (System/currentTimeMillis) started) 2000))))
 
 (deftest test-cancellation-is-forwarded-to-the-active-adapter
   (let [controller (llm/make-abort-controller)

@@ -1,0 +1,66 @@
+(ns attractor.task-runner-review-test
+  (:require [clojure.test :refer [deftest is]] [io :as io]
+            [attractor.pipeline :as pipeline]
+            [attractor.task-runner :as runner]
+            [attractor.imported-task-runner-test :as fixture]))
+(def approve {:verdict :approve :findings [] :evidence ["Inspected acceptance tests"]})
+(def revise {:verdict :revise :findings ["Acceptance case missing"] :evidence ["Inspected diff"]})
+(defn run-pair [report]
+  (let [calls (atom [])
+        outcome (fixture/run-case "exit 0" "unused" ["A"]
+                  {:prepared (pipeline/prepare (io/slurp "examples/task-runner/graph.dot"))
+                   :bind (fn [registry dir]
+                           (runner/bind-reviews registry
+                             {:state_dir (str dir "/attractor_runs/task-runner/state")
+                              :correctness (fn [& _] (swap! calls conj :correctness) approve)
+                              :requirements (fn [& _] (swap! calls conj :requirements) report)
+                              :adjudicate (fn [_] (swap! calls conj :adjudicate) approve)}))})]
+    (assoc outcome :reviews @calls)))
+(deftest paired-approval-publishes-through-native-bindings
+  (let [{:keys [result reviews seen state]} (run-pair approve)]
+    (is (= :success (:status result)))
+    (is (= #{:correctness :requirements :adjudicate} (set reviews)))
+    (is (= 3 (count reviews)))
+    (is (not-any? #(contains? #{"critique" "verdict"} %) seen))
+    (is (io/file-exists? (str state "/critique.md")))))
+(deftest repeated-review-disagreement-stalls-without-publishing
+  (let [{:keys [result reviews seen]} (run-pair revise)]
+    (is (= :fail (:status result)))
+    (is (= 3 (count (filter #(= :adjudicate %) reviews))))
+    (is (some #(= "postmortem" %) seen))
+    (is (not-any? #(= "package" %) seen))))
+(deftest invalid-review-stops-at-postmortem-without-adjudication
+  (let [{:keys [result reviews seen]} (run-pair {})]
+    (is (= :fail (:status result)))
+    (is (not-any? #(= :adjudicate %) reviews))
+    (is (some #(= "postmortem" %) seen))
+    (is (not-any? #(= "package" %) seen))))
+
+(deftest review-report-publication-failure-cannot-reach-package
+  (let [outcome (fixture/run-case "exit 0" "unused" ["A"]
+                  {:prepared (pipeline/prepare (io/slurp "examples/task-runner/graph.dot"))
+                   :bind (fn [registry dir]
+                           (runner/bind-reviews registry
+                             {:state_dir (str dir "/missing-directory/state")
+                              :correctness (fn [& _] approve)
+                              :requirements (fn [& _] approve)
+                              :adjudicate (fn [_] approve)}))})]
+    (is (= :fail (get-in outcome [:result :status])))
+    (is (some #(= "postmortem" %) (:seen outcome)))
+    (is (not-any? #(= "package" %) (:seen outcome)))))
+
+(deftest contextual-adjudicator-is-bound-with-the-gate-context
+  (let [seen (atom nil)
+        outcome (fixture/run-case "exit 0" "unused" []
+                  {:prepared (pipeline/prepare (io/slurp "examples/task-runner/graph.dot"))
+                   :bind (fn [registry dir]
+                           (runner/bind-reviews registry
+                             {:state_dir (str dir "/attractor_runs/task-runner/state")
+                              :correctness (fn [& _] approve)
+                              :requirements (fn [& _] approve)
+                              :adjudicate_with_context
+                              (fn [reports node ctx graph logs]
+                                (reset! seen [(count reports) (:id node) (some? ctx) (some? graph) (string? logs)])
+                                approve)}))})]
+    (is (= :success (get-in outcome [:result :status])))
+    (is (= [2 "adjudicate" true true true] @seen))))

@@ -1,0 +1,47 @@
+(ns attractor.tool-choice-capability-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest named-choice-requires-a-nonempty-string-name-before-dispatch
+  (let [reject (fn [_] (throw (ex-info "Adapter must not run" {:category :unexpected-dispatch})))
+        adapter (llm/make-adapter "fixture" reject reject)
+        client (llm/make-client {:providers {"fixture" adapter} :default_provider "fixture"})]
+    (doseq [invoke [llm/client-complete llm/client-stream]
+            tool-name [nil "" "  " 42]]
+      (let [error (try (invoke client {:model "model" :messages []
+                                      :tool_choice {:mode "named" :tool_name tool-name}})
+                       {} (catch Object e (ex-data e)))]
+        (is (= :invalid-request (:category error)))
+        (is (false? (:retryable error)))))))
+
+(deftest named-choice-with-string-key-fields-is-preserved
+  (let [choice {"mode" "named" "tool_name" "lookup"}
+        adapter (llm/make-adapter "fixture" (fn [r] (:tool_choice r)) (fn [_] []))
+        client (llm/make-client {:providers {"fixture" adapter} :default_provider "fixture"})]
+    (is (= choice (llm/client-complete client {:model "model" :messages [] :tool_choice choice})))))
+
+(deftest unsupported-tool-choice-never-reaches-the-adapter
+  (let [reject (fn [_] (throw (ex-info "Provider invocation must not occur" {:category :unexpected-dispatch})))
+        adapter (llm/make-adapter "fixture" reject reject
+                  {:supports_tool_choice (fn [mode] (= "auto" mode))})
+        client (llm/make-client {:providers {"fixture" adapter} :default_provider "fixture"})]
+    (doseq [invoke [llm/client-complete llm/client-stream]]
+      (is (= :unsupported-tool-choice
+             (try (invoke client {:model "model" :messages [] :tool_choice {:mode "required"}})
+                  :unexpected-success
+                  (catch Object error (:category (ex-data error)))))))))
+
+(deftest supported-tool-choice-reaches-the-adapter
+  (let [adapter (llm/make-adapter "fixture"
+                  (fn [r] {:accepted (:tool_choice r)})
+                  (fn [r] [{:accepted (:tool_choice r)}])
+                  {:supports_tool_choice (fn [mode] (= "required" mode))})
+        client (llm/make-client {:providers {"fixture" adapter} :default_provider "fixture"})
+        request {:model "model" :messages [] :tool_choice {:mode "required"}}]
+    (is (= {:accepted {:mode "required"}} (llm/client-complete client request)))
+    (is (= [{:accepted {:mode "required"}}] (vec (llm/client-stream client request))))))
+
+(deftest native-adapters-advertise-tool-choice-capabilities
+  (doseq [provider ["openai" "anthropic" "gemini"]]
+    (let [supports (:supports_tool_choice (llm/make-provider-adapter provider {}))]
+      (is (and (some? supports) (every? supports ["auto" "none" "required" "named"])))
+      (is (and (some? supports) (not (supports "unsupported")))))))

@@ -8,43 +8,83 @@
       [(subs s 0 idx) (subs s (+ idx (count sep)))]
       [s ""])))
 
-;; Parse a literal property value (strip quotes)
-(defn- parse-val [v]
-  (let [v (str/trim (str v))]
-    (if (and (str/starts-with? v "\"") (str/ends-with? v "\"") (>= (count v) 2))
-      (subs v 1 (dec (count v)))
-      v)))
+(defn- syntax-error! [message]
+  (throw (ex-info message {:category :stylesheet-syntax})))
 
-;; Parse CSS-like model_stylesheet text into a list of rule maps:
-;; [{:selector "*" :specificity 0 :order 0 :properties {:llm_model "..." :llm_provider "..." :reasoning_effort "..."}} ...]
+;; Delimiters inside quoted strings are data, including escaped quotes.
+(defn- declaration-end [text]
+  (loop [i 0 quoted? false escaped? false]
+    (if (= i (count text))
+      (syntax-error! "Unterminated stylesheet rule or string")
+      (let [ch (subs text i (inc i))]
+        (cond
+          escaped? (recur (inc i) quoted? false)
+          (and quoted? (= ch "\\")) (recur (inc i) true true)
+          (= ch "\"") (recur (inc i) (not quoted?) false)
+          (and (not quoted?) (#{";" "}"} ch)) i
+          (and (not quoted?) (= ch "{")) (syntax-error! "Unexpected opening brace")
+          :else (recur (inc i) quoted? false))))))
+
+(defn- custom-property? [property]
+  (boolean (re-matches #"--[a-z][a-z0-9-]*" (name property))))
+
+(defn- property-value [text custom?]
+  (if (str/starts-with? text "\"")
+    (do
+      (when-not (re-matches #"\"(?:\\[\"nt\\]|[^\"\\])*\"" text)
+        (syntax-error! "Invalid quoted property value"))
+      (loop [i 1 chars []]
+        (if (>= i (dec (count text)))
+          (apply str chars)
+          (let [ch (subs text i (inc i))]
+            (if (= ch "\\")
+              (let [escaped (subs text (inc i) (+ i 2))]
+                (recur (+ i 2) (conj chars (case escaped "n" "\n" "t" "\t" escaped))))
+              (recur (inc i) (conj chars ch)))))))
+    (if (or (re-matches #"[A-Za-z_][A-Za-z0-9_.:-]*" text)
+            (and custom? (re-matches #"[0-9]+" text)))
+      text
+      (syntax-error! "Invalid or missing property value"))))
+
+(defn- read-declarations [text]
+  (loop [remaining (str/trim text) properties {}]
+    (let [end (declaration-end remaining)
+          declaration (str/trim (subs remaining 0 end))
+          delimiter (subs remaining end (inc end))
+          [property value] (split-once declaration ":")
+          property (keyword (str/trim property))]
+      (when-not (or (#{:llm_model :llm_provider :reasoning_effort} property) (custom-property? property))
+        (syntax-error! "Expected a model declaration or --custom-property"))
+      (let [properties (assoc properties property (property-value (str/trim value) (custom-property? property)))
+            tail (str/trim (subs remaining (inc end)))]
+        (cond
+          (= delimiter "}") [properties tail]
+          (str/starts-with? tail "}") [properties (str/trim (subs tail 1))]
+          :else (recur tail properties))))))
+
+(defn- read-stylesheet [css-text]
+  (loop [remaining (str/trim (or css-text "")) rules []]
+    (if (str/blank? remaining)
+      rules
+      (let [prefix (re-find #"^(?:\*|#[A-Za-z_][A-Za-z0-9_]*|\.[a-z0-9-]+|[A-Za-z_][A-Za-z0-9_]*)\s*\{" remaining)]
+        (when-not prefix (syntax-error! "Expected a stylesheet selector and opening brace"))
+        (let [selector (str/trim (subs prefix 0 (dec (count prefix))))
+              [properties tail] (read-declarations (subs remaining (count prefix)))
+              specificity (cond (= selector "*") 0
+                                (str/starts-with? selector "#") 3
+                                (str/starts-with? selector ".") 2
+                                :else 1)]
+          (recur tail (conj rules {:selector selector :specificity specificity
+                                   :order (count rules) :properties properties})))))))
+
+;; Invalid input yields no rules so transforms cannot partially apply it before
+;; the validation phase reports the canonical stylesheet_syntax diagnostic.
 (defn parse-stylesheet [css-text]
-  (if (str/blank? css-text)
-    []
-    (let [re #"[*#.a-zA-Z0-9_-]+[ \t\r\n]*\{[^}]+\}"
-          matches (re-seq re css-text)]
-      (map-indexed
-        (fn [idx m]
-          (let [[raw-selector raw-decls] (split-once (str m) "{")
-                sel (str/trim raw-selector)
-                decls-str (str/trim (str/replace raw-decls #"\}[ \t\r\n]*$" ""))
-                spec (cond
-                       (= sel "*") 0
-                       (str/starts-with? sel "#") 3
-                       (str/starts-with? sel ".") 2
-                       :else 1)
-                decls (->> (str/split decls-str #";")
-                           (map str/trim)
-                           (remove str/blank?)
-                           (map (fn [d]
-                                  (let [[prop val] (split-once d ":")]
-                                    [(keyword (str/trim prop)) (parse-val val)])))
-                           (filter (fn [[prop _]] (#{:llm_model :llm_provider :reasoning_effort} prop)))
-                           (into {}))]
-            {:selector sel
-             :specificity spec
-             :order idx
-             :properties decls}))
-        matches))))
+  (try (read-stylesheet css-text)
+       (catch Object error
+         (if (= :stylesheet-syntax (:category (ex-data error)))
+           []
+           (throw error)))))
 
 ;; Check if a node matches a stylesheet rule
 ;; node is a map with :id, :shape, :class
@@ -91,22 +131,15 @@
                             (:reasoning_effort stylesheet-props)
                             (:reasoning_effort graph-attrs)
                             "high")]
+    (merge (into {} (filter (fn [[k _]] (custom-property? k))
+                           (merge graph-attrs stylesheet-props (:attrs node))))
     {:llm_model final-model
      :llm_provider final-provider
-     :reasoning_effort final-reasoning}))
+     :reasoning_effort final-reasoning})))
 
-;; Validate stylesheet syntax
-;; Returns nil if valid, or a diagnostic error message if invalid
 (defn validate-stylesheet-syntax [css-text]
-  (if (str/blank? css-text)
-    nil
-    (let [trimmed (str/trim css-text)]
-      ;; Simple check: every '{' should have a matching '}'
-      (let [open-count (count (filter #(= % \{) trimmed))
-            close-count (count (filter #(= % \}) trimmed))]
-        (if (not= open-count close-count)
-          "Unbalanced braces in model_stylesheet"
-          (let [rules (parse-stylesheet trimmed)]
-            (if (and (not (str/blank? trimmed)) (empty? rules))
-              "Invalid model_stylesheet syntax: no valid rules found"
-              nil)))))))
+  (try (read-stylesheet css-text) nil
+       (catch Object error
+         (if (= :stylesheet-syntax (:category (ex-data error)))
+           (ex-message error)
+           (throw error)))))

@@ -1,0 +1,108 @@
+(ns attractor.nrepl-hub-test
+  (:require [clojure.test :refer [deftest is]] [clojure.edn :as edn]
+            [attractor.nrepl-hub :as transport] [attractor.hub :as hub]
+            [attractor.execution :as execution] [attractor.profiles :as profiles]))
+
+(defn options []
+  {:session_options
+   {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+    :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                               :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+    :project_docs []
+    :complete_fn (fn [r] {:message {:role :assistant :content (:content (last (:messages r)))}})}})
+(defn call [h payload]
+  (transport/handle-message h {"id" "request-7" "op" "attractor/request" "payload" (pr-str payload)}))
+(defn value [reply] (edn/read-string (get reply "value")))
+(defn stop [h] (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))
+
+(deftest typed-answers-survive-edn-transport-and-invalid-answers-do-not-consume-question
+  (let [h (hub/start! (options))]
+    (try
+      (doseq [answer [{:value :skipped :text "eof"} {:value :yes} {:value :no}
+                      {:value :timeout} {:text "free text"}
+                      {:value "R" :text "Revise" :selected_option {:key "R" :label "Revise"}
+                       :metadata {:operator "local"}}]]
+        (let [pending (promise)]
+          (swap! (:questions h) assoc "q" {:question_id "q" :answer pending})
+          (doseq [invalid [nil "skip" {:value :bogus} {:value 1} {:value "R" :text 7}
+                           {:value "R" :selected_option {:key 1 :label "Bad"}}]]
+            (is (= :invalid-request
+                   (get-in (value (call h {:op :question/answer :question_id "q" :answer invalid})) [:error :category])))
+            (is (not (realized? pending))))
+          (is (true? (get-in (value (call h {:op :question/answer :question_id "q" :answer answer})) [:value :answered])))
+          (is (= answer (deref pending 100 :missing)))))
+      (finally (stop h)))))
+
+(defn await-eval [h id]
+  (let [deadline (+ (System/nanoTime) 3000000000)]
+    (loop []
+      (let [reply (value (call h {:op :eval/result :eval_id id}))]
+        (if (or (:error reply) (= :completed (get-in reply [:value :state])) (>= (System/nanoTime) deadline)) reply
+            (do (sleep 5) (recur)))))))
+
+(deftest remote-evaluation-uses-printable-values-and-keeps-namespace
+  (let [h (hub/start! (options))]
+    (try
+      (let [client (:value (value (call h {:op :client/attach})))
+            submitted (value (call h {:op :eval/submit :code "(def remote-number 41) (println \"remote\") (fn [x] x)"}))
+            result (await-eval h (get-in submitted [:value :eval_id]))]
+        (is (string? (get-in submitted [:value :eval_id])))
+        (is (not (contains? (:value submitted) :completion)))
+        (is (= "remote\n" (get-in result [:value :result :value :printed])))
+        (is (string? (get-in result [:value :result :value :value_repr])))
+        (is (not (contains? (get-in result [:value :result :value]) :value)))
+        (let [events (get-in (value (call h {:op :events/since :client_id (:client_id client) :cursor (:cursor client)})) [:value :events])
+              event (:event (last (filter #(= :eval_result (get-in % [:event :type])) events)))]
+          (is (= "remote\n" (:printed event)))
+          (is (string? (:value_repr event)))
+          (is (not (contains? event :value))))
+        (let [next (:value (value (call h {:op :eval/submit :code "(inc remote-number)"})))]
+          (is (= "42" (get-in (await-eval h (:eval_id next)) [:value :result :value :value_repr]))))
+        (is (= :unknown-eval (get-in (value (call h {:op :eval/result :eval_id "missing"})) [:error :category]))))
+      (finally (stop h)))))
+
+(deftest expired-cursor-carries-remote-recovery-position
+  (let [h (hub/start! (assoc (options) :event_capacity 1))]
+    (try
+      (let [client (:value (value (call h {:op :client/attach})))
+            _ (call h {:op :session/open})
+            latest (:value (value (call h {:op :session/open})))
+            expired (value (call h {:op :events/since :client_id (:client_id client) :cursor (:cursor client)}))
+            cursor (get-in expired [:error :oldest_cursor])]
+        (is (= :cursor-expired (get-in expired [:error :category])))
+        (is (integer? cursor))
+        (let [recovered (:value (value (call h {:op :events/since :client_id (:client_id client) :cursor cursor})))]
+          (is (= (:session_id latest) (:session_id (last (:events recovered)))))))
+      (finally (stop h)))))
+
+(deftest explicit-protocol-and-data-errors
+  (let [h (hub/start! (options))]
+    (try
+      (let [description (transport/handle-message h {"id" "d" "op" "describe"})]
+        (is (= "d" (get description "id")))
+        (is (= #{"describe" "attractor/request"} (set (keys (get description "ops"))))))
+      (is (= ["error" "unknown-op" "done"]
+             (get (transport/handle-message h {"id" "e" "op" "eval" "code" "42"}) "status")))
+      (doseq [payload ["{:op :session/open} {:op :session/open}" "[]" "{:op :session/open" "#=(+ 1 2)"]]
+        (let [reply (transport/handle-message h {"id" "bad" "op" "attractor/request" "payload" payload})]
+          (is (= :invalid-request (get-in (value reply) [:error :category])))))
+      (is (= :unknown-operation (get-in (value (call h {:op :hub/stop})) [:error :category])))
+      (is (= [] (:value (value (call h {:op :session/list})))))
+      (finally (stop h)))))
+
+(deftest session-submission-is-data-and-results-remain-hub-owned
+  (let [h (hub/start! (options))]
+    (try
+      (let [opened (call h {:op :session/open :id "must-not-win"})
+            id (get-in (value opened) [:value :session_id])
+            submitted (call h {:op :session/submit :session_id id :text "hello"})
+            turn (get-in (value submitted) [:value :turn_id])]
+        (is (= "request-7" (get opened "id")))
+        (is (= "request-7" (:id (value opened))))
+        (is (= #{:session_id :turn_id} (set (keys (:value (value submitted))))))
+        (is (string? turn))
+        (let [done (deref (get-in @(:sessions h) [id :turn :completion]) 3000 {})
+              result (value (call h {:op :session/result :session_id id :turn_id turn}))]
+          (is (= {:value "hello"} done))
+          (is (= {:session_id id :turn_id turn :state :completed :result done} (:value result)))))
+      (finally (stop h)))))

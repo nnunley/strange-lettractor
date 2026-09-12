@@ -1,0 +1,103 @@
+(ns attractor.embedded-review
+  (:require [clojure.string :as str]
+            [attractor.context :as context]))
+
+(def max-report-bytes 16384)
+
+(defn- reject! [reason]
+  (throw (ex-info (str "Embedded review: " (name reason))
+                  {:category :review_evidence_invalid :reason reason})))
+
+(defn- nonblank? [s] (and (string? s) (not (str/blank? s))))
+(defn- strings? [v] (and (vector? v) (<= (count v) 64) (every? nonblank? v)))
+
+(defn- checked-report [report]
+  (when-not (and (map? report)
+                (= #{:verdict :findings :evidence} (set (keys report)))
+                (contains? #{:approve :revise} (:verdict report))
+                (strings? (:findings report))
+                (strings? (:evidence report)) (seq (:evidence report))
+                (or (= :approve (:verdict report)) (seq (:findings report))))
+    (reject! :invalid-report))
+  (when (> (count (bytes (pr-str report))) max-report-bytes)
+    (reject! :report-too-large))
+  report)
+
+(defn- check-cancel! [node]
+  (when (and (:cancelled? node) ((:cancelled? node)))
+    (throw (ex-info "Review cancelled" {:category :cancelled}))))
+
+(defn- failure [node error]
+  (assoc (if (or (= :cancelled (:category (ex-data error)))
+          (and (:cancelled? node) ((:cancelled? node))))
+    {:status :cancelled :failure_reason "Review cancelled"}
+    {:status :fail :retryable false
+     :category (or (:category (ex-data error)) :review_callback_failed)
+     :failure_reason (if (:reason (ex-data error))
+                       (str "Invalid review evidence: " (name (:reason (ex-data error))))
+                       "Embedded review callback failed")})
+         :context_updates {"review.report" nil "review.approved" false
+                           "review.reports" [] "review.adjudication" nil}))
+
+(defn make-reviewer
+  "Bind a native handler around a review function [node ctx graph logs-root].
+   It returns {:verdict :approve|:revise :findings [strings] :evidence [strings]}.
+   Successful execution is distinct from approval. Evidence strings are claims
+   supplied by the reviewer, not independently verified by this wrapper."
+  [review-fn]
+  (when-not (fn? review-fn) (reject! :invalid-reviewer))
+  (fn [node ctx graph logs-root]
+    (try
+      (check-cancel! node)
+      (let [report (review-fn node ctx graph logs-root)]
+        (check-cancel! node)
+        {:status :success :context_updates {"review.report" (checked-report report)}})
+      (catch Object e (failure node e)))))
+
+(defn make-contextual-pair-gate
+  "Bind a handler that validates both expected parallel branch outcomes before
+   invoking adjudicate with [reports node ctx graph logs-root], where reports
+   contain {:reviewer id :report report} in declared order.
+   Only two approvals plus adjudicator approval return success. Missing, failed,
+   duplicate or malformed branches cannot be replaced by the fan-in best result.
+   The parallel node must be wait_all; both branches end at the shared fan-in."
+  [reviewer-ids adjudicate]
+  (when-not (and (vector? reviewer-ids) (= 2 (count reviewer-ids))
+                (every? nonblank? reviewer-ids) (= 2 (count (set reviewer-ids))))
+    (reject! :invalid-reviewer-ids))
+  (when-not (fn? adjudicate) (reject! :invalid-adjudicator))
+  (fn [node ctx graph logs-root]
+    (try
+      (check-cancel! node)
+      (let [results (context/ctx-get ctx "parallel.results")]
+        (when-not (and (vector? results) (= 2 (count results))
+                      (every? map? results)
+                      (= (set reviewer-ids) (set (map :id results)))
+                      (every? #(and (= :success (:status %))
+                                    (= (:id %) (:node_id %))) results))
+          (reject! :invalid-branches))
+        (let [by-id (into {} (map (fn [result] [(:id result) result]) results))
+              reports (mapv (fn [id] {:reviewer id :report
+                                     (checked-report (get-in by-id [id :context_updates "review.report"]))})
+                            reviewer-ids)
+              decision (adjudicate reports node ctx graph logs-root)
+              _ (check-cancel! node)
+              decision (checked-report decision)
+              approved? (and (= :approve (:verdict decision))
+                             (every? #(= :approve (get-in % [:report :verdict])) reports))
+              updates {"review.reports" reports "review.adjudication" decision
+                       "review.approved" approved?}]
+          (if approved?
+            {:status :success :context_updates updates}
+            {:status :fail :retryable false :category :review_changes_requested
+             :failure_reason "Both reviewers and adjudication must approve"
+             :context_updates updates})))
+      (catch Object e (failure node e)))))
+
+(defn make-pair-gate
+  "Reports-only adjudicator compatibility wrapper. Use make-contextual-pair-gate
+   when the callback needs the gate's cancellation signal or execution context."
+  [reviewer-ids adjudicate]
+  (when-not (fn? adjudicate) (reject! :invalid-adjudicator))
+  (make-contextual-pair-gate reviewer-ids
+    (fn [reports _node _ctx _graph _logs-root] (adjudicate reports))))

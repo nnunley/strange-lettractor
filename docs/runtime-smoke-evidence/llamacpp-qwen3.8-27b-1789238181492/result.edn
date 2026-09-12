@@ -1,0 +1,1 @@
+{:scenario "SCN-ATTR-SMOKE-LIVE", :status :fail, :counts {:error 1, :pass 1, :test 1, :fail 3}, :model "llamacpp/qwen3.8-27b", :logs_root "docs/runtime-smoke-evidence/llamacpp-qwen3.8-27b-1789238181492/logs", :recorded_at "1789238181652"}

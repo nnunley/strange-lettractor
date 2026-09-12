@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.stylesheet :as s]
             [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
             [attractor.transforms :as transforms]))
 
 (deftest test-stylesheet-specificity
@@ -37,6 +38,24 @@
     (is (empty? (s/parse-stylesheet "this is not a stylesheet")))
     (is (some? (s/validate-stylesheet-syntax "this is not a stylesheet")))))
 
+(deftest all-selector-levels-compete-through-public-preparation
+  (let [prepared (pipeline/prepare
+                   "digraph Cascade {
+                      graph [model_stylesheet=\"#chosen { llm_model: id-model; } .fast { llm_model: class-model; } box { llm_model: shape-model; } * { llm_model: universal-model; }\"];
+                      start [shape=Mdiamond];
+                      shaped [shape=box]; classified [shape=box, class=fast];
+                      chosen [shape=box, class=fast];
+                      explicit [shape=box, class=fast, llm_model=\"explicit-model\"];
+                      exit [shape=Msquare];
+                      start -> shaped -> classified -> chosen -> explicit -> exit;
+                    }")
+        nodes (get-in prepared [:graph :nodes])]
+    (is (= "universal-model" (get-in nodes ["start" :llm_model])))
+    (is (= "shape-model" (get-in nodes ["shaped" :llm_model])))
+    (is (= "class-model" (get-in nodes ["classified" :llm_model])))
+    (is (= "id-model" (get-in nodes ["chosen" :llm_model])))
+    (is (= "explicit-model" (get-in nodes ["explicit" :llm_model])))))
+
 (deftest test-stylesheet-can-set-reasoning-effort
   (let [dot "digraph G {
                graph [model_stylesheet=\"box { reasoning_effort: low; }\"]
@@ -44,3 +63,48 @@
              }"
         graph (-> (parser/parse-dot dot) transforms/apply-transforms)]
     (is (= "low" (:reasoning_effort (parser/find-node graph "task"))))))
+
+(deftest malformed-stylesheets-are-rejected-in-full
+  (doseq [css ["junk * { llm_model: model; }"
+               "* { llm_model: model; } junk"
+               "* { llm_model model; }"
+               "* { llm_model: ; }"
+               "* { llm_model: model llm_provider: mock; }"
+               "* { unknown: value; }"
+               "* { llm_model: model;; }"
+               "* {}" "* { llm_model: model; } } {"
+               "* { llm_model: \"unfinished; }"
+               "* { llm_model: @@@; }"
+               ".bad_class { llm_model: m; }"
+               "* { llm_model: \"a\\qb\"; }"]]
+    (is (some? (s/validate-stylesheet-syntax css)) css)
+    (is (empty? (s/parse-stylesheet css)) css)))
+
+(deftest quoted-stylesheet-values-preserve-delimiters-and-escapes
+  (let [css "* { llm_model: \"vendor/a;b}c{d\\\"e\"; llm_provider: mock; } #task { reasoning_effort: low }"
+        rules (s/parse-stylesheet css)]
+    (is (nil? (s/validate-stylesheet-syntax css)))
+    (is (= 2 (count rules)))
+    (is (= "vendor/a;b}c{d\"e" (get-in (vec rules) [0 :properties :llm_model])))
+    (is (= "low" (:reasoning_effort (s/resolve-node-model-props {:id "task"} rules {}))))))
+
+(deftest public-preparation-reports-malformed-stylesheet
+  (let [result (pipeline/prepare
+                 "digraph G { graph [model_stylesheet=\"* { llm_model: model; } garbage\"] start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }")]
+    (is (some #(and (= "stylesheet_syntax" (:rule %)) (= :error (:severity %)))
+              (:diagnostics result)))))
+
+(deftest custom-properties-follow-stylesheet-precedence
+  (let [css "* { --context-window: 8000; --reserve-tokens: 1000; } .review { --context-window: 16000; } #task { --context-window: 32000; }"
+        rules (s/parse-stylesheet css)
+        resolved (s/resolve-node-model-props {:id "task" :class "review" :attrs {:--reserve-tokens "2000"}}
+                                           rules {:--context-window "4000" :--max-output-tokens "512"})]
+    (is (nil? (s/validate-stylesheet-syntax css)))
+    (is (= "32000" (:--context-window resolved)))
+    (is (= "2000" (:--reserve-tokens resolved)))
+    (is (= "512" (:--max-output-tokens resolved)))))
+
+(deftest dot-custom-property-overrides-survive-preparation
+  (let [prepared (pipeline/prepare
+                   "digraph G { graph [model_stylesheet=\"* { --reserve-tokens: 1000; }\"]; start [shape=Mdiamond]; task [\"--reserve-tokens\"=2000]; exit [shape=Msquare]; start -> task -> exit; }")]
+    (is (= 2000 (get-in prepared [:graph :nodes "task" :--reserve-tokens])))))

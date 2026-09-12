@@ -1,0 +1,91 @@
+(ns attractor.server-question-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.server :as server] [json :as json]
+            [attractor.web-interviewer :as web] [attractor.interviewer :as interviewer]))
+
+(defn await-state [id timeout-ms ready?]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [pipe (get @server/active-pipelines id)]
+        (cond (ready? pipe) pipe
+              (>= (System/currentTimeMillis) deadline) pipe
+              :else (do (core/sleep 5) (recur)))))))
+
+(defn await-result [id timeout-ms] (await-state id timeout-ms :outcome))
+
+(deftest empty-pipeline-registry-is-an-empty-json-array
+  (let [saved @server/active-pipelines]
+    (try
+      (reset! server/active-pipelines {})
+      (is (= [] (json/read-json (:body (server/app-handler {:request-method :get :path "/pipelines"})))))
+      (finally (reset! server/active-pipelines saved)))))
+
+(deftest http-human-gate-honors-question-timeout-and-default-route
+  (let [response (server/app-handler
+                   {:request-method :post :path "/pipelines"
+                    :body "digraph Web { start [shape=Mdiamond]; gate [shape=hexagon, human.timeout_seconds=\"0.01\", human.default_choice=right]; left [shape=box]; right [shape=box]; exit [shape=Msquare]; start -> gate; gate -> left [label=\"[L] Left\"]; gate -> right [label=\"[R] Right\"]; left -> exit; right -> exit; }"})
+        id (get (json/read-json (:body response)) "id")]
+    (try
+      (let [pipe (await-result id 1000)]
+        (is (= :success (:status pipe)))
+        (is (= "R" (get-in pipe [:outcome :context "human.gate.selected"])))
+        (is (empty? @(:questions pipe))))
+      (finally
+        (when-let [pipe (get @server/active-pipelines id)]
+          (reset! (:cancelled pipe) true)
+          (await-result id 2000))))))
+
+(deftest parallel-http-questions-remain-distinct-and-route-their-own-answers
+  (let [response (server/app-handler
+                   {:request-method :post :path "/pipelines"
+                    :body "digraph Web { start [shape=Mdiamond]; par [shape=component]; a [shape=hexagon, label=Alpha, human.timeout_seconds=\"2\"]; b [shape=hexagon, label=Beta, human.timeout_seconds=\"2\"]; join [shape=tripleoctagon]; exit [shape=Msquare]; start -> par; par -> a; par -> b; a -> join [label=\"[A] Alpha chosen\"]; b -> join [label=\"[B] Beta chosen\"]; join -> exit; }"})
+        id (get (json/read-json (:body response)) "id")]
+    (try
+      (await-state id 1000 #(= #{"Alpha" "Beta"} (set (map :text (vals @(:questions %))))))
+      (let [questions (json/read-json (:body (server/app-handler
+                                             {:request-method :get :path (str "/pipelines/" id "/questions")})))]
+        (is (= #{"Alpha" "Beta"} (set (map #(get % "text") (vals questions)))))
+        (is (= #{"a" "b"} (set (map #(get % "stage") (vals questions)))))
+        (doseq [[qid question] questions]
+          (let [answer-response (server/app-handler
+                                  {:request-method :post :path (str "/pipelines/" id "/questions/" qid "/answer")
+                                   :body (json/write-json {"answer" (if (= "Alpha" (get question "text")) "A" "B")})})]
+            (is (= 200 (:status answer-response)))))
+        (let [pipe (await-result id 1000)
+              outcomes (get-in pipe [:outcome :context "parallel.results"])]
+          (is (= :success (:status pipe)) (pr-str {:questions @(:questions pipe) :answers @(:pending-answers pipe) :outcome (:outcome pipe)}))
+          (is (= #{"A" "B"} (set (map #(get-in % [:context_updates "human.gate.selected"]) outcomes))))
+          (is (empty? @(:questions pipe)))
+          (is (empty? @(:pending-answers pipe)))))
+      (finally
+        (when-let [pipe (get @server/active-pipelines id)]
+          (reset! (:cancelled pipe) true)
+          (await-result id 2000))))))
+
+(deftest web-timeout-preserves-complete-default-answer
+  (let [questions (atom {}) answers (atom {})
+        ask (web/make-interviewer questions answers (atom false))
+        default {:value "Y" :selected_option {:key "Y" :label "Proceed"} :text "Proceed"}]
+    (is (= default (interviewer/ask ask {:text "Proceed?" :type :confirmation
+                                        :timeout_seconds 0 :default default})))
+    (is (= :timeout (:value (interviewer/ask ask {:text "Proceed?" :type :confirmation :timeout_seconds 0}))))
+    (is (empty? @questions))
+    (is (empty? @answers))))
+
+(deftest cancelling-http-pipeline-clears-its-untimed-question
+  (let [response (server/app-handler
+                   {:request-method :post :path "/pipelines"
+                    :body "digraph Web { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Proceed\"]; }"})
+        id (get (json/read-json (:body response)) "id")]
+    (try
+      (let [waiting (await-state id 1000 #(seq @(:questions %)))]
+        (is (some? (seq @(:questions waiting)))))
+      (server/app-handler {:request-method :post :path (str "/pipelines/" id "/cancel")})
+      (let [pipe (await-result id 1000)]
+        (is (= :cancelled (:status pipe)))
+        (is (empty? @(:questions pipe)))
+        (is (empty? @(:pending-answers pipe))))
+      (finally
+        (when-let [pipe (get @server/active-pipelines id)]
+          (reset! (:cancelled pipe) true)
+          (await-result id 2000))))))

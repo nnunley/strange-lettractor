@@ -1,0 +1,36 @@
+(ns attractor.gemini-alias-contract-test
+  (:require [clojure.test :refer [deftest is]] [json :as json]
+            [attractor.llm :as llm] [attractor.providers :as providers]))
+
+(deftest custom-gemini-provider-remembers-tool-names-from-complete-and-stream
+  (doseq [stream? [false true]]
+    (let [protocol-of providers/protocol-of
+          replay (atom nil)
+          body {:responseId "g1" :candidates [{:content {:parts [{:functionCall {:name "lookup" :args {}}}]}
+                                               :finishReason "STOP"}] :usageMetadata {}}
+          finished {:responseId "g2" :candidates [{:content {:parts [{:text "done"}]} :finishReason "STOP"}]
+                    :usageMetadata {}}]
+      (with-redefs [providers/protocol-of (fn [id] (if (= id "gemini-proxy") :gemini-generate-content (protocol-of id)))]
+        (let [adapter (llm/make-provider-adapter "gemini-proxy"
+                        {:api_key "fixture" :base_url "https://fixture.invalid/v1beta"
+                         :transport (fn [request]
+                                      (let [payload (json/read-json (:body request))
+                                            result? (get-in payload ["contents" 1 "parts" 0 "functionResponse"])]
+                                        (if result?
+                                          (do (reset! replay payload) {:status 200 :body (json/write-json finished)})
+                                          {:status 200 :body (if (= :stream (:as request))
+                                                               (str "data: " (json/write-json body) "\n\n")
+                                                               (json/write-json body))})))})
+              client (llm/make-client {:providers {"gemini-proxy" adapter} :default_provider "gemini-proxy"})
+              request {:model "fixture" :messages [{:role :user :content "look up"}]}
+              response (if stream? (:response (last (vec (llm/client-stream client request))))
+                           (llm/client-complete client request))
+              id (get-in response [:tool_calls 0 :id])
+              result (llm/client-complete client
+                       {:model "fixture" :messages [(:message response)
+                                                    {:role :tool :content [{:kind :tool_result
+                                                                            :tool_result {:tool_call_id id :content "found"}}]}]})]
+          (is (string? id))
+          (is (= "lookup" (get-in @replay ["contents" 1 "parts" 0 "functionResponse" "name"])))
+          (is (= "found" (get-in @replay ["contents" 1 "parts" 0 "functionResponse" "response" "result"])))
+          (is (= "done" (get-in result [:message :text]))))))))

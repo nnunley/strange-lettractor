@@ -1,5 +1,11 @@
 # Upstream let-go follow-ups
 
+2026-09-12: the configured local runtime also needs the JSON string-key fix in
+[`runtime-patches/README.md`](../runtime-patches/README.md). HTTP question IDs and
+context keys previously included reader quotes. The native compiled-server probe
+now passes with that patch. Empty lazy sequences still serialize incorrectly as
+`[null]` in the observed runtime; the pipeline listing now constructs a vector.
+
 These are temporary workarounds or unproved runtime guarantees, not permanent
 design choices. Revisit this checklist whenever updating the local let-go checkout
 or binary. An issue being closed is not sufficient: verify the fix is present in

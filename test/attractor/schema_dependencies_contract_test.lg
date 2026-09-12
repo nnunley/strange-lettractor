@@ -1,0 +1,27 @@
+(ns attractor.schema-dependencies-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest dependent-required-uses-presence-and-is-not-bidirectional
+  (doseq [schema [{:dependentRequired {"enabled" ["reason"]}}
+                  {"dependencies" {"enabled" ["reason"]}}]]
+    (doseq [trigger [false nil true]]
+      (is (false? (first (llm/validate-json-schema {"enabled" trigger} schema))))
+      (is (true? (first (llm/validate-json-schema {"enabled" trigger "reason" nil} schema)))))
+    (is (true? (first (llm/validate-json-schema {"reason" "standalone"} schema))))
+    (is (true? (first (llm/validate-json-schema {} schema))))))
+
+(deftest dependent-schemas-validate-the-whole-object
+  (doseq [keyword [:dependentSchemas :dependencies]]
+    (let [schema {keyword {"enabled" {:required ["reason"]
+                                      :properties {"reason" {:type "string"}}}}}]
+      (is (false? (first (llm/validate-json-schema {"enabled" false} schema))))
+      (is (false? (first (llm/validate-json-schema {"enabled" nil "reason" 3} schema))))
+      (is (true? (first (llm/validate-json-schema {"enabled" false "reason" "disabled"} schema))))
+      (is (true? (first (llm/validate-json-schema {"reason" 3} schema)))))))
+
+(deftest dependent-schema-can-reject-presence-or-resolve-a-local-reference
+  (is (false? (first (llm/validate-json-schema {"secret" nil}
+                      {:dependentSchemas {"secret" false}}))))
+  (is (false? (first (llm/validate-json-schema {"enabled" true}
+                      {:$defs {"explanation" {:required ["reason"]}}
+                       :dependentSchemas {"enabled" {:$ref "#/$defs/explanation"}}})))))

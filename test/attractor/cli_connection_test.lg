@@ -1,0 +1,30 @@
+(ns attractor.cli-connection-test
+  (:require [clojure.test :refer [deftest is]] [os :as os]
+            [attractor.cli :as cli] [attractor.hub :as hub]
+            [attractor.nrepl-client :as remote]
+            [attractor.console.session :as console] [attractor.console.line :as line]))
+
+(deftest attached-console-does-not-create-or-stop-a-hub
+  (let [h (hub/start! {}) address (atom nil) closed (atom false) exit (atom nil) error (atom nil)]
+    (try
+      (with-redefs [hub/start! (fn [_] (throw (ex-info "Unexpected local hub" {})))
+                    remote/connect! (fn [a] (reset! address a) :remote)
+                    remote/console-options (fn [_] {:request_fn (fn [r] (deref (hub/request! h r) 1000 {}))
+                                                    :events_fn (fn [id cursor] (hub/events-since h id cursor))})
+                    remote/close! (fn [_] (reset! closed true))
+                    line/run! (fn [c _] (console/handle! c {:type :line :text "/quit"}))
+                    os/exit (fn [code] (reset! exit code))]
+        (try (cli/cmd-console ["--connect" "4555"]) (catch Object e (reset! error (ex-message e)))))
+      (is (nil? @error) (str @error))
+      (is (= {:host "127.0.0.1" :port 4555} @address))
+      (is (= 0 @exit))
+      (is @closed)
+      (is (nil? (:error (deref (hub/request! h {:id "alive" :op :session/list}) 1000 {}))))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+(deftest invalid-connection-port-fails-before-startup
+  (doseq [args [["--connect"] ["--connect" "0"] ["--connect" "65536"] ["--connect" "abc"]]]
+    (with-redefs [hub/start! (fn [_] (throw (ex-info "Local startup" {:category :wrong-startup})))
+                  remote/connect! (fn [_] (throw (ex-info "Network startup" {:category :wrong-startup})))]
+      (is (= :configuration_error
+             (try (cli/cmd-console args) nil (catch Object e (:category (ex-data e)))))))))

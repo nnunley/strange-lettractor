@@ -105,6 +105,35 @@ digraph Chaining {
     (is (= "outer" (:thread_id (p/find-node graph "After"))))
     (is (= 2 (count (:subgraphs graph))))))
 
+(deftest edge-defaults-are-inherited-and-restored-at-subgraph-boundaries
+  (let [graph (p/parse-dot
+                "digraph ScopedEdges {
+                   edge [weight=1, label=global]
+                   a -> b
+                   subgraph outer {
+                     b -> c
+                     edge [weight=7, label=outer]
+                     c -> d
+                     subgraph inner {
+                       d -> e
+                       edge [weight=9, label=inner]
+                       e -> f [weight=11]
+                     }
+                     f -> g
+                   }
+                   g -> h
+                   subgraph sibling { h -> i }
+                 }")]
+    (is (= [{:from "a" :to "b" :weight 1 :label "global"}
+            {:from "b" :to "c" :weight 1 :label "global"}
+            {:from "c" :to "d" :weight 7 :label "outer"}
+            {:from "d" :to "e" :weight 7 :label "outer"}
+            {:from "e" :to "f" :weight 11 :label "inner"}
+            {:from "f" :to "g" :weight 7 :label "outer"}
+            {:from "g" :to "h" :weight 1 :label "global"}
+            {:from "h" :to "i" :weight 1 :label "global"}]
+           (mapv #(select-keys % [:from :to :weight :label]) (:edges graph))))))
+
 (deftest test-explicit-false-auto-status-overrides-inherited-true
   (let [graph (p/parse-dot
                 "digraph G {
@@ -130,3 +159,24 @@ digraph Chaining {
     (is (re-matches #"run-[0-9a-f-]{36}" run))
     (is (= 12 (count (attractor.ids/short run))))
     (is (not (str/includes? (str text run) "#uuid")))))
+
+(deftest escapes-are-decoded-once-in-left-to-right-order
+  (doseq [[encoded expected] [["\\\\n" "\\n"] ["\\\\t" "\\t"]
+                              ["\\\\\\n" "\\\n"] ["\\n\\t" "\n\t"]
+                              ["\\\\\\\"" "\\\""] ["\\q" "\\q"]]]
+    (is (= expected (p/unescape-string encoded)))))
+
+(deftest comments-do-not-consume-quoted-prompt-or-edge-text
+  (let [graph (p/parse-dot
+                "digraph Comments {
+                   // fake [prompt=bad]
+                   start [shape=Mdiamond];
+                   work [prompt=\"Fetch https://host/path /* literal */ and // text\"];
+                   /* ignored -> node; */
+                   exit [shape=Msquare];
+                   start -> work [label=\"/* proceed */ // now\"];
+                   work -> exit;
+                 }")]
+    (is (= "Fetch https://host/path /* literal */ and // text" (get-in graph [:nodes "work" :prompt])))
+    (is (= "/* proceed */ // now" (:label (first (:edges graph)))))
+    (is (= #{"start" "work" "exit"} (set (keys (:nodes graph)))))))

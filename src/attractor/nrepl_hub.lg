@@ -1,0 +1,63 @@
+(ns attractor.nrepl-hub
+  (:require [clojure.edn :as edn] [attractor.hub :as hub]))
+
+(def ^:private operations
+  #{:eval/submit :eval/result
+    :workflow/run :workflow/resume :workflow/list :workflow/result :workflow/inspect :workflow/events :workflow/checkpoint :workflow/cancel
+    :agent/run :agent/list :agent/result :agent/cancel
+    :session/open :session/list :session/submit :session/result :session/cancel
+    :question/list :question/answer :client/attach :client/detach :events/since})
+
+(defn- fail! [category] (throw (ex-info (name category) {:category category})))
+
+(defn- printable-result [value]
+  (assoc (dissoc value :value) :value_repr (pr-str (:value value))))
+
+(defn- wire-event [envelope]
+  (if (and (= :eval (:source envelope)) (= :eval_result (get-in envelope [:event :type]))
+           (= :ok (get-in envelope [:event :status])))
+    (update envelope :event printable-result)
+    envelope))
+
+(defn- wire-reply [op reply]
+  (let [reply (if (map? (:value reply)) (update reply :value dissoc :completion) reply)]
+    (cond
+      (and (= op :events/since) (:value reply)) (update-in reply [:value :events] #(mapv wire-event %))
+      (and (= op :eval/result) (contains? (get-in reply [:value :result]) :value))
+      (update-in reply [:value :result :value] printable-result)
+      :else reply)))
+(defn- request-data [message]
+  (let [payload (get message "payload")]
+    (when-not (and (string? payload) (<= (count payload) 1048576)) (fail! :invalid-request))
+    (let [forms (try (edn/read-all-string payload) (catch Object _ (fail! :invalid-request)))]
+      (when-not (and (= 1 (count forms)) (map? (first forms)) (keyword? (:op (first forms))))
+        (fail! :invalid-request))
+      (assoc (first forms) :id (get message "id")))))
+
+(defn handle-message
+  "One nREPL response map. Application envelopes are EDN strings inside bencode;
+   completion promises remain in the supplied hub. This does not own the hub."
+  [h message]
+  (let [id (get message "id") base (if (string? id) {"id" id} {})]
+    (try
+      (when-not (and (map? message) (string? id)) (fail! :invalid-request))
+      (case (get message "op")
+        "describe"
+        (assoc base "ops" {"describe" {} "attractor/request" {}}
+                    "status" ["done"])
+        "attractor/request"
+        (let [request (request-data message)
+              _ (when-not (contains? operations (:op request)) (fail! :unknown-operation))
+              reply (if (= :events/since (:op request))
+                      {:id id :value (hub/events-since h (:client_id request) (:cursor request))}
+                      (deref (hub/request! h request) 5000
+                             {:id id :error {:category :request-timeout
+                                            :message "Request may still complete; do not blindly retry mutations"}}))
+              reply (wire-reply (:op request) reply)]
+          (assoc base "value" (pr-str reply) "status" (if (:error reply) ["error" "done"] ["done"])))
+        (assoc base "status" ["error" "unknown-op" "done"]))
+      (catch Object e
+        (assoc base "status" ["error" "done"]
+                    "value" (pr-str {:id id :error (merge (select-keys (ex-data e) [:oldest_cursor])
+                                                   {:category (or (:category (ex-data e)) :transport-error)
+                                                    :message (ex-message e)})}))))))

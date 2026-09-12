@@ -1,0 +1,51 @@
+(ns attractor.development-repl-test
+  (:require [clojure.test :refer [deftest is]]
+            [io :as io] [os :as os]
+            [attractor.ids :as ids]
+            [attractor.pipeline :as pipeline]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+
+(defn- preparation []
+  (pipeline/prepare (io/slurp "examples/development-repl.dot")))
+
+(deftest development-repl-has-valid-model-routing-and-fresh-context
+  (let [prepared (preparation) nodes (get-in prepared [:graph :nodes])]
+    (is (empty? (:diagnostics prepared)))
+    (doseq [id ["local_work" "local_repair" "frontier_work" "second_opinion"]]
+      (is (= "truncate" (:fidelity (get nodes id))))
+      (is (nil? (:thread_id (get nodes id)))))
+    (is (= ["llamacpp" "qwen3.8-27b"]
+           ((juxt :llm_provider :llm_model) (get nodes "local_work"))))
+    (is (= ["openrouter" "openai/gpt-5.2"]
+           ((juxt :llm_provider :llm_model) (get nodes "frontier_work"))))
+    (is (= ["openrouter" "anthropic/claude-opus-4.6"]
+           ((juxt :llm_provider :llm_model) (get nodes "second_opinion"))))))
+
+(deftest development-repl-routes-verification-failures-and-human-decisions
+  (doseq [[failed answers expected]
+          [[#{} ["L" "Q"] ["task_ready" "local_work" "check_local"]]
+           [#{"check_local"} ["L" "Q"]
+            ["task_ready" "local_work" "check_local" "local_repair" "check_repair"]]
+           [#{"check_local" "check_repair"} ["L" "F" "Q"]
+            ["task_ready" "local_work" "check_local" "local_repair" "check_repair" "frontier_work" "check_frontier"]]
+           [#{"local_work" "frontier_work"} ["L" "F" "O" "Q"]
+            ["task_ready" "local_work" "frontier_work" "second_opinion" "check_second"]]
+           [#{"local_work" "frontier_work" "check_second"} ["L" "F" "O" "Q"]
+            ["task_ready" "local_work" "frontier_work" "second_opinion" "check_second"]]
+           [#{"local_work"} ["L" "Q"] ["task_ready" "local_work"]]
+           [#{} ["F" "F" "N" "L" "Q"]
+            ["frontier_work" "check_frontier" "task_ready" "local_work" "check_local"]]]]
+    (let [seen (atom [])
+          queue (interviewer/make-queue-interviewer (mapv #(hash-map :value %) answers))
+          registry (handlers/make-handler-registry queue nil)
+          step (fn [node _ _ _]
+                 (swap! seen conj (:id node))
+                 {:status (if (contains? failed (:id node)) :fail :success)})]
+      (handlers/register-handler! registry "tool" step)
+      (handlers/register-handler! registry "codergen" step)
+      (let [result (pipeline/execute-prepared (preparation)
+                     {:registry registry :max-steps 40
+                      :logs-root (str (os/temp-dir) "/development-repl-" (ids/uuid-text))})]
+        (is (= :success (:status result)))
+        (is (= expected @seen) (pr-str @seen))))))

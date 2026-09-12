@@ -1,0 +1,97 @@
+(ns attractor.middleware-routing-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest rerouted-stream-retries-only-before-output-is-delivered
+  (doseq [partial? [false true]]
+    (let [failure (fn [] (lazy-seq (throw (ex-info "socket reset by peer" {}))))
+          initial (if partial?
+                    (cons {:type :text_delta :delta "original"} (failure))
+                    (failure))
+          recovered [{:type :text_delta :delta "recovered"}
+                     {:type :finish :finish_reason :stop :usage {}}]
+          script (atom [initial recovered])
+          client (llm/make-client
+                   {:providers {"local" (llm/make-adapter "local" (fn [_] {}) nil)
+                                "frontier" (llm/make-adapter "frontier" (fn [_] {})
+                                             (fn [_]
+                                               (first (first (swap-vals! script rest)))))}
+                    :default_provider "local"
+                    :middleware [(fn [r next] (next (assoc r :provider "frontier")))]})
+          events (vec (:events (llm/stream "model" "go"
+                                 {:client client :max_retries 1
+                                  :retry_policy {:sleep_fn (fn [_] nil)}})))]
+      (is (= (if partial? [:text_delta :error] [:text_delta :finish])
+             (mapv :type events)))
+      (is (= (if partial? "original" "recovered") (:delta (first events))))
+      (when partial?
+        (is (= :network (:category (ex-data (:error (last events))))))
+        (is (true? (:retryable (ex-data (:error (last events))))))))))
+
+(deftest high-level-stream-errors-identify-the-routed-provider
+  (doseq [tail [[{:type :error :error {"code" "rate_limit_error" "message" "busy"}}]
+                []]]
+    (let [client (llm/make-client
+                   {:providers {"local" (llm/make-adapter "local" (fn [_] {}) nil)
+                                "frontier" (llm/make-adapter "frontier" (fn [_] {})
+                                             (fn [_] (concat [{:type :text_delta :delta "frontier output"}] tail)))}
+                    :default_provider "local"
+                    :middleware [(fn [r next] (next (assoc r :provider "frontier")))]})
+          events (vec (:events (llm/stream "model" "go" {:client client})))
+          error (:error (last events))]
+      (is (= [:text_delta :error] (mapv :type events)))
+      (is (= "frontier output" (:delta (first events))))
+      (is (= "frontier" (:provider (ex-data error))))
+      (is (= (if (seq tail) :rate-limit :provider) (:category (ex-data error)))))))
+
+(defn- fixture-client [destination]
+  (let [adapter (fn [id]
+                  (llm/make-adapter id
+                    (fn [r] {:adapter id :model (:model r) :provider (:provider r)})
+                    (fn [r] [{:type :text_delta :delta id :model (:model r)
+                              :provider (:provider r)}])))]
+    (llm/make-client
+      {:providers {"local" (adapter "local") "frontier" (adapter "frontier")}
+       :default_provider "local"
+       :middleware [(fn [request next] (next (assoc request :provider destination)))]})))
+
+(deftest invalid-rerouting-is-non-retryable
+  (let [client (fixture-client "missing")
+        error (try (doall (:events (llm/stream "model" "go"
+                                    {:client client
+                                     :retry_policy {:on_retry
+                                                    (fn [_ _ _]
+                                                      (throw (ex-info "configuration was retried"
+                                                                      {:category :unexpected-retry})))}})))
+                   nil
+                   (catch Object e e))]
+    (is (= :configuration (:category (ex-data error))))
+    (is (false? (:retryable (ex-data error))))))
+
+(deftest middleware-provider-change-selects-the-matching-adapter
+  (let [client (fixture-client :frontier)]
+    (is (= {:adapter "frontier" :model "native/model" :provider "frontier"}
+           (llm/client-complete client {:model "native/model" :messages []})))
+    (is (= [{:type :text_delta :delta "frontier" :model "native/model" :provider "frontier"}]
+           (vec (llm/client-stream client {:model "native/model" :messages []}))))))
+
+(deftest middleware-cannot-send-an-unknown-provider-to-the-original-adapter
+  (doseq [invoke [llm/client-complete llm/client-stream]]
+    (is (= :configuration
+           (try (invoke (fixture-client "missing") {:model "model" :messages []}) :unexpected-success
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest routing-after-middleware-does-not-strip-a-native-model-twice
+  (let [client (fixture-client "local")]
+    (is (= "local/model"
+           (:model (llm/client-complete client {:model "local/local/model" :messages []}))))))
+
+(deftest streaming-support-is-checked-on-the-final-adapter
+  (let [client (llm/make-client
+                 {:providers {"local" (llm/make-adapter "local" (fn [_] {}) nil)
+                              "frontier" (llm/make-adapter "frontier" (fn [_] {})
+                                           (fn [_] [{:type :text_delta :delta "ready"}]))}
+                  :default_provider "local"
+                  :middleware [(fn [r next] (next (assoc r :provider "frontier")))]})]
+    (is (= [{:type :text_delta :delta "ready"}]
+           (try (vec (llm/client-stream client {:model "model" :messages []}))
+                (catch Object e {:error (:category (ex-data e))}))))))

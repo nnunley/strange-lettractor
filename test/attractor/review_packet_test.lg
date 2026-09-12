@@ -1,0 +1,66 @@
+(ns attractor.review-packet-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [json :as json] [io :as io] [os :as os]
+            [attractor.review-packet :as packet] [attractor.handlers :as handlers]))
+(defn fixture []
+  (let [root (str (os/temp-dir) "/review-packet-" (random-uuid))]
+    (io/mkdir root)
+    (os/sh "git" "init" "-q" root)
+    (io/spit (str root "/code.txt") "base\n")
+    (os/sh "git" "-C" root "add" "code.txt")
+    (os/sh "git" "-C" root "-c" "user.name=Fixture" "-c" "user.email=fixture@example.test"
+           "-c" "commit.gpgsign=false" "commit" "-qm" "base")
+    (io/mkdir (str root "/attractor_runs/task-runner/state"))
+    (io/spit (str root "/attractor_runs/task-runner/task.md") "Implement both changes")
+    (io/spit (str root "/attractor_runs/task-runner/state/verify.log") "2 tests passed")
+    root))
+(defn options [root] {:working_dir root :max_bytes 20000})
+(deftest collection-includes-index-worktree-and-untracked-evidence
+  (let [root (fixture)]
+    (io/spit (str root "/code.txt") "base\nstaged\n")
+    (os/sh "git" "-C" root "add" "code.txt")
+    (io/spit (str root "/code.txt") "base\nstaged\nunstaged\n")
+    (io/spit (str root "/new '$(touch INJECTED).txt") "new content\n")
+    (let [text (packet/collect {} (options root)) result (json/read-json text)]
+      (is (= "Implement both changes" (get result "task")))
+      (is (= "2 tests passed" (get result "verification_log")))
+      (is (str/includes? (get result "tracked_patch") "+staged"))
+      (is (str/includes? (get result "tracked_patch") "+unstaged"))
+      (is (= 1 (count (get result "untracked_patches"))))
+      (is (str/includes? (get-in result ["untracked_patches" 0 "patch"]) "+new content"))
+      (is (not (io/file-exists? (str root "/INJECTED"))))
+      (is (<= (count (bytes text)) 20000)))))
+(deftest missing-artifacts-and-overflow-do-not-return-partial-packets
+  (let [root (fixture)]
+    (is (= :review_packet_too_large
+           (try (packet/collect {} (assoc (options root) :max_bytes 10)) nil
+                (catch Object e (:category (ex-data e))))))
+    (is (= :review_packet_artifact_missing
+           (try (packet/collect {} (assoc (options root) :task_file "missing.md")) nil
+                (catch Object e (:category (ex-data e))))))))
+(deftest cancellation-precedes-filesystem-and-git-access
+  (is (= :cancelled
+         (try (packet/collect {:cancelled? (fn [] true)} {:working_dir "/missing" :max_bytes 1000}) nil
+              (catch Object e (:category (ex-data e)))))))
+
+(deftest symlinks-are-reviewed-as-links-without-reading-their-target
+  (let [root (fixture) outside (str (os/temp-dir) "/review-secret-" (random-uuid))]
+    (io/spit outside "PRIVATE TARGET CONTENT")
+    (os/sh "ln" "-s" outside (str root "/link"))
+    (let [text (packet/collect {} (options root))]
+      (is (str/includes? text "120000"))
+      (is (not (str/includes? text "PRIVATE TARGET CONTENT"))))))
+
+(deftest observable-workspace-drift-rejects-the-packet
+  (let [root (fixture) original handlers/handle-tool changed (atom false)]
+    (with-redefs [handlers/handle-tool
+                  (fn [node ctx graph logs]
+                    (let [result (original node ctx graph logs)]
+                      (when (and (not @changed)
+                                 (str/includes? (get-in node [:attrs :tool_command]) "--binary HEAD"))
+                        (reset! changed true)
+                        (io/spit (str root "/code.txt") "changed during collection\n"))
+                      result))]
+      (is (= :review_packet_changed
+             (try (packet/collect {} (options root)) nil
+                  (catch Object e (:category (ex-data e)))))))))

@@ -1,0 +1,98 @@
+(ns attractor.task-review-bindings-test
+  (:require [clojure.test :refer [deftest is]] [io :as io] [os :as os] [clojure.string :as str]
+            [attractor.task-review-bindings :as bindings] [attractor.context :as context]
+            [attractor.llm :as llm] [attractor.cli :as cli]
+            [attractor.pipeline :as pipeline]
+            [attractor.imported-task-runner-test :as imported]
+            [attractor.review-packet-test :as fixture]))
+
+(deftest shipped-task-runner-applies-stylesheet-to-every-review-role
+  (let [prepared (pipeline/prepare (io/slurp "examples/task-runner/graph.dot"))]
+    (doseq [id ["review_correctness" "review_requirements" "adjudicate"]]
+      (is (= "qwen3.8-27b" (get-in prepared [:graph :nodes id :llm_model])))
+      (is (= "16384" (get-in prepared [:graph :nodes id :--context-window]))))))
+
+(deftest missing-budgets-fail-without-provider-dispatch
+  (let [root (fixture/fixture) original (atom {"existing" identity})
+        bound (bindings/bind-reviews original root) calls (atom 0)]
+    (is (= #{"existing"} (set (keys @original))))
+    (with-redefs [llm/generate-object (fn [& _] (swap! calls inc))]
+      (is (= :review_configuration_invalid
+             (:category ((get @bound "task.review.correctness")
+                         {:llm_model "mock/model"} (context/make-context {}) {} "logs"))))
+      (is (= 0 @calls)))))
+
+(deftest public-cli-selects-native-review-models-and-budgets-from-stylesheet
+  (let [root (fixture/fixture) dot-path (str root "/attractor_runs/review.dot")
+        calls (atom []) exits (atom [])]
+    (io/spit dot-path
+      "digraph Review {
+         graph [model_stylesheet=\".review { llm_provider: mock; llm_model: reviewer; --context-window: 20000; --reserve-tokens: 2000; --max-output-tokens: 1000; } #adjudicate { llm_model: judge; --max-output-tokens: 1500; }\"];
+         start [shape=Mdiamond]; exit [shape=Msquare];
+         reviews [shape=component, join_policy=wait_all, max_parallel=2];
+         review_correctness [class=review, type=\"task.review.correctness\", shape=parallelogram, tool_command=\"false\"];
+         review_requirements [class=review, type=\"task.review.requirements\", shape=parallelogram, tool_command=\"false\"];
+         join [shape=tripleoctagon];
+         adjudicate [class=review, type=\"task.review.adjudicate\", shape=parallelogram, tool_command=\"false\"];
+         start -> reviews; reviews -> review_correctness; reviews -> review_requirements;
+         review_correctness -> join; review_requirements -> join; join -> adjudicate;
+         adjudicate -> exit [condition=\"outcome=success\"];
+       }")
+    (with-redefs [os/cwd (fn [] root) os/exit #(swap! exits conj %)
+                  llm/generate-object
+                  (fn [model prompt schema options]
+                    (swap! calls conj [model (:max_tokens options)])
+                    {:output {"verdict" "approve" "findings" [] "evidence" ["Supplied evidence"]}})]
+      (with-out-str
+        (cli/cmd-run [dot-path "--mock" "--auto-approve"
+                      "--logs-root" (str root "/attractor_runs/cli")]))
+      (is (= [0] @exits))
+      (is (= [["mock/reviewer" 1000] ["mock/reviewer" 1000] ["mock/judge" 1500]] @calls))
+      (is (io/file-exists? (str root "/attractor_runs/task-runner/state/critique.md"))))))
+
+(deftest shipped-loop-runs-real-verifier-and-stylesheet-bound-reviews
+  (let [calls (atom [])
+        result
+        (with-redefs [llm/generate-object
+                      (fn [model prompt schema options]
+                        (swap! calls conj {:model model :prompt prompt :max_tokens (:max_tokens options)})
+                        {:output {"verdict" "approve" "findings" [] "evidence" ["Inspected supplied change and verifier log"]}})]
+          (imported/run-case "printf 'real verifier passed'" "unused" ["A"]
+            {:prepared (pipeline/prepare (io/slurp "examples/task-runner/graph.dot"))
+             :bind (fn [registry dir]
+                     (os/sh "git" "init" "-q" dir)
+                     (io/spit (str dir "/.gitignore") "logs/\n")
+                     (io/spit (str dir "/code.txt") "before\n")
+                     (os/sh "git" "-C" dir "add" ".gitignore" "code.txt")
+                     (os/sh "git" "-C" dir "-c" "user.name=Fixture"
+                            "-c" "user.email=fixture@example.test" "-c" "commit.gpgsign=false" "commit" "-qm" "base")
+                     (io/spit (str dir "/code.txt") "changed\n")
+                     (bindings/bind-reviews registry dir))}))]
+    (is (= :success (get-in result [:result :status])))
+    (is (= 3 (count @calls)))
+    (is (every? #(= "llamacpp/qwen3.8-27b" (:model %)) @calls))
+    (is (every? #(str/includes? (:prompt %) "real verifier passed") @calls))
+    (is (every? #(str/includes? (:prompt %) "+changed") @calls))
+    (is (io/file-exists? (str (:state result) "/SHIPPED.md")))))
+
+(deftest reviews-of-different-evidence-cannot-approve-a-handoff
+  (doseq [change-at [1 3]]
+    (let [root (fixture/fixture) calls (atom 0)
+          registry (bindings/bind-reviews (atom {}) root)
+          node {:llm_model "mock/reviewer" :--context-window "20000"
+                :--reserve-tokens "2000" :--max-output-tokens "1000"}]
+      (with-redefs [llm/generate-object
+                    (fn [& _]
+                      (when (= change-at (swap! calls inc))
+                        (io/spit (str root "/code.txt") "changed after model saw evidence\n"))
+                      {:output {"verdict" "approve" "findings" [] "evidence" ["Supplied evidence"]}})]
+        (let [a ((get @registry "task.review.correctness") node (context/make-context {}) {} "logs")
+              b ((get @registry "task.review.requirements") node (context/make-context {}) {} "logs")
+              ctx (context/make-context
+                    {"parallel.results" [(assoc a :id "review_correctness" :node_id "review_correctness")
+                                         (assoc b :id "review_requirements" :node_id "review_requirements")]})
+              result ((get @registry "task.review.adjudicate") node ctx {} "logs")]
+          (is (= :fail (:status result)))
+          (is (= :review_evidence_changed (:category result)))
+          (is (false? (get-in result [:context_updates "review.approved"])))
+          (is (= (if (= change-at 1) 2 3) @calls)))))))

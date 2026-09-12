@@ -105,7 +105,7 @@ root and checkpoint pointers written into the same timeline, so a run can
 resume from CXDB alone. Kilroy talks to it over a binary msgpack protocol and
 HTTP (`internal/cxdb/`, `internal/attractor/engine/cxdb_*.go`,
 `scripts/start-cxdb.sh`). Ours keeps the same information in three places:
-the hub's in-memory event log, `artifacts/index.edn` on disk, and
+the hub's in-memory event log, `artifacts/.store/index.edn` on disk, and
 `checkpoint.edn`. Exploration should decide whether CXDB becomes an optional
 event sink and artifact backend behind the existing event families and
 artifact store, whether resume can read a CXDB timeline, and whether an

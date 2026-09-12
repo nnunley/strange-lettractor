@@ -83,18 +83,24 @@ Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
 
 The console is the interactive front door: conversation with the native
 agent, let-go evaluation, workflow runs and external agent jobs in one place,
-over an in-process hub. Two things are named everywhere: a **model**, addressed
+over a local hub or an attached nREPL hub. Two things are named everywhere: a **model**, addressed
 as `provider/name`, and an **agent**, anything that runs a tool loop against a
 model (`native` is Attractor's own; `claude` and `codex` are external).
 
 ```sh
 bin/attractor console --mock          # line console, mock model
 bin/attractor console --tui --mock    # full-screen tiny-tui console
+bin/attractor console --connect 4555  # attach to an existing loopback nREPL hub
 
 # live model through an OpenAI-compatible endpoint (llama.cpp shown)
 OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 OPENAI_COMPAT_API_KEY=local \
   bin/attractor console --tui --model qwen3.8-27b --provider openai-compat
 ```
+
+For a persistent hub, run `bin/attractor hub --mock --port 4555` in one terminal
+and attach with `console --connect 4555` in another. Quitting a client preserves
+hub work; `bin/attractor hub --stop 4555` shuts down the host. See
+[nREPL hub usage](docs/nrepl-hub.md) for model configuration and embedding.
 
 Inside the console:
 
@@ -124,6 +130,12 @@ lgx run-pipeline examples/hello.dot                      # the same through lgx
 ```
 
 See the [tutorial](docs/tutorial.md) for pipeline examples, configuration, and CLI usage.
+For local-model development with verification, human review and frontier escalation,
+use the [development REPL workflow](docs/development-repl.md).
+For an imported attempt/verify/critique loop, see the
+[adapted Amplifier task runner](examples/task-runner/README.md).
+For controller checks implemented as bound let-go functions, see
+[embedded paired review](docs/embedded-review.md).
 See [deployment context discovery](docs/context-capacity.md) for live capacity,
 explicit overrides, advisory fallback, and the current local-runtime prerequisite.
 

@@ -1,0 +1,118 @@
+(ns attractor.tool-repair-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(defn- exercise [mode calls repair & [settings]]
+  (let [requests (atom []) executions (atom [])
+        respond (fn [request]
+                  (swap! requests conj request)
+                  {:provider "mock" :message {:role :assistant :content "done"}
+                   :tool_calls (if (= 1 (count @requests)) calls [])
+                   :usage {} :finish_reason (if (= 1 (count @requests)) :tool_calls :stop)})
+        adapter (llm/make-adapter "mock" respond
+                  (fn [request] [{:type :finish :response (respond request)}]))
+        options (merge
+                  {:client (llm/make-client {:providers {"mock" adapter} :default_provider "mock"})
+                   :repair_tool_call repair
+                   :tools [{:name "double"
+                            :parameters {:type "object" :properties {:x {:type "integer"}} :required ["x"]}
+                            :execute (fn [args]
+                                       (swap! executions conj args)
+                                       (if (:execution_error settings)
+                                         (throw (ex-info "executor failed" {}))
+                                         (* 2 (or (get args "x") (:x args)))))}]}
+                  (dissoc (or settings {}) :execution_error))
+        result (try
+                 (if (= mode :generate)
+                   {:steps (:steps (llm/generate "mock/model" "work" options))}
+                   (let [stream (llm/stream "mock/model" "work" options)]
+                     (try {:steps (mapv :step (filter #(= :step_finish (:type %)) (vec (:events stream))))}
+                          (finally ((:close stream))))))
+                 (catch Object error {:error error}))]
+    (assoc result :requests @requests :executions @executions)))
+
+(deftest repair-invalid-json-and-schema-before-execution
+  (doseq [mode [:generate :stream] arguments ["{bad" {"x" "oops"}]]
+    (let [seen (atom []) call {:id "c1" :name "double" :arguments arguments}
+          result (exercise mode [call]
+                   (fn [original error]
+                     (swap! seen conj [original error])
+                     (assoc original :arguments {"x" 2})))
+          tool-result (first (get-in result [:steps 0 :tool_results]))]
+      (is (nil? (:error result)))
+      (is (= 1 (count @seen)))
+      (is (= call (ffirst @seen)))
+      (is (some? (second (first @seen))))
+      (is (= [{"x" 2}] (:executions result)))
+      (is (= {:tool_call_id "c1" :tool_name "double" :content 4 :is_error false} tool-result))
+      (is (= 2 (count (:requests result))))
+      (is (every? #(not (contains? % :repair_tool_call)) (:requests result))))))
+
+(deftest failed-repair-is-a-tool-error-without-execution
+  (doseq [mode [:generate :stream]
+          repair [nil (fn [_ _] nil)
+                  (fn [_ _] (throw (ex-info "cannot repair" {})))
+                  (fn [call _] (assoc call :arguments {"x" "still invalid"}))
+                  (fn [call _] (assoc call :id "different" :arguments {"x" 2}))
+                  (fn [call _] (assoc call :name "different" :arguments {"x" 2}))]]
+    (let [result (exercise mode [{:id "c1" :name "double" :arguments {"x" "bad"}}] repair)
+          tool-result (first (get-in result [:steps 0 :tool_results]))]
+      (is (nil? (:error result)))
+      (is (= [] (:executions result)))
+      (is (= "c1" (:tool_call_id tool-result)))
+      (is (true? (:is_error tool-result)))
+      (is (= 2 (count (:requests result)))))))
+
+(deftest valid-unknown-and-execution-errors-do-not-trigger-repair
+  (doseq [mode [:generate :stream]
+          [name settings error?] [["double" {} false] ["missing" {} true]
+                                   ["double" {:execution_error true} true]]]
+    (let [repairs (atom 0)
+          result (exercise mode [{:id "c1" :name name :arguments {"x" 2}}]
+                   (fn [call _] (swap! repairs inc) call) settings)]
+      (is (= 0 @repairs))
+      (is (= error? (get-in result [:steps 0 :tool_results 0 :is_error]))))))
+
+(deftest abort-during-repair-does-not-execute-or-continue
+  (doseq [mode [:generate :stream]]
+    (let [controller (llm/make-abort-controller) repairs (atom 0)
+          result (exercise mode [{:id "c1" :name "double" :arguments {"x" "bad"}}]
+                   (fn [call _]
+                     (swap! repairs inc)
+                     ((:abort controller))
+                     (assoc call :arguments {"x" 2}))
+                   {:abort_signal (:signal controller)})]
+      (is (= 1 @repairs))
+      (is (= [] (:executions result)))
+      (is (= 1 (count (:requests result))))
+      (is (= :abort (:category (ex-data (:error result))))))))
+
+(deftest repairs-overlap-and-results-retain-original-call-order
+  (doseq [mode [:generate :stream]]
+    (let [second-started (promise) overlap (atom false)
+          result (exercise mode
+                   [{:id "c1" :name "double" :arguments {"x" "bad"}}
+                    {:id "c2" :name "double" :arguments {"x" "bad"}}]
+                   (fn [call _]
+                     (if (= "c1" (:id call))
+                       (do (reset! overlap (true? (deref second-started 2000 false)))
+                           (assoc call :arguments {"x" 2}))
+                       (do (deliver second-started true)
+                           (assoc call :arguments {"x" 3})))))
+          results (get-in result [:steps 0 :tool_results])
+          messages (get-in result [:requests 1 :messages])]
+      (is @overlap)
+      (is (= ["c1" "c2"] (mapv :tool_call_id results)))
+      (is (= [4 6] (mapv :content results)))
+      (is (= [false false] (mapv :is_error results)))
+      (is (= ["c1" "c2"] (mapv #(get-in % [:content 0 :tool_call_id])
+                                (filter #(= :tool (:role %)) messages)))))))
+
+(deftest invalid-repairs-are-not-repaired-recursively
+  (doseq [mode [:generate :stream]]
+    (let [repairs (atom 0)
+          result (exercise mode [{:id "c1" :name "double" :arguments "{"}]
+                   (fn [call _] (swap! repairs inc) call))]
+      (is (= 1 @repairs))
+      (is (= [] (:executions result)))
+      (is (true? (get-in result [:steps 0 :tool_results 0 :is_error]))))))

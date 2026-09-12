@@ -1,0 +1,90 @@
+(ns attractor.retry-predicate-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(deftest custom-predicate-overrides-default-classification
+  (doseq [[default-retryable decision expected-calls expected-result]
+          [[false true 2 :ok] [true false 1 :failed]]]
+    (let [calls (atom 0) seen (atom []) delays (atom [])
+          failure (ex-info "request failed" {:category :request-timeout
+                                             :retryable default-retryable})
+          result (try
+                   (llm/retry
+                     (fn [] (if (= 1 (swap! calls inc)) (throw failure) :ok))
+                     {:max_retries 1 :jitter false :base_delay 0.25
+                      :should_retry (fn [error] (swap! seen conj error) decision)
+                      :sleep_fn (fn [delay] (swap! delays conj delay))})
+                   (catch Object error (is (identical? failure error)) :failed))]
+      (is (= expected-result result))
+      (is (= expected-calls @calls))
+      (is (= 1 (count @seen)))
+      (is (identical? failure (first @seen)))
+      (is (= (if decision [0.25] []) @delays)))))
+
+(deftest custom-predicate-keeps-retry-count-and-server-delay-bounds
+  (doseq [[retry-after expected-calls expected-delays]
+          [[nil 3 [0.25 0.5]] [90.0 1 []]]]
+    (let [calls (atom 0) delays (atom [])
+          failure (ex-info "timeout" (cond-> {:retryable false}
+                                      retry-after (assoc :retry_after retry-after)))
+          error (try
+                  (llm/retry
+                    (fn [] (swap! calls inc) (throw failure))
+                    {:max_retries 2 :max_delay 60.0 :jitter false :base_delay 0.25
+                     :should_retry (constantly true)
+                     :sleep_fn (fn [delay] (swap! delays conj delay))})
+                  (catch Object error error))]
+      (is (identical? failure error))
+      (is (= expected-calls @calls))
+      (is (= expected-delays @delays)))))
+
+(deftest generate-forwards-custom-timeout-retry-policy
+  (let [calls (atom 0) seen (atom [])
+        adapter (llm/make-adapter
+                  "mock"
+                  (fn [_]
+                    (if (= 1 (swap! calls inc))
+                      (throw (ex-info "timeout" {:category :request-timeout :retryable false}))
+                      {:provider "mock" :message {:role :assistant :content "recovered"}
+                       :tool_calls [] :usage {} :finish_reason :stop}))
+                  (fn [_] []))
+        result (try
+                 (llm/generate "model" "hello"
+                   {:client (llm/make-client {:providers {"mock" adapter} :default_provider "mock"})
+                    :retry_policy {:max_retries 1 :sleep_fn (fn [_] nil)
+                                   :should_retry (fn [error]
+                                                   (swap! seen conj (:category (ex-data error)))
+                                                   (= :request-timeout (:category (ex-data error))))}})
+                 (catch Object error {:error (ex-data error)}))]
+    (is (= "recovered" (:text result)))
+    (is (= 2 @calls))
+    (is (= [:request-timeout] @seen))))
+
+(deftest stream-retries-timeouts-only-before-delivering-events
+  (doseq [partial? [false true]]
+    (let [calls (atom 0) seen (atom [])
+          failure (ex-info "timeout" {:category :request-timeout :retryable false})
+          adapter (llm/make-adapter
+                    "mock" (fn [_] nil)
+                    (fn [_]
+                      (if (= 1 (swap! calls inc))
+                        (if partial?
+                          (lazy-seq (cons {:type :text_delta :delta "partial"}
+                                          (lazy-seq (throw failure))))
+                          (lazy-seq (throw failure)))
+                        [{:type :stream_start}
+                         {:type :finish :finish_reason :stop :usage {}
+                          :response {:message {:text "recovered"}
+                                     :tool_calls [] :usage {} :finish_reason :stop}}])))
+          result (llm/stream "mock/model" "hello"
+                   {:client (llm/make-client {:providers {"mock" adapter} :default_provider "mock"})
+                    :retry_policy {:max_retries 1 :sleep_fn (fn [_] nil)
+                                   :should_retry (fn [error] (swap! seen conj error) true)}})
+          events (vec (:events result))]
+      (is (= (if partial? 1 2) @calls))
+      (is (= (if partial? 0 1) (count @seen)))
+      (is (= (if partial? [:text_delta :error] [:stream_start :finish])
+             (mapv :type events)))
+      (if partial?
+        (is (= "partial" (get-in ((:partial_response result)) [:message :text])))
+        (is (identical? failure (first @seen)))))))

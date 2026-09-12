@@ -1,0 +1,62 @@
+(ns attractor.task-review-bindings
+  (:require [attractor.task-runner :as runner] [attractor.model-review :as model]
+            [attractor.review-packet :as packet] [attractor.llm :as llm]
+            [attractor.embedded-review :as review] [attractor.context :as context]
+            [attractor.workflow :as workflow]
+            [clojure.string :as str]))
+
+(defn- budget [node property default]
+  (let [value (get node property default)]
+    (cond (integer? value) value
+          (and (string? value) (re-matches #"[0-9]+" value)) (parse-long value)
+          :else nil)))
+
+(defn- configuration [node]
+  (when (str/blank? (:llm_model node))
+    (throw (ex-info "Review node requires llm_model" {:category :review_configuration_invalid})))
+  (let [parsed (llm/parse-model-spec (:llm_model node) (:llm_provider node))]
+    {:model (str (:provider parsed) "/" (:model parsed))
+     :options {:context_window (budget node :--context-window nil)
+               :reserve_tokens (budget node :--reserve-tokens nil)
+               :max_output_tokens (budget node :--max-output-tokens 1024)
+               :reasoning_effort (:reasoning_effort node)}}))
+
+(defn- stamped-reviewer [build-packet]
+  (fn [node ctx graph logs]
+    (let [digest (atom nil)
+          callback (fn [n c g l]
+                     (let [{:keys [model options]} (configuration n)
+                           capture (fn [a b c d]
+                                     (let [text (build-packet a b c d)]
+                                       (reset! digest (workflow/sha256-text text)) text))]
+                       ((attractor.model-review/make-reviewer model capture options) n c g l)))
+          outcome ((review/make-reviewer callback) node ctx graph logs)]
+      (assoc-in outcome [:context_updates "review.evidence_digest"]
+                (when (= :success (:status outcome)) @digest)))))
+
+(defn- changed! []
+  (throw (ex-info "Review evidence changed or is missing" {:category :review_evidence_changed})))
+
+(defn bind-reviews
+  "Install native task-review handlers whose models and budgets come from
+   stylesheet-resolved node attributes. No provider calls until execution."
+  [registry working-dir]
+  (let [build-packet (packet/make-packet-builder {:working_dir working-dir})
+        reviewer (stamped-reviewer build-packet)
+        adjudicator (fn [reports node ctx graph logs]
+                      (let [{:keys [model options]} (configuration node)
+                            ;; Validate model budgets before reading evidence.
+                            _ (attractor.model-review/make-adjudicator model build-packet options)
+                            text (build-packet node ctx graph logs)
+                            digest (workflow/sha256-text text)
+                            branches (context/ctx-get ctx "parallel.results")
+                            _ (when-not (every? #(= digest (get-in % [:context_updates "review.evidence_digest"])) branches)
+                                (changed!))
+                            decision ((attractor.model-review/make-adjudicator model (fn [& _] text) options)
+                                      reports node ctx graph logs)]
+                        (when-not (= digest (workflow/sha256-text (build-packet node ctx graph logs)))
+                          (changed!))
+                        decision))]
+    (runner/bind-reviews registry {:correctness_handler reviewer :requirements_handler reviewer
+                                   :adjudicate_with_context adjudicator
+                                   :state_dir (str working-dir "/attractor_runs/task-runner/state")})))

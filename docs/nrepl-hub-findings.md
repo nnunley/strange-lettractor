@@ -1,5 +1,17 @@
 # nREPL hub capability investigation
 
+Later 2026-09-12: local `net/listen`, `net/local-address`, `net/accept` and listener
+close are now implemented and pass native/bundled wire checks. The tracked patch
+is `runtime-patches/net-listener.patch`. This resolves the local primitive gap;
+it does not change stock nREPL dispatch or establish the product's nREPL adapter.
+
+2026-09-12 recheck: the configured runtime still exposes only `close!`, `dial`,
+`read!`, and `write!` in `net`; its nREPL dispatch remains fixed and interrupt
+remains a response-only stub. The user reaffirmed nREPL for let-go clients and
+HTTP for other clients, sharing one owner. See
+[shared-hub-transport-plan.md](shared-hub-transport-plan.md) for current code
+evidence and the migration sequence.
+
 The console must be an RPC client, not the framework owner. The stock local
 let-go nREPL is not yet a sufficient framework hub transport.
 

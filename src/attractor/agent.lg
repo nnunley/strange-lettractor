@@ -838,7 +838,7 @@
                      (if (string? raw-output) raw-output (pr-str raw-output)))]
       (let [post (tool-hooks/run! hooks :post identity raw-args outcome (:execution_env @session) stopped? event-fn)]
         (when (:cancelled post) (abort-session! session)))
-      (event-fn (merge {:type :tool_call_end :call_id call-id}
+      (event-fn (merge {:type :tool_call_end :call_id call-id :tool_name tool-name}
                        (if (:is_error outcome) {:error raw-text} {:output raw-text}) attachments
                        (when attachment? {:result raw-output})))
       (merge {:tool_call_id call-id :tool_name tool-name

@@ -1,0 +1,54 @@
+(ns attractor.pattern-properties-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest property-names-validate-keys-independently-of-values
+  (let [schema {:propertyNames {:pattern "^[a-z]+$" :minLength 2}}]
+    (is (true? (first (llm/validate-json-schema {"name" 42} schema))))
+    (is (false? (first (llm/validate-json-schema {"Bad Key" "name"} schema))))
+    (is (false? (first (llm/validate-json-schema {"a" "name"} schema))))
+    (is (false? (first (llm/validate-json-schema {"" "name"} schema))))
+    (is (true? (first (llm/validate-json-schema {} schema))))))
+
+(deftest property-names-support-boolean-and-reference-schemas
+  (is (true? (first (llm/validate-json-schema {} {:propertyNames false}))))
+  (is (false? (first (llm/validate-json-schema {"name" nil} {:propertyNames false}))))
+  (is (false? (first (llm/validate-json-schema {"wrong" true}
+                      {"$defs" {"key" {"enum" ["name"]}}
+                       "propertyNames" {"$ref" "#/$defs/key"}})))))
+
+(deftest pattern-properties-validate-values-and-exempt-matching-keys-from-extras
+  (let [schema {:type "object" :patternProperties {"^S_" {:type "string"}
+                                                           "^I_" {:type "integer"}}
+                :additionalProperties false}]
+    (is (true? (first (llm/validate-json-schema {"S_name" "Ada" "I_age" 35} schema))))
+    (is (false? (first (llm/validate-json-schema {"I_age" "35"} (dissoc schema :additionalProperties)))))
+    (is (false? (first (llm/validate-json-schema {"other" "value"} schema))))
+    (is (true? (first (llm/validate-json-schema {"S_name" "Ada" "extra" true}
+                           (assoc schema :additionalProperties {:type "boolean"})))))))
+
+(deftest all-matching-patterns-and-explicit-properties-apply
+  (let [schema {:properties {"apple" {:minLength 2}}
+                :patternProperties {"p" {:type "string"} "^a" {:maxLength 3}}}]
+    (is (true? (first (llm/validate-json-schema {"apple" "abc"} schema))))
+    (is (false? (first (llm/validate-json-schema {"apple" "abcd"} schema))))
+    (is (false? (first (llm/validate-json-schema {"apple" 42} schema))))
+    (is (false? (first (llm/validate-json-schema {"apple" "a"} schema))))))
+
+(deftest pattern-schemas-can-use-local-references-and-boolean-false
+  (is (false? (first (llm/validate-json-schema {"secret" "value"}
+                      {:patternProperties {"secret" false}}))))
+  (is (false? (first (llm/validate-json-schema {"item" "wrong"}
+                      {"$defs" {"number" {"type" "integer"}}
+                       "patternProperties" {"item" {"$ref" "#/$defs/number"}}})))))
+
+(deftest generate-object-rejects-a-pattern-property-type-violation
+  (let [adapter (llm/make-adapter "fixture"
+                  (fn [_] {:message {:content "{\"I_age\":\"wrong\"}"}
+                           :tool_calls [] :finish_reason :stop :usage {}}) nil)
+        client (llm/make-client {:providers {"fixture" adapter}})]
+    (is (= :no-object-generated
+           (try (llm/generate-object "fixture/model" "age"
+                  {:type "object" :patternProperties {"^I_" {:type "integer"}}}
+                  {:client client})
+                :unexpected-success
+                (catch Object e (:category (ex-data e))))))))

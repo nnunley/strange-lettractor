@@ -1,12 +1,31 @@
 (ns attractor.models)
 
-;; Ordered best-first within each provider. The catalog is advisory: callers
+;; Current general-purpose entries precede retained older entries per provider.
+;; This advisory selection order is not a cross-model benchmark. Callers
 ;; may still pass model identifiers that are not listed here.
 ;; :knowledge_cutoff is present only where the vendor publishes a reliable
 ;; cutoff; the sources are listed in docs/model-catalog-sources.md. A missing
 ;; cutoff is reported as "unknown", never estimated.
 (def catalog
-  [{:id "claude-opus-4-6" :provider "anthropic"
+  [{:id "claude-fable-5-1" :provider "anthropic"
+    :display_name "Claude Fable 5.1" :context_window 1000000
+    :reasoning_mode :adaptive :adaptive_only true :forced_tool_choice false
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["fable"]
+    :knowledge_cutoff "2026-06"}
+   {:id "claude-opus-5" :provider "anthropic"
+    :display_name "Claude Opus 5" :context_window 1000000
+    :reasoning_mode :adaptive
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases []
+    :knowledge_cutoff "2026-05"}
+   {:id "claude-sonnet-5" :provider "anthropic"
+    :display_name "Claude Sonnet 5" :context_window 1000000
+    :reasoning_mode :adaptive
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases []
+    :knowledge_cutoff "2026-01"}
+   {:id "claude-opus-4-6" :provider "anthropic"
     :display_name "Claude Opus 4.6" :context_window 200000
     :max_output 128000 :supports_tools true :supports_vision true
     :supports_reasoning true :aliases ["opus" "claude-opus"]
@@ -21,21 +40,31 @@
     :supports_reasoning true :aliases ["haiku" "claude-haiku"]
     :knowledge_cutoff "2025-02"}
 
+   {:id "gpt-6-astra" :provider "openai"
+    :display_name "GPT-6 Astra" :context_window 1050000
+    :max_output 128000 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases ["astra"]
+    :knowledge_cutoff "2026-04-30"}
    {:id "gpt-5.2" :provider "openai"
-    :display_name "GPT-5.2" :context_window 1047576
+    :display_name "GPT-5.2" :context_window 400000
     :max_output 128000 :supports_tools true :supports_vision true
     :supports_reasoning true :aliases ["gpt-5"]
     :knowledge_cutoff "2025-08-31"}
    {:id "gpt-5.2-codex" :provider "openai"
-    :display_name "GPT-5.2 Codex" :context_window 1047576
+    :display_name "GPT-5.2 Codex" :context_window 400000
     :max_output 128000 :supports_tools true :supports_vision true
     :supports_reasoning true :aliases ["codex" "gpt-codex"]
     :knowledge_cutoff "2025-08-31"}
-   {:id "gpt-5.2-mini" :provider "openai"
-    :display_name "GPT-5.2 Mini" :context_window 1047576
+   {:id "gpt-5-mini" :provider "openai"
+    :display_name "GPT-5 Mini" :context_window 400000
     :max_output 128000 :supports_tools true :supports_vision true
-    :supports_reasoning true :aliases ["gpt-mini"]}
+    :supports_reasoning true :aliases ["gpt-mini"]
+    :knowledge_cutoff "2024-05-31"}
 
+   {:id "gemini-3.8-flash" :provider "gemini"
+    :display_name "Gemini 3.8 Flash" :context_window 1048576
+    :max_output 65536 :supports_tools true :supports_vision true
+    :supports_reasoning true :aliases []}
    {:id "gemini-3.1-pro-preview" :provider "gemini"
     :display_name "Gemini 3.1 Pro Preview" :context_window 1048576
     :max_output 65536 :supports_tools true :supports_vision true

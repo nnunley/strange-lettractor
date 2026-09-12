@@ -1,0 +1,34 @@
+(ns attractor.configuration-error-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest adapter-construction-errors-declare-non-retryability
+  (doseq [construct [(fn [] (llm/make-adapter "" (fn [_] {}) nil))
+                    (fn [] (llm/make-adapter "fixture" nil nil))]]
+    (let [error (try (construct) nil (catch Object e e))]
+      (is (= :configuration (:category (ex-data error))))
+      (is (false? (:retryable (ex-data error)))))))
+
+(deftest unsupported-adapter-streaming-does-not-enter-retry
+  (let [client (llm/make-client
+                 {:providers {"mock" (llm/make-provider-adapter "mock")}
+                  :default_provider "mock"})
+        error (try (doall (:events (llm/stream "mock/model" "go"
+                                    {:client client
+                                     :retry_policy {:on_retry
+                                                    (fn [_ _ _]
+                                                      (throw (ex-info "configuration was retried"
+                                                                      {:category :unexpected-retry})))}})))
+                   nil (catch Object e e))]
+    (is (= :configuration (:category (ex-data error))))
+    (is (= "mock" (:provider (ex-data error))))
+    (is (false? (:retryable (ex-data error))))))
+
+(deftest unsupported-provider-protocol-is-non-retryable-for-both-operations
+  (let [adapter (llm/make-provider-adapter "unregistered-contract-provider"
+                  {:api_key "fixture-only" :base_url "https://unused.invalid"})]
+    (doseq [operation [(:complete adapter) (:stream adapter)]]
+      (let [error (try (operation {:model "model" :messages []}) nil
+                       (catch Object e e))]
+        (is (= :configuration (:category (ex-data error))))
+        (is (= "unregistered-contract-provider" (:provider (ex-data error))))
+        (is (false? (:retryable (ex-data error))))))))

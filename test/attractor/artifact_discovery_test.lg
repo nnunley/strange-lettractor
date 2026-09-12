@@ -46,7 +46,7 @@
         (is (false? (get-in by-id ["notes" :is_file_backed])))
         (is (true? (get-in by-id ["blob" :is_file_backed])))
         (is (os/stat (str logs "/artifacts/blob.edn")))
-        (is (os/stat (str logs "/artifacts/index.edn"))))
+        (is (os/stat (str logs "/artifacts/.store/index.edn"))))
       ;; The checkpoint records the metadata the handler returned.
       (let [checkpoint (context/load-checkpoint (str logs "/checkpoint.edn"))]
         (is (= #{"notes" "blob"} (set (map :id (get-in checkpoint [:node_outcomes "produce" :artifacts])))))

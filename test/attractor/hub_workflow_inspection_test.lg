@@ -1,0 +1,128 @@
+(ns attractor.hub-workflow-inspection-test
+  (:require [clojure.test :refer [deftest is]] [io :as io] [os :as os]
+            [attractor.ids :as ids] [attractor.hub :as hub]
+            [attractor.context :as context] [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+(defn request [h op fields]
+  (deref (hub/request! h (merge {:id "inspect-test" :op op} fields)) 3000 {}))
+(def dot "digraph Inspect { start [shape=Mdiamond]; work [shape=box]; exit [shape=Msquare]; start -> work -> exit; }")
+
+(defn await-question [h run-id]
+  (let [deadline (+ (System/nanoTime) 3000000000)]
+    (loop []
+      (let [found (first (filter #(= run-id (:run_id %)) (:value (request h :question/list {}))))]
+        (if (or found (>= (System/nanoTime) deadline)) found
+            (do (sleep 5) (recur)))))))
+
+(deftest restarted-inspection-and-checkpoint-follow-the-active-log-root
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "hub-restart-inspection")) _ (io/mkdir root)
+        initial (str root "/run")
+        h (hub/start! {:workflow_registry_fn
+                       (fn [r]
+                         (let [registry (handlers/make-handler-registry (:interviewer r) nil {})]
+                           (handlers/register-handler! registry "codergen"
+                             (fn [_ ctx _ _]
+                               {:status :success :context_updates
+                                {"phase" (if (= "restart" (context/ctx-get ctx "phase")) "review" "restart")}}))
+                           registry))})]
+    (try
+      (let [run (:value (request h :workflow/run
+                          {:logs_root initial
+                           :dot_source "digraph RestartInspect { start [shape=Mdiamond]; work [shape=box]; gate [shape=hexagon]; exit [shape=Msquare]; start -> work; work -> work [condition=\"context.phase=restart\", loop_restart=true]; work -> gate [condition=\"context.phase=review\"]; gate -> exit [label=\"[Y] Yes\"]; }"}))
+            id (:run_id run) question (await-question h id)
+            restart (first (filter #(= :pipeline.restarting (:type %))
+                                   (get-in (request h :workflow/events {:run_id id}) [:value :events])))
+            snapshot (:value (request h :workflow/inspect {:run_id id}))
+            checkpoint (:value (request h :workflow/checkpoint {:run_id id}))]
+        (is (some? question))
+        (is (string? (:new_logs_root restart)))
+        (is (= (:new_logs_root restart) (:logs_root snapshot)))
+        (is (= (str (:new_logs_root restart) "/workflow/manifest.edn") (get-in snapshot [:publication :manifest])))
+        (is (= "review" (get-in checkpoint [:context_values "phase"])))
+        (request h :question/answer {:question_id (:question_id question) :value "Y"})
+        (is (= :success (get-in (deref (:completion run) 3000 {}) [:value :status])))
+        (let [resumed (:value (request h :workflow/resume {:checkpoint_path (str initial "/checkpoint.edn")}))
+              resumed-id (:run_id resumed) q (await-question h resumed-id)
+              event (first (filter #(= :pipeline.restarting (:type %))
+                                   (get-in (request h :workflow/events {:run_id resumed-id}) [:value :events])))
+              current (:value (request h :workflow/inspect {:run_id resumed-id}))]
+          (is (some? q))
+          (is (string? (:new_logs_root event)))
+          (is (= (:new_logs_root event) (:logs_root current)))
+          (is (= (str (:new_logs_root event) "/workflow/manifest.edn") (get-in current [:publication :manifest])))
+          (is (= "review" (get-in (request h :workflow/checkpoint {:run_id resumed-id}) [:value :context_values "phase"])))
+          (request h :question/answer {:question_id (:question_id q) :value "Y"})
+          (is (= :success (get-in (deref (:completion resumed) 3000 {}) [:value :status])))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest resumed-inspection-uses-the-verified-graph-and-live-checkpoint-context
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "hub-resume-inspection"))
+        logs (str root "/logs") saved (str logs "/before-gate.edn")
+        _ (io/mkdir root)
+        h (hub/start! {:workflow_registry_fn
+                       (fn [r]
+                         (let [registry (handlers/make-handler-registry (:interviewer r) nil {})]
+                           (handlers/register-handler! registry "codergen"
+                             (fn [_ _ _ _] {:status :success :context_updates {"seed" "saved"}}))
+                           registry))})]
+    (try
+      (let [original (:value (request h :workflow/run
+                              {:logs_root logs :dot_source "digraph ResumeInspect { start [shape=Mdiamond]; work [shape=box]; gate [shape=hexagon]; exit [shape=Msquare]; start -> work -> gate; gate -> exit [label=\"[Y] Yes\"]; }"}))]
+        (is (some? (await-question h (:run_id original))))
+        (io/spit saved (io/slurp (str logs "/checkpoint.edn")))
+        (request h :workflow/cancel {:run_id (:run_id original)})
+        (is (not= ::pending (deref (:completion original) 3000 ::pending)))
+        (let [resumed (:value (request h :workflow/resume {:checkpoint_path saved}))
+              question (await-question h (:run_id resumed))
+              snapshot (:value (request h :workflow/inspect {:run_id (:run_id resumed)}))]
+          (is (some? question))
+          (is (= :running (:state snapshot)))
+          (is (= "ResumeInspect" (get-in snapshot [:publication :graph :id])))
+          (is (= (:dot_source (:value (request h :workflow/inspect {:run_id (:run_id original)})))
+                 (:dot_source snapshot)))
+          (is (= "saved" (get-in snapshot [:context "seed"])))
+          (is (= "gate" (get-in snapshot [:context "current_node"])))
+          (is (= (os/canonical-path logs) (:logs_root snapshot)))
+          (request h :question/answer {:question_id (:question_id question) :value "Y"})
+          (is (= :success (get-in (deref (:completion resumed) 3000 {}) [:value :status])))))
+      (finally
+        (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)
+        (os/sh "rm" "-rf" "--" root)))))
+
+(deftest inspection-shares-live-context-and-verified-publication
+  (let [entered (promise) release (promise)
+        root (str (os/temp-dir) "/" (ids/prefixed "hub-inspection"))
+        _ (io/mkdir root)
+        h (hub/start! {:workflow_registry_fn
+                       (fn [_]
+                         (let [registry (handlers/make-handler-registry (interviewer/make-auto-approve-interviewer) nil {})]
+                           (handlers/register-handler! registry "codergen"
+                             (fn [_ ctx _ _]
+                               (context/ctx-set! ctx "visible" "while-running")
+                               (deliver entered true)
+                               (deref release 3000 nil)
+                               {:status :success}))
+                           registry))})]
+    (try
+      (let [run (:value (request h :workflow/run {:dot_source dot :logs_root (str root "/logs")}))
+            id (:run_id run)]
+        (is (true? (deref entered 3000 false)))
+        (let [snapshot (:value (request h :workflow/inspect {:run_id id}))]
+          (is (= :running (:state snapshot)))
+          (is (= "while-running" (get-in snapshot [:context "visible"])))
+          (is (= "Inspect" (get-in snapshot [:publication :graph :id])))
+          (is (string? (get-in snapshot [:publication :fingerprint])))
+          (is (= dot (:dot_source snapshot)))
+          (is (= (str root "/logs") (:logs_root snapshot))))
+        (deliver release true)
+        (let [result (deref (:completion run) 3000 {})
+              snapshot (:value (request h :workflow/inspect {:run_id id}))]
+          (is (= :success (get-in result [:value :status])))
+          (is (= :completed (:state snapshot)))
+          (is (= result (:result snapshot)))
+          (is (= (get-in result [:value :context]) (:context snapshot)))))
+      (is (= :unknown-run (get-in (request h :workflow/inspect {:run_id "missing"}) [:error :category])))
+      (finally
+        (deliver release true)
+        (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)
+        (os/sh "rm" "-rf" "--" root)))))

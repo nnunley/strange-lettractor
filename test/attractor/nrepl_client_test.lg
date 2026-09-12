@@ -1,0 +1,26 @@
+(ns attractor.nrepl-client-test
+  (:require [clojure.test :refer [deftest is]] [attractor.nrepl-client :as client]
+            [bencode :as bencode] [net :as net]))
+
+(deftest lost-and-malformed-replies-close-the-connection-and-mark-uncertainty
+  (doseq [[read-reply category] [[(fn [] nil) :connection-closed]
+                                [(fn [] (throw (ex-info "read failed" {}))) :transport-error]
+                                [(fn [] {"id" "wrong" "status" ["done"] "value" "{}"}) :protocol-error]
+                                [(fn [] {"id" "submit" "status" ["done"] "value" "{"}) :protocol-error]]]
+    (let [connection {:connection :socket :closed (atom false) :lock (atom false) :response_timeout_ms 10}
+          socket-closed (atom false) sent (atom nil)]
+      (with-redefs [bencode/write! (fn [_ message] (reset! sent message))
+                    bencode/read! (fn [_ _] (read-reply))
+                    net/close! (fn [_] (reset! socket-closed true))]
+        (let [error (try (client/request! connection {:id "submit" :op :workflow/run :dot_source "digraph G {}"}) nil
+                         (catch Object e (ex-data e)))]
+          (is (= category (:category error)))
+          (is (true? (:outcome_unknown error)))
+          (is (= "submit" (:request_id error)))
+          (is (= "submit" (get @sent "id")))
+          (is @socket-closed)
+          (is @(:closed connection))
+          (is (false? @(:lock connection)))
+          (is (= :connection-closed
+                 (try (client/request! connection {:op :workflow/list}) nil
+                      (catch Object e (:category (ex-data e)))))))))))

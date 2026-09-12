@@ -3,11 +3,17 @@
 
 ;; Unescape string literals
 (defn unescape-string [s]
-  (-> s
-      (str/replace "\\\"" "\"")
-      (str/replace "\\n" "\n")
-      (str/replace "\\t" "\t")
-      (str/replace "\\\\" "\\")))
+  (loop [i 0 result []]
+    (if (>= i (count s))
+      (apply str result)
+      (let [ch (subs s i (inc i))]
+        (if (and (= ch "\\") (< (inc i) (count s)))
+          (let [escaped (subs s (inc i) (+ i 2))
+                decoded (case escaped
+                          "\"" "\"" "n" "\n" "t" "\t" "\\" "\\"
+                          (str "\\" escaped))]
+            (recur (+ i 2) (conj result decoded)))
+          (recur (inc i) (conj result ch)))))))
 
 ;; Helper to read a quoted string token
 (defn- read-quoted-str [src start n]
@@ -194,8 +200,11 @@
             (= (:val t) ",")
             (throw (ex-info "Unexpected comma in attribute block" {:token-index i}))
 
-            ;; key = val
-            (= (:type t) :word)
+            ;; Custom CSS properties need quoted DOT names: unquoted -- is
+            ;; reserved for unsupported undirected edges.
+            (or (= (:type t) :word)
+                (and (= (:type t) :string)
+                     (re-matches #"--[a-z][a-z0-9-]*" (:val t))))
             (let [k-name (:val t)
                   next-t (get tokens (inc i))]
               (when-not (and next-t (= (:val next-t) "="))
@@ -302,9 +311,13 @@
       ;; edge [ ... ]
       (= val "edge")
       (let [[attrs next-idx] (parse-attr-block-tokens tokens (inc idx))]
-        (-> state
-            (assoc :idx next-idx)
-            (update :edge-defaults merge attrs)))
+        (if (:current-subgraph state)
+          (-> state
+              (assoc :idx next-idx)
+              (update-in [:current-subgraph :scoped-edge-defaults] merge attrs))
+          (-> state
+              (assoc :idx next-idx)
+              (update :edge-defaults merge attrs))))
 
       ;; subgraph [name] { ... }
       (= val "subgraph")
@@ -323,6 +336,9 @@
                                       :scoped-node-defaults
                                       (or (get-in state [:current-subgraph :scoped-node-defaults])
                                           (:node-defaults state))
+                                      :scoped-edge-defaults
+                                      (or (get-in state [:current-subgraph :scoped-edge-defaults])
+                                          (:edge-defaults state))
                                       :label ""
                                       :derived-class ""
                                       :node-ids #{}
@@ -365,7 +381,8 @@
           ;; Edge chain
           (let [[chain curr-idx] (collect-edge-chain tokens idx n first-id)
                 [attrs next-idx] (parse-attr-block-tokens tokens curr-idx)
-                merged-edge-attrs (merge (:edge-defaults state) attrs)
+                defaults (or (get-in state [:current-subgraph :scoped-edge-defaults]) (:edge-defaults state))
+                merged-edge-attrs (merge defaults attrs)
                 merged-edge-attrs (update merged-edge-attrs :weight (fn [w] (if (number? w) w 0)))
                 new-edges (map (fn [[from to]]
                                  {:from from

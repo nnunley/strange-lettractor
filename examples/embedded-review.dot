@@ -1,0 +1,23 @@
+// Bind review.correctness, review.requirements and review.adjudicate using
+// attractor.embedded-review. See docs/embedded-review.md.
+digraph EmbeddedReview {
+    graph [goal="Require two valid independent reviews and adjudication"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    reviews [shape=component, join_policy="wait_all", max_parallel=2]
+    correctness [type="review.correctness", shape=parallelogram, tool_command="false"]
+    requirements [type="review.requirements", shape=parallelogram, tool_command="false"]
+    join [shape=tripleoctagon]
+    adjudicate [type="review.adjudicate", shape=parallelogram, tool_command="false"]
+
+    start -> reviews
+    reviews -> correctness
+    reviews -> requirements
+    correctness -> join
+    correctness -> join [condition="outcome=fail"]
+    requirements -> join
+    requirements -> join [condition="outcome=fail"]
+    join -> adjudicate
+    join -> adjudicate [condition="outcome=fail"]
+    adjudicate -> exit [condition="outcome=success"]
+}

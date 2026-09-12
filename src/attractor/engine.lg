@@ -5,6 +5,8 @@
             [json :as json]
             [math :as math]
             [attractor.parser :as parser]
+            [attractor.transforms :as transforms]
+            [attractor.validation :as validation]
             [attractor.conditions :as conditions]
             [attractor.context :as context]
             [attractor.composition :as composition]
@@ -728,7 +730,8 @@
 
    :start-child
    (fn [dotfile child-logs manager-node]
-     (let [child-graph (parser/parse-dot (io/slurp dotfile))
+     (let [child-graph (transforms/apply-transforms (parser/parse-dot (io/slurp dotfile)))
+           _ (validation/raise-on-errors (validation/validate child-graph))
            child-registry (clone-handler-registry registry)
            child-context (context/make-context)
            child-stop (atom false)
@@ -1231,6 +1234,8 @@
 (defn resume-pipeline-from-checkpoint [checkpoint graph options]
   (let [last-node-id (:current_node checkpoint)
         ctx (context/make-context (:context_values checkpoint))
+        _ (swap! ctx assoc :logs (vec (or (:logs checkpoint) [])))
+        _ (when-let [observe (:attractor.engine/on-resume-context options)] (observe ctx))
         completed-nodes (:completed_nodes checkpoint)
         last-node (parser/find-node graph last-node-id)
         last-incoming-edge

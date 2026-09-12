@@ -1,0 +1,83 @@
+(ns attractor.nrepl-server
+  (:require [net :as net] [bencode :as bencode] [attractor.nrepl-hub :as protocol]
+            [attractor.ids :as ids]))
+
+(defn- locked [lock f]
+  (loop [] (when-not (compare-and-set! lock false true) (sleep 1) (recur)))
+  (try (f) (finally (reset! lock false))))
+
+(defn- serve-connection! [server id connection done]
+  (try
+    (loop []
+      (when-let [message (bencode/read! connection)]
+        (let [stop? (and (:allow_stop server) (= "attractor/stop" (get message "op")) (string? (get message "id")))
+              reply (if stop?
+                      {"id" (get message "id") "status" ["done"]}
+                      (protocol/handle-message (:hub server) message))
+              reply (if (and (:allow_stop server) (= "describe" (get message "op")) (contains? reply "ops"))
+                      (assoc-in reply ["ops" "attractor/stop"] {}) reply)]
+          (bencode/write! connection reply)
+          ;; Host cleanup may close this socket; acknowledge before waking it.
+          (when stop? (deliver (:stop_requested server) true)))
+        (recur)))
+    (catch Object _ nil) ;; A failed socket terminates this connection only.
+    (finally
+      (net/close! connection)
+      (locked (:lock server)
+        (fn []
+          (deliver done true)
+          (swap! (:state server) update :connections dissoc id))))))
+
+(defn- accept-clients! [server]
+  (try
+    (loop []
+      (when-let [connection (net/accept (:listener server))]
+        (locked (:lock server)
+          (fn []
+            (let [state @(:state server)]
+              (if (or (:closed state) (>= (count (:connections state)) (:max_clients server)))
+                (net/close! connection)
+                (let [id (ids/prefixed "connection") done (promise)]
+                  (swap! (:state server) assoc-in [:connections id] {:connection connection :done done})
+                  (try
+                    (future (serve-connection! server id connection done))
+                    (catch Object e
+                      (net/close! connection)
+                      (deliver done true)
+                      (swap! (:state server) update :connections dissoc id)
+                      (throw e))))))))
+        (recur)))
+    (catch Object e
+      (when-not (:closed @(:state server))
+        (swap! (:state server) assoc :accept_error (ex-message e))))
+    (finally (deliver (:accept_done server) true))))
+
+(defn start!
+  "Serve explicit nREPL hub operations on a loopback listener. The caller owns
+   the hub; closing this adapter only closes and joins its network workers."
+  [h opts]
+  (let [port (get opts :port 0) max-clients (get opts :max_clients 32)]
+    (when-not (and (integer? port) (<= 0 port 65535) (integer? max-clients) (pos? max-clients))
+      (throw (ex-info "Invalid listener options" {:category :invalid-options})))
+    (let [listener (net/listen "127.0.0.1" port)
+          server {:hub h :listener listener :address (net/local-address listener)
+                  :max_clients max-clients :lock (atom false)
+                  :allow_stop (true? (:allow_stop opts)) :stop_requested (promise)
+                  :state (atom {:closed false :connections {}}) :accept_done (promise)}]
+      (try
+        (future (accept-clients! server))
+        server
+        (catch Object e (net/close! listener) (throw e))))))
+
+(defn close! [server]
+  (let [connections (locked (:lock server)
+                      (fn []
+                        (swap! (:state server) assoc :closed true)
+                        (vals (:connections @(:state server)))))]
+    ;; Close every socket before joining anything: reads and writes may block.
+    (net/close! (:listener server))
+    (doseq [entry connections] (net/close! (:connection entry)))
+    (doseq [done (cons (:accept_done server) (map :done connections))]
+      (when (= ::pending (deref done 6000 ::pending))
+        (throw (ex-info "nREPL adapter worker did not settle" {:category :shutdown-timeout}))))
+    {:closed true}))

@@ -1,0 +1,16 @@
+(ns attractor.schema-equality-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest enum-and-const-use-json-value-equality
+  (doseq [[left right equivalent?] [[1 1.0 true]
+                                    [{"value" [1]} {"value" [1.0]} true]
+                                    [9007199254740993 9007199254740992.0 false]
+                                    [true 1 false] ["1" 1 false]
+                                    [[1 2] [2 1] false] [nil nil true]]]
+    (is (= equivalent? (first (llm/validate-json-schema left {:enum [right]}))))
+    (is (= equivalent? (first (llm/validate-json-schema left {:const right}))))))
+
+(deftest unique-items-recognizes-numeric-equivalence-at-any-depth
+  (is (false? (first (llm/validate-json-schema [1 1.0] {:uniqueItems true}))))
+  (is (false? (first (llm/validate-json-schema [{"n" [1]} {"n" [1.0]}] {:uniqueItems true}))))
+  (is (true? (first (llm/validate-json-schema [9007199254740993 9007199254740992.0] {:uniqueItems true})))))

@@ -1,0 +1,42 @@
+(ns attractor.usage-aggregation-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(defn- two-step-generation [first-usage second-usage]
+  (let [adapter (llm/make-adapter "fixture"
+                  (fn [request]
+                    (if (= :tool (:role (last (:messages request))))
+                      {:message {:role :assistant :content "done"} :tool_calls []
+                       :finish_reason :stop :usage second-usage}
+                      {:message {:role :assistant :content ""}
+                       :tool_calls [{:id "lookup-1" :name "lookup" :arguments {}}]
+                       :finish_reason :tool_calls :usage first-usage}))
+                  (fn [_] []))]
+    (llm/generate "fixture/model" "look up"
+                  {:client (llm/make-client {:providers {"fixture" adapter}})
+                   :tools [{:name "lookup" :parameters {:type "object"}
+                            :execute (fn [_] "found")}]
+                   :max_tool_rounds 1})))
+
+(deftest optional-usage-fields-follow-none-addition-across-real-tool-steps
+  (doseq [[left right expected] [[nil nil nil] [nil 7 7] [5 nil 5] [5 7 12]]]
+    (let [first-usage {:input_tokens 2 :output_tokens 1 :total_tokens 3
+                       :reasoning_tokens left :cache_read_tokens nil :cache_write_tokens left}
+          second-usage {:input_tokens 4 :output_tokens 2 :total_tokens 6
+                        :reasoning_tokens right :cache_read_tokens nil :cache_write_tokens right}
+          result (try (two-step-generation first-usage second-usage)
+                      (catch Object e {:error (ex-message e)}))]
+      (is (= "done" (:text result)) (pr-str result))
+      (is (= {:input_tokens 6 :output_tokens 3 :total_tokens 9
+               :reasoning_tokens expected :cache_read_tokens nil :cache_write_tokens expected}
+             (:total_usage result)))
+      (is (= [first-usage second-usage] (mapv :usage (:steps result)))))))
+
+(deftest raw-provider-metadata-remains-per-step-and-is-not-added-as-a-number
+  (let [first-usage {:input_tokens 2 :output_tokens 1 :total_tokens 3 :raw {"source" "first"}}
+        second-usage {:input_tokens 4 :output_tokens 2 :total_tokens 6 :raw {"source" "second"}}
+        result (try (two-step-generation first-usage second-usage)
+                    (catch Object e {:error (ex-message e)}))]
+    (is (= "done" (:text result)) (pr-str result))
+    (is (= 9 (get-in result [:total_usage :total_tokens])))
+    (is (= [first-usage second-usage] (mapv :usage (:steps result))))
+    (is (not (contains? (:total_usage result) :raw)))))

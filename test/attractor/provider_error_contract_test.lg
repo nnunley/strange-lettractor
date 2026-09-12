@@ -1,0 +1,62 @@
+(ns attractor.provider-error-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest server-failures-are-not-reclassified-by-service-names
+  (doseq [message ["safety service unavailable" "billing database unavailable"
+                   "upstream deployment not found" "invalid key in server cache"]
+          response [{:status 503 :body {"error" {"message" message}}}
+                    {:status 400 :body {"error" {"status" "UNAVAILABLE" "message" message}}}]]
+    (let [data (ex-data (llm/provider-error "fixture" response))]
+      (is (= [:server true] [(:category data) (:retryable data)])))))
+
+(deftest ambiguous-client-errors-retain-message-refinements
+  (doseq [[message category] [["context length exceeded" :context-length]
+                             ["blocked by safety policy" :content-filter]
+                             ["insufficient credit balance" :quota-exceeded]]]
+    (is (= category (:category (ex-data (llm/provider-error "fixture"
+                                        {:status 400 :body {"error" {"message" message}}})))))))
+
+(deftest native-grpc-status-is-not-masked-by-the-http-envelope
+  (doseq [[status category retryable]
+          [["NOT_FOUND" :not-found false] ["INVALID_ARGUMENT" :invalid-request false]
+           ["UNAUTHENTICATED" :authentication false] ["PERMISSION_DENIED" :access-denied false]
+           ["RESOURCE_EXHAUSTED" :rate-limit true] ["UNAVAILABLE" :server true]
+           ["DEADLINE_EXCEEDED" :request-timeout false] ["INTERNAL" :server true]]]
+    (let [data (ex-data (llm/provider-error "gemini"
+                         {:status 400 :body {"error" {"status" status "message" "request failed"}}}))]
+      (is (= [category retryable 400]
+             [(:category data) (:retryable data) (:status_code data)])))))
+
+(deftest unknown-grpc-status-retains-http-fallback
+  (is (= :server (:category (ex-data (llm/provider-error "gemini"
+                                      {:status 503 :body {"error" {"status" "FUTURE_STATUS"}}}))))))
+
+(deftest http-status-errors-follow-the-unified-taxonomy
+  (doseq [[status category retryable]
+          [[400 :invalid-request false] [401 :authentication false]
+           [403 :access-denied false] [404 :not-found false]
+           [408 :request-timeout false] [413 :context-length false]
+           [422 :invalid-request false] [429 :rate-limit true]
+           [500 :server true] [504 :server true] [505 :server true] [599 :server true]]]
+    (let [data (ex-data (llm/provider-error "fixture"
+                         {:status status :body {"error" {"message" "request failed"}}}))]
+      (is (= [category retryable status "fixture"]
+             [(:category data) (:retryable data) (:status_code data) (:provider data)])))))
+
+(deftest anthropic-native-error-type-survives-normalization
+  (let [body "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}"
+        error (try (llm/anthropic-complete
+                     {:model "fixture" :api_key "fixture-only" :messages []
+                      :transport (fn [_] {:status 429 :body body})})
+                   nil (catch Object e e))
+        data (ex-data error)]
+    (is (= :rate-limit (:category data)))
+    (is (true? (:retryable data)))
+    (is (= "rate_limit_error" (:error_code data)))
+    (is (= "rate_limit_error" (get-in data [:raw "error" "type"])))))
+
+(deftest provider-error-code-takes-precedence-over-generic-type
+  (is (= "specific_code"
+         (:error_code (ex-data (llm/provider-error "fixture"
+                                {:status 400 :body {"error" {"type" "generic_type"
+                                                              "code" "specific_code"}}}))))))

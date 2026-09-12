@@ -1,5 +1,245 @@
 # Progress
 
+## Original-spec execution audit — 2026-09-12
+
+Found and fixed manager child lifecycle bypass: raw child graphs went directly
+from parse to execution, skipping model stylesheet transforms and validation.
+Three new assertions reproduced missing model selection and execution of an
+invalid child. Manager start now transforms and validates before launching child
+work. Engine suite 46/209 passes; native CLI builds. Compiled real-file valid and
+invalid child probes verify prompt goal expansion/checkpoint creation and invalid
+child rejection without work artifacts. Full suite passes. The user rejected
+the fixed discovered-test-count assertion; it was removed, and the remaining
+final-form reader guard plus engine behavior tests pass independently. Audit scope and
+remaining limits are in `docs/runtime-execution-audit.md`.
+
+## Goal continuation — 2026-09-11
+
+Original-scope reconciliation requested by the user: all 58 requirement-story
+statuses are component-done/proved; old roadmap pending text is stale. Remaining
+recorded closure is live Gemini parity, intended-runtime verification and a fresh
+original-checklist/artifact audit. One cited parity evidence file is absent.
+See `docs/original-spec-status.md`; no full-goal completion claim is made.
+
+Native review consistency regression: changing code after a reviewer sees its
+packet or during adjudication previously allowed approval (seven failing
+assertions). Reviewer outcomes now carry native packet SHA-256 digests; adjudication
+requires both to match its packet and checks again after generation. Focused
+binding suite 17/63 and task-runner suite 12/41 pass. This detects observations,
+not atomicity or test-log provenance. No new full-suite claim.
+
+Shipped stylesheet integration correction: both reviewer declarations in
+examples/task-runner/graph.dot repeated class, allowing the later gate class to
+erase review and its model/budget selections. A preparation regression failed
+four assertions. Each node now declares class="review,gate" once. A new journey
+runs the shipped graph through real shell verification, real Git packet collection,
+three native model-review/adjudication calls with scripted responses, and handoff
+publication. Focused task-review-bindings passes 16 tests / 55 assertions,
+including imported shell and collector fixtures. Live quality and recursive
+controller execution remain unproved; no new full-suite run for this DOT-only fix.
+
+Stylesheet-bound review checkpoint: the user corrected the separate JSON
+configuration choice. JSON loader/file/flag were removed. CLI run/resume/console
+now install task.review.* handlers that consume resolved model attributes and
+--context-window/--reserve-tokens/--max-output-tokens custom properties. Class/ID
+precedence and invalid budget refusal pass through public CLI tests (7/20,
+including collector 5/14). Stylesheet custom-property regression first failed four
+assertions. The CSS revision passed the full suite at 999/9254/0. Explicit DOT
+custom overrides then exposed a quoted-attribute parsing gap; the added public
+preparation regression failed before the parser accepted quoted --custom names.
+Stylesheet now passes 8/46, parser 10/45. Literal custom values are supported,
+not var() interpolation. Full suite for the final parser revision passes:
+1000 tests / 9255 assertions / zero failures.
+
+The intermediate full suite exposed a server lifecycle race: a prior background
+completion could recreate a removed registration through update on a missing map
+key. A barrier-controlled regression reproduced it; completion/error updates now
+retain absence. Server tests pass 13/61; full suite before stylesheet replacement
+passed 999 tests / 9257 assertions / zero failures.
+
+Native evidence collector checkpoint: `review-packet/collect` and
+`make-packet-builder` collect task/verification artifacts, HEAD revision, tracked
+and untracked patches through cancellable timed Git execution. Two observations
+must match; oversized evidence fails before model dispatch. Focused real-Git
+tests pass 5/14, including staged/unstaged changes, shell-sensitive names,
+symlink non-dereference, missing artifacts, cancellation and drift. This does not
+prove log freshness or an atomic workspace snapshot; Git output is limited after
+capture. Full suite after collector/model-adjudication additions: 995 tests,
+9242 assertions, 0 failures. CLI bindings and end-to-end recursive execution
+remain open.
+
+Native adjudication checkpoint: model-review/make-adjudicator now combines the
+original evidence packet and ordered reports in one measured native structured
+request. embedded-review/make-contextual-pair-gate forwards node/context/graph/logs
+and preserves the reports-only API through its compatibility wrapper. Task runner
+accepts mutually exclusive :adjudicate_with_context or :adjudicate bindings.
+Focused model-review 7/26, embedded-review 8/39, task-runner 12/41 all pass; the
+new context binding first failed against the existing reports-only implementation.
+Provider-call cancellation prevents approval and combined report overflow prevents
+dispatch. No live quality or automatic evidence collection claim. Full objective,
+CLI/console binding discovery, context-budgeted recursive execution remain open.
+
+
+Native reviewer checkpoint: `model-review/make-reviewer` now connects native
+structured LLM generation to the embedded report contract. Each invocation is
+fresh, has no model tools, bounds output, measures supplied evidence/schema input
+and refuses oversized packets. Cancellation is checked around packet generation
+and passed to the native abort signal. Focused 4 tests / 14 assertions passes;
+embedded gate regressions 8/39 also pass. No existing runtime path changed, so
+verification remained focused. Evidence collection, live-model quality, native
+adjudication and CLI/console binding discovery remain open; no full-goal claim.
+
+
+Task-runner integration checkpoint: primary graph now uses bound parallel
+correctness/requirements reviews and native adjudication. `task-runner/bind-reviews`
+copies the supplied registry, atomically publishes readable critique, and carries
+structured approval/refusal state in checkpointed context. Three refusals reach
+postmortem; invalid evidence and artifact failures cannot reach packaging.
+Single-critic shell graph preserved as `shell-review.dot`; upstream source intact.
+Focused 11 tests / 39 assertions includes original 7/23 plus new paired 4/16.
+Callbacks remain application supplied; live quality, review tool restrictions,
+CLI/console binding discovery and remaining shell-gate migration are pending.
+Full suite: 982 tests / 9200 assertions / zero failures. Diff whitespace check
+clean; no background test process remains.
+
+
+Embedded gate checkpoint: `attractor.embedded-review` binds native reviewer and
+adjudication functions to registry handlers. Reports are schema/size checked;
+the pair gate requires exact branch identities, successful execution and all
+three approvals. Failed/malformed/missing branches cannot be replaced by the
+standard fan-in best result. Cancellation/invalid output clears stale approval.
+RED 21 assertions; final focused 8 tests / 39 assertions, including execution of
+`examples/embedded-review.dot` and a missing-gate binding. No live reviewers,
+restricted review tools, CLI binding configuration or task-runner migration is
+claimed. See `docs/embedded-review.md` for the public binding contract.
+Full suite passes 978 tests / 9184 assertions / zero failures; focused 8/39
+was rerun after switching the integration fixture to the shipped example DOT.
+No background test process remains.
+
+
+Upstream reuse checkpoint: copied Amplifier task-runner at commit
+`2d8c781fd4290e035c6fc7b64ff36f46a7332045` with its MIT license. Adapted graph
+in `examples/task-runner/graph.dot` uses native tool.output routing, preserved
+state, strict critique verdicts, finite budget escalation, native timeouts and
+uncommitted handoff. Real shell/engine fixtures: RED 10 failures, GREEN 7 tests /
+23 assertions. An additional timeout regression failed before changing the
+counter to persist each attempted verification before launch. No core runtime
+changes this slice; final checks were focused on the imported workflow. Paired
+review, recursive context budgeting and live-model execution remain open.
+
+
+Recursive compiler checkpoint: `development-workflow/compile-plan` admits the
+complete tree and produces validated captured DOT sources. Native subpipeline
+execution with scripted controller stages proves nested child ordering/result
+propagation, parent integration routing, paired review, finite repairs and
+failure propagation. Unconfigured stages fail. Focused GREEN: 8 tests / 38
+assertions. The generated three-file fixture in `examples/recursive-development/`
+passes Kilroy single-file validation with zero diagnostics. Native controller
+handlers, execution budgets, live review evidence and console controls remain
+pending. Compiler escaping tests exposed double decoding in the general DOT
+parser; a single-pass fix passes 10 parser tests / 45 assertions (RED 2 failures).
+Final full suite: 963 tests / 9122 assertions / zero failures; no background
+test process remains. User clarified that workflow reuse is the priority, not
+Kilroy validator conformance; see `docs/upstream-workflow-survey.md`.
+
+
+Native planner checkpoint: `development-planner/make-planner` now performs fresh
+bounded structured calls through the native LLM client. Large source context is
+processed completely in measured chunks with bounded notes; oversized fixed
+metadata stops explicitly. Call/output limits, cancellation and response schema
+validation apply. Stub RED: 5 tests / 13 failed assertions / 1 expected
+admission error; final focused GREEN: 8 tests / 37 assertions, plus admission
+9/50. Final full suite: 954 tests / 9078 assertions / zero failures
+(`make test`, `/tmp/attractor-tool-repair-suite.log`); diff whitespace check clean.
+No live inference or independent reviewer claim. DOT compilation,
+execution/PAR, context controls and full conformance remain unfinished.
+
+
+Latest component: `development-plan/decompose` now admits recursively proposed
+task trees against explicit context/reserve budgets, preserving requirement IDs
+and original parent integration obligations. It rejects oversized leaves,
+non-shrinking splits, missing/invented requirements, malformed tasks, limits and
+cancellation. RED: 5 tests / 28 failures; expanded GREEN: 9 tests / 50 assertions.
+This is the admission/decomposition boundary, not yet native model planning,
+DOT generation or execution. `docs/recursive-development-plan.md` retains the
+full requested controller scope and names all unfinished stages. Whole-suite
+verification passed 945 tests / 9033 assertions / zero failures; a final
+malformed-requirements regression and fix were added and passed in the focused
+9/50 run after that broad run began.
+
+User reports funded OpenRouter and willingness to use Meta Muse Contributor.
+The verified candidate is `openrouter/meta/muse-spark-1.3-contributor`; it is a
+lower-cost frontier model, with no universal quality ranking assumed against
+Anthropic/OpenAI. Terms/pricing source and no-live-call status are in the plan.
+
+Latest slice: unified LLM §5.8 tool-call repair is implemented for generate and
+stream. The callback receives the original call and validation exception, gets
+one attempt, and must return valid arguments with unchanged identity. Errors
+continue as tool results; cancellation prevents repaired execution. Callback
+options are removed before provider dispatch. RED: 4 tests / 30 failed
+assertions. GREEN: expanded 6/128; existing LLM 83/495 and ownership 9/35.
+Full suite passed: 937 tests / 8991 assertions / zero failures. See
+`docs/tool-call-repair.md` for the selected callback
+contract and limits. Reviewer-agent usage was exhausted earlier in this session;
+this slice has direct code inspection and tests, not independent review.
+
+Still pending: the user's recursive local plan-to-DOT controller, context-budget
+subdivision, plan/code/test/paired-adversarial-review execution and return-control
+workflow. The static example is not a substitute. Kilroy validation of all six
+existing DOTs is recorded in `docs/kilroy-validation.md`; no graph was rewritten
+merely to satisfy incompatible validator conventions. Per-subagent console
+context controls and native Gemini live verification are also unimplemented or
+unverified.
+
+Current slice: stylesheet parsing now consumes the entire input using the
+§8.2 grammar instead of extracting matching fragments. Malformed input returns
+no partial rules and public preparation emits the §7.2 `stylesheet_syntax`
+error. Quoted delimiters and escapes survive parsing. RED: 21 failed assertions;
+GREEN: stylesheet 6/41 after six additional lexical regression failures were
+fixed; lifecycle 8/162, parity 25/61, validation 3/4. Independent re-review is
+clean. Final full suite: 929 tests / 8837 assertions / zero failures. The first
+full run had two CLI output assertions fail; agent-cli passed 7/39 in isolation
+and the subsequent serial full run passed. No unrelated runtime fix was made.
+
+User-requested local development loop: `examples/development-repl.dot` and
+`docs/development-repl.md` now provide local work, verification, one local repair,
+explicit frontier escalation, independent escalation and human review/next task.
+User pointed out absent console subagent context controls; worker nodes therefore
+use fresh truncate sessions and a disk handoff, with the actual missing controls
+documented. The DOT does not claim to implement console compaction or clearing.
+Focused artifact evidence: 2 tests / 26 assertions (seven routing journeys), plus
+isolated real ToolHandler exit/log checks for failure and success. No live model
+calls or development edits were launched by this example. Independent artifact
+review was unavailable due to the reviewer agent's usage limit; root inspected
+the actual handlers and CLI and performed the boundary checks above.
+
+Prior confirmed gap (now fixed above): unified LLM §5.8 `repair_tool_call` was never invoked.
+The read-only audit reproduced a supplied callback receiving zero calls,
+no tool execution and an error result for repairable invalid arguments.
+Both generate and stream share the affected `execute-tool-call` dispatcher.
+This was implementation work, separate from native Gemini live
+verification. Claude confirmed ownership of the four existing console edits;
+they remain preserved and uncommitted.
+
+The current-state specification audit found that unified LLM §6.3's custom
+`should_retry` predicate was ignored. `llm/retry` now uses the configured
+predicate with the original exception, falling back to error classification
+when absent. Retry counts and server delay bounds still apply.
+
+Regression evidence: three tests initially produced 15 failed assertions;
+the corrected implementation passes four tests / 28 assertions including
+public generate and stream behavior. The existing LLM namespace passes
+83 tests / 495 assertions. Independent review found no actionable defect;
+ownership tests passed 9/35 and an always-true predicate still allowed only
+one provider invocation when the caller aborted. Full-suite verification
+after the final test addition passed 926 tests / 8806 assertions / zero
+failures; the final focused run also passed 4/28. The earlier baseline passed
+922 tests / 8778 assertions. Existing console edits were preserved.
+
+Next: continue requirement-by-requirement auditing; ledger `done` labels
+alone do not establish completion. Native Gemini live evidence remains
+unverified. Older checkpoint text below is historical, not current status.
+
 **Phase:** dynamic deployment context discovery implemented and mechanically verified
 **Next:** resume remaining adapter/environment and hub contracts
 

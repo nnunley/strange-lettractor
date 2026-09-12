@@ -1,0 +1,1 @@
+{:scenario "SCN-PROVIDER-MATRIX", :providers [{:provider "llamacpp", :model "qwen3.8-27b"}], :rows [{:status :pass, :provider "llamacpp", :model "qwen3.8-27b", :duration_ms 5238, :journey :multi-round-tools, :detail {:terminal_value "verified-be32ae8e-fd81-422f-84d2-96d9303e33e0", :steps 4, :round_indices [0 1 2]}}], :recorded_at "1789240385149"}

@@ -896,6 +896,25 @@ digraph Gate {
         (str "child context: " (pr-str (:context result))))
     (io/delete-file child-dotfile)))
 
+(deftest manager-child-applies-stylesheet-and-rejects-invalid-graphs
+  (doseq [invalid? [false true]]
+    (let [child (str (os/temp-dir) "/manager-preparation-" (System/nanoTime) ".dot")
+          seen (atom [])
+          _ (io/spit child
+                     (str "digraph Child { graph [model_stylesheet=\"box { llm_model: selected; }\"]; "
+                          "start [shape=Mdiamond]; work [shape=box]; "
+                          (if invalid? "start -> work;" "exit [shape=Msquare]; start -> work -> exit;") "}"))
+          parent (p/parse-dot
+                   (str "digraph Parent { graph [stack.child_dotfile=\"" child "\"]; "
+                        "start [shape=Mdiamond]; manager [shape=house, manager.poll_interval=\"1ms\", manager.max_cycles=100]; "
+                        "exit [shape=Msquare]; start -> manager -> exit; }"))
+          registry (h/make-handler-registry (i/make-auto-approve-interviewer)
+                                           (fn [node _ _] (swap! seen conj (:llm_model node)) {:status :success}))
+          result (e/run-pipeline parent {:registry registry :logs-root (test-logs "manager-preparation")})]
+      (if invalid?
+        (do (is (= :fail (:status result))) (is (empty? @seen)))
+        (do (is (= :success (:status result))) (is (= ["selected"] @seen)))))))
+
 (deftest test-manager-real-child-observes-attempt-cancellation
   ;; nooga/let-go#809: UUID str includes EDN quotes; revisit via docs/let-go-followups.md.
   (let [fixture-id (str/replace (str (random-uuid)) #"[^A-Za-z0-9-]" "")

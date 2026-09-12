@@ -1,7 +1,8 @@
 (ns attractor.conditions-test
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.conditions :as c]
-            [attractor.context :as ctx]))
+            [attractor.context :as ctx] [attractor.pipeline :as pipeline]
+            [attractor.ids :as ids] [io :as io] [os :as os]))
 
 (deftest test-condition-evaluation
   (testing "Outcome matching"
@@ -41,3 +42,53 @@
     (is (some? (c/validate-condition-syntax "outcome==success")))
     (is (some? (c/validate-condition-syntax "x<=1")))
     (is (some? (c/validate-condition-syntax "outcome=")))))
+
+(deftest string-comparison-preserves-whitespace-and-decodes-literal-escapes
+  (let [values {"value" " ready " "escaped" "line\n\t\"quoted\"\\end"}]
+    (is (false? (c/evaluate-condition "context.value=ready" {} values)))
+    (is (true? (c/evaluate-condition "context.value!=ready" {} values)))
+    (is (true? (c/evaluate-condition "context.value=\" ready \"" {} values)))
+    (is (false? (c/evaluate-condition "context.value=\"ready\"" {} values)))
+    (is (true? (c/evaluate-condition "context.escaped=\"line\\n\\t\\\"quoted\\\"\\\\end\"" {} values)))
+    (is (true? (c/evaluate-condition "context.missing=\"\"" {} values)))
+    (is (false? (c/evaluate-condition "context.missing=\" \"" {} values)))
+    (is (false? (c/evaluate-condition "preferred_label=Go" {:preferred_label "go"} values)))))
+
+(deftest quoted-operators-are-literal-text-in-validation-and-evaluation
+  (doseq [[condition value]
+          [["context.value=\"a && b\" && outcome=success" "a && b"]
+           ["context.value=\"a!=b\"" "a!=b"]
+           ["context.value=\"a==b <= c > d\"" "a==b <= c > d"]
+           ["context.value=\"say \\\"yes && no\\\"\" && outcome=success" "say \"yes && no\""]]]
+    (is (nil? (c/validate-condition-syntax condition)))
+    (is (true? (c/evaluate-condition condition {:status :success} {"value" value})))
+    (is (false? (c/evaluate-condition condition {:status :success} {"value" "different"})))))
+
+(deftest malformed-literals-and-operators-are-rejected
+  (doseq [condition ["context.x=\"unfinished" "context.x=\"a\" trailing" "context.x=\"a\"\"b\""
+                     "context.x==a" "context.x<=a" "context.x=a||b" "bad key=a"]]
+    (is (some? (c/validate-condition-syntax condition)) condition)))
+
+(deftest qualified-nil-falls-back-without-discarding-false-or-empty-values
+  (is (= "fallback" (c/resolve-key "context.value" {} {"context.value" nil "value" "fallback"})))
+  (is (= "fallback" (c/resolve-key "context.value" {} {:context.value nil :value "fallback"})))
+  (is (= "false" (c/resolve-key "context.value" {} {"context.value" false "value" "fallback"})))
+  (is (= "" (c/resolve-key "context.value" {} {"context.value" "" "value" "fallback"}))))
+
+(deftest quoted-conjunction-routes-through-public-pipeline-execution
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "quoted-condition"))]
+    (try
+      (let [outcome (pipeline/run
+                      "digraph LiteralRoute {
+                         start [shape=Mdiamond]; choose [shape=diamond];
+                         good [shape=box]; bad [shape=box]; exit [shape=Msquare];
+                         start -> choose;
+                         choose -> good [condition=\"context.value=\\\"a && b\\\" && outcome=success\"];
+                         choose -> bad [condition=\"context.value!=\\\"a && b\\\"\", weight=99];
+                         good -> exit; bad -> exit;
+                       }"
+                      {:logs-root root :context (ctx/make-context {"value" "a && b"})})]
+        (is (= :success (:status outcome)))
+        (is (some #{"good"} (:completed_nodes outcome)))
+        (is (not-any? #{"bad"} (:completed_nodes outcome))))
+      (finally (os/sh "rm" "-rf" "--" root)))))

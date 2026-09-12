@@ -1,0 +1,32 @@
+(ns attractor.web-interviewer
+  (:require [attractor.interviewer :as interviewer] [attractor.ids :as ids]
+            [clojure.core :as core]))
+
+(defn make-interviewer [questions pending-answers cancelled]
+  (reify interviewer/IInterviewer
+    (ask [_ question]
+      (let [timeout (:timeout_seconds question)
+            _ (when (and (some? timeout) (not (and (number? timeout) (>= timeout 0))))
+                (throw (ex-info "Question timeout must be nonnegative seconds" {:category :configuration_error})))
+            deadline (when (some? timeout) (+ (System/nanoTime) (* timeout 1000000000)))
+            id (ids/prefixed "q")]
+        (try
+          (swap! questions assoc id question)
+          (loop []
+            (cond
+              @cancelled {:value :cancelled :text "cancelled"}
+              (contains? @pending-answers id) (get @pending-answers id)
+              (and deadline (>= (System/nanoTime) deadline))
+              (or (:default question) {:value :timeout :text "timeout"})
+              :else
+              (do
+                (core/sleep (if deadline
+                              (max 1 (long (min 20 (/ (- deadline (System/nanoTime)) 1000000))))
+                              20))
+                (recur))))
+          (finally
+            (swap! questions dissoc id)
+            (swap! pending-answers dissoc id)))))
+    (ask-multiple [this questions]
+      (mapv #(interviewer/ask this %) questions))
+    (inform [_ _ _] nil)))

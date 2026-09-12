@@ -43,3 +43,18 @@ digraph Unreachable {
         diags (v/validate g)
         rules (set (map :rule diags))]
     (is (contains? rules "reachability"))))
+
+(deftest boundary-identifiers-and-shapes-require-exactly-one-node
+  (doseq [source ["digraph G { Start -> end; }"
+                  "digraph G { start -> exit; }"
+                  "digraph G { entry [shape=Mdiamond]; finish [shape=Msquare]; entry -> finish; }"]]
+    (is (not-any? #(contains? #{"start_node" "terminal_node"} (:rule %)) (v/validate (p/parse-dot source)))))
+  (doseq [[source rule]
+          [["digraph G { a [shape=Mdiamond]; b [shape=Mdiamond]; exit [shape=Msquare]; a -> exit; b -> exit; }" "start_node"]
+           ["digraph G { start; entry [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; entry -> exit; }" "start_node"]
+           ["digraph G { start [shape=Mdiamond]; a [shape=Msquare]; b [shape=Msquare]; start -> a; start -> b; }" "terminal_node"]
+           ["digraph G { start [shape=Mdiamond]; end; finish [shape=Msquare]; start -> end; start -> finish; }" "terminal_node"]]]
+    (let [graph (p/parse-dot source)
+          error (try (v/validate-or-raise graph) nil (catch Object e e))]
+      (is (= :validation_error (:category (ex-data error))))
+      (is (some #(and (= rule (:rule %)) (= :error (:severity %))) (:diagnostics (ex-data error)))))))

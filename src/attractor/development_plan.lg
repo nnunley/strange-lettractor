@@ -1,0 +1,112 @@
+(ns attractor.development-plan
+  (:require [clojure.string :as str]))
+
+(defn- reject! [reason data]
+  (throw (ex-info (str "Development planning: " (name reason))
+                  (merge {:category :development-plan :reason reason} data))))
+
+(defn- nonblank? [s] (and (string? s) (not (str/blank? s))))
+(defn- strings? [xs] (and (vector? xs) (seq xs) (every? nonblank? xs)))
+
+(defn- checked-task [task]
+  (when-not (and (map? task) (nonblank? (:objective task)) (string? (:context task)))
+    (reject! :invalid-task {}))
+  (when-not (strings? (:acceptance task)) (reject! :invalid-acceptance {}))
+  (let [requirements (:requirements task)]
+    (when-not (and (vector? requirements) (seq requirements)
+                  (every? #(and (map? %) (nonblank? (:id %)) (nonblank? (:text %))) requirements)
+                  (= (count requirements) (count (set (map :id requirements)))))
+      (reject! :invalid-requirements {})))
+  (select-keys task [:objective :requirements :context :acceptance]))
+
+(defn task-packet
+  "The exact text admitted for a worker, excluding separately reserved runtime
+   instructions, tool schemas, response and tool-result capacity."
+  [task]
+  (str "Task:\n" (:objective task)
+       "\nRequirements:\n"
+       (str/join "\n" (map #(str (:id %) ": " (:text %)) (:requirements task)))
+       "\nAcceptance:\n" (str/join "\n" (:acceptance task))
+       "\nContext:\n" (:context task)))
+
+(defn- checked-options [options]
+  (let [window (:context_window options) reserve (:reserve_tokens options)
+        depth (get options :max_depth 8) nodes (get options :max_nodes 128)
+        children (get options :max_children 16)]
+    (when-not (and (integer? window) (pos? window) (integer? reserve)
+                  (>= reserve 0) (< reserve window))
+      (reject! :invalid-budget {}))
+    (when-not (and (integer? depth) (<= 0 depth 64)
+                  (integer? nodes) (pos? nodes)
+                  (integer? children) (pos? children))
+      (reject! :invalid-limits {}))
+    (when (and (contains? options :count_tokens) (not (fn? (:count_tokens options))))
+      (reject! :invalid-counter {}))
+    (merge options {:input_budget (- window reserve) :max_depth depth
+                    :max_nodes nodes :max_children children
+                    :counter_kind (if (:count_tokens options) :provided :utf8-byte-estimate)
+                    :count_tokens (or (:count_tokens options) #(count (bytes %)))})))
+
+(defn- measured [task options]
+  (let [tokens ((:count_tokens options) (task-packet task))]
+    (when-not (and (integer? tokens) (>= tokens 0))
+      (reject! :invalid-token-count {}))
+    tokens))
+
+(defn- child-tasks [parent proposed options]
+  (when-not (and (vector? proposed) (seq proposed)) (reject! :invalid-children {}))
+  (when (> (count proposed) (:max_children options)) (reject! :fanout-limit {}))
+  (let [requirements (:requirements parent)
+        known (set (map :id requirements))
+        children
+        (mapv (fn [proposal]
+                (let [ids (:requirement_ids proposal)]
+                  (when-not (and (strings? ids) (= (count ids) (count (set ids))))
+                    (reject! :invalid-requirements {}))
+                  (when-not (every? known ids) (reject! :unknown-requirement {}))
+                  (checked-task
+                    (assoc (select-keys proposal [:objective :context :acceptance])
+                           :requirements (vec (filter #(contains? (set ids) (:id %)) requirements))))))
+              proposed)
+        covered (set (mapcat #(map :id (:requirements %)) children))]
+    (when-not (= known covered)
+      (reject! :missing-requirements {:missing (vec (remove covered (map :id requirements)))}))
+    children))
+
+(defn decompose
+  "Recursively admit a task tree from planner proposals. No files or workflows
+   are published. `planner` receives {:id :task :depth :input_tokens :input_budget
+   :must_split} and returns {:kind :leaf} or {:kind :split :children [...]}, where
+   children carry :objective, :requirement_ids, :context and :acceptance.
+   Throws on any invalid proposal; never returns a partially admitted tree."
+  [task planner options]
+  (let [options (checked-options options) task (checked-task task) visited (atom 0)
+        check-cancel! (fn [] (when (and (:cancelled? options) ((:cancelled? options)))
+                              (reject! :cancelled {})))]
+    (when-not (fn? planner) (reject! :invalid-planner {}))
+    (letfn [(visit [task id depth]
+              (check-cancel!)
+              (when (> depth (:max_depth options)) (reject! :depth-limit {:id id}))
+              (when (>= @visited (:max_nodes options)) (reject! :node-limit {:id id}))
+              (swap! visited inc)
+              (let [tokens (measured task options)
+                    oversized? (> tokens (:input_budget options))
+                    decision (planner {:id id :task task :depth depth :input_tokens tokens
+                                       :input_budget (:input_budget options) :must_split oversized?})
+                    _ (check-cancel!)
+                    node {:id id :task task :input_tokens tokens
+                          :input_budget (:input_budget options) :counter_kind (:counter_kind options)}]
+                (case (:kind decision)
+                  :leaf (do
+                          (when oversized? (reject! :leaf-over-budget {:id id :input_tokens tokens}))
+                          (assoc node :kind :leaf))
+                  :split
+                  (let [children (child-tasks task (:children decision) options)]
+                    (when (and oversized? (some #(>= (measured % options) tokens) children))
+                      (reject! :nonshrinking-split {:id id}))
+                    ;; Keep the parent task intact as the integration obligation.
+                    (assoc node :kind :branch
+                           :children (mapv (fn [index child] (visit child (str id "_" index) (inc depth)))
+                                           (range (count children)) children)))
+                  (reject! :invalid-decision {:id id}))))]
+      (visit task "task" 0))))

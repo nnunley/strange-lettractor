@@ -1,0 +1,50 @@
+(ns attractor.default-model-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(defn- echo-adapter [provider options]
+  (llm/make-adapter provider
+    (fn [r] (select-keys r [:provider :model]))
+    (fn [r] [(select-keys r [:provider :model])])
+    {:options options}))
+
+(defn- results [client request]
+  [(llm/client-complete client request)
+   (first (llm/client-stream client request))])
+
+(deftest missing-model-selects-current-catalog-entry
+  (doseq [[provider expected] [["openai" "gpt-6-astra"]
+                               ["anthropic" "claude-fable-5-1"]
+                               ["gemini" "gemini-3.8-flash"]]
+          request [{:messages []} {:model nil :messages []}]]
+    (let [client (llm/make-client
+                   {:providers {provider (echo-adapter provider {})}
+                    :default_provider provider})]
+      (doseq [result (results client request)]
+        (is (= {:provider provider :model expected} result))))))
+
+(deftest model-default-follows-final-middleware-destination
+  (let [client (llm/make-client
+                 {:providers {"openai" (echo-adapter "openai" {})
+                              "anthropic" (echo-adapter "anthropic" {})}
+                  :default_provider "openai"
+                  :middleware [(fn [r next] (next (assoc r :provider "anthropic")))]})]
+    (doseq [result (results client {:messages []})]
+      (is (= {:provider "anthropic" :model "claude-fable-5-1"} result)))))
+
+(deftest explicit-and-adapter-configured-models-take-precedence
+  (doseq [provider ["openai" "private-endpoint"]]
+    (let [client (llm/make-client
+                   {:providers {provider (echo-adapter provider {:model "configured-model"})}
+                    :default_provider provider})]
+      (doseq [result (results client {:messages [] :model nil})]
+        (is (= "configured-model" (:model result))))
+      (doseq [result (results client {:messages [] :model "native/explicit-model"})]
+        (is (= "native/explicit-model" (:model result)))))))
+
+(deftest unknown-provider-retains-its-adapter-default-behavior
+  (let [client (llm/make-client
+                 {:providers {"private-endpoint" (echo-adapter "private-endpoint" {})}
+                  :default_provider "private-endpoint"})]
+    (doseq [result (results client {:messages []})]
+      (is (= {:provider "private-endpoint"} result)))))

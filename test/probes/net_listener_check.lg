@@ -1,0 +1,63 @@
+(ns net-listener-check
+  (:require [net :as net] [bencode :as bencode] [os :as os]))
+
+(defn ensure! [value message] (when-not value (throw (ex-info message {}))))
+(defn fails? [f] (try (f) false (catch Object _ true)))
+
+(defn check! []
+  (doseq [args [["" 0] ["127.0.0.1" -1] ["127.0.0.1" 65536] ["127.0.0.1" "0"]]]
+    (ensure! (fails? #(apply net/listen args)) "Invalid listen arguments were accepted"))
+  (ensure! (fails? #(net/accept nil)) "Invalid listener was accepted")
+  (ensure! (fails? #(net/local-address nil)) "Invalid address target was accepted")
+  (let [listener (net/listen "127.0.0.1" 0)
+        address (net/local-address listener)
+        connections (atom []) workers (atom [])
+        own (fn [c] (swap! connections conj c) c)]
+    (try
+      (ensure! (= "127.0.0.1" (:host address)) "Listener host changed")
+      (ensure! (pos? (:port address)) "Port zero was not resolved")
+      (ensure! (fails? #(net/listen "127.0.0.1" (:port address))) "Duplicate bind must fail")
+      (doseq [label ["first" "second"]]
+        (let [client (own (net/dial (:host address) (:port address)))
+              server (own (net/accept listener))]
+          ;; Two coalesced frames exercise the persistent decoder on an accepted
+          ;; connection. Fragmented input must also remain a single frame.
+          (net/write! client "d2:op4:pinged2:op4:ponge")
+          (ensure! (= {"op" "ping"} (bencode/read! server 1000)) "First frame changed")
+          (ensure! (= {"op" "pong"} (bencode/read! server 1000)) "Buffered second frame lost")
+          (net/write! client "d2:op")
+          (net/write! client "4:pinge")
+          (ensure! (= {"op" "ping"} (bencode/read! server 1000)) "Fragmented frame changed")
+          (bencode/write! server {:id label :status ["done"]})
+          (ensure! (= {"id" label "status" ["done"]} (bencode/read! client 1000)) "Reply changed")))
+      (let [entered (promise)
+            waiter (future (deliver entered true) (fails? #(net/accept listener)))]
+        (swap! workers conj waiter)
+        (ensure! (true? (deref entered 1000 false)) "Accept worker did not start")
+        (ensure! (= ::pending (deref waiter 20 ::pending)) "Accept should wait for a client")
+        (net/close! listener)
+        (net/close! listener)
+        (ensure! (true? (deref waiter 1000 false)) "Close did not wake accept")
+        (ensure! (fails? #(net/accept listener)) "Accept after close must fail"))
+      (let [[client server] (take 2 @connections)]
+        (bencode/write! client {"still" "connected"})
+        (ensure! (= {"still" "connected"} (bencode/read! server 1000)) "Listener close killed accepted connection")
+        (let [entered (promise)
+              reader (future (deliver entered true) (fails? #(bencode/read! server)))]
+          (swap! workers conj reader)
+          (ensure! (true? (deref entered 1000 false)) "Read worker did not start")
+          (ensure! (= ::pending (deref reader 20 ::pending)) "Read should wait for input")
+          (net/close! server)
+          (ensure! (true? (deref reader 1000 false)) "Connection close did not wake read")))
+      {:pass true :checks [:port-zero :bind-error :two-clients :coalesced-frames
+                           :fragmented-frame :bidirectional-bencode :close-wakes-accept
+                           :idempotent-close :accepted-connection-survives :close-wakes-read
+                           :invalid-arguments]}
+      (finally
+        (net/close! listener)
+        (doseq [c @connections] (net/close! c))
+        (doseq [w @workers]
+          (ensure! (not= ::pending (deref w 2000 ::pending)) "Listener worker did not settle"))))))
+
+(defn -main [& _] (prn (check!)))
+(when *command-line-args* (apply -main *command-line-args*))

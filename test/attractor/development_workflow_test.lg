@@ -1,0 +1,104 @@
+(ns attractor.development-workflow-test
+  (:require [clojure.test :refer [deftest is]] [json :as json]
+            [attractor.development-workflow :as development]
+            [attractor.handlers :as handlers] [attractor.pipeline :as pipeline]
+            [attractor.context :as context] [os :as os]))
+
+(def task {:objective "Implement reading" :requirements [{:id "R1" :text "Read files"}]
+           :context "source" :acceptance ["Read tests pass"]})
+(def admission {:context_window 3000 :reserve_tokens 500 :count_tokens count})
+(defn leaf [_] {:kind :leaf})
+(defn nested [request]
+  (if (< (:depth request) 2)
+    {:kind :split :children [{:objective "Nested read" :requirement_ids ["R1"]
+                             :context "small source" :acceptance ["Read tests pass"]}]}
+    {:kind :leaf}))
+(defn tmp [] (str (os/temp-dir) "/development-workflow-" (random-uuid)))
+
+(deftest compiler-captures-every-task-and-retains-parent-obligations
+  (let [{:keys [tree sources prepared]} (development/compile-plan task nested admission {:max_repairs 1})]
+    (is (= :branch (:kind tree)))
+    (is (= #{"task.dot" "task_0.dot" "task_0_0.dot"} (set (keys sources))))
+    (is (empty? (:diagnostics prepared)))
+    (is (= task (get-in tree [:task])))
+    (is (= "branch" (get-in prepared [:graph :attrs :development.kind])))
+    (is (= "Implement reading"
+           (get (json/read-json (get-in prepared [:graph :attrs :development.task])) "objective")))
+    (is (= "task_0.dot" (get-in prepared [:graph :nodes "child_0" :attrs :subpipeline.dotfile])))))
+
+(deftest generated-data-cannot-inject-dot-statements
+  (let [text "quoted \"; evil [shape=box]; //\nline \\ data"
+        result (development/compile-plan (assoc task :context text :objective text) leaf admission {})
+        graph (get-in result [:prepared :graph])]
+    (is (empty? (get-in result [:prepared :diagnostics])))
+    (is (nil? (get-in graph [:nodes "evil"])))
+    (is (= text (get (json/read-json (get-in graph [:attrs :development.task])) "context")))))
+
+(defn execute [compiled fail?]
+  (let [seen (atom []) plans (atom {}) registry (handlers/make-handler-registry)
+        stage (fn [node ctx graph _]
+                (let [id (get-in graph [:attrs :development.task_id])
+                      step (get-in node [:attrs :development.stage])]
+                  (swap! seen conj [id (:id node) step])
+                  (when (= step "plan") (swap! plans assoc id (:values @ctx)))
+                  {:status (if (or (= step "blocked") (fail? id (:id node) step)) :fail :success)
+                   :context_updates (if (= step "publish")
+                                      {"development.result" {:task id :evidence "fixture only"}} {})}))]
+    (handlers/register-handler! registry "tool" stage)
+    {:result (pipeline/execute-prepared (:prepared compiled)
+               {:registry registry :logs-root (tmp) :max-steps 100})
+     :seen @seen :plans @plans}))
+
+(deftest nested-children-complete-before-parent-integration
+  (let [compiled (development/compile-plan task nested admission {:max_repairs 0})
+        {:keys [result seen plans]} (execute compiled (fn [& _] false))]
+    (is (= :success (:status result)))
+    (is (= ["task_0_0" "task_0" "task"]
+           (vec (map first (filter #(= "plan" (nth % 2)) seen)))))
+    (is (= "task_0" (get-in plans ["task" "development.child.task_0" :task])))
+    (is (= "task_0_0" (get-in plans ["task_0" "development.child.task_0_0" :task])))
+    (is (= 6 (count (filter #(= "review" (nth % 2)) seen))))
+    (is (= 3 (count (filter #(= "adjudicate" (nth % 2)) seen))))))
+
+(deftest failing-tests-and-reviews-have-finite-repair-routes
+  (let [compiled (development/compile-plan task leaf admission {:max_repairs 1})
+        repaired (execute compiled (fn [_ node _] (= "test_0" node)))
+        exhausted (execute compiled (fn [_ _ stage] (= "test" stage)))
+        rejected (execute compiled (fn [_ _ stage] (= "adjudicate" stage)))]
+    (is (= :success (get-in repaired [:result :status])))
+    (is (= 1 (count (filter #(= "repair" (nth % 2)) (:seen repaired)))))
+    (is (= :fail (get-in exhausted [:result :status])))
+    (is (= 2 (count (filter #(= "test" (nth % 2)) (:seen exhausted)))))
+    (is (empty? (filter #(= "review" (nth % 2)) (:seen exhausted))))
+    (is (= :fail (get-in rejected [:result :status])))
+    (is (= 2 (count (filter #(= "adjudicate" (nth % 2)) (:seen rejected)))))))
+
+(deftest child-failure-prevents-parent-integration
+  (let [compiled (development/compile-plan task nested admission {:max_repairs 0})
+        {:keys [result seen]} (execute compiled (fn [id _ stage] (and (= id "task_0_0") (= stage "test"))))]
+    (is (= :fail (:status result)))
+    (is (empty? (filter #(and (= "task" (first %)) (= "plan" (nth % 2))) seen)))))
+
+(deftest unconfigured-execution-fails-before-any-model-work
+  (let [compiled (development/compile-plan task leaf admission {})
+        result (pipeline/execute-prepared (:prepared compiled) {:logs-root (tmp) :max-steps 20})]
+    (is (= :fail (:status result)))))
+
+(deftest failed-review-branches-still-reach-adjudication
+  (doseq [failed #{#{"review_a_0"} #{"review_a_0" "review_b_0"}}]
+    (let [compiled (development/compile-plan task leaf admission {:max_repairs 0})
+          {:keys [result seen]} (execute compiled
+                                  (fn [_ node stage] (or (contains? failed node) (= stage "adjudicate"))))]
+      (is (= :fail (:status result)))
+      (is (= 2 (count (filter #(= "review" (nth % 2)) seen))))
+      (is (= 1 (count (filter #(= "adjudicate" (nth % 2)) seen))))
+      (is (empty? (filter #(= "publish" (nth % 2)) seen))))))
+
+(deftest invalid-repair-limits-reject-before-planning
+  (let [calls (atom 0)]
+    (doseq [limit [-1 5 "1"]]
+      (is (= :invalid-repair-limit
+             (try (development/compile-plan task (fn [_] (swap! calls inc) {:kind :leaf})
+                                            admission {:max_repairs limit}) nil
+                  (catch Object e (:reason (ex-data e)))))))
+    (is (= 0 @calls))))

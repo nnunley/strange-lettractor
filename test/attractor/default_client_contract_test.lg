@@ -1,0 +1,44 @@
+(ns attractor.default-client-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core] [attractor.llm :as llm]))
+
+(defn- client [text close]
+  (llm/make-client
+    {:providers {"fixture" (llm/make-adapter "fixture"
+                            (fn [_] {:message {:content text} :tool_calls []
+                                     :finish_reason :stop :usage {}})
+                            nil {:close close})}
+     :default_provider "fixture"}))
+
+(deftest explicit-default-wins-over-an-in-flight-lazy-initialization
+  (let [saved @llm/default-client started (promise) release (promise)
+        discarded-closed (promise)
+        lazy-client (client "environment" #(deliver discarded-closed :closed))
+        explicit (client "explicit" nil)]
+    (try
+      (llm/set-default-client! nil)
+      (with-redefs [llm/client-from-env
+                    (fn [] (deliver started :started)
+                           (deref release 2000 :expired)
+                           lazy-client)]
+        (let [waiting (core/future (llm/get-default-client))]
+          (try
+            (is (= :started (deref started 2000 :not-started)))
+            (llm/set-default-client! explicit)
+            (deliver release :continue)
+            (is (= explicit (deref waiting 2000 :not-finished)))
+            (is (= explicit (llm/get-default-client)))
+            (is (= "explicit" (:text (llm/generate "model" "hello"))))
+            (is (= :closed (deref discarded-closed 100 :not-closed)))
+            (finally (deliver release :continue) @waiting))))
+      (finally (llm/set-default-client! saved)))))
+
+(deftest lazy-default-is-reused-by-subsequent-generations
+  (let [saved @llm/default-client initialized (client "lazy" nil)]
+    (try
+      (llm/set-default-client! nil)
+      (with-redefs [llm/client-from-env (fn [] initialized)]
+        (is (= "lazy" (:text (llm/generate "model" "first")))))
+      (with-redefs [llm/client-from-env (fn [] (throw (ex-info "Must reuse initialized client" {})))]
+        (is (= "lazy" (:text (llm/generate "model" "second")))))
+      (finally (llm/set-default-client! saved)))))

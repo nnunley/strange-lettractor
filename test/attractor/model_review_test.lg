@@ -1,0 +1,96 @@
+(ns attractor.model-review-test
+  (:require [clojure.test :refer [deftest is]] [json :as json]
+            [attractor.llm :as llm] [attractor.model-review :as model]
+            [attractor.embedded-review :as review]))
+(defn setup [& [on-request]]
+  (let [requests (atom [])
+        adapter (llm/make-adapter "mock"
+                  (fn [request] (swap! requests conj request)
+                    (when on-request (on-request request))
+                    {:message {:role :assistant :content (json/write-json
+                                  {:verdict "approve" :findings [] :evidence ["Reviewed supplied patch"]})}
+                     :tool_calls [] :finish_reason :stop :usage {}})
+                  (fn [_] []))]
+    {:requests requests :options {:context_window 6000 :reserve_tokens 1200 :max_output_tokens 1000
+                                  :count_tokens #(count (bytes %))
+                                  :client (llm/make-client {:providers {"mock" adapter} :default_provider "mock"})}}))
+(deftest native-review-is-structured-fresh-and-without-tools
+  (let [{:keys [requests options]} (setup)
+        callback (model/make-reviewer "mock/model" (fn [& _] "Task, patch and test output") options)
+        handler (review/make-reviewer callback)]
+    (dotimes [_ 2]
+      (is (= :approve (get-in (handler {:prompt "Review correctness"} nil {} "unused")
+                              [:context_updates "review.report" :verdict]))))
+    (is (= 2 (count @requests)))
+    (is (every? #(= 1 (count (:messages %))) @requests))
+    (is (every? #(empty? (:tools %)) @requests))
+    (is (every? #(= 1000 (:max_tokens %)) @requests))))
+(deftest oversized-evidence-is-rejected-before-a-provider-call
+  (let [{:keys [requests options]} (setup)
+        handler (review/make-reviewer
+                  (model/make-reviewer "mock/model" (fn [& _] (apply str (repeat 8000 "x"))) options))]
+    (is (= :review_packet_too_large (:category (handler {} nil {} "unused"))))
+    (is (empty? @requests))))
+(deftest cancelled-review-does-not-build-or-send-a-packet
+  (let [{:keys [requests options]} (setup) built (atom 0)
+        callback (model/make-reviewer "mock/model" (fn [& _] (swap! built inc) "Evidence") options)
+        outcome ((review/make-reviewer callback) {:cancelled? (fn [] true)} nil {} "unused")]
+    (is (= :cancelled (:status outcome)))
+    (is (= 0 @built))
+    (is (empty? @requests))))
+
+(deftest invalid-counts-and-packet-time-cancellation-stop-dispatch
+  (let [{:keys [requests options]} (setup)
+        invalid (review/make-reviewer
+                  (model/make-reviewer "mock/model" (fn [& _] "Evidence")
+                                       (assoc options :count_tokens (fn [_] -1))))
+        cancelled (atom false)
+        cancel (review/make-reviewer
+                 (model/make-reviewer "mock/model" (fn [& _] (reset! cancelled true) "Evidence") options))]
+    (is (= :review_counter_invalid (:category (invalid {} nil {} "unused"))))
+    (is (= :cancelled (:status (cancel {:cancelled? #(deref cancelled)} nil {} "unused"))))
+    (is (empty? @requests))))
+
+(deftest native-adjudication-receives-both-reports-and-execution-context
+  (let [{:keys [requests options]} (setup)
+        approved {:verdict :approve :findings [] :evidence ["Original evidence"]}
+        reports [{:id "a" :node_id "a" :status :success :context_updates {"review.report" approved}}
+                 {:id "b" :node_id "b" :status :success :context_updates {"review.report" approved}}]
+        seen (atom nil)
+        adjudicate (model/make-adjudicator "mock/model"
+                     (fn [node ctx graph logs] (reset! seen [(:id node) ctx graph logs]) "Original task") options)
+        ctx (attractor.context/make-context {"parallel.results" reports})
+        gate (review/make-contextual-pair-gate ["a" "b"] adjudicate)
+        outcome (gate {:id "gate"} ctx {:name "graph"} "logs")]
+    (is (= :success (:status outcome)))
+    (is (= ["gate" ctx {:name "graph"} "logs"] @seen))
+    (is (= 1 (count @requests)))
+    (is (clojure.string/includes? (get-in (first @requests) [:messages 0 :content]) "Original task"))
+    (is (clojure.string/includes? (get-in (first @requests) [:messages 0 :content]) "Original evidence"))))
+
+(deftest cancellation-during-adjudication-provider-call-prevents-approval
+  (let [cancelled (atom false)
+        {:keys [requests options]} (setup (fn [_] (reset! cancelled true)))
+        report {:verdict :approve :findings [] :evidence ["Evidence"]}
+        results (mapv (fn [id] {:id id :node_id id :status :success
+                               :context_updates {"review.report" report}}) ["a" "b"])
+        callback (model/make-adjudicator "mock/model" (fn [& _] "Task evidence") options)
+        handler (review/make-contextual-pair-gate ["a" "b"] callback)
+        outcome (handler {:cancelled? #(deref cancelled)}
+                  (attractor.context/make-context {"parallel.results" results}) {} "logs")]
+    (is (= :cancelled (:status outcome)))
+    (is (= false (get-in outcome [:context_updates "review.approved"])))
+    (is (= 1 (count @requests)))
+    (is (some? (:abort_signal (first @requests))))))
+
+(deftest adjudication-budgets-include-the-review-reports
+  (let [{:keys [requests options]} (setup)
+        report {:verdict :approve :findings [] :evidence [(apply str (repeat 3000 "x"))]}
+        results (mapv (fn [id] {:id id :node_id id :status :success
+                               :context_updates {"review.report" report}}) ["a" "b"])
+        callback (model/make-adjudicator "mock/model" (fn [& _] "Original task") options)
+        outcome ((review/make-contextual-pair-gate ["a" "b"] callback) {}
+                  (attractor.context/make-context {"parallel.results" results}) {} "logs")]
+    (is (= :fail (:status outcome)))
+    (is (= :review_packet_too_large (:category outcome)))
+    (is (empty? @requests))))

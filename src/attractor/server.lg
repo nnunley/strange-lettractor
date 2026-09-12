@@ -1,12 +1,13 @@
 (ns attractor.server
   (:require [attractor.ids :as ids] [clojure.string :as str] [clojure.core :as core]
             [json :as json]
-            [io :as io]
+            [attractor.graphviz :as graphviz]
             [os :as os]
             [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
+            [attractor.web-interviewer :as web-interviewer]
             [attractor.workflow :as workflow-lib]
             [http :as http]))
 
@@ -34,16 +35,7 @@
    :body svg})
 
 (defn render-graph-svg [dot-source]
-  (let [dot-path (str (os/temp-dir) "/strange-lettractor-" (ids/uuid-text) ".dot")]
-    (try
-      (io/spit dot-path dot-source)
-      (let [result (os/sh "dot" "-Tsvg" dot-path)]
-        (if (zero? (:exit result))
-          (:out result)
-          (throw (ex-info (str "Graphviz failed: " (:err result))
-                          {:exit (:exit result)}))))
-      (finally
-        (os/sh "rm" "-f" dot-path)))))
+  (graphviz/render-svg dot-source))
 
 ;; Handle POST /pipelines (start pipeline)
 (defn handle-start-pipeline [req]
@@ -67,31 +59,7 @@
           preparation-phase (atom :waiting)]
 
       ;; Custom interviewer for web human-gates
-      (let [web-interviewer (reify interviewer/IInterviewer
-                              (ask [_ q]
-                                (let [qid (str "q-" (System/currentTimeMillis))]
-                                  (swap! questions-atom assoc qid q)
-                                  ;; Wait for answer to be posted or timeout
-                                  (loop [wait-ms 0]
-                                    (if @cancelled
-                                      (do
-                                        (swap! questions-atom dissoc qid)
-                                        {:value :cancelled :text "cancelled"})
-                                      (if-let [ans (get @pending-answers qid)]
-                                      (do
-                                        (swap! questions-atom dissoc qid)
-                                        (swap! pending-answers dissoc qid)
-                                        ans)
-                                      (if (> wait-ms 30000) ; 30s timeout
-                                        (do
-                                          (swap! questions-atom dissoc qid)
-                                          (or (:default q) {:value :timeout :text "timeout"}))
-                                        (do
-                                          (core/sleep 200)
-                                          (recur (+ wait-ms 200)))))))))
-                              (ask-multiple [this questions]
-                                (vec (map (fn [q] (interviewer/ask this q)) questions)))
-                              (inform [_ _ _] nil))
+      (let [web-interviewer (web-interviewer/make-interviewer questions-atom pending-answers cancelled)
 
             registry (handlers/make-handler-registry web-interviewer nil)
 
@@ -201,10 +169,18 @@
                                          :on-prepared on-prepared
                                          :on-published on-published
                                          :on-event on-event})]
-              (swap! active-pipelines update pipeline-id assoc :status (:status outcome) :outcome outcome))
+              (swap! active-pipelines
+                     (fn [pipelines]
+                       (if (contains? pipelines pipeline-id)
+                         (update pipelines pipeline-id assoc :status (:status outcome) :outcome outcome)
+                         pipelines))))
             (catch Object e
               (if (= :registered @preparation-phase)
-                (swap! active-pipelines update pipeline-id assoc :status :fail :error (str e))
+                (swap! active-pipelines
+                       (fn [pipelines]
+                         (if (contains? pipelines pipeline-id)
+                           (update pipelines pipeline-id assoc :status :fail :error (str e))
+                           pipelines)))
                 (do
                   (swap! active-pipelines dissoc pipeline-id)
                   (deliver prepared-signal {:error e})
@@ -309,7 +285,7 @@
 
       ;; GET /pipelines
       (and (= method :get) (= path "/pipelines"))
-      (json-response (map (fn [[id p]] {:id id :status (str (:status p)) :graph_id (:id (:graph p))})
+      (json-response (mapv (fn [[id p]] {:id id :status (str (:status p)) :graph_id (:id (:graph p))})
                           @active-pipelines))
 
       ;; Routes with pipeline ID: /pipelines/:id/...
@@ -354,7 +330,9 @@
 
             ;; GET /pipelines/:id/questions
             (and (= method :get) (= sub-route "questions"))
-            (json-response (into {} (map (fn [[qid q]] [qid {:text (:text q) :type (name (:type q)) :options (:options q)}])
+            (json-response (into {} (map (fn [[qid q]]
+                                          [qid (assoc (select-keys q [:text :options :default :timeout_seconds :stage :metadata])
+                                                      :type (name (:type q)))])
                                          @(:questions pipe))))
 
             ;; POST /pipelines/:id/questions/:qid/answer

@@ -120,7 +120,7 @@
       (if claimed
         (let [ans (first claimed)]
           (if (map? ans) ans {:value ans :text (str ans)}))
-        (or (:default question) {:value :skipped :text "queue exhausted"}))))
+        {:value :skipped :text "queue exhausted"})))
 
   (ask-multiple [this questions]
     (vec (map (fn [q] (ask this q)) questions)))

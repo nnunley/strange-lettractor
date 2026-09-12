@@ -1,0 +1,122 @@
+(ns attractor.development-planner-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str] [json :as json]
+            [attractor.llm :as llm]
+            [attractor.development-plan :as plan]
+            [attractor.development-planner :as planner]))
+
+(def task {:objective "Implement reading"
+           :requirements [{:id "R1" :text "Read the requested files"}]
+           :context "small source" :acceptance ["Read test passes"]})
+
+(defn- setup [respond]
+  (let [requests (atom []) inputs (atom [])
+        adapter (llm/make-adapter "mock"
+                  (fn [request]
+                    (let [prompt (get-in request [:messages 0 :content])
+                          input (json/read-json (second (str/split prompt #"Input:\n")))]
+                      (swap! requests conj request) (swap! inputs conj input)
+                      {:provider "mock" :message {:role :assistant :content (json/write-json (respond input))}
+                       :tool_calls [] :finish_reason :stop :usage {}}))
+                  (fn [_] []))]
+    {:requests requests :inputs inputs
+     :options {:context_window 7000 :reserve_tokens 1200 :max_output_tokens 1000
+               :max_notes_tokens 400 :max_calls 64 :count_tokens #(count (bytes %))
+               :client (llm/make-client {:providers {"mock" adapter} :default_provider "mock"})}}))
+
+(defn- reason [f] (try (f) nil (catch Object e (:reason (ex-data e)))))
+(defn- request-for [t] {:id "task" :task t :depth 0 :input_tokens 100 :input_budget 1000 :must_split false})
+
+(deftest small-task-uses-native-structured-generation-with-bounded-output
+  (let [{:keys [requests inputs options]} (setup (fn [_] {:action "leaf" :children []}))
+        result ((planner/make-planner "mock/model" options) (request-for task))]
+    (is (= {:kind :leaf} result))
+    (is (= 1 (count @requests)))
+    (is (= "decide" (get (first @inputs) "phase")))
+    (is (= (:context task) (get (first @inputs) "source_context")))
+    (is (= 1000 (:max_tokens (first @requests))))
+    (is (empty? (:tools (first @requests))))))
+
+(deftest oversized-source-is-processed-without-dropping-chunks
+  (let [{:keys [requests inputs options]} (setup (fn [input]
+                                                (if (= "summarize" (get input "phase"))
+                                                  {:notes "Relevant source inspected"}
+                                                  {:action "leaf" :children []})))
+        source (apply str (repeat 1500 "héllo\n\"data\"\\"))
+        result ((planner/make-planner "mock/model" options) (request-for (assoc task :context source)))
+        summaries (filter #(= "summarize" (get % "phase")) @inputs)]
+    (is (= {:kind :leaf} result))
+    (is (> (count summaries) 1))
+    (is (= source (apply str (map #(get % "source_chunk") summaries))))
+    (is (= "decide" (get (last @inputs) "phase")))
+    (is (= "Relevant source inspected" (get (last @inputs) "notes")))
+    (is (every? #(<= (planner/request-size
+                       (get-in % [:messages 0 :content])
+                       (get-in % [:response_format :json_schema]) (:count_tokens options))
+                     5800) @requests))))
+
+(deftest native-planner-decomposes-through-the-admission-boundary
+  (let [{:keys [options]} (setup (fn [input]
+                                 (cond
+                                   (= "summarize" (get input "phase")) {:notes "source summary"}
+                                   (get input "must_split")
+                                   {:action "split" :children [{:objective "Implement read"
+                                     :requirement_ids ["R1"] :context "small relevant source"
+                                     :acceptance ["Read test passes"]}]}
+                                   :else {:action "leaf" :children []})))
+        root (assoc task :context (apply str (repeat 15000 "x")))
+        tree (plan/decompose root (planner/make-planner "mock/model" options)
+                             {:context_window 2000 :reserve_tokens 200 :count_tokens count})]
+    (is (= :branch (:kind tree)))
+    (is (= :leaf (get-in tree [:children 0 :kind])))))
+
+(deftest limits-reject-before-an-oversized-or-excess-request
+  (let [{:keys [requests options]} (setup (fn [_] {:notes "summary"}))]
+    (is (= :planner-input-too-large
+           (reason #((planner/make-planner "mock/model" options)
+                      (request-for (assoc task :objective (apply str (repeat 10000 "x"))))))))
+    (is (= 0 (count @requests)))
+    (is (= :planner-call-limit
+           (reason #((planner/make-planner "mock/model" (assoc options :max_calls 1))
+                      (request-for (assoc task :context (apply str (repeat 30000 "x"))))))))
+    (is (= 1 (count @requests)))))
+
+(deftest oversized-notes-stop-continuation
+  (let [{:keys [requests options]} (setup (fn [_] {:notes (apply str (repeat 500 "x"))}))]
+    (is (= :planner-notes-too-large
+           (reason #((planner/make-planner "mock/model" options)
+                      (request-for (assoc task :context (apply str (repeat 10000 "x"))))))))
+    (is (= 1 (count @requests)))))
+
+(deftest cancellation-prevents-first-and-followup-calls
+  (let [cancelled (atom true)
+        {:keys [requests options]} (setup (fn [_] (reset! cancelled true) {:notes "summary"}))
+        callback (planner/make-planner "mock/model" (assoc options :cancelled? #(deref cancelled)))
+        input (request-for (assoc task :context (apply str (repeat 10000 "x"))))]
+    (is (= :cancelled (reason #(callback input))))
+    (is (empty? @requests))
+    (reset! cancelled false)
+    (is (= :cancelled (reason #(callback input))))
+    (is (= 1 (count @requests)))))
+
+(deftest configuration-and-counts-are-validated-before-provider-dispatch
+  (let [{:keys [requests options]} (setup (fn [_] {:action "leaf" :children []}))]
+    (doseq [change [{:context_window 0} {:reserve_tokens 7000} {:max_output_tokens 1201}]]
+      (is (= :invalid-budget (reason #(planner/make-planner "mock/model" (merge options change))))))
+    (is (= :invalid-limits (reason #(planner/make-planner "mock/model" (assoc options :max_calls 0)))))
+    (is (= :invalid-counter (reason #(planner/make-planner "mock/model" (assoc options :count_tokens 42)))))
+    (is (= :invalid-token-count
+           (reason #((planner/make-planner "mock/model" (assoc options :count_tokens (fn [_] -1)))
+                      (request-for task)))))
+    (is (empty? @requests))))
+
+(deftest provider-output-must-satisfy-the-decision-contract
+  (doseq [output [{:action "leaf" :children [{:objective "unexpected" :requirement_ids ["R1"]
+                                            :context "context" :acceptance ["check"]}]}
+                  {:action "invented" :children []}
+                  {:action "split" :children [{:objective "missing required fields"}]}]]
+    (let [{:keys [requests options]} (setup (fn [_] output))
+          error (try ((planner/make-planner "mock/model" options) (request-for task)) nil
+                     (catch Object e e))]
+      (is (some? error))
+      (is (= 1 (count @requests))))))

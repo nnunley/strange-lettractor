@@ -1,0 +1,7 @@
+{:providers
+ {"or-responses" {:protocol :openai-responses
+                  :base_url "https://openrouter.ai/api/v1"
+                  :api_key_from "openrouter"}
+  "or-messages" {:protocol :anthropic-messages
+                 :base_url "https://openrouter.ai/api/v1"
+                 :api_key_from "openrouter"}}}

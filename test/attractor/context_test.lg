@@ -11,6 +11,33 @@
   (str (os/temp-dir) "/lettractor-checkpoint-" label "-"
        (random-uuid) extension))
 
+(deftest artifact-named-index-does-not-overwrite-registration-metadata
+  (let [root (checkpoint-path "artifact-index" "")
+        store (context/make-artifact-store root)
+        large (apply str (repeat (inc context/file-backing-threshold) "x"))]
+    (context/store-artifact! store "other" "Other" {:kept true})
+    (context/store-artifact! store "index" "Index" large)
+    (is (= large (context/retrieve-artifact store "index")))
+    (let [reopened (context/make-artifact-store root)]
+      (is (= large (context/retrieve-artifact reopened "index")))
+      (is (= {:kept true} (context/retrieve-artifact reopened "other")))
+      (context/remove-artifact! reopened "index")
+      (is (= {:kept true} (context/retrieve-artifact (context/make-artifact-store root) "other"))))))
+
+(deftest legacy-artifact-index-migrates-before-index-artifact-is-published
+  (let [root (checkpoint-path "artifact-legacy" "")
+        info {:id "old" :name "Old" :size_bytes 3 :is_file_backed false}
+        large (apply str (repeat (inc context/file-backing-threshold) "z"))]
+    (io/mkdir (str root "/artifacts"))
+    (io/spit (str root "/artifacts/index.edn")
+             (pr-str {:artifacts {"old" {:info info :inline "old"}}}))
+    (let [store (context/make-artifact-store root)]
+      (is (= "old" (context/retrieve-artifact store "old")))
+      (context/store-artifact! store "index" "Index" large)
+      (let [reopened (context/make-artifact-store root)]
+        (is (= "old" (context/retrieve-artifact reopened "old")))
+        (is (= large (context/retrieve-artifact reopened "index")))))))
+
 (deftest test-checkpoint-roundtrip-preserves-pinned-workflow-fields
   (let [path (checkpoint-path "pinned-roundtrip" ".edn")
         checkpoint {:timestamp "now"

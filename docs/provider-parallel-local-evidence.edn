@@ -1,0 +1,1 @@
+{:scenario "SCN-PROVIDER-MATRIX", :providers [{:provider "llamacpp", :model "qwen3.8-27b"}], :rows [{:status :pass, :provider "llamacpp", :model "qwen3.8-27b", :duration_ms 3357, :journey :parallel-tools, :detail {:overlap_verified true, :steps 2, :results ["left-f285ae71-c5a7-4d96-ac65-e9f8a06d79e0" "right-a533c0cf-fd60-42f7-971c-e8c3c07282ba"]}}], :recorded_at "1789240741473"}

@@ -10,20 +10,29 @@
 (defn- fail! [message] (throw (ex-info message {:category :console})))
 (defn- short-id [id] (ids/short id))
 (defn- request! [console op fields]
-  (let [reply (deref (hub/request! (:hub console) (merge {:id (ids/uuid-text) :op op} fields))
-                     (:request_timeout_ms console) {:error {:category :request-timeout}})]
+  (let [reply ((:request_fn console) (merge {:id (ids/uuid-text) :op op} fields))]
     (if-let [error (:error reply)]
-      (fail! (str (name op) " failed: " (name (or (:category error) :error))
-                  (when (:message error) (str " " (:message error)))))
+      ;; hub/fail! throws with the category as its ex-message, so printing both
+      ;; repeats the same word: "submit failed: busy busy".
+      (let [category (name (or (:category error) :error)) message (:message error)]
+        (fail! (str (name op) " failed: " category
+                    (when (and message (not= message category)) (str " " message)))))
       (:value reply))))
 
 (defn open!
   "Attach to a running hub. Options: :request_timeout_ms, :agent_defaults
    (cwd/model/tools/permission_mode/sandbox/approval_policy/timeout_ms for
    /agent), :run_defaults (:logs_root_fn, :auto_approve), :aliases
-   ({\"claude\" \"agent claude\"}: explicit slash shortcuts, none by default)."
+   ({\"claude\" \"agent claude\"}: explicit slash shortcuts, none by default).
+   :request_fn takes a request and returns its envelope; :events_fn takes client
+   ID and cursor. Supply both to attach without an in-process hub."
   [hub & [opts]]
-  (let [console {:hub hub :request_timeout_ms (get opts :request_timeout_ms 5000)
+  (let [timeout (get opts :request_timeout_ms 5000)
+        console {:hub hub :request_timeout_ms timeout
+                 :request_fn (or (:request_fn opts)
+                                 (fn [request] (deref (hub/request! hub request) timeout
+                                                      {:error {:category :request-timeout}})))
+                 :events_fn (or (:events_fn opts) (fn [client cursor] (hub/events-since hub client cursor)))
                  :agent_defaults (or (:agent_defaults opts) {})
                  :run_defaults (or (:run_defaults opts) {})
                  :aliases (or (:aliases opts) {})}
@@ -72,23 +81,33 @@
   (let [buffered (get-in @console [:text_buffers key])]
     (swap! console update :text_buffers dissoc key)
     buffered))
+;; A tag identifies which session/run/job a line came from. The focused session
+;; gets an empty one: in a single-session REPL every line would carry the same
+;; prefix, which is noise, not attribution. `tagged` is what keeps an empty tag
+;; from leaving a leading space.
+(defn- tagged [tag text] (if (str/blank? tag) text (str tag " " text)))
+
 (defn- text-lines [tag text]
-  (if (str/blank? text) [] (mapv #(str tag " " %) (str/split text #"\n"))))
+  (if (str/blank? text) [] (mapv #(tagged tag %) (str/split text #"\n"))))
 
 (defn- session-lines [console envelope]
-  (let [tag (str "[session " (short-id (:session_id envelope)) "]") event (:event envelope)
-        sid (:session_id envelope)]
+  (let [sid (:session_id envelope)
+        tag (if (= sid (:session @console)) "" (str "[session " (short-id sid) "]"))
+        event (:event envelope)]
     (case (:type event)
-      :session_start [(str tag " session started")]
+      :session_start [(tagged tag "session started")]
       :assistant_text_delta (do (buffer-text! console sid (:delta event)) [])
       :assistant_text_end (let [buffered (take-buffer! console sid)]
                             (text-lines tag (or (:text event) buffered)))
-      :tool_call_start [(str tag " tool " (:tool_name event) " …")]
-      :tool_call_end [(str tag " tool " (short-id (:call_id event)) (if (:error event) " failed" " done"))]
-      :error (do (take-buffer! console sid) [(str tag " error: " (:error event))])
-      :processing_end (into (text-lines tag (take-buffer! console sid)) [(str tag " turn complete")])
-      :session_end (do (take-buffer! console sid) [(str tag " session ended")])
-      :warning [(str tag " warning: " (or (:message event) (pr-str event)))]
+      :tool_call_start [(tagged tag (str "tool " (:tool_name event) " …"))]
+      ;; Name, not call id: the id is only useful for correlating with a
+      ;; transcript, and the start line already showed the name.
+      :tool_call_end [(tagged tag (str "tool " (or (:tool_name event) (short-id (:call_id event)))
+                                       (if (:error event) " failed" " done")))]
+      :error (do (take-buffer! console sid) [(tagged tag (str "error: " (:error event)))])
+      :processing_end (into (text-lines tag (take-buffer! console sid)) [(tagged tag "turn complete")])
+      :session_end (do (take-buffer! console sid) [(tagged tag "session ended")])
+      :warning [(tagged tag (str "warning: " (or (:message event) (pr-str event))))]
       [])))
 
 (defn- eval-lines [envelope]
@@ -98,7 +117,7 @@
       (if (= :error (:status event))
         [(str "[eval] error: " (get-in event [:error :message]))]
         (vec (concat (when-not (str/blank? (:printed event)) (str/split (:printed event) #"\n"))
-                     [(str "[eval] => " (pr-str (:value event)))])))
+                     [(str "[eval] => " (if (contains? event :value_repr) (:value_repr event) (pr-str (:value event))))])))
       [])))
 
 (defn- workflow-lines [envelope]
@@ -160,14 +179,14 @@
         (swap! console assoc :final_lines [])
         {:lines (vec late)})
       (try
-        (let [{:keys [events cursor]} (hub/events-since (:hub c) (get-in c [:client :client_id]) (:cursor c))]
+        (let [{:keys [events cursor]} ((:events_fn c) (get-in c [:client :client_id]) (:cursor c))]
           (swap! console assoc :cursor cursor)
           {:lines (vec (mapcat #(render-envelope console %) events))})
         (catch Object e
           (if (= :cursor-expired (:category (ex-data e)))
             ;; Fell behind the bounded log: resync to its newest cursor and say so.
-            (let [{:keys [cursor events]} (hub/events-since (:hub c) (get-in c [:client :client_id])
-                                                            (dec (:seq (first (:events @(:log (:hub c)))))))]
+            (let [{:keys [cursor events]} ((:events_fn c) (get-in c [:client :client_id])
+                                                       (:oldest_cursor (ex-data e)))]
               (swap! console assoc :cursor cursor)
               {:lines (into ["… older events dropped (client fell behind the hub log)"]
                             (mapcat #(render-envelope console %) events))})

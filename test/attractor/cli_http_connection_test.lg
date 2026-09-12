@@ -1,0 +1,67 @@
+(ns attractor.cli-http-connection-test
+  (:require [clojure.test :refer [deftest is]] [json :as json] [http :as http]
+            [attractor.cli :as cli] [attractor.hub :as hub]
+            [attractor.server :as server] [attractor.nrepl-client :as remote]
+            [attractor.nrepl-server :as nserver]))
+
+(deftest standalone-http-owns-one-shared-hub-and-cleans-up-on-exit
+  (doseq [failure [nil :http :nrepl]]
+    (let [h (hub/start! {}) listener-closed (atom false) remote-closed (atom false)]
+      (try
+        (with-redefs [hub/start! (fn [_] h)
+                      server/start-server (fn [_] (throw (ex-info "Legacy owner" {:category :legacy-owner})))
+                      nserver/start! (fn [owner opts]
+                                       (is (identical? h owner))
+                                       (is (= 0 (:port opts)))
+                                       (when (= :nrepl failure) (throw (ex-info "Listener failed" {:category :nrepl})))
+                                       {:address {:host "127.0.0.1" :port 4555}})
+                      nserver/close! (fn [_] (reset! listener-closed true))
+                      remote/connect! (fn [address] (is (= 4555 (:port address))) :remote)
+                      remote/close! (fn [_] (reset! remote-closed true))
+                      remote/request! (fn [_ r] (deref (hub/request! h r) 1000 {}))
+                      http/serve (fn [handler _]
+                                   (is (= 200 (:status (handler {:request-method :get :path "/pipelines"}))))
+                                   (when (= :http failure) (throw (ex-info "HTTP failed" {:category :http}))))]
+          (is (= failure (try (cli/cmd-serve ["--mock"]) nil (catch Object e (:category (ex-data e)))))))
+        (is (= (not= :nrepl failure) @listener-closed))
+        (is (= (not= :nrepl failure) @remote-closed))
+        (is (= :stopped (get-in (deref (hub/request! h {:id "after" :op :workflow/list}) 1000 {}) [:error :category])))
+        (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))))))
+
+(deftest invalid-owned-listener-options-fail-before-startup
+  (doseq [args [["--nrepl-port"] ["--nrepl-port" "-1"] ["--nrepl-port" "65536"]
+                ["--connect" "4555" "--nrepl-port" "4556"]]]
+    (with-redefs [hub/start! (fn [_] (throw (ex-info "Unexpected startup" {:category :wrong-startup})))
+                  server/start-server (fn [_] (throw (ex-info "Legacy startup" {:category :wrong-startup})))
+                  remote/connect! (fn [_] (throw (ex-info "Network startup" {:category :wrong-startup})))]
+      (is (= :configuration_error (try (cli/cmd-serve args) nil (catch Object e (:category (ex-data e)))))))))
+
+(deftest attached-http-uses-the-existing-hub-and-closes-on-server-exit
+  (doseq [fail? [false true]]
+    (let [h (hub/start! {}) address (atom nil) closed (atom false) response (atom nil)]
+      (try
+        (with-redefs [hub/start! (fn [_] (throw (ex-info "Unexpected local hub" {})))
+                      server/start-server (fn [_] (throw (ex-info "Unexpected legacy server" {:category :wrong-startup})))
+                      remote/connect! (fn [a] (reset! address a) :remote)
+                      remote/request! (fn [_ r] (deref (hub/request! h r) 1000 {}))
+                      remote/close! (fn [_] (reset! closed true))
+                      http/serve (fn [handler addr]
+                                   (is (= "127.0.0.1:7071" addr))
+                                   (reset! response (handler {:path "/pipelines" :request-method :get}))
+                                   (when fail? (throw (ex-info "Bind failed" {:category :bind-error}))))]
+          (is (= (when fail? :bind-error)
+                 (try (cli/cmd-serve ["--connect" "4555" "--port" "127.0.0.1:7071"]) nil
+                      (catch Object e (:category (ex-data e)))))))
+        (is (= {:host "127.0.0.1" :port 4555} @address))
+        (is @closed)
+        (is (= 200 (:status @response)))
+        (is (= [] (json/read-json (or (:body @response) "null"))))
+        (is (nil? (:error (deref (hub/request! h {:id "alive" :op :workflow/list}) 1000 {}))))
+        (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))))))
+
+(deftest invalid-http-connection-port-fails-before-startup
+  (doseq [args [["--connect"] ["--connect" "0"] ["--connect" "65536"] ["--connect" "abc"]]]
+    (with-redefs [remote/connect! (fn [_] (throw (ex-info "Network startup" {:category :wrong-startup})))
+                  server/start-server (fn [_] (throw (ex-info "Legacy startup" {:category :wrong-startup})))]
+      (is (= :configuration_error
+             (try (cli/cmd-serve args) nil (catch Object e (:category (ex-data e)))))))))

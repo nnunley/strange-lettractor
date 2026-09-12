@@ -1,0 +1,161 @@
+(ns attractor.provider-matrix-evidence-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core]
+            [live.provider-matrix-checks :as checks]))
+
+(deftest url-image-evidence-requires-subject-and-visible-color
+  (is (= "cat, orange" (:response_text (checks/url-image-evidence "cat, orange"))))
+  (doseq [text [nil "" "cat" "cat, black" "dog, orange"]]
+    (is (= :incorrect-image-answer
+           (try (checks/url-image-evidence text) :unexpected-pass
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest url-image-wire-evidence-rejects-missing-or-substituted-url
+  (doseq [[protocol body]
+          [[:openai-responses {"input" [{"content" [{"type" "input_image" "image_url" "https://example.test/photo.jpg"}]}]}]
+           [:anthropic-messages {"messages" [{"content" [{"type" "image" "source" {"type" "url" "url" "https://example.test/photo.jpg"}}]}]}]
+           [:gemini-generate-content {"contents" [{"parts" [{"fileData" {"mimeType" "image/jpeg" "fileUri" "https://example.test/photo.jpg"}}]}]}]]]
+    (is (true? (:image_url_verified (checks/url-image-wire-evidence protocol body "https://example.test/photo.jpg"))))
+    (is (= :image-payload-mismatch
+           (try (checks/url-image-wire-evidence protocol body "https://example.test/other.jpg") :unexpected-pass
+                (catch Object e (:category (ex-data e))))))
+    (is (= :image-payload-mismatch
+           (try (checks/url-image-wire-evidence protocol {} "https://example.test/photo.jpg") :unexpected-pass
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest image-wire-evidence-requires-exact-native-image-payload
+  (doseq [[protocol body]
+          [[:openai-responses {"input" [{"content" [{"type" "input_image" "image_url" "data:image/png;base64,iVBORw=="}]}]}]
+           [:anthropic-messages {"messages" [{"content" [{"type" "image" "source" {"type" "base64" "media_type" "image/png" "data" "iVBORw=="}}]}]}]
+           [:gemini-generate-content {"contents" [{"parts" [{"inlineData" {"mimeType" "image/png" "data" "iVBORw=="}}]}]}]]]
+    (is (true? (:image_payload_verified (checks/image-wire-evidence protocol body "iVBORw=="))))
+    (is (= :image-payload-mismatch
+           (try (checks/image-wire-evidence protocol body "DIFFERENT") :unexpected-pass
+                (catch Object e (:category (ex-data e))))))
+    (is (= :image-payload-mismatch
+           (try (checks/image-wire-evidence protocol {} "iVBORw==") :unexpected-pass
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest image-evidence-requires-both-colors-in-spatial-order
+  (is (= "red,blue" (:response_text (checks/image-evidence "red,blue"))))
+  (is (= " RED, BLUE\n" (:response_text (checks/image-evidence " RED, BLUE\n"))))
+  (doseq [text [nil "" "blue,red" "red" "white" "I cannot see the image"]]
+    (is (= :incorrect-image-answer
+           (try (checks/image-evidence text) :unexpected-pass
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest provider-options-evidence-requires-observed-request-and-real-response
+  (let [expected {"metadata" {"audit_token" "opaque"}}]
+    (is (= [expected] (:wire_options (checks/provider-options-evidence [expected] expected "ok"))))
+    (doseq [[observed text] [[[] "ok"] [[{}] "ok"] [[expected] ""]]]
+      (is (= :provider-options-mismatch
+             (try (checks/provider-options-evidence observed expected text) :unexpected-pass
+                  (catch Object e (:category (ex-data e)))))))))
+
+(deftest usage-evidence-checks-provider-fields-instead-of-plausible-totals
+  (doseq [[protocol raw expected]
+          [[:openai-responses {"usage" {"input_tokens" 10 "output_tokens" 3
+                                          "input_tokens_details" {"cached_tokens" 4}
+                                          "output_tokens_details" {"reasoning_tokens" 2}}}
+            {:input_tokens 10 :output_tokens 3 :total_tokens 13 :cache_read_tokens 4 :reasoning_tokens 2}]
+           [:anthropic-messages {"usage" {"input_tokens" 10 "output_tokens" 3
+                                            "cache_read_input_tokens" 4 "cache_creation_input_tokens" 2}}
+            {:input_tokens 10 :output_tokens 3 :total_tokens 13 :cache_read_tokens 4 :cache_write_tokens 2}]
+           [:gemini-generate-content {"usageMetadata" {"promptTokenCount" 10 "candidatesTokenCount" 3
+                                                        "cachedContentTokenCount" 4 "thoughtsTokenCount" 2}}
+            {:input_tokens 10 :output_tokens 3 :total_tokens 13 :cache_read_tokens 4 :reasoning_tokens 2}]]]
+    (is (= expected (:normalized_usage (checks/usage-evidence protocol {:raw raw :usage expected})))))
+  (is (= :usage-mismatch
+         (try (checks/usage-evidence :openai-responses
+                {:raw {"usage" {"input_tokens" 10 "output_tokens" 3}}
+                 :usage {:input_tokens 9 :output_tokens 4 :total_tokens 13 :reasoning_tokens 0 :cache_read_tokens 0}})
+              :unexpected-pass (catch Object e (:category (ex-data e))))))
+  (is (= :missing-raw-usage
+         (try (checks/usage-evidence :openai-responses {:usage {:input_tokens 10 :output_tokens 3 :total_tokens 13}})
+              :unexpected-pass (catch Object e (:category (ex-data e)))))))
+
+(deftest cache-evidence-compares-against-total-prompt-not-uncached-tokens
+  (let [usage {:input_tokens 100 :cache_read_tokens 60 :cache_write_tokens 0}
+        turns (vec (repeat 5 usage))]
+    (is (= 0.6 (get-in (checks/cache-evidence :openai-responses turns) [:cache_turns 4 :cache_fraction])))
+    (is (= :cache-threshold-not-met
+           (try (checks/cache-evidence :anthropic-messages turns) :unexpected-pass
+                (catch Object e (:category (ex-data e))))))
+    (doseq [[invalid category]
+            [[(subvec turns 0 4) :cache-threshold-not-met]
+             [(assoc-in turns [1 :cache_read_tokens] 0) :cache-threshold-not-met]
+             [(assoc-in turns [4 :cache_read_tokens] 50) :cache-threshold-not-met]
+             [(assoc-in turns [4 :cache_read_tokens] 101) :missing-cache-usage]
+             [(assoc-in turns [4 :input_tokens] nil) :missing-cache-usage]]]
+      (is (= category (try (checks/cache-evidence :openai-responses invalid) :unexpected-pass
+                           (catch Object e (:category (ex-data e)))))))
+    (is (= 160 (get-in (checks/cache-evidence :anthropic-messages
+                         (vec (repeat 5 {:input_tokens 10 :cache_read_tokens 100 :cache_write_tokens 50})))
+                       [:cache_turns 4 :prompt_tokens])))))
+
+(deftest streamed-tool-evidence-requires-arguments-execution-and-continuation
+  (let [events [{:type :tool_call_end :tool_call {:name "lookup_ticket" :arguments {"ticket" "S7"}}}
+                {:type :step_finish :step {:tool_results [{:content "opaque-result" :is_error false}]}}
+                {:type :text_delta :delta "opaque-result"}]
+        response {:message {:text "opaque-result"}}]
+    (is (= 1 (:step_finish_index
+               (checks/streaming-tool-evidence events response [{"ticket" "S7"}] "opaque-result"))))
+    (doseq [[evs result executions]
+            [[events response []]
+             [(assoc-in events [0 :tool_call :arguments] {"ticket" "wrong"}) response [{"ticket" "S7"}]]
+             [(assoc-in events [2 :delta] "unused") response [{"ticket" "S7"}]]
+             [events {:message {:text "unused"}} [{"ticket" "S7"}]]
+             [[(second events) (first events) (last events)] response [{"ticket" "S7"}]]]]
+      (is (= :missing-streamed-tool-evidence
+             (try (checks/streaming-tool-evidence evs result executions "opaque-result") :unexpected-pass
+                  (catch Object e (:category (ex-data e)))))))))
+
+(deftest tool-overlap-check-requires-peer-to-enter-before-return
+  (let [left (promise) right (promise)
+        a (checks/overlapping-executor left right "left" 1000)
+        b (checks/overlapping-executor right left "right" 1000)
+        fa (core/future (a {})) fb (core/future (b {}))]
+    (is (= "left" (deref fa 2000 :timeout)))
+    (is (= "right" (deref fb 2000 :timeout))))
+  (is (= :tools-not-concurrent
+         (try ((checks/overlapping-executor (promise) (promise) "left" 10) {})
+              :unexpected-pass (catch Object e (:category (ex-data e)))))))
+
+(deftest parallel-result-evidence-rejects-separated-or-unused-results
+  (let [left {:content "left"} right {:content "right"}
+        valid {:text "left right" :steps [{:tool_calls [{:name "left"} {:name "right"}]
+                                           :tool_results [left right]}]}]
+    (is (= ["left" "right"] (:results (checks/parallel-evidence valid ["left" "right"]))))
+    (doseq [invalid [(assoc valid :text "left")
+                     (assoc-in valid [:steps 0 :tool_results 1 :is_error] true)
+                     (assoc valid :steps [{:tool_calls [{:name "left"}] :tool_results [left]}
+                                          {:tool_calls [{:name "right"}] :tool_results [right]}])]]
+      (is (= :missing-parallel-results
+             (try (checks/parallel-evidence invalid ["left" "right"]) :unexpected-pass
+                  (catch Object e (:category (ex-data e)))))))))
+
+(deftest multi-round-evidence-rejects-batched-missing-and-unused-results
+  (let [expected ["next-a" "next-b" "terminal"]
+        steps (mapv #(hash-map :tool_results [{:content % :is_error false}]) expected)
+        valid {:text "terminal" :steps steps}]
+    (is (= [0 1 2] (:round_indices (checks/multi-round-evidence valid expected))))
+    (doseq [invalid [(assoc valid :text "ignored")
+                     (assoc valid :steps [(first steps) (last steps)])
+                     (assoc valid :steps [{:tool_results (mapv #(hash-map :content %) expected)}])
+                     (assoc-in valid [:steps 1 :tool_results 0 :is_error] true)]]
+      (is (= :missing-tool-rounds
+             (try (checks/multi-round-evidence invalid expected) :unexpected-pass
+                  (catch Object e (:category (ex-data e)))))))))
+
+(deftest reasoning-parity-requires-positive-reported-token-usage
+  (doseq [usage [nil {} {:reasoning_tokens nil} {:reasoning_tokens 0}
+                 {:reasoning_tokens -1} {:reasoning_tokens "12"}]]
+    (is (= :missing-reasoning-usage
+           (try
+             (checks/reasoning-evidence {:text "391" :reasoning "I calculated it" :usage usage})
+             :unexpected-pass
+             (catch Object e (:category (ex-data e)))))))
+  (is (= {:reasoning_tokens 12 :reasoning_text_present false}
+         (checks/reasoning-evidence {:text "391" :usage {:reasoning_tokens 12}})))
+  (is (= {:reasoning_tokens 8 :reasoning_text_present true}
+         (checks/reasoning-evidence {:reasoning "calculation" :usage {:reasoning_tokens 8}}))))

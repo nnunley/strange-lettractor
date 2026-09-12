@@ -1,0 +1,73 @@
+(ns attractor.nrepl-client
+  (:require [net :as net] [bencode :as bencode] [clojure.edn :as edn]
+            [attractor.ids :as ids]))
+
+(defn- fail! [category message] (throw (ex-info message {:category category})))
+(defn connect!
+  "Connect to an existing hub adapter. The caller closes this connection;
+   session/workflow ownership stays in the remote hub."
+  [address & [opts]]
+  (let [timeout (get opts :response_timeout_ms 6000)]
+    (when-not (and (integer? timeout) (pos? timeout))
+      (fail! :invalid-options "response_timeout_ms must be positive"))
+    {:connection (net/dial (:host address) (:port address))
+     :lock (atom false) :closed (atom false) :response_timeout_ms timeout}))
+
+(defn close! [client]
+  ;; Do not acquire the request lock: closing must wake a blocked reader/writer.
+  (reset! (:closed client) true)
+  (net/close! (:connection client)))
+
+(defn stop-host!
+  "Ask a CLI-owned adapter to stop. Acknowledgement means accepted, not that
+   hub cleanup has completed. Embedded adapters do not expose this by default."
+  [address]
+  (let [connection (net/dial (:host address) (:port address)) id (ids/uuid-text)]
+    (try
+      (bencode/write! connection {"id" id "op" "attractor/stop"})
+      (let [reply (bencode/read! connection 6000)]
+        (when-not (= {"id" id "status" ["done"]} reply)
+          (fail! :stop-rejected "Hub host did not acknowledge stop"))
+        {:accepted true})
+      (finally (net/close! connection)))))
+
+(defn request!
+  "Synchronous hub envelope. One outstanding request per connection; no retries.
+   Close on I/O or malformed replies so late frames cannot answer later requests."
+  [client request]
+  (let [id (or (:id request) (ids/uuid-text))]
+    (when-not (and (map? request) (string? id)) (fail! :invalid-request "Expected a request map and string ID"))
+    (loop []
+      (when @(:closed client) (fail! :connection-closed "nREPL connection is closed"))
+      (when-not (compare-and-set! (:lock client) false true) (sleep 1) (recur)))
+    (try
+      (when @(:closed client) (fail! :connection-closed "nREPL connection is closed"))
+      (bencode/write! (:connection client) {"id" id "op" "attractor/request" "payload" (pr-str (dissoc request :id))})
+      (let [reply (bencode/read! (:connection client) (:response_timeout_ms client))]
+        (when (nil? reply) (fail! :connection-closed "Hub closed the connection before replying"))
+        (when-not (and (= id (get reply "id")) (some #{"done"} (get reply "status")) (string? (get reply "value")))
+          (fail! :protocol-error "Invalid or uncorrelated nREPL response"))
+        (let [forms (try (edn/read-all-string (get reply "value"))
+                         (catch Object _ (fail! :protocol-error "Unreadable hub response envelope")))
+              envelope (first forms)]
+          (when-not (and (= 1 (count forms)) (map? envelope) (= id (:id envelope))
+                         (not= (contains? envelope :value) (contains? envelope :error)))
+            (fail! :protocol-error "Invalid hub response envelope"))
+          envelope))
+      (catch Object e
+        (try (close! client) (catch Object _ nil))
+        (throw (ex-info (ex-message e)
+                        (merge (ex-data e)
+                               {:category (or (:category (ex-data e)) :transport-error)
+                                :request_id id :outcome_unknown true}))))
+      (finally (reset! (:lock client) false)))))
+
+(defn events-since [client client-id cursor]
+  (let [reply (request! client {:op :events/since :client_id client-id :cursor cursor})]
+    (if-let [error (:error reply)]
+      (throw (ex-info (or (:message error) (name (:category error))) error))
+      (:value reply))))
+
+(defn console-options [client]
+  {:request_fn (fn [request] (request! client request))
+   :events_fn (fn [client-id cursor] (events-since client client-id cursor))})

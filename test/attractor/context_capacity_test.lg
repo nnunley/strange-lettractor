@@ -238,7 +238,10 @@
       (is (= "done" (agent/process-input! session "use the fixture tool")))
       (is (= [1000 16] @windows))
       (is (= 2 @probes))
-      (is (= 1 (count (filter #(= :tool_call_end (:type %)) (agent/session-events session)))))
+      (let [ends (filter #(= :tool_call_end (:type %)) (agent/session-events session))]
+        (is (= 1 (count ends)))
+        ;; The end event names its tool: consoles render the name, not the call id.
+        (is (= ["noop"] (mapv :tool_name ends))))
       (finally (agent/close-session! session)))))
 
 (deftest copied-session-profiles-do-not-turn-live-observations-into-fallbacks

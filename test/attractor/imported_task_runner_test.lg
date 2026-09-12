@@ -1,0 +1,89 @@
+(ns attractor.imported-task-runner-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [io :as io] [os :as os]
+            [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]))
+
+(defn prepared [] (pipeline/prepare (io/slurp "examples/task-runner/shell-review.dot")))
+(defn root [] (str (os/temp-dir) "/imported-runner-" (random-uuid)))
+(defn run-case [verifier verdict answers & [options]]
+  (let [dir (root) state (str dir "/attractor_runs/task-runner/state") seen (atom [])
+        registry (handlers/make-handler-registry
+                   (interviewer/make-queue-interviewer (mapv #(hash-map :value %) answers)) nil)
+        original-tool (get @registry "tool")]
+    (io/mkdir (str dir "/attractor_runs/task-runner"))
+    (io/spit (str dir "/attractor_runs/task-runner/task.md") "A fixture task")
+    (io/spit (str dir "/attractor_runs/task-runner/task.verify.sh") verifier)
+    (handlers/register-handler! registry "tool"
+      (fn [node ctx graph logs]
+        (swap! seen conj (:id node))
+        (original-tool (assoc-in node [:attrs :tool_command]
+                         (str "cd '" dir "' && " (get-in node [:attrs :tool_command]))) ctx graph logs)))
+    (handlers/register-handler! registry "codergen"
+      (fn [node _ _ _]
+        (swap! seen conj (:id node))
+        (case (:id node)
+          "critique" (io/spit (str state "/critique.md") verdict)
+          "package" (io/spit (str state "/SHIPPED.md") "Fixture handoff")
+          "diagnose" (io/spit (str state "/postmortem/diagnosis.md") "BLOCKED\nFixture failure")
+          "postmortem" (io/spit (str state "/postmortem/report.md") "Fixture report")
+          nil)
+        {:status :success}))
+    {:result (pipeline/execute-prepared (or (:prepared options) (prepared))
+               {:registry (if (:bind options) ((:bind options) registry dir) registry) :logs-root (str dir "/logs") :max-steps 80})
+     :seen @seen :state state :dir dir :registry registry}))
+
+(deftest copied-runner-prepares-with-native-contracts
+  (let [p (prepared)]
+    (is (empty? (:diagnostics p)))
+    (is (not (str/includes? (io/slurp "examples/task-runner/shell-review.dot") "tool.last_line")))
+    (is (not (str/includes? (get-in p [:graph :nodes "setup" :attrs :tool_command]) "rm -rf")))))
+
+(deftest real-verification-and-strict-critique-reach-handoff
+  (let [{:keys [result seen state]} (run-case "exit 0" "VERDICT: SHIP\n" [])]
+    (is (= :success (:status result)))
+    (is (= ["setup" "orient" "attempt" "verify" "critique" "verdict" "package" "ship_check"] seen))
+    (is (io/file-exists? (str state "/SHIPPED.md")))))
+
+(deftest repeated-verification-failure-diagnoses-and-abandons
+  (let [{:keys [result seen]} (run-case "echo permanent failure; exit 7" "VERDICT: SHIP\n" ["A"])]
+    (is (= :fail (:status result)))
+    (is (= 2 (count (filter #(= "verify" %) seen))))
+    (is (some #(= "diagnose" %) seen))
+    (is (not-any? #(= "package" %) seen))))
+
+(deftest nonexact-ship-verdict-does-not-publish
+  (let [{:keys [result seen]} (run-case "exit 0" "VERDICT: NOT SHIP\n" ["A"])]
+    (is (= :fail (:status result)))
+    (is (= 3 (count (filter #(= "critique" %) seen))))
+    (is (some #(= "postmortem" %) seen))
+    (is (not-any? #(= "package" %) seen))))
+
+(deftest restarting-refuses-to-delete-existing-run-artifacts
+  (let [{:keys [state dir registry]} (run-case "exit 0" "VERDICT: SHIP\n" [])
+        before (io/slurp (str state "/convergence.jsonl"))
+        result (pipeline/execute-prepared (prepared)
+                 {:registry registry :logs-root (str dir "/second-logs") :max-steps 10})]
+    (is (= :fail (:status result)))
+    (is (= before (io/slurp (str state "/convergence.jsonl"))))
+    (is (= "Fixture handoff" (io/slurp (str state "/SHIPPED.md"))))))
+
+(deftest budget-bump-has-a-hard-ceiling
+  (let [{:keys [state dir registry]} (run-case "exit 0" "VERDICT: SHIP\n" [])
+        p (prepared) node (get-in p [:graph :nodes "bump_budget"])]
+    (io/spit (str state "/budget") "15")
+    (is (= :fail (:status ((get @registry "tool") node nil (:graph p) (str dir "/budget-log")))))
+    (is (= "15" (io/slurp (str state "/budget"))))
+    (is (= "30m" (get-in p [:graph :nodes "verify" :attrs :timeout])))))
+
+(deftest interrupted-verification-still-consumes-each-attempt
+  (let [{:keys [state dir registry]} (run-case "exit 0" "VERDICT: SHIP\n" [])
+        p (prepared)
+        node (-> (get-in p [:graph :nodes "verify"])
+                 (assoc :timeout "100ms") (assoc-in [:attrs :timeout] "100ms"))]
+    (io/spit (str state "/iter") "0")
+    (io/spit (str state "/convergence.jsonl") "")
+    (io/spit (str dir "/attractor_runs/task-runner/task.verify.sh") "sleep 2")
+    (dotimes [_ 2]
+      (is (= :fail (:status ((get @registry "tool") node nil (:graph p) (str dir "/timeout-log"))))))
+    (is (= "2\n" (io/slurp (str state "/iter"))))))

@@ -1,0 +1,88 @@
+// Run from the repository you want to edit. See docs/development-repl.md.
+// The console supplies the REPL; this graph controls one task at a time.
+// Edit only these model stylesheet entries to change the three tiers.
+digraph DevelopmentRepl {
+    graph [
+        goal="Implement the current request in attractor_runs/repl/task.md, verify it, and return control to the developer",
+        default_max_retry=0,
+        default_fidelity="compact",
+        model_stylesheet="
+            .local { llm_provider: llamacpp; llm_model: qwen3.8-27b; reasoning_effort: medium; }
+            .frontier { llm_provider: openrouter; llm_model: \"openai/gpt-5.2\"; reasoning_effort: high; }
+            .second-opinion { llm_provider: openrouter; llm_model: \"anthropic/claude-opus-4.6\"; reasoning_effort: high; }
+        "
+    ]
+
+    start [shape=Mdiamond]
+    exit [shape=Msquare, label="Return to console"]
+    intake [shape=hexagon, label="Edit attractor_runs/repl/task.md, then choose the next action"]
+    task_ready [shape=parallelogram, timeout="10s", tool_command="test -s attractor_runs/repl/task.md"]
+
+    local_work [shape=box, class="local", fidelity="truncate", timeout="20m",
+        prompt="Read attractor_runs/repl/task.md now; it is the current request and supersedes earlier task text. Read repository instructions and inspect current changes before editing. Preserve unrelated work. Plan a bounded next step, implement it using your tools, and run targeted checks. Do not merely describe changes you could make. Do not commit, push, or deploy unless the task explicitly requests it. Before returning, write attractor_runs/repl/handoff.md with the current task, changed files, checks actually run and their results, unresolved failures, and the next concrete action. Do not claim completion from intent or a model's confidence. The workflow will run independent verification after this turn."]
+
+    local_repair [shape=box, class="local", fidelity="truncate", timeout="20m",
+        prompt="Read the current attractor_runs/repl/task.md, handoff.md and verify.log in that directory. Diagnose the verification failure from evidence, then make one bounded repair attempt. Preserve unrelated work and do not weaken tests to obtain a pass. Run focused checks and update handoff.md with the root cause, edits, actual evidence and remaining uncertainty. If you cannot fix it, record the precise blocker for the frontier model. Do not commit or push unless explicitly requested."]
+
+    frontier_work [shape=box, class="frontier", fidelity="truncate", timeout="20m",
+        prompt="You are the escalation worker. Read the current attractor_runs/repl/task.md, handoff.md and verify.log if present, repository instructions and the actual diff. Reproduce the blocker; challenge the previous diagnosis before making a bounded correction. Use tools to implement and verify. Preserve unrelated edits, do not weaken verification, and do not commit or push unless explicitly requested. Update attractor_runs/repl/handoff.md with your reasoning, changed files, measured results and a precise handback that the local model can use. Completion is decided by verification and the developer, not your confidence."]
+
+    second_opinion [shape=box, class="second-opinion", fidelity="truncate", timeout="20m",
+        prompt="Provide an independent escalation and repair. Read the current attractor_runs/repl/task.md, handoff.md and verify.log if present, repository instructions and the actual diff. Investigate why earlier attempts failed; reassess their assumptions. Implement the smallest correction that satisfies the full current request, run focused checks, and record concrete evidence or the remaining blocker in attractor_runs/repl/handoff.md. Preserve unrelated changes and existing tests. Do not commit, push or deploy unless explicitly requested. Hand routine follow-up back to the local model."]
+
+    // Each check is a separate node so failure routing preserves the attempt tier.
+    // Keep the exit code: printing the log must not turn a failed check into SUCCESS.
+    subgraph verification {
+        node [shape=parallelogram, timeout="30m", tool_command="sh -c \"${ATTRACTOR_REPL_VERIFY:-make test}\" > attractor_runs/repl/verify.log 2>&1; result=$?; tail -n 80 attractor_runs/repl/verify.log; exit \"$result\""]
+        check_local [label="Verify local change"]
+        check_repair [label="Verify local repair"]
+        check_frontier [label="Verify frontier change"]
+        check_second [label="Verify second opinion"]
+    }
+
+    frontier_gate [shape=hexagon, label="Local attempt needs help. Escalate this task to a paid frontier model?"]
+    second_gate [shape=hexagon, label="Frontier attempt failed or errored. Try a different frontier model?"]
+    blocked [shape=hexagon, label="Verification is still failing. Inspect handoff.md and verify.log; revise the task or stop"]
+    review [shape=hexagon, label="Verification passed. Review the actual diff and handoff.md against your request"]
+
+    start -> intake
+    intake -> task_ready [label="[L] Run current task locally"]
+    intake -> frontier_gate [label="[F] Choose frontier help"]
+    intake -> exit [label="[Q] Return to console"]
+    task_ready -> local_work [condition="outcome=success"]
+    task_ready -> intake [condition="outcome=fail", label="Task file missing or empty"]
+
+    local_work -> check_local [condition="outcome=success"]
+    local_work -> frontier_gate [condition="outcome=fail"]
+    check_local -> review [condition="outcome=success"]
+    check_local -> local_repair [condition="outcome=fail"]
+    local_repair -> check_repair [condition="outcome=success"]
+    local_repair -> frontier_gate [condition="outcome=fail"]
+    check_repair -> review [condition="outcome=success"]
+    check_repair -> frontier_gate [condition="outcome=fail"]
+
+    // First choices stop safely if a caller accidentally uses auto-approve.
+    frontier_gate -> exit [label="[Q] Return to console"]
+    frontier_gate -> frontier_work [label="[F] Use GPT frontier worker"]
+    frontier_gate -> second_opinion [label="[O] Use Claude independent worker"]
+    frontier_gate -> task_ready [label="[L] Revise task and retry locally"]
+    frontier_work -> check_frontier [condition="outcome=success"]
+    frontier_work -> second_gate [condition="outcome=fail"]
+    check_frontier -> review [condition="outcome=success"]
+    check_frontier -> second_gate [condition="outcome=fail"]
+    second_gate -> exit [label="[Q] Return to console"]
+    second_gate -> second_opinion [label="[O] Use Claude independent worker"]
+    second_gate -> task_ready [label="[L] Revise task and retry locally"]
+    second_opinion -> check_second [condition="outcome=success"]
+    second_opinion -> blocked [condition="outcome=fail"]
+    check_second -> review [condition="outcome=success"]
+    check_second -> blocked [condition="outcome=fail"]
+
+    blocked -> exit [label="[Q] Return to console with unresolved task"]
+    blocked -> task_ready [label="[L] Revise task and retry locally"]
+    blocked -> frontier_gate [label="[F] Choose another escalation"]
+    review -> exit [label="[Q] Finish this workflow and return to console"]
+    review -> intake [label="[N] Enter the next task"]
+    review -> task_ready [label="[L] Revise the current task locally"]
+    review -> frontier_gate [label="[F] Request frontier review or repair"]
+}

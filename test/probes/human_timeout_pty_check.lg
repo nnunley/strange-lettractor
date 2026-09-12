@@ -13,7 +13,7 @@
 (def ^:private two-gates-dot
   (str/join "\n" ["digraph G {" "start [shape=Mdiamond]"
                   "first [shape=hexagon, label=\"First?\", human.timeout_seconds=\"0.4\", human.default_choice=\"mid\"]"
-                  "mid [shape=box, prompt=\"mid\"]"
+                  "mid [shape=parallelogram, tool_command=\"sleep 0.8\"]"
                   "second [shape=hexagon, label=\"Second?\", human.timeout_seconds=\"0.4\", human.default_choice=\"b\"]"
                   "a [shape=box, prompt=\"a\"] b [shape=box, prompt=\"b\"] exit [shape=Msquare]"
                   "start -> first" "first -> mid [label=\"Go\"]" "first -> exit [label=\"Quit\"]"
@@ -23,18 +23,18 @@
   (let [dir (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) path (str dir "/g.dot") typescript (str dir "/ts")]
     (io/spit path dot)
     (let [started (System/currentTimeMillis)
-          result (os/sh "/bin/sh" "-c" (str "(" input-script ") | /usr/bin/script -q " typescript
+          result (os/sh "/bin/sh" "-c" (str "(" (str/replace input-script "__TRANSCRIPT__" typescript) ") | /usr/bin/script -q " typescript
                                              " ./bin/attractor run " path " --mock --logs-root " dir "/logs"))
           text (io/slurp typescript)]
       (os/sh "/bin/rm" "-rf" "--" dir)
       {:exit (:exit result) :elapsed (- (System/currentTimeMillis) started) :text text})))
 
 (deftest no-input-completes-through-the-default-at-the-deadline
-  ;; stdin stays open (no EOF) for 1.5s with nothing typed; the 0.5s gate must
+  ;; Keep stdin open beyond startup and the gate deadline; the 0.5s gate must
   ;; resolve by timeout, not by EOF (which would SKIP and fail the run).
-  (let [{:keys [exit elapsed text]} (run-under-pty gate-dot "sleep 1.5")]
+  (let [{:keys [exit elapsed text]} (run-under-pty gate-dot "sleep 4")]
     (is (= 0 exit) text)
-    (is (< elapsed 4000) (str "bounded: " elapsed "ms"))
+    (is (< elapsed 6500) (str "bounded: " elapsed "ms"))
     (is (str/includes? text "[timeout]"))
     (is (str/includes? text "Stage 'hold' started"))
     (is (not (str/includes? text "Stage 'ship' started")))))
@@ -46,10 +46,20 @@
     (is (str/includes? text "Stage 'ship' started"))
     (is (not (str/includes? text "[timeout]")))))
 
+(deftest eof-skips-without-selecting-a-default-or-first-edge
+  (let [{:keys [exit text]}
+        (run-under-pty (str/replace gate-dot "human.timeout_seconds=\"0.5\"" "human.timeout_seconds=\"10\"")
+                       "sleep 0.1")]
+    (is (= 1 exit) text)
+    (is (not (str/includes? text "Stage 'ship' started")))
+    (is (not (str/includes? text "Stage 'hold' started")))))
+
 (deftest late-answer-does-not-answer-the-next-gate
   ;; "Quit" arrives after the first gate timed out; the second gate must not
-  ;; consume it and must reach its own default.
-  (let [{:keys [exit text]} (run-under-pty two-gates-dot "sleep 1.3; printf 'Q\\n'; sleep 1.5")]
+  ;; consume it and must reach its own default. Synchronize with the first
+  ;; timeout, then type during a real intervening tool stage. An absolute
+  ;; delay from process launch can instead type into the second prompt.
+  (let [{:keys [exit text]} (run-under-pty two-gates-dot "for attempt in 1 2 3 4 5 6 7 8 9 10; do if grep -q '\\[timeout\\]' __TRANSCRIPT__ 2>/dev/null; then break; fi; sleep 0.2; done; printf 'Q\\n'; sleep 3")]
     (is (= 0 exit) text)
     (is (str/includes? text "Stage 'mid' started"))
     (is (str/includes? text "Stage 'b' started") text)

@@ -6,6 +6,8 @@
             [attractor.cli :as cli]
             [attractor.engine :as engine]
             [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [async :as async]
             [attractor.parser :as parser]
             [attractor.pipeline :as pipeline]
             [attractor.transforms :as transforms]))
@@ -28,6 +30,42 @@
 
 (def cli-dot
   "digraph CLI { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }")
+
+(deftest stdin-eof-skips-human-gate-without-selecting-an-edge
+  (let [path (str (os/temp-dir) "/cli-eof-" (random-uuid) ".dot")
+        logs (str (os/temp-dir) "/cli-eof-" (random-uuid))
+        lines (async/chan 1) console (interviewer/make-console-interviewer lines)
+        exits (atom [])]
+    (async/close! lines)
+    (io/spit path "digraph EOF { start [shape=Mdiamond]; gate [shape=hexagon]; wrong [shape=diamond]; exit [shape=Msquare]; start -> gate; gate -> wrong [label=Continue]; wrong -> exit; }")
+    (let [printed (with-redefs [interviewer/make-console-interviewer (fn [] console)
+                               os/exit #(swap! exits conj %)]
+                    (with-out-str (cli/cmd-run [path "--mock" "--logs-root" logs])))]
+      (is (= [1] @exits))
+      (is (not (str/includes? printed "Stage 'wrong' started"))))))
+
+(deftest expired-human-question-does-not-crash-cli-or-replace-default-route
+  (doseq [late-answer [{:value :timeout} {:value "L" :text "Late"}]]
+    (let [path (str (os/temp-dir) "/cli-expired-" (random-uuid) ".dot")
+          logs (str (os/temp-dir) "/cli-expired-" (random-uuid))
+          completed (promise) run pipeline/run exits (atom [])]
+      (io/spit path "digraph Expired { start [shape=Mdiamond]; gate [shape=hexagon, human.timeout_seconds=0.01, human.default_choice=defaulted]; defaulted [shape=diamond]; late [shape=diamond]; exit [shape=Msquare]; start -> gate; gate -> defaulted [label=Default]; gate -> late [label=Late]; defaulted -> exit; late -> exit; }")
+      (with-redefs [pipeline/run (fn [source options]
+                                  (let [result (run source options)]
+                                    (deliver completed result) result))
+                    interviewer/make-console-interviewer
+                    (fn [] (interviewer/make-callback-interviewer
+                             (fn [_]
+                               ;; Release stdin only after the real hub has
+                               ;; expired the question and the run completed.
+                               (when (= :wait-expired (deref completed 3000 :wait-expired))
+                                 (throw (ex-info "workflow did not finish" {})))
+                               late-answer)))
+                    os/exit #(swap! exits conj %)]
+        (with-out-str (cli/cmd-run [path "--mock" "--logs-root" logs])))
+      (is (= [0] @exits))
+      (is (= ["start" "gate" "defaulted" "exit"]
+             (:completed_nodes (deref completed 100 :missing)))))))
 
 (deftest file-inspection-captures-relative-children-and-source-cycles
   (let [dir (str (os/temp-dir) "/attractor-cli-recursive-" (random-uuid))
@@ -107,7 +145,7 @@
     (is (= removed-source (get-in @calls [0 1 :current-source-path])))
     ;; The hub adds its event emitter and cancellation predicate; nothing
     ;; else (no parsed source, no transforms) reaches public recovery.
-    (is (= #{:registry :current-source-path :on-event :cancelled?}
+    (is (= #{:registry :current-source-path :on-event :cancelled? :on-resumed :on-restarted}
            (set (keys (get-in @calls [0 1])))))
     (is (= [0] @exits))))
 
@@ -129,7 +167,7 @@
     (is (str/includes? usage "resume [dotfile] --checkpoint <path>"))
     (is (= 1 (count @calls)))
     (is (= checkpoint (get-in @calls [0 0])))
-    (is (= #{:registry :on-event :cancelled?} (set (keys (get-in @calls [0 1])))))
+    (is (= #{:registry :on-event :cancelled? :on-resumed :on-restarted} (set (keys (get-in @calls [0 1])))))
     (is (not (str/includes? @output "workflow_drift")))
     (is (= [0] @exits))))
 
@@ -190,7 +228,7 @@
       (is (= 1 (count @resume-calls)))
       (is (= checkpoint-path (get-in @resume-calls [0 0])))
       (is (= dot-path (get-in @resume-calls [0 1 :current-source-path])))
-      (is (= #{:registry :current-source-path :on-event :cancelled?}
+      (is (= #{:registry :current-source-path :on-event :cancelled? :on-resumed :on-restarted}
              (set (keys (get-in @resume-calls [0 1])))))
       (is (str/includes? (get-in @resume-result [:diagnostics 0 :message])
                          (str ":state " expected-state)))

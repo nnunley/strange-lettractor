@@ -1,0 +1,63 @@
+(ns attractor.review-packet
+  (:require [attractor.handlers :as handlers] [clojure.string :as str]
+            [io :as io] [os :as os] [json :as json]))
+
+(defn- reject! [category]
+  (throw (ex-info (str "Review packet: " (name category)) {:category category})))
+(defn- quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+
+(defn collect
+  "Collect task, verification output, and HEAD-relative workspace changes.
+   Reject oversized evidence and observable changes between two collections.
+   This is not an atomic snapshot. Git output is size-checked after capture."
+  [node options]
+  (let [check! #(when (and (:cancelled? node) ((:cancelled? node))) (reject! :cancelled))
+        _ (check!)
+        root (:working_dir options)
+        limit (get options :max_bytes 1048576)
+        max-files (get options :max_files 128)
+        _ (when-not (and (string? root) (not (str/blank? root))
+                         (integer? limit) (pos? limit) (integer? max-files) (pos? max-files))
+            (reject! :review_configuration_invalid))
+        bounded (fn [s] (when (> (count (bytes s)) limit) (reject! :review_packet_too_large)) s)
+        command (fn [cmd]
+                  (check!)
+                  (let [result (handlers/handle-tool
+                                 (assoc node :attrs {:tool_command cmd :timeout "30s"}) nil nil nil)]
+                    (check!)
+                    (when-not (= :success (:status result)) (reject! :review_packet_git_failed))
+                    (bounded (get-in result [:context_updates "tool.output"] ""))))
+        git (str "git -c core.fsmonitor=false -C " (quote-shell root) " ")
+        scope " -- . ':(exclude)attractor_runs/**'"
+        read-artifact (fn [path]
+                        (check!)
+                        (let [path (if (str/starts-with? path "/") path (str root "/" path))
+                              stat (os/stat path)]
+                          (when (or (nil? stat) (:dir? stat)) (reject! :review_packet_artifact_missing))
+                          (when (> (:size stat) limit) (reject! :review_packet_too_large))
+                          (bounded (io/slurp path))))
+        snapshot (fn []
+                   (let [task (read-artifact (get options :task_file "attractor_runs/task-runner/task.md"))
+                         verification (read-artifact (get options :verification_file "attractor_runs/task-runner/state/verify.log"))
+                         revision (str/trim (command (str git "rev-parse HEAD")))
+                         tracked (command (str git "diff --no-ext-diff --no-textconv --binary HEAD" scope))
+                         paths (vec (remove empty? (str/split
+                                   (command (str git "ls-files --others --exclude-standard -z" scope)) #"\x00")))
+                         _ (when (> (count paths) max-files) (reject! :review_packet_too_large))
+                         patches (mapv (fn [path]
+                                         {:path path :patch
+                                          (command (str git "diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null "
+                                                        (quote-shell path)
+                                                        "; result=$?; [ \"$result\" -eq 1 ] || exit \"$result\""))}) paths)]
+                     (bounded (json/write-json {:base_revision revision :task task :verification_log verification
+                                                :tracked_patch tracked :untracked_patches patches}))))
+        first-packet (snapshot)
+        second-packet (snapshot)]
+    (check!)
+    (when-not (= first-packet second-packet) (reject! :review_packet_changed))
+    first-packet))
+
+(defn make-packet-builder
+  "Build the four-argument packet callback accepted by model-review."
+  [options]
+  (fn [node _ctx _graph _logs-root] (collect node options)))

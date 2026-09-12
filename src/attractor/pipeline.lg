@@ -29,6 +29,7 @@
    :custom-rules
    :on-prepared
    :on-published
+   :on-restarted
    :source-loader
    :source-path
    :base-dir
@@ -36,6 +37,12 @@
    :attractor.pipeline/plan-id])
 
 (declare fresh-logs-root execute-prepared)
+
+(defn- publish-restart! [bundle root options]
+  (let [manifest (workflow/publish! bundle root)]
+    (when-let [observe (:on-restarted options)]
+      (observe {:logs_root root :manifest manifest :fingerprint (:fingerprint bundle)}))
+    manifest))
 
 (defn- captured-handoff [bundle plan-id]
   {:workflow bundle
@@ -68,7 +75,7 @@
                 :logs-root logs-root
                 :workflow-fingerprint (:fingerprint bundle)
                 :attractor.engine/publish-restart
-                (fn [root] (workflow/publish! bundle root))
+                (fn [root] (publish-restart! bundle root options))
                 :workflow-manifest workflow/manifest-relative-path)
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
@@ -294,7 +301,9 @@
   "Resume from an immutable, fingerprint-verified workflow snapshot.
 
    Current source files are inspected only for drift diagnostics. Execution is
-   always delegated with the exact selected graph from the published run."
+   always delegated with the exact selected graph from the published run.
+   :on-resumed observes verified metadata and the engine's checkpoint-seeded
+   context before execution; it cannot replace that context through options."
   ([checkpoint-path] (resume checkpoint-path {}))
   ([checkpoint-path options]
    (let [resolved-checkpoint-path (resolve-checkpoint-path! checkpoint-path)
@@ -316,8 +325,18 @@
                 :logs-root run-root
                 :on-event caller-on-event
                 :workflow-fingerprint expected-fingerprint
+                :attractor.engine/on-resume-context
+                (fn [ctx]
+                  (when-let [observe (:on-resumed options)]
+                    (observe {:context ctx :logs_root run-root
+                              :dot_source (:source (first (filter #(= plan-id (:logical-id %))
+                                                                  (:source-records bundle))))
+                              :publication {:graph graph
+                                            :diagnostics (if (seq changes) [(drift-diagnostic changes)] [])
+                                            :manifest (str run-root "/" workflow/manifest-relative-path)
+                                            :fingerprint expected-fingerprint}})))
                 :attractor.engine/publish-restart
-                (fn [root] (workflow/publish! (:captured-bundle verified) root))
+                (fn [root] (publish-restart! (:captured-bundle verified) root options))
                 :workflow-manifest workflow/manifest-relative-path)
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected

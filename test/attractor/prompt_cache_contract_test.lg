@@ -1,0 +1,26 @@
+(ns attractor.prompt-cache-contract-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [json :as json] [attractor.llm :as llm]))
+
+(deftest explicit-nested-cache-blocks-add-beta-header-with-auto-cache-disabled
+  (doseq [[location block]
+          [[:system [{:type "text" :text "stable" :cache_control {:type "ephemeral"}}]]
+           [:messages [{:role "user" :content [{:type "text" :text "question" :cache_control {:type "ephemeral"}}]}]]
+           [:tools [{:name "lookup" :input_schema {:type "object"} :cache_control {:type "ephemeral"}}]]
+           ["system" [{"type" "text" "text" "stable" "cache_control" {"type" "ephemeral"}}]]]]
+    (let [sent (atom nil)
+          _ (llm/anthropic-complete
+              {:model "fixture" :api_key "fixture"
+               :messages [{:role :user :content "question"}]
+               :provider_options {:anthropic (assoc {:auto_cache false :beta_headers ["custom-beta"]} location block)}
+               :transport (fn [request]
+                            (reset! sent request)
+                            {:status 200 :body (json/write-json
+                                                {:id "answer" :content [{:type "text" :text "ok"}]
+                                                 :stop_reason "end_turn" :usage {:input_tokens 1 :output_tokens 1}})})})
+          header (get-in @sent [:headers "anthropic-beta"])
+          body (json/read-json (:body @sent))]
+      (is (str/includes? (or header "") "prompt-caching-2024-07-31"))
+      (is (str/includes? (or header "") "custom-beta"))
+      (is (= (json/read-json (json/write-json block)) (get body (name location))))
+      (is (nil? (get body "auto_cache"))))))

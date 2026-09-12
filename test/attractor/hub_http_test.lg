@@ -1,0 +1,169 @@
+(ns attractor.hub-http-test
+  (:require [clojure.test :refer [deftest is]] [clojure.edn :as edn] [json :as json]
+            [clojure.string :as str]
+            [attractor.hub :as hub] [attractor.hub-http :as http]
+            [attractor.nrepl-hub :as nrepl] [attractor.handlers :as handlers]
+            [attractor.ids :as ids] [os :as os] [io :as io]))
+(defn request [h op fields] (deref (hub/request! h (merge {:id "test" :op op} fields)) 3000 {}))
+(defn start-hub [] (hub/start! {:workflow_registry_fn (fn [r] (handlers/make-handler-registry (:interviewer r) nil {}))}))
+(def dot "digraph Shared { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Yes\"]; }")
+(defn start-run [h logs]
+  (let [reply (nrepl/handle-message h {"id" "start" "op" "attractor/request"
+                                      "payload" (pr-str {:op :workflow/run :dot_source dot :logs_root logs})})]
+    (get-in (edn/read-string (get reply "value")) [:value :run_id])))
+(defn wait-for [f pred]
+  (let [deadline (+ (System/nanoTime) 3000000000)]
+    (loop [] (let [v (f)] (if (or (pred v) (>= (System/nanoTime) deadline)) v (do (sleep 5) (recur)))))))
+(defn call [handler method path & [body]]
+  (handler {:request-method method :path path :body (when body (json/write-json body))}))
+(defn data [reply] (json/read-json (:body reply)))
+
+(deftest http-reports-transport-failures-and-unknown-routes
+  (doseq [[category status] [[:connection-closed 503] [:transport-error 503] [:protocol-error 502]]]
+    (let [handler (http/make-handler #(throw (ex-info "Hub reply lost" {:category category :outcome_unknown true :request_id (:id %)})))
+          reply (call handler :post "/pipelines" {"dot" dot})]
+      (is (= status (:status reply)))
+      (is (= true (get (data reply) "outcome_unknown")))
+      (is (string? (get (data reply) "request_id")))))
+  (let [handler (http/make-handler (fn [_] (throw (ex-info "Unexpected hub request" {}))))]
+    (is (= 404 (:status (call handler :get "/unknown")))))
+  (let [handler (http/make-handler #(assoc (select-keys % [:id]) :error {:category :request-timeout :message "Still pending"}))
+        reply (call handler :post "/pipelines" {"dot" dot})]
+    (is (= 503 (:status reply)))
+    (is (= true (get (data reply) "outcome_unknown")))
+    (is (string? (get (data reply) "request_id")))))
+
+(deftest http-submission-waits-for-publication-and-rejects-invalid-dot
+  (let [h (start-hub) root (str (os/temp-dir) "/" (ids/prefixed "http-admission"))
+        _ (io/mkdir root)
+        handler (http/make-handler
+                  #(deref (hub/request! h (cond-> % (= :workflow/run (:op %))
+                                           (assoc :logs_root (str root "/" (ids/uuid-text))))) 3000 {}))]
+    (try
+      (doseq [body [dot (json/write-json {"dot" dot})]]
+        (let [reply (handler {:request-method :post :path "/pipelines" :body body})
+              started (data reply) id (get started "id")
+              snapshot (:value (request h :workflow/inspect {:run_id id}))]
+          (is (= 201 (:status reply)))
+          (is (= "started" (get started "status")))
+          (is (= "Shared" (get started "graph_id")))
+          (is (= :published (:admission snapshot)))
+          (is (string? (get-in snapshot [:publication :fingerprint])))
+          (request h :workflow/cancel {:run_id id})))
+      (is (= 400 (:status (handler {:request-method :post :path "/pipelines" :body "not a graph"}))))
+      (is (= 400 (:status (handler {:request-method :post :path "/pipelines" :body dot :preparation-timeout-ms 0}))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest nrepl-run-is-inspected-and-answered-through-http
+  (let [h (start-hub) root (str (os/temp-dir) "/" (ids/prefixed "shared-http"))
+        _ (io/mkdir root) handler (http/make-handler #(deref (hub/request! h %) 3000 {}))]
+    (try
+      (let [id (start-run h (str root "/run")) path (str "/pipelines/" id)
+            questions (wait-for #(data (call handler :get (str path "/questions")))
+                                #(some (fn [q] (= "gate" (get q "stage"))) (vals %)))
+            qid (first (keys questions))]
+        (is (= "gate" (get-in questions [qid "stage"])))
+        (is (some #(= id (get % "id")) (data (call handler :get "/pipelines"))))
+        (is (= ":running" (get (data (call handler :get path)) "status")))
+        (is (pos? (get (data (call handler :get path)) "event_count")))
+        (is (= "gate" (get (data (call handler :get (str path "/context"))) "current_node")))
+        (let [graph (call handler :get (str path "/graph"))]
+          (is (= 200 (:status graph)))
+          (is (= "image/svg+xml" (get-in graph [:headers "Content-Type"])))
+          (is (str/includes? (:body graph) "<svg"))
+          (is (str/includes? (:body graph) "<title>Shared</title>")))
+        (is (= 200 (:status (call handler :post (str path "/questions/" qid "/answer") {"answer" "Y"}))))
+        (let [done (wait-for #(request h :workflow/result {:run_id id}) #(= :completed (get-in % [:value :state])))]
+          (is (= :success (get-in done [:value :result :value :status]))))
+        (is (= ":success" (get (data (call handler :get path)) "status")))
+        (is (= "Y" (get (data (call handler :get (str path "/context"))) "human.gate.selected")))
+        (is (= {} (data (call handler :get (str path "/questions")))))
+        (is (= 404 (:status (call handler :post (str path "/questions/" qid "/answer") {"answer" "Y"})))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest an-active-event-stream-reports-lost-transport-without-workflow-completion
+  (let [h (start-hub) root (str (os/temp-dir) "/" (ids/prefixed "stream-failure"))
+        _ (io/mkdir root) disconnected (atom false)
+        handler (http/make-handler
+                  #(if @disconnected
+                     (throw (ex-info "Peer closed" {:category :connection-closed :request_id (:id %)
+                                                     :outcome_unknown true}))
+                     (deref (hub/request! h %) 3000 {})))]
+    (try
+      (let [id (start-run h root)
+            question (first (wait-for #(get (request h :question/list {}) :value) seq))
+            history (:value (request h :workflow/events {:run_id id}))
+            reply (call handler :get (str "/pipelines/" id "/events"))
+            first-frame (first (:body reply))]
+        (is (str/starts-with? first-frame "id: 0\n"))
+        (reset! disconnected true)
+        (let [frames (try (vec (rest (:body reply))) (catch Object _ []))
+              failure (last frames)]
+          (is (and (string? failure) (str/starts-with? failure "event: stream.error\n")))
+          (is (not-any? #(str/starts-with? % "event: end\n") frames))
+          (when (and (string? failure) (str/starts-with? failure "event: stream.error\n"))
+            (let [payload (json/read-json (second (str/split (str/trim failure) #"data: ")))]
+              (is (= id (get payload "run_id")))
+              (is (= (:event_count history) (get payload "next_event_id")))
+              (is (= "connection-closed" (get payload "category")))
+              (is (nil? (get payload "status"))))))
+        (is (= :running (get-in (request h :workflow/result {:run_id id}) [:value :state])))
+        (request h :question/answer {:question_id (:question_id question) :value "Y"}))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest shared-http-replays-events-and-reads-the-hubs-checkpoint
+  (let [h (start-hub) root (str (os/temp-dir) "/" (ids/prefixed "shared-http-stream"))
+        _ (io/mkdir root) handler (http/make-handler #(deref (hub/request! h %) 3000 {}))]
+    (try
+      (let [id (start-run h (str root "/run")) path (str "/pipelines/" id)
+            q (first (wait-for #(get (request h :question/list {}) :value) seq))
+            checkpoint (call handler :get (str path "/checkpoint"))
+            stream (call handler :get (str path "/events"))]
+        (is (= 200 (:status checkpoint)))
+        (is (= "start" (get (data checkpoint) "current_node")))
+        (let [history (:value (request h :workflow/events {:run_id id}))
+              idle (handler {:request-method :get :path (str path "/events")
+                             :headers {"Last-Event-ID" (str (dec (:event_count history)))}})
+              heartbeat (future (first (:body idle)))]
+          (is (= ": keep-alive\n\n" (deref heartbeat 2000 ::pending)))
+          (is (= :running (get-in (request h :workflow/result {:run_id id}) [:value :state]))))
+        (is (= 200 (:status stream)))
+        (when (= 200 (:status stream))
+          (is (= "text/event-stream" (get-in stream [:headers "Content-Type"])))
+          (is (str/starts-with? (first (:body stream)) "id: 0\n"))
+          (let [drained (future (vec (rest (:body stream))))]
+            (is (= ::pending (deref drained 20 ::pending)))
+            (call handler :post (str path "/questions/" (:question_id q) "/answer") {"answer" "Y"})
+            (let [frames (deref drained 3000 [])]
+              (is (some #(str/includes? % "pipeline.completed") frames))
+              (is (= 1 (count (filter #(str/starts-with? % "event: end\n") frames)))))
+            (let [replay (handler {:request-method :get :path (str path "/events")
+                                  :headers {"Last-Event-ID" "0"}})]
+              (is (str/starts-with? (first (:body replay)) "id: 1\n"))))
+          (is (= 400 (:status (handler {:request-method :get :path (str path "/events") :headers {"Last-Event-ID" "abc"}}))))
+          (is (= 400 (:status (handler {:request-method :get :path (str path "/events") :headers {"Last-Event-ID" "999999"}}))))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest http-controls-cannot-answer-or-cancel-a-different-run
+  (let [h (start-hub) root (str (os/temp-dir) "/" (ids/prefixed "shared-http-isolation"))
+        _ (io/mkdir root) handler (http/make-handler #(deref (hub/request! h %) 3000 {}))]
+    (try
+      (let [a (start-run h (str root "/a")) b (start-run h (str root "/b"))
+            all (wait-for #(get (request h :question/list {}) :value)
+                          #(= #{a b} (set (map :run_id %))))
+            bq (:question_id (first (filter #(= b (:run_id %)) all)))
+            path-a (str "/pipelines/" a) path-b (str "/pipelines/" b)]
+        (is (string? bq))
+        (is (= 404 (:status (call handler :post (str path-a "/questions/" bq "/answer") {"answer" "Y"}))))
+        (is (= #{a b} (set (map :run_id (:value (request h :question/list {}))))))
+        (is (= 200 (:status (call handler :post (str path-a "/cancel")))))
+        (let [done (wait-for #(request h :workflow/result {:run_id a}) #(= :completed (get-in % [:value :state])))]
+          (is (true? (get-in done [:value :result :value :cancelled]))))
+        (is (= ":cancelled" (get (data (call handler :get path-a)) "status")))
+        (is (= ":running" (get (data (call handler :get path-b)) "status")))
+        (is (contains? (data (call handler :get (str path-b "/questions"))) bq))
+        (let [history (:value (request h :workflow/events {:run_id a}))]
+          (is (some #(= :pipeline.started (:type %)) (:events history)))
+          (is (= [] (get-in (request h :workflow/events {:run_id a :from (:event_count history)}) [:value :events])))
+          (is (= :invalid-cursor (get-in (request h :workflow/events {:run_id a :from -1}) [:error :category])))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))

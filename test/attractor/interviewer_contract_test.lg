@@ -69,14 +69,13 @@
                          {:value "rationale" :text "rationale"}
                          "\n[?] Explain\n> "))
 
-(deftest queue-consumes-supplied-answer-maps-in-order-before-default
+(deftest queue-consumes-supplied-answer-maps-in-order-then-skips
   (let [queue (interview/make-queue-interviewer answers)]
     (is (= answers (interview/ask-multiple queue questions)))
     (is (= {:value :skipped :text "queue exhausted"}
            (interview/ask queue (dissoc complete-question :default))))
-    ;; Local extension: exhausted queues use Question.default. Upstream
-    ;; queue pseudocode always returns SKIPPED on exhaustion.
-    (is (= default-answer (interview/ask queue complete-question)))
+    ;; Exhaustion is a skip, not a timeout that selects Question.default.
+    (is (= :skipped (:value (interview/ask queue complete-question))))
     (is (= :skipped (:value (interview/ask queue {:type :freeform}))))
     (is (nil? (interview/inform queue "done" "review")))))
 

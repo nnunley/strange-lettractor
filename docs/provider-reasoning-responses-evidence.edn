@@ -1,0 +1,1 @@
+{:scenario "SCN-PROVIDER-MATRIX", :providers [{:provider "or-responses", :model "openai/gpt-5.2"}], :rows [{:status :pass, :provider "or-responses", :model "openai/gpt-5.2", :duration_ms 12741, :journey :reasoning, :detail {:reasoning_text_present false, :reasoning_tokens 1183}}], :recorded_at "1789243654413"}

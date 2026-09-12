@@ -2,7 +2,9 @@
   "SCN-ATTR-SMOKE-LIVE: the upstream smoke pipeline through one real model.
    Opt-in: set ATTRACTOR_LIVE_MODEL to provider/name (for example
    openai-compat/qwen3.8-27b with OPENAI_COMPAT_BASE_URL pointing at llama.cpp). Without it
-   the run exits 3 and prints a skip record; a skip is never a pass."
+   the run exits 3 and prints a skip record; a skip is never a pass.
+   Stage artifacts and result.edn persist under docs/runtime-smoke-evidence;
+   only the model's temporary working directory is removed."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
             [os :as os] [io :as io] [json :as json]
             [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
@@ -24,9 +26,13 @@
      "review -> implement [condition=\"outcome=fail\", label=\"Fix\"]" "}"]))
 
 (def model (os/getenv "ATTRACTOR_LIVE_MODEL"))
+(def evidence-root
+  (str "docs/runtime-smoke-evidence/"
+       (str/replace (or model "unset") #"[^A-Za-z0-9._-]" "-")
+       "-" (System/currentTimeMillis)))
 
 (deftest live-smoke-routes-persists-and-completes
-  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) logs-root (str root "/logs")
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d"))) logs-root (str evidence-root "/logs")
         events (atom [])
         ;; Confine the live agent's tools to the temporary root, never the repo.
         workdir (str root "/work") _ (os/sh "/bin/mkdir" "-p" workdir)
@@ -61,7 +67,15 @@
     (do (prn {:scenario "SCN-ATTR-SMOKE-LIVE" :status :skipped :reason "ATTRACTOR_LIVE_MODEL not set"})
         (os/exit 3))
     (let [output (with-out-str (clojure.test/run-tests))]
+      (io/mkdir evidence-root)
+      (io/spit (str evidence-root "/result.edn")
+               (pr-str {:scenario "SCN-ATTR-SMOKE-LIVE" :model model
+                        :status (if clojure.test/*test-result* :pass :fail)
+                        :counts clojure.test/*report-counters*
+                        :recorded_at (str (System/currentTimeMillis))
+                        :logs_root (str evidence-root "/logs")}))
       (prn clojure.test/*report-counters*)
+      (println (str "Retained evidence: " evidence-root))
       (when-not clojure.test/*test-result* (println output))
       (os/exit (if clojure.test/*test-result* 0 1)))))
 (when *command-line-args* (apply -main *command-line-args*))

@@ -1,0 +1,126 @@
+(ns attractor.hub-admission-test
+  (:require [clojure.test :refer [deftest is]] [attractor.hub :as hub]
+            [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
+            [attractor.ids :as ids] [attractor.workflow :as workflow] [io :as io] [os :as os]))
+(defn request [h op fields] (deref (hub/request! h (merge {:id "admission" :op op} fields)) 3000 {}))
+(def dot "digraph Admission { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }")
+(deftest expired-preparation-cannot-publish-or-execute
+ (doseq [inspect? [true false]]
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "admission")) _ (io/mkdir root)
+        entered (promise) release (promise) prepare pipeline/prepare
+        h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+    (try
+      (with-redefs [pipeline/prepare (fn [source options]
+                                     (deliver entered true)
+                                     (deref release 3000 nil)
+                                     (prepare source options))]
+        (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root :preparation_timeout_ms 20}))]
+          (is (true? (deref entered 1000 false)))
+          (sleep 30)
+          (when inspect?
+           (let [snapshot (:value (request h :workflow/inspect {:run_id (:run_id run)}))]
+            (is (= :timed_out (:admission snapshot)))
+            (is (nil? (:publication snapshot)))))
+          (deliver release true)
+          (let [result (deref (:completion run) 3000 {})
+                snapshot (:value (request h :workflow/inspect {:run_id (:run_id run)}))]
+            (is (= :preparation_timeout (get-in result [:error :category])))
+            (is (= :timed_out (:admission snapshot)))
+            (is (nil? (:publication snapshot)))
+            (is (empty? (get-in (request h :workflow/events {:run_id (:run_id run)}) [:value :events]))))))
+      (finally (deliver release true) (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root))))))
+
+(deftest publication-wins-and-invalid-deadlines-are-rejected
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "admitted")) _ (io/mkdir root)
+        h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+    (try
+      (doseq [timeout [-1 "20"]]
+        (is (= :invalid-request (:category (:error (request h :workflow/run {:dot_source dot :logs_root root :preparation_timeout_ms timeout}))))))
+      (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root :preparation_timeout_ms 2000}))]
+        (is (= :success (get-in (deref (:completion run) 3000 {}) [:value :status])))
+        (is (= :published (get-in (request h :workflow/inspect {:run_id (:run_id run)}) [:value :admission]))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest missing-corrupt-and-misaddressed-publications-stay-unpublished
+  (doseq [fault [:missing :corrupt :wrong-path]]
+    (let [root (str (os/temp-dir) "/" (ids/prefixed "publication-fault")) _ (io/mkdir root)
+          h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+      (try
+        (with-redefs [pipeline/run
+                      (fn [source options]
+                        (let [prepared (pipeline/prepare source)
+                              path (if (= :missing fault) (str root "/workflow/manifest.edn")
+                                       (workflow/publish! (:workflow prepared) (:logs-root options)))]
+                          (when (= :corrupt fault) (io/spit path "{}"))
+                          ((:on-published options) prepared (if (= :wrong-path fault) (str path ".wrong") path))
+                          {:status :success}))]
+          (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root}))
+                result (deref (:completion run) 3000 {})
+                snapshot (:value (request h :workflow/inspect {:run_id (:run_id run)}))]
+            (is (some? (:error result)))
+            (is (= :failed (:admission snapshot)))
+            (is (nil? (:publication snapshot)))))
+        (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root))))))
+
+(deftest verification-finishing-after-the-deadline-cannot-register
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "verification-timeout")) _ (io/mkdir root)
+        entered (promise) release (promise) verify workflow/verify-published!
+        h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+    (try
+      (with-redefs [workflow/verify-published! (fn [root fingerprint]
+                                                (let [verified (verify root fingerprint)]
+                                                  (deliver entered true)
+                                                  (deref release 3000 nil)
+                                                  verified))]
+        (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root :preparation_timeout_ms 50}))]
+          (is (true? (deref entered 1000 false)))
+          (sleep 60)
+          (is (= :timed_out (get-in (request h :workflow/inspect {:run_id (:run_id run)}) [:value :admission])))
+          (deliver release true)
+          (is (= :preparation_timeout (get-in (deref (:completion run) 3000 {}) [:error :category])))
+          (is (nil? (get-in (request h :workflow/inspect {:run_id (:run_id run)}) [:value :publication])))))
+      (finally (deliver release true) (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest publication-rejects-a-graph-that-differs-from-the-captured-plan
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "publication-mismatch")) _ (io/mkdir root)
+        h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+    (try
+      (with-redefs [pipeline/run
+                    (fn [source options]
+                      (let [prepared (pipeline/prepare source)
+                            path (workflow/publish! (:workflow prepared) (:logs-root options))]
+                        ((:on-published options) (assoc-in prepared [:graph :id] "Uncaptured") path)
+                        {:status :success}))]
+        (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root}))
+              result (deref (:completion run) 3000 {})
+              snapshot (:value (request h :workflow/inspect {:run_id (:run_id run)}))]
+          (is (= :workflow_snapshot_corrupt (get-in result [:error :category])))
+          (is (= :failed (:admission snapshot)))
+          (is (nil? (:publication snapshot)))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))
+
+(deftest repeated-publication-preserves-the-winning-registration
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "publication-repeat")) _ (io/mkdir root)
+        observed (promise)
+        h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})]
+    (try
+      (with-redefs [pipeline/run
+                    (fn [source options]
+                      (let [prepared (pipeline/prepare source)
+                            path (workflow/publish! (:workflow prepared) (:logs-root options))]
+                        ((:on-published options) prepared path)
+                        (let [first-publication (:publication (first (vals @(:workflows h))))]
+                          (let [callbacks (mapv (fn [message]
+                                                  (future ((:on-published options)
+                                                           (assoc prepared :diagnostics [{:message message}]) path)))
+                                                ["concurrent callback A" "concurrent callback B"])
+                                results (mapv #(deref % 3000 ::pending) callbacks)]
+                            (deliver observed [first-publication (:publication (first (vals @(:workflows h)))) results])))
+                        {:status :success}))]
+        (let [run (:value (request h :workflow/run {:dot_source dot :logs_root root}))]
+          (is (= :success (get-in (deref (:completion run) 3000 {}) [:value :status])))
+          (let [[first-publication repeated results] (deref observed 1000 [])]
+            (is (= [:published :published] results))
+            (is (some? first-publication))
+            (is (identical? first-publication repeated)))))
+      (finally (request h :hub/stop {}) (os/sh "rm" "-rf" "--" root)))))

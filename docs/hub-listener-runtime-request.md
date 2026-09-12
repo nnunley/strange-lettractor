@@ -1,8 +1,15 @@
 # Runtime request: owned TCP listeners for a let-go RPC hub
 
-Status: independently reviewed; acceptance details posted on existing
+Original request: independently reviewed; acceptance details posted on existing
 [let-go #523](https://github.com/nooga/let-go/issues/523#issuecomment-5579712836).
-No runtime files modified and no listener implementation claimed.
+Update 2026-09-12: implemented locally as `runtime-patches/net-listener.patch`.
+The native `test/probes/net_listener_check.lg` passes both as a script and a
+standalone bundle. It verifies port zero, bind errors, two bencode clients,
+fragmented/coalesced frames, close waking accept/read, idempotent listener close
+and accepted connections surviving listener close. Existing runtime TCP/bencode
+tests also pass. This is an explicit-close primitive; automatic scope ownership
+and the nREPL adapter are not implemented by it. The historical findings below
+describe the runtime before this patch, not the configured binary now.
 
 Strange Lettractor needs a long-lived hub that owns agents/workflows while
 terminal clients attach and detach independently. Product code, including

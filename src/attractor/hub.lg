@@ -1,6 +1,7 @@
 (ns attractor.hub
   (:require [attractor.ids :as ids] [clojure.core :as core] [async :as async] [clojure.string :as str]
             [attractor.agent :as agent] [attractor.pipeline :as pipeline]
+            [attractor.context :as context] [attractor.workflow :as workflow] [os :as os]
             [attractor.interviewer :as interviewer]
             [attractor.agents.registry :as registry]))
 
@@ -8,6 +9,22 @@
   (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
   (try (f) (finally (reset! lock false))))
 (defn- fail! [category] (throw (ex-info (name category) {:category category})))
+(defn- request-answer [request]
+  (if (contains? request :answer)
+    (let [answer (:answer request) value (:value answer) option (:selected_option answer)]
+      (when-not (and (map? answer)
+                     (not (contains? request :value)) (not (contains? request :text))
+                     (or (string? value) (#{:yes :no :skipped :timeout} value)
+                         (and (nil? value) (string? (:text answer))))
+                     (or (nil? (:text answer)) (string? (:text answer)))
+                     (or (nil? option)
+                         (and (map? option) (string? (:key option)) (string? (:label option)))))
+        (fail! :invalid-request))
+      answer)
+    (let [value (or (:value request) (:text request))]
+      (when-not (and (string? value) (or (nil? (:text request)) (string? (:text request))))
+        (fail! :invalid-request))
+      {:value value :text (or (:text request) value)})))
 (defn- fresh-id [prefix] (ids/prefixed prefix))
 (defn- error-data [error]
   ;; Worker diagnostics (stderr, exit code) travel with the category so a
@@ -34,7 +51,8 @@
       (let [{:keys [events clients] newest :cursor} @(:log hub)]
         (when-not (contains? clients client-id) (fail! :unknown-client))
         (when-not (and (integer? cursor) (<= 0 cursor newest)) (fail! :invalid-cursor))
-        (when (and (seq events) (< cursor (dec (:seq (first events))))) (fail! :cursor-expired))
+        (when (and (seq events) (< cursor (dec (:seq (first events)))))
+          (throw (ex-info "cursor-expired" {:category :cursor-expired :oldest_cursor (dec (:seq (first events)))})))
         {:cursor newest :events (vec (filter #(> (:seq %) cursor) events))}))))
 
 (defn- entry! [hub id]
@@ -95,6 +113,14 @@
 (defn- finish-under-lock! [hub f]
   (locked (:event_lock hub) f))
 
+(defn- expire-admission! [entry]
+  ;; Call under the event lock, shared with publication and completion.
+  (when (and (= :pending @(:admission entry)) (:preparation_deadline entry)
+             (>= (System/nanoTime) (:preparation_deadline entry)))
+    (reset! (:admission entry) :timed_out)
+    (reset! (:cancelled entry) true))
+  @(:admission entry))
+
 (defn- question-entry! [hub id]
   (or (get @(:questions hub) id) (fail! :unknown-question)))
 
@@ -126,13 +152,16 @@
 
 (defn- start-workflow!
   "Register and launch one workflow run or resume. `runner` receives the
-   hub-bound registry, the event emitter and the cancellation predicate and
+   hub-bound registry, event emitter, cancellation predicate and observer map and
    returns the pipeline outcome."
-  [hub request runner]
+  [hub request runner & [runtime]]
   (when-not (:workflow_registry_fn hub) (fail! :workflows-unavailable))
-  (let [run-id (fresh-id "run") cancelled (atom false) completion (promise)
+  (let [run-id (fresh-id "run") cancelled (atom false) completion (promise) events (atom [])
+        admission (atom :pending)
         base {:source :workflow :run_id run-id}
-        emit (fn [event] (append-envelope! hub (assoc base :event event)))
+        emit (fn [event]
+               (swap! events conj event)
+               (append-envelope! hub (assoc base :event event)))
         ;; The registry factory receives a hub-backed interviewer bound to
         ;; this run; it may still choose auto-approve.
         registry ((:workflow_registry_fn hub)
@@ -140,13 +169,64 @@
         ;; Register before launching so a fast failure cannot publish
         ;; :done ahead of the entry and be overwritten.
         _ (swap! (:workflows hub) assoc run-id {:run_id run-id :cancelled cancelled :completion completion
-                                                :source_path (:source_path request) :done false})]
+                                                :source_path (:source_path request) :done false
+                                                :dot_source (:dot_source request) :logs_root (:logs_root runtime)
+                                                :context (:context runtime) :events events :admission admission
+                                                :preparation_deadline (:preparation_deadline runtime)})
+        published (fn [prepared manifest-path]
+                    (let [fingerprint (get-in prepared [:workflow :fingerprint])
+                          expected (str (:logs_root runtime) "/" workflow/manifest-relative-path)
+                          verified (workflow/verify-published! (:logs_root runtime) fingerprint)]
+                      (when-not (and (= expected manifest-path)
+                                     (= fingerprint (get-in verified [:workflow :fingerprint]))
+                                     (= (workflow/plan-fingerprint (:graph prepared))
+                                        (workflow/plan-fingerprint (:graph verified))))
+                        (fail! :workflow_snapshot_corrupt))
+                      (finish-under-lock! hub
+                        (fn []
+                          (when (= :timed_out (expire-admission! (get @(:workflows hub) run-id)))
+                            (fail! :preparation_timeout))
+                          (when @cancelled (fail! :cancelled))
+                          (when-not (contains? @(:workflows hub) run-id) (fail! :unknown-run))
+                          (if-let [existing (get-in @(:workflows hub) [run-id :publication])]
+                            (when-not (and (= manifest-path (:manifest existing))
+                                           (= fingerprint (:fingerprint existing)))
+                              (fail! :workflow_snapshot_corrupt))
+                            (swap! (:workflows hub) assoc-in [run-id :publication]
+                                   {:manifest manifest-path :fingerprint fingerprint
+                                    :graph (:graph prepared) :diagnostics (:diagnostics prepared)}))
+                          (reset! admission :published)))))
+        resumed (fn [inspection]
+                  (finish-under-lock! hub
+                    (fn []
+                      (when @cancelled (fail! :cancelled))
+                      (when-not (contains? @(:workflows hub) run-id) (fail! :unknown-run))
+                      (swap! (:workflows hub) update run-id merge
+                             (select-keys inspection [:context :logs_root :publication :dot_source]))
+                      (reset! admission :published))))
+        restarted (fn [{:keys [logs_root manifest fingerprint]}]
+                    (let [verified (workflow/verify-published! logs_root fingerprint)]
+                      (when-not (and (= manifest (str logs_root "/" workflow/manifest-relative-path))
+                                     (= fingerprint (get-in verified [:workflow :fingerprint])))
+                        (fail! :workflow_snapshot_corrupt))
+                      (finish-under-lock! hub
+                        (fn []
+                          (let [entry (get @(:workflows hub) run-id)]
+                            (when-not entry (fail! :unknown-run))
+                            (when @cancelled (fail! :cancelled))
+                            (when-not (= fingerprint (get-in entry [:publication :fingerprint]))
+                              (fail! :workflow_snapshot_corrupt))
+                            (swap! (:workflows hub) update run-id
+                                   #(-> % (assoc :logs_root logs_root)
+                                          (assoc-in [:publication :manifest] manifest))))))))]
     (launch! (fn []
-               (let [outcome (runner registry emit (fn [] @cancelled))]
+               (let [outcome (runner registry emit (fn [] @cancelled) {:published published :resumed resumed :restarted restarted})]
                  (if @cancelled (assoc outcome :cancelled true) outcome)))
              (fn [done result]
                (finish-under-lock! hub
                  (fn []
+                   (expire-admission! (get @(:workflows hub) run-id))
+                   (when (= :pending @admission) (reset! admission :failed))
                    (swap! (:workflows hub) assoc-in [run-id :done] true)
                    (deliver done result))))
              completion)
@@ -168,6 +248,14 @@
 (defn- agent-entry! [hub id]
   (or (get @(:agents hub) id) (fail! :unknown-agent-job)))
 
+(defn- completion-snapshot [identity completion]
+  ;; Never block the worker that also admits answers and cancellation. Observe
+  ;; the promise directly: an entry's :done flag can precede its delivery.
+  (let [result (deref completion 0 ::pending)]
+    (if (= ::pending result)
+      (assoc identity :state :running)
+      (assoc identity :state :completed :result result))))
+
 (defn- operation! [hub request]
   (case (:op request)
     :eval/submit
@@ -176,9 +264,11 @@
       (when (:busy @(:eval hub)) (fail! :busy))
       (swap! (:eval hub) assoc :busy true)
       (let [eval-id (fresh-id "eval")
+            completion (promise)
+            _ (swap! (:eval hub) assoc-in [:jobs eval-id] completion)
             base {:source :eval :eval_id eval-id :session_id (:session_id request) :run_id (:run_id request)}
             _ (append-envelope! hub (assoc base :event {:type :eval_start :code code}))
-            completion
+            _
             (launch! (fn []
                        (try (eval-in-user-ns! hub code (:session_id request) (:run_id request))
                             (catch Object e
@@ -193,25 +283,61 @@
                        (finish-under-lock! hub
                          (fn []
                            (swap! (:eval hub) assoc :busy false)
-                           (deliver done result)))))]
+                           (deliver done result))))
+                     completion)]
         {:eval_id eval-id :completion completion}))
+    :eval/result
+    (let [completion (get-in @(:eval hub) [:jobs (:eval_id request)])]
+      (when-not completion (fail! :unknown-eval))
+      (completion-snapshot {:eval_id (:eval_id request)} completion))
     :workflow/run
-    (let [source (:dot_source request)]
+    (let [source (:dot_source request)
+          timeout (:preparation_timeout_ms request)
+          _ (when (and (contains? request :preparation_timeout_ms)
+                       (not (and (integer? timeout) (<= 0 timeout)))) (fail! :invalid-request))
+          deadline (when timeout (+ (System/nanoTime) (* timeout 1000000)))
+          ctx (context/make-context)
+          logs-root (or (:logs_root request) (str "attractor_runs/" (fresh-id "run")))]
       (when-not (string? source) (fail! :invalid-request))
-      (start-workflow! hub request
-        (fn [registry emit cancelled?]
+      (start-workflow! hub (assoc request :logs_root logs-root)
+        (fn [registry emit cancelled? observers]
           (pipeline/run source
-            {:logs-root (:logs_root request) :source-path (:source_path request)
-             :registry registry :on-event emit :cancelled? cancelled?}))))
+            {:logs-root logs-root :source-path (:source_path request) :context ctx :on-published (:published observers)
+             :on-restarted (:restarted observers)
+             :registry registry :on-event emit :cancelled? cancelled?}))
+        {:context ctx :logs_root logs-root :preparation_deadline deadline}))
     :workflow/resume
     (let [checkpoint (:checkpoint_path request)]
       (when-not (string? checkpoint) (fail! :invalid-request))
       (start-workflow! hub (assoc request :source_path (or (:current_source_path request) checkpoint))
-        (fn [registry emit cancelled?]
+        (fn [registry emit cancelled? observers]
           (pipeline/resume checkpoint
-            (cond-> {:registry registry :on-event emit :cancelled? cancelled?}
+            (cond-> {:registry registry :on-event emit :cancelled? cancelled? :on-resumed (:resumed observers)
+                     :on-restarted (:restarted observers)}
               (string? (:current_source_path request))
               (assoc :current-source-path (:current_source_path request)))))))
+    :workflow/result
+    (let [entry (workflow-entry! hub (:run_id request))]
+      (completion-snapshot {:run_id (:run_id entry)} (:completion entry)))
+    :workflow/inspect
+    (finish-under-lock! hub (fn []
+     (let [entry (workflow-entry! hub (:run_id request))
+          admission (expire-admission! entry)
+          snapshot (completion-snapshot {:run_id (:run_id entry)} (:completion entry))]
+      (merge snapshot (select-keys entry [:source_path :dot_source :logs_root :publication])
+             {:admission admission :cancelled @(:cancelled entry) :event_count (count @(:events entry))
+              :context (if-let [ctx (:context entry)] (context/ctx-snapshot ctx)
+                           (get-in snapshot [:result :value :context]))}))))
+    :workflow/events
+    (let [entry (workflow-entry! hub (:run_id request)) events @(:events entry)
+          from (get request :from 0)]
+      (when-not (and (integer? from) (<= 0 from (count events))) (fail! :invalid-cursor))
+      {:event_count (count events) :events (subvec events from)})
+    :workflow/checkpoint
+    (let [entry (workflow-entry! hub (:run_id request)) root (:logs_root entry)]
+      (when root
+        (let [path (str root "/checkpoint.edn")]
+          (when (os/stat path) (context/load-checkpoint path)))))
     :workflow/cancel
     (let [entry (workflow-entry! hub (:run_id request))]
       (reset! (:cancelled entry) true)
@@ -220,12 +346,11 @@
     (mapv (fn [[id e]] {:question_id id :run_id (:run_id e) :question (:question e)}) @(:questions hub))
     :question/answer
     (let [entry (question-entry! hub (:question_id request))
-          value (or (:value request) (:text request))]
-      (when-not (string? value) (fail! :invalid-request))
+          answer (request-answer request)]
       ;; Claim the question atomically so a second answer is rejected even
       ;; before the waiting interviewer wakes up.
       (swap! (:questions hub) dissoc (:question_id request))
-      (deliver (:answer entry) {:value value :text (or (:text request) value)})
+      (deliver (:answer entry) answer)
       {:question_id (:question_id request) :answered true})
     :workflow/list
     (mapv (fn [[id e]] {:run_id id :source_path (:source_path e) :done (:done e) :cancelled @(:cancelled e)})
@@ -263,6 +388,9 @@
                                            result)))))
                  completion)
         {:agent_id job-id :completion completion}))
+    :agent/result
+    (let [entry (agent-entry! hub (:agent_id request))]
+      (completion-snapshot {:agent_id (:agent_id entry)} (:completion entry)))
     :agent/cancel
     (let [entry (agent-entry! hub (:agent_id request))]
       (reset! (:cancelled entry) true)
@@ -304,6 +432,11 @@
             turn {:session_id id :turn_id turn-id :completion completion}]
         (swap! (:sessions hub) assoc-in [id :turn] turn)
         turn))
+    :session/result
+    (let [entry (entry! hub (:session_id request)) turn (:turn entry)]
+      (when-not (and turn (string? (:turn_id request)) (= (:turn_id request) (:turn_id turn)))
+        (fail! :unknown-turn))
+      (completion-snapshot (select-keys turn [:session_id :turn_id]) (:completion turn)))
     :session/cancel
     (let [entry (entry! hub (:session_id request))]
       {:session_id (:session_id request) :completion (cancel-entry! hub entry)})
@@ -398,7 +531,7 @@
                :allow_agent_scenario (boolean (:allow_agent_scenario opts))
                :mailbox (async/chan mailbox-capacity) :admission_lock (atom false)
                :event_lock (atom false) :admission (atom {:stop_replies []})
-               :eval (atom {:busy false}) :workflows (atom {}) :agents (atom {}) :questions (atom {})
+               :eval (atom {:busy false :jobs {}}) :workflows (atom {}) :agents (atom {}) :questions (atom {})
                :user_ns (create-ns (user-ns-name))
                :sessions (atom {}) :log (atom {:events [] :cursor 0 :clients #{}})}
           hub (init-user-ns! hub)]

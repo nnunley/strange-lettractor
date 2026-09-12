@@ -269,25 +269,50 @@
 
 ;; Parity Matrix Case 17: Checkpoint save and resume produces same result
 (deftest test-parity-17-checkpoint-resume
-  (let [dot "digraph G {
-    start [shape=Mdiamond]
-    step1 [shape=box]
-    step2 [shape=box]
-    exit  [shape=Msquare]
-
-    start -> step1 -> step2 -> exit
-}"
-        g (p/parse-dot dot)
-        logs (test-logs "17")
-        res (e/run-pipeline g {:logs-root logs})
-        cp-path (str logs "/checkpoint.edn")]
-    (is (= :success (:status res)))
-    (is (os/stat cp-path))
-    (let [loaded (ctx/load-checkpoint cp-path)]
-      (is (= "exit" (:current_node loaded)))
-      (is (= ["start" "step1" "step2" "exit"] (:completed_nodes loaded)))
-      (is (= :success (get-in loaded [:node_outcomes "step1" :status]))))
-    ))
+  (let [source "digraph G { start [shape=Mdiamond]; step1 [shape=box]; step2 [shape=box]; exit [shape=Msquare]; start -> step1 -> step2 -> exit; }"
+        graph (p/parse-dot source)
+        full-root (test-logs "17-full") resumed-root (test-logs "17-resumed")
+        visits (atom [])
+        registry (h/make-handler-registry)
+        _ (h/register-handler! registry "codergen"
+            (fn [node context _ _]
+              (swap! visits conj (:id node))
+              (case (:id node)
+                "step1" (do (ctx/ctx-append-log! context "prepared")
+                            {:status :success :context_updates {"payload" "prepared"}})
+                "step2" (do (ctx/ctx-append-log! context "consumed")
+                            {:status :success :context_updates
+                             {"result" (str (ctx/ctx-get context "payload") " and consumed")}}))))
+        full (e/run-pipeline graph {:logs-root full-root :registry registry})
+        full-checkpoint (ctx/load-checkpoint (str full-root "/checkpoint.edn"))
+        _ (reset! visits [])
+        interrupted (e/run-pipeline graph {:logs-root resumed-root :registry registry :max-steps 2})
+        path (str resumed-root "/checkpoint.edn")
+        saved (ctx/load-checkpoint path)]
+    (is (= :success (:status full)))
+    (is (= :fail (:status interrupted)))
+    (is (= ["step1"] @visits))
+    (is (= "step1" (:current_node saved)))
+    (is (= ["start" "step1"] (:completed_nodes saved)))
+    (is (= "prepared" (get-in saved [:context_values "payload"])))
+    (reset! visits [])
+    (let [resumed (e/resume-pipeline path graph {:logs-root resumed-root :registry registry})
+          restored (ctx/load-checkpoint path)]
+      (is (= :success (:status resumed)))
+      (is (= ["step2"] @visits) "resume executes only unfinished work")
+      (is (= (:completed_nodes full) (:completed_nodes resumed)))
+      (is (= (select-keys full-checkpoint [:current_node :completed_nodes :node_retries :logs])
+             (select-keys restored [:current_node :completed_nodes :node_retries :logs])))
+      (is (= ["prepared" "consumed"] (:logs restored)))
+      ;; Loading fills optional Outcome defaults; compare semantic fields.
+      (doseq [node ["start" "step1" "step2"]]
+        (is (= (get-in full-checkpoint [:node_outcomes node :status])
+               (get-in restored [:node_outcomes node :status])))
+        (is (= (or (get-in full-checkpoint [:node_outcomes node :context_updates]) {})
+               (or (get-in restored [:node_outcomes node :context_updates]) {}))))
+      (is (= "prepared and consumed" (get-in restored [:context_values "result"])))
+      (is (= (select-keys (:context_values full-checkpoint) ["payload" "result"])
+             (select-keys (:context_values restored) ["payload" "result"]))))))
 
 (deftest test-resume-preserves-prior-goal-gate-outcomes
   (let [dot "digraph G {

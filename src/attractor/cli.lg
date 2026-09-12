@@ -6,14 +6,18 @@
             [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
+            [attractor.task-review-bindings :as task-review-bindings]
             [attractor.interviewer :as interviewer]
-            [attractor.server :as server]
+            [attractor.hub-http :as hub-http]
+            [http :as http]
             [attractor.llm :as llm]
             [attractor.fan-in-llm :as fanin-llm]
             [attractor.agent :as agent]
             [attractor.agents.registry :as registry]
             [attractor.agents.backend :as backend]
             [attractor.hub :as hub]
+            [attractor.nrepl-client :as nrepl-client]
+            [attractor.nrepl-server :as nrepl-server]
             [attractor.console.session :as session]
             [attractor.console.line :as line]
             [attractor.console.tui :as tui]
@@ -98,15 +102,17 @@
    handler registries come from the hub's request (auto-approve or the
    hub-bound interviewer), the codergen backend and fan-in ranker from args."
   [args]
-  (hub/start! {:session_options (console-session-options args)
-               :workflow_registry_fn
-               (fn [request]
-                 (handlers/make-handler-registry
-                   (if (:auto_approve request)
-                     (interviewer/make-auto-approve-interviewer)
-                     (:interviewer request))
-                   (make-codergen-backend-from-args args)
-                   {:fan-in-ranker (make-fan-in-ranker-from-args args)}))}))
+  (let [working-dir (os/cwd)]
+    (hub/start! {:session_options (console-session-options args)
+                 :workflow_registry_fn
+                 (fn [request]
+                   (task-review-bindings/bind-reviews
+                     (handlers/make-handler-registry
+                       (if (:auto_approve request)
+                         (interviewer/make-auto-approve-interviewer)
+                         (:interviewer request))
+                       (make-codergen-backend-from-args args)
+                       {:fan-in-ranker (make-fan-in-ranker-from-args args)}) working-dir))})))
 
 (defn- with-hub
   "Run `f` with a hub started from `args` (a function of args, or nil for a
@@ -120,8 +126,7 @@
 
 (defn- answer-questions-from-stdin!
   "Hub questions for a CLI-owned run are answered on this process's stdin
-   through the console interviewer, then delivered back to the hub. Answer
-   values are sent as text, the same contract the console uses."
+   through the console interviewer, then delivered as complete typed answers."
   [hub stdin-interviewer]
   (fn [envelope]
     (when (= :question (:source envelope))
@@ -129,9 +134,15 @@
         (case (:type event)
           :question
           (let [answer (interviewer/ask stdin-interviewer (:question event))
-                value (:value answer)
-                text (if (keyword? value) (name value) (str (or (:text answer) value)))]
-            (hub-call! hub :question/answer {:question_id (:question_id envelope) :value text :text text}))
+                value (:value answer)]
+            ;; The hub owns the deadline. A local timeout isn't a textual
+            ;; answer, and the question may expire while stdin is being read.
+            (when-not (= :timeout value)
+              (try
+                (hub-call! hub :question/answer {:question_id (:question_id envelope) :answer answer})
+                (catch Object e
+                  (when-not (= :unknown-question (:category (ex-data e)))
+                    (throw e))))))
           :inform (println (str "[" (:stage event) "] " (:message event)))
           nil)))))
 
@@ -245,7 +256,14 @@
             (map #(str (name (or (:agent %) :agent)) " job " (:agent_id %)) (remove :done (ask :agent/list))))))
 
 (defn cmd-console [args]
-  (let [agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
+  (let [connect? (boolean (some #{"--connect"} args))
+        port-text (find-arg-val args "--connect")
+        port (when (and connect? (string? port-text) (re-matches #"[0-9]+" port-text))
+               (try (parse-long port-text) (catch Object _ nil)))
+        _ (when (and connect? (not (and (integer? port) (<= 1 port 65535))))
+            (throw (ex-info "--connect requires a loopback nREPL port between 1 and 65535"
+                            {:category :configuration_error})))
+        agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
                          (find-arg-val args "--agent-model") (assoc :model (find-arg-val args "--agent-model"))
                          (find-arg-val args "--agent-tools") (assoc :tools (str/split (find-arg-val args "--agent-tools") #","))
                          (find-arg-val args "--agent-permission-mode") (assoc :permission_mode (find-arg-val args "--agent-permission-mode"))
@@ -253,14 +271,21 @@
                          (find-arg-val args "--agent-timeout-ms") (assoc :timeout_ms (parse-long (find-arg-val args "--agent-timeout-ms"))))
         ;; Human gates are hub questions answered from the console; the stdin
         ;; interviewer is never used here.
-        hub (workflow-hub args)
+        connection (when connect? (nrepl-client/connect! {:host "127.0.0.1" :port port}))
+        hub (when-not connection (workflow-hub args))
         aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")
                                                      (let [[name expansion] (str/split (str value) #"=" 2)]
                                                        (when (and (seq name) (seq expansion)) [name expansion]))))
                                (partition 2 1 args)))
-        console (session/open! hub {:agent_defaults agent-defaults
+        console (try
+                  (session/open! hub (merge {:agent_defaults agent-defaults
                                     :run_defaults {:auto_approve (boolean (some #{"--auto-approve"} args))}
-                                    :aliases aliases})
+                                    :aliases aliases}
+                                    (when connection (nrepl-client/console-options connection))))
+                  (catch Object e
+                    (when connection (nrepl-client/close! connection))
+                    (when hub (deref (hub/request! hub {:id "console-startup-stop" :op :hub/stop}) 10000 nil))
+                    (throw e)))
         outcome (try
                   (if (some #{"--tui"} args)
                     (tui/run! console {})
@@ -269,14 +294,65 @@
                   (catch Object e
                     (println (str "console failed: " (ex-message e)))
                     :failed)
-                  (finally (session/close! console)))]
+                  (finally
+                    (try (session/close! console)
+                         (finally (when connection (nrepl-client/close! connection))))))]
     ;; The console process owns this in-process hub, so exiting stops it. Say
     ;; so when that cancels work the client was told would keep running.
-    (let [running (running-work hub)]
-      (when (seq running)
-        (println (str "stopping the in-process hub cancels: " (str/join ", " running)))))
-    (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil)
+    (when hub
+      (let [running (running-work hub)]
+        (when (seq running)
+          (println (str "stopping the in-process hub cancels: " (str/join ", " running))))))
+    (when hub (deref (hub/request! hub {:id "console-stop" :op :hub/stop}) 10000 nil))
     (os/exit (if (= :ok outcome) 0 1))))
+
+(defn cmd-hub [args]
+  (let [stop? (boolean (some #{"--stop"} args))
+        raw (if stop? (find-arg-val args "--stop")
+                (if (some #{"--port"} args) (find-arg-val args "--port") "2137"))
+        port (when (and (string? raw) (re-matches #"[0-9]+" raw))
+               (try (parse-long raw) (catch Object _ nil)))
+        port-file (find-arg-val args "--port-file")]
+    (when-not (and (integer? port) (<= (if stop? 1 0) port 65535)
+                  (not (and stop? (some #{"--port" "--port-file"} args)))
+                  (or (not (some #{"--port-file"} args)) (and (string? port-file) (not (str/blank? port-file)))))
+      (throw (ex-info "Use hub --port 0..65535 [--port-file PATH] or hub --stop 1..65535"
+                      {:category :configuration_error})))
+    (if stop?
+      (do (nrepl-client/stop-host! {:host "127.0.0.1" :port port})
+          (println "Hub stop requested"))
+      (do
+        (when (and port-file (os/stat port-file))
+          (throw (ex-info "Port file already exists" {:category :configuration_error :path port-file})))
+        (let [h (workflow-hub args) adapter (atom nil) published (atom nil)]
+          (try
+            (reset! adapter (nrepl-server/start! h {:port port :allow_stop true}))
+            (let [actual (get-in @adapter [:address :port])]
+              (when port-file
+                (io/spit port-file (str actual "\n"))
+                (reset! published (str actual "\n")))
+              (println (str "nREPL hub listening on 127.0.0.1:" actual))
+              (println (str "Attach: attractor console --connect " actual))
+              (println (str "Stop: attractor hub --stop " actual))
+              (io/flush *out*))
+            (loop []
+              (cond
+                (realized? (:stop_requested @adapter)) nil
+                (realized? (:accept_done @adapter))
+                (throw (ex-info "Hub listener stopped unexpectedly"
+                                {:category :listener-failed :message (:accept_error @(:state @adapter))}))
+                :else (do (core/sleep 25) (recur))))
+            (finally
+              (try
+                (when @adapter (nrepl-server/close! @adapter))
+                (finally
+                  (try
+                    (let [result (deref (hub/request! h {:id "host-stop" :op :hub/stop}) 10000 ::timeout)]
+                      (when-not (= true (get-in result [:value :stopped]))
+                        (throw (ex-info "Hub shutdown did not complete" {:category :shutdown-failed :result result}))))
+                    (finally
+                      (when (and @published (os/stat port-file) (= @published (io/slurp port-file)))
+                        (os/sh "rm" "-f" "--" port-file)))))))))))))
 
 (defn print-usage []
   (println "Attractor - Workflow Orchestration Engine for Multi-Stage LLM Pipelines")
@@ -288,14 +364,17 @@
   (println "  validate <dotfile>                                  Validate pipeline structure & syntax")
   (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
-  (println "  serve [--port <port>]                               Start HTTP management server")
+  (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Shared HTTP/nREPL server")
+  (println "  hub [--port PORT] [--port-file PATH] [--mock|--llm]  Start a persistent loopback nREPL hub")
+  (println "  hub --stop PORT                                    Request graceful hub shutdown")
   (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
   (println "  providers                                           Show the effective provider registry (attractor.edn)")
   (println (str "  agent <" (str/join "|" (registry/agent-names)) "> --prompt-file <file>          Run one external agent job, EDN events"))
   (println "    [--cwd <dir>] [--model <m>] [--timeout-ms <ms>] [--tools Read,Edit] [--permission-mode plan|acceptEdits|dontAsk]")
   (println "    [--sandbox read-only|workspace-write|danger-full-access] [--approval-policy never|on-request|untrusted]")
   (println "    DOT run/resume accept --agent <name> with the same options")
-  (println "  console [--tui] [--mock|--llm] [--model <provider/name>] [--alias name=expansion]")
+  (println "    Native task-review models and budgets are selected by the DOT model_stylesheet")
+  (println "  console [--connect PORT] [--tui] [--mock|--llm] [--model <provider/name>] [--alias name=expansion]")
   (println "                                                      Interactive console: chat, : eval, /run, /agent <name>")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
@@ -459,9 +538,43 @@
           (os/exit 0)
           (os/exit 1))))))
 
+(defn- serve-connected [port remote-port]
+  (let [connection (nrepl-client/connect! {:host "127.0.0.1" :port remote-port})]
+    (try
+      (println (str "Attractor HTTP adapter on " port ", attached to hub " remote-port))
+      (io/flush *out*)
+      (http/serve (hub-http/make-handler #(nrepl-client/request! connection %)) port)
+      (finally (nrepl-client/close! connection)))))
+
 (defn cmd-serve [args]
-  (let [port (or (find-arg-val args "--port") ":7070")]
-    (server/start-server port)))
+  (let [port (or (find-arg-val args "--port") ":7070")
+        connect? (boolean (some #{"--connect"} args))
+        text (find-arg-val args "--connect")
+        remote-port (when (and connect? (string? text) (re-matches #"[0-9]+" text)) (parse-long text))
+        own-port? (boolean (some #{"--nrepl-port"} args))
+        own-text (if own-port? (find-arg-val args "--nrepl-port") "0")
+        own-port (when (and (string? own-text) (re-matches #"[0-9]+" own-text)) (parse-long own-text))]
+    (when (or (and connect? own-port?) (not (and (integer? own-port) (<= 0 own-port 65535))))
+      (throw (ex-info "Use --nrepl-port 0..65535 for an owned hub or --connect PORT for an existing hub"
+                      {:category :configuration_error})))
+    (when (and connect? (not (and (integer? remote-port) (<= 1 remote-port 65535))))
+      (throw (ex-info "--connect requires a loopback nREPL port between 1 and 65535"
+                      {:category :configuration_error})))
+    (if connect?
+      (serve-connected port remote-port)
+      (let [h (workflow-hub args) adapter (atom nil)]
+        (try
+          (reset! adapter (nrepl-server/start! h {:port own-port}))
+          (let [actual (get-in @adapter [:address :port])]
+            (println (str "nREPL hub listening on 127.0.0.1:" actual))
+            (println (str "Attach: attractor console --connect " actual))
+            (serve-connected port actual))
+          (finally
+            (try (when @adapter (nrepl-server/close! @adapter))
+                 (finally
+                   (let [result (deref (hub/request! h {:id "http-owner-stop" :op :hub/stop}) 10000 ::timeout)]
+                     (when-not (= true (get-in result [:value :stopped]))
+                       (throw (ex-info "Hub shutdown did not complete" {:category :shutdown-failed :result result}))))))))))))
 
 (defn cmd-clean [args]
   (let [all? (some #{"--all" "-a"} args)
@@ -571,6 +684,7 @@
       "graph" (cmd-graph rest-args)
       "resume" (cmd-resume rest-args)
       "serve" (cmd-serve rest-args)
+      "hub" (cmd-hub rest-args)
       "clean" (cmd-clean rest-args)
       "cleanup" (cmd-clean rest-args)
       "models" (cmd-models rest-args)

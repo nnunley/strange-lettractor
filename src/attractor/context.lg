@@ -308,14 +308,17 @@
                        :error (:err result)})))))
 
 ;; Store an artifact (in memory if <= 100KB, file-backed if > 100KB)
-(defn- index-path [base-dir] (str base-dir "/artifacts/index.edn"))
+(defn- index-path [base-dir] (str base-dir "/artifacts/.store/index.edn"))
 
 (defn- read-index
   "Persistent registrations under base-dir: id -> {:info ... :inline value?}.
    Data only, read with the non-evaluating EDN reader; absent or unreadable
    index means no prior artifacts."
   [base-dir]
-  (let [path (when-not (str/blank? base-dir) (index-path base-dir))]
+  (let [path (when-not (str/blank? base-dir)
+               (let [current (index-path base-dir)]
+                 (if (io/file-exists? current) current
+                     (str base-dir "/artifacts/index.edn"))))]
     (if (and path (io/file-exists? path))
       (try (let [index (edn/read-string (io/slurp path))]
              (if (map? index) (or (:artifacts index) {}) {}))
@@ -324,7 +327,7 @@
 
 (defn- write-index! [base-dir artifacts]
   (when-not (str/blank? base-dir)
-    (let [dir (str base-dir "/artifacts") path (index-path base-dir)
+    (let [dir (str base-dir "/artifacts/.store") path (index-path base-dir)
           temp (str path ".tmp-" (ids/uuid-text))
           persisted (into {} (map (fn [[id entry]]
                                     [id (cond-> {:info (:info entry)}
@@ -340,7 +343,7 @@
                 (read-index base-dir))))
 
 (defn make-artifact-store
-  "Open a store over base-dir. Registrations persist in artifacts/index.edn,
+  "Open a store over base-dir. Registrations persist in artifacts/.store/index.edn,
    so a new store over the same run root (a later handler, a resumed run,
    another process) discovers what earlier stores recorded (ATTR-ART-02)."
   [base-dir]
@@ -373,6 +376,13 @@
               (and (> size file-backing-threshold)
                    (not (str/blank? base-dir)))
               old-entry (get-in @store [:artifacts id])
+              ;; Preserve legacy registrations before an artifact named index
+              ;; can replace the old metadata file. New metadata lives in a
+              ;; directory that cannot collide with an artifact filename.
+              _ (when (and (not (str/blank? base-dir))
+                           (not (io/file-exists? (index-path base-dir)))
+                           (io/file-exists? (str base-dir "/artifacts/index.edn")))
+                  (write-index! base-dir (:artifacts @store)))
               stored-data
               (if is-file-backed
                 (let [art-dir (str base-dir "/artifacts")

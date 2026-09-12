@@ -1,0 +1,88 @@
+(ns attractor.retry-after-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest leap-second-http-dates-preserve-the-final-second
+  (let [n (now)
+        fixed (.Add n (- (.Sub n #inst "2016-12-31T23:59:58Z")))]
+    (with-redefs [let-go.core/now (fn [] fixed)]
+      (doseq [date ["Sat, 31 Dec 2016 23:59:60 GMT"
+                   "Saturday, 31-Dec-16 23:59:60 GMT"
+                   "Sat Dec 31 23:59:60 2016"]]
+        (is (= 2.0 (:retry_after (ex-data (llm/provider-error "fixture"
+                                          {:status 429 :headers {"Retry-After" date}}))))))
+      (is (nil? (:retry_after (ex-data (llm/provider-error "fixture"
+                                       {:status 429 :headers {"Retry-After" "Sat, 31 Dec 2016 23:59:61 GMT"}}))))))))
+
+(deftest legacy-date-rollover-compares-the-complete-timestamp
+  (let [n (now)
+        fixed (.Add n (- (.Sub n #inst "2026-06-01T12:00:00Z")))]
+    (with-redefs [let-go.core/now (fn [] fixed)]
+      (doseq [[date future?] [["Monday, 01-Jun-76 11:59:59 GMT" true]
+                             ["Monday, 01-Jun-76 12:00:00 GMT" true]
+                             ["Monday, 01-Jun-76 12:00:01 GMT" false]
+                             ["Tuesday, 02-Jun-76 12:00:00 GMT" false]]]
+        (let [delay (:retry_after (ex-data (llm/provider-error "fixture"
+                                           {:status 429 :headers {"Retry-After" date}})))]
+          (is (if future? (and (number? delay) (> delay 0.0)) (= 0.0 delay))))))))
+
+(deftest invalid-numeric-delays-use-normal-backoff
+  (doseq [value ["-2" "NaN" "Inf" "Infinity" "-Inf" "1e999" "not a delay"]]
+    (let [error (llm/provider-error "fixture" {:status 429 :headers {"Retry-After" value}})
+          observed (promise)
+          result (try (llm/retry (fn [] (throw error))
+                        {:base_delay 2.0 :jitter false
+                         :sleep_fn (fn [delay]
+                                     (deliver observed delay)
+                                     (throw (ex-info "observed backoff" {:category :observed-backoff})))})
+                      nil (catch Object e e))]
+      (is (nil? (:retry_after (ex-data error))))
+      (is (= :observed-backoff (:category (ex-data result))))
+      (is (= 2.0 (deref observed 0 :no-backoff))))))
+
+(deftest numeric-zero-and-fractional-delays-remain-supported
+  (doseq [[value expected] [["0" 0.0] [" 2.5 " 2.5] ["15" 15.0]]]
+    (is (= expected (:retry_after (ex-data (llm/provider-error "fixture"
+                                           {:status 429 :headers {"Retry-After" value}})))))))
+
+(deftest retry-after-http-dates-become-delays
+  (doseq [date ["Thu, 01 Jan 2099 00:00:00 GMT" "Thu Jan  1 00:00:00 2099"]]
+    (let [before (System/currentTimeMillis)
+          delay (:retry_after (ex-data (llm/provider-error "fixture"
+                                        {:status 429 :headers {"Retry-After" date}})))
+          after (System/currentTimeMillis)
+          target 4070908800000]
+      (is (and (number? delay)
+               (<= (/ (- target after) 1000.0) delay (/ (- target before) 1000.0))))))
+  (doseq [date ["Sun, 06 Nov 1994 08:49:37 GMT"
+               "Sunday, 06-Nov-94 08:49:37 GMT" "Sun Nov  6 08:49:37 1994"]]
+    (is (= 0.0 (:retry_after (ex-data (llm/provider-error "fixture"
+                                      {:status 429 :headers {"Retry-After" date}})))))))
+
+(deftest retry-after-header-names-are-case-insensitive
+  (doseq [header ["Retry-After" "retry-after" "RETRY-AFTER" "ReTrY-AfTeR"
+                  :Retry-After :retry-after :RETRY-AFTER :ReTrY-AfTeR]]
+    (let [error (llm/provider-error "fixture"
+                  {:status 429 :headers {header "90"} :body {"error" {"message" "slow down"}}})
+          result (try (llm/retry (fn [] (throw error))
+                        {:max_delay 60.0
+                         :on_retry (fn [_ _ _]
+                                     (throw (ex-info "unexpected retry" {:category :unexpected-retry})))})
+                      nil (catch Object e e))]
+      (is (= :rate-limit (:category (ex-data result))))
+      (is (= 90.0 (:retry_after (ex-data result)))))))
+
+(deftest invalid-http-dates-do-not-create-delays
+  (doseq [date ["Mon, 29 Feb 2100 00:00:00 GMT" "Thu, 32 Jan 2099 00:00:00 GMT"
+               "Thu, 01 Jan 2099 24:00:00 GMT" "Thu, 01 Xxx 2099 00:00:00 GMT"]]
+    (is (nil? (:retry_after (ex-data (llm/provider-error "fixture"
+                                     {:status 429 :headers {"Retry-After" date}})))))))
+
+(deftest distant-http-date-prevents-a-retry-beyond-max-delay
+  (let [error (llm/provider-error "fixture"
+                {:status 429 :headers {"Retry-After" "Thu, 01 Jan 2099 00:00:00 GMT"}})
+        result (try (llm/retry (fn [] (throw error))
+                      {:max_delay 60.0
+                       :on_retry (fn [_ _ _] (throw (ex-info "unexpected retry" {})))})
+                    nil (catch Object e e))]
+    (is (identical? error result))
+    (is (> (or (:retry_after (ex-data result)) 0) 60.0))))

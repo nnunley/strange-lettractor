@@ -1,0 +1,37 @@
+(ns attractor.conditional-schema-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(def operation-schema
+  {:type "object"
+   :if {:properties {"action" {:const "write"}} :required ["action"]}
+   :then {:required ["content"]}
+   :else {:required ["reason"]}})
+
+(deftest conditional-schema-enforces-only-the-selected-branch
+  (doseq [[value valid?] [[{"action" "write" "content" "hello"} true]
+                         [{"action" "write" "reason" "oops"} false]
+                         [{"action" "skip" "reason" "unchanged"} true]
+                         [{"action" "skip" "content" "oops"} false]
+                         [{"reason" "no action"} true]
+                         [{} false]]]
+    (is (= valid? (first (llm/validate-json-schema value operation-schema))))))
+
+(deftest absent-conditional-branches-and-boolean-schemas-follow-json-schema
+  (doseq [[schema valid?] [[{:if true :then false :else true} false]
+                          [{:if false :then true :else false} false]
+                          [{:if true :else false} true]
+                          [{:if false :then false} true]
+                          [{:then false :else false} true]
+                          [{"if" false "else" false} false]]]
+    (is (= valid? (first (llm/validate-json-schema {} schema))))))
+
+(deftest streamed-final-object-is-subject-to-conditional-validation
+  (let [adapter (llm/make-adapter "fixture" (fn [_] nil)
+                  (fn [_] [{:type :stream_start}
+                           {:type :text_delta :delta "{\"action\":\"write\"}"}
+                           {:type :finish :finish_reason :stop}]))
+        result (llm/stream-object "fixture/model" "perform action" operation-schema
+                 {:client (llm/make-client {:providers {"fixture" adapter}})})]
+    (is (= :no-object-generated
+           (try ((:object result)) :unexpected-success
+                (catch Object e (:category (ex-data e))))))))

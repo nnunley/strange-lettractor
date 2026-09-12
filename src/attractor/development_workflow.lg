@@ -1,0 +1,103 @@
+(ns attractor.development-workflow
+  (:require [clojure.string :as str] [json :as json]
+            [attractor.development-plan :as plan]
+            [attractor.pipeline :as pipeline]
+            [attractor.validation :as validation]))
+
+(defn- reject! [reason]
+  (throw (ex-info (str "Development workflow: " (name reason))
+                  {:category :development-plan :reason reason})))
+
+(defn- attrs [entries]
+  (str "[" (str/join ", " (map (fn [[k v]] (str (name k) "=" (json/write-json v))) entries)) "]"))
+(defn- node [id entries] (str "  " id " " (attrs entries) ";\n"))
+(defn- edge
+  ([from to] (str "  " from " -> " to ";\n"))
+  ([from to condition] (str "  " from " -> " to " " (attrs [[:condition condition]]) ";\n")))
+(defn- routes [from success failure]
+  ;; Native failure routing requires an explicit outcome=fail edge. The fallback
+  ;; handles every other non-success status and satisfies Kilroy's total routing.
+  (str (edge from success "outcome=success")
+       (edge from failure "outcome=fail") (edge from failure)))
+(defn- stage [id action attempt]
+  ;; Default tool execution cannot pretend to have implemented a controller stage.
+  (node id [[:shape "parallelogram"] [:type "tool"] [:tool_command "false"]
+            [:development.stage action] [:development.attempt attempt]
+            [:fidelity "truncate"] [:timeout "20m"]]))
+
+(defn- attempt-dot [index repairs]
+  (let [suffix (str "_" index)
+        work (str "code" suffix) check (str "test" suffix)
+        par (str "par" suffix) a (str "review_a" suffix) b (str "review_b" suffix)
+        join (str "join" suffix) decide (str "adjudicate" suffix) publish (str "publish" suffix)
+        failure (if (< index repairs) (str "code_" (inc index)) "blocked")]
+    (str (stage work (if (zero? index) "code" "repair") index)
+         (stage check "test" index)
+         (node par [[:shape "component"] [:join_policy "wait_all"] [:max_parallel 2]])
+         (stage a "review" index) (stage b "review" index)
+         (node join [[:shape "tripleoctagon"]])
+         (stage decide "adjudicate" index) (stage publish "publish" index)
+         (routes work check failure) (routes check par failure)
+         (edge par a) (edge par b)
+         (edge a join "outcome=fail") (edge a join)
+         (edge b join "outcome=fail") (edge b join)
+         ;; Fan-in selection is not review approval. Adjudication must inspect
+         ;; both original parallel.results, including failures and malformed data.
+         (edge join decide "outcome=fail") (edge join decide)
+         (routes decide publish failure) (routes publish "exit" "blocked"))))
+
+(defn- task-dot [tree repairs]
+  (let [children (:children tree)
+        child-ids (mapv #(str "child_" %) (range (count children)))
+        first-stage (if (seq children) (first child-ids) "plan")]
+    (str "digraph DevelopmentTask {\n"
+         "  graph " (attrs [[:goal "Complete the captured task with test and review evidence"]
+                            [:default_max_retry 0] [:default_fidelity "truncate"]
+                            [:development.task_id (:id tree)] [:development.kind (name (:kind tree))]
+                            [:development.task (json/write-json (:task tree))]
+                            [:development.input_budget (:input_budget tree)]
+                            [:development.counter_kind (name (:counter_kind tree))]
+                            [:development.max_repairs repairs]]) ";\n"
+         (node "start" [[:shape "Mdiamond"]]) (node "exit" [[:shape "Msquare"]])
+         (stage "blocked" "blocked" 0) (stage "plan" "plan" 0)
+         (edge "start" first-stage)
+         (apply str
+           (map (fn [index child]
+                  (let [id (nth child-ids index)
+                        next-id (if (< (inc index) (count children)) (nth child-ids (inc index)) "plan")]
+                    (str (node id [[:type "subpipeline"] [:shape "parallelogram"]
+                                   [:tool_command "false"]
+                                   [:subpipeline.dotfile (str (:id child) ".dot")]
+                                   [:output_map (pr-str {"development.result" (str "development.child." (:id child))})]])
+                         (routes id next-id "blocked"))))
+                (range (count children)) children))
+         (routes "plan" "code_0" "blocked")
+         (apply str (map #(attempt-dot % repairs) (range (inc repairs)))) "}\n")))
+
+(defn compile-plan
+  "Admit a recursive task tree, generate one DOT source per task, and prepare its
+   complete captured closure. Returns {:tree :sources :prepared}. No publication
+   or execution occurs. Execution requires controller stage handlers; generated
+   tool stages fail by default. Parent task data remains an integration
+   obligation, not an admitted integration prompt."
+  [task planner admission-options options]
+  (let [repairs (get options :max_repairs 1)]
+    (when-not (and (integer? repairs) (<= 0 repairs 4)) (reject! :invalid-repair-limit))
+    (let [tree (plan/decompose task planner admission-options)
+          sources (atom {})
+          cancelled? (:cancelled? admission-options)]
+      (letfn [(capture [tree]
+                (when (and cancelled? (cancelled?)) (reject! :cancelled))
+                (swap! sources assoc (str (:id tree) ".dot") (task-dot tree repairs))
+                (doseq [child (:children tree)] (capture child)))]
+        (capture tree))
+      (let [files @sources
+            prepared (pipeline/prepare (get files "task.dot")
+                       {:source-loader
+                        (fn [_ reference]
+                          (when-not (contains? files reference) (reject! :unknown-generated-source))
+                          {:logical-id (str "workflow://development/" reference)
+                           :physical-id (str "generated:" reference) :source (get files reference)})})]
+        (validation/raise-on-errors (:diagnostics prepared))
+        (when (and cancelled? (cancelled?)) (reject! :cancelled))
+        {:tree tree :sources files :prepared prepared}))))

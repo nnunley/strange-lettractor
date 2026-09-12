@@ -1,0 +1,173 @@
+(ns live.provider-matrix-checks
+  (:require [clojure.string :as str]))
+
+(defn url-image-wire-evidence [protocol body url]
+  (let [[images expected]
+        (case protocol
+          :openai-responses
+          [(filter #(= "input_image" (get % "type"))
+                   (mapcat #(get % "content") (get body "input")))
+           {"type" "input_image" "image_url" url}]
+          :anthropic-messages
+          [(filter #(= "image" (get % "type"))
+                   (mapcat #(get % "content") (get body "messages")))
+           {"type" "image" "source" {"type" "url" "url" url}}]
+          :gemini-generate-content
+          [(filter #(or (contains? % "fileData") (contains? % "inlineData"))
+                   (mapcat #(get % "parts") (get body "contents")))
+           {"fileData" {"mimeType" "image/jpeg" "fileUri" url}}])]
+    (when-not (= [expected] (vec images))
+      (throw (ex-info "Serialized image URL differs from the requested URL"
+                      {:category :image-payload-mismatch})))
+    {:image_url_verified true :image_url url}))
+
+(defn url-image-evidence [text]
+  (when-not (= ["cat" "orange"]
+               (mapv str/trim (str/split (str/lower-case (or text "")) #",")))
+    (throw (ex-info "Image subject and fur color were not correctly identified"
+                    {:category :incorrect-image-answer :response_text text})))
+  {:response_text text :expected_subject "cat" :expected_color "orange"})
+
+(defn image-wire-evidence [protocol body expected-base64]
+  (let [[images expected]
+        (case protocol
+          :openai-responses
+          [(filter #(= "input_image" (get % "type"))
+                   (mapcat #(get % "content") (get body "input")))
+           {"type" "input_image" "image_url" (str "data:image/png;base64," expected-base64)}]
+          :anthropic-messages
+          [(filter #(= "image" (get % "type"))
+                   (mapcat #(get % "content") (get body "messages")))
+           {"type" "image" "source" {"type" "base64" "media_type" "image/png" "data" expected-base64}}]
+          :gemini-generate-content
+          [(filter #(contains? % "inlineData")
+                   (mapcat #(get % "parts") (get body "contents")))
+           {"inlineData" {"mimeType" "image/png" "data" expected-base64}}])]
+    (when-not (= [expected] (vec images))
+      (throw (ex-info "Serialized image differs from the expected PNG payload"
+                      {:category :image-payload-mismatch})))
+    {:image_payload_verified true}))
+
+(defn image-evidence [text]
+  (when-not (= ["red" "blue"]
+               (mapv str/trim (str/split (str/lower-case (or text "")) #",")))
+    (throw (ex-info "Image colors were not identified in left-to-right order"
+                    {:category :incorrect-image-answer :response_text text})))
+  {:response_text text :expected_colors ["red" "blue"]})
+
+(defn provider-options-evidence [observed expected text]
+  (when-not (and (seq observed) (every? #(= expected %) observed)
+                 (not (str/blank? text)))
+    (throw (ex-info "Provider options were not preserved in the accepted wire request"
+                    {:category :provider-options-mismatch})))
+  {:wire_options observed :response_received true})
+
+(defn usage-evidence [protocol response]
+  (let [raw (get (:raw response) (if (= protocol :gemini-generate-content) "usageMetadata" "usage"))
+        input (get raw (if (= protocol :gemini-generate-content) "promptTokenCount" "input_tokens"))
+        output (get raw (if (= protocol :gemini-generate-content) "candidatesTokenCount" "output_tokens"))
+        _ (when-not (and (map? raw) (integer? input) (pos? input)
+                         (integer? output) (pos? output))
+            (throw (ex-info "Raw provider token counts are missing or invalid" {:category :missing-raw-usage})))
+        expected (merge {:input_tokens input :output_tokens output :total_tokens (+ input output)}
+                        (case protocol
+                          :openai-responses
+                          {:cache_read_tokens (or (get-in raw ["input_tokens_details" "cached_tokens"]) 0)
+                           :reasoning_tokens (or (get-in raw ["output_tokens_details" "reasoning_tokens"]) 0)}
+                          :anthropic-messages
+                          {:cache_read_tokens (or (get raw "cache_read_input_tokens") 0)
+                           :cache_write_tokens (or (get raw "cache_creation_input_tokens") 0)}
+                          :gemini-generate-content
+                          {:cache_read_tokens (or (get raw "cachedContentTokenCount") 0)
+                           :reasoning_tokens (or (get raw "thoughtsTokenCount") 0)}
+                          {}))
+        actual (select-keys (:usage response) (keys expected))]
+    (when-not (= expected actual)
+      (throw (ex-info "Normalized usage differs from the raw provider counters"
+                      {:category :usage-mismatch :reported_usage actual :raw_usage raw})))
+    {:raw_usage raw :normalized_usage actual}))
+
+(defn cache-evidence [protocol usages]
+  (let [turns (mapv (fn [usage]
+                      (let [input (:input_tokens usage) read (:cache_read_tokens usage)
+                            written (or (:cache_write_tokens usage) 0)]
+                        (when-not (every? #(and (integer? %) (>= % 0)) [input read written])
+                          (throw (ex-info "Missing or invalid cache accounting" {:category :missing-cache-usage})))
+                        (let [total (if (= :anthropic-messages protocol) (+ input read written) input)]
+                          (when (or (zero? total) (> read total))
+                            (throw (ex-info "Inconsistent cache accounting" {:category :missing-cache-usage})))
+                          {:usage usage :prompt_tokens total :cache_fraction (/ (double read) total)}))) usages)]
+    (when-not (and (>= (count turns) 5)
+                   (pos? (get-in turns [1 :usage :cache_read_tokens]))
+                   (every? #(> (:cache_fraction %) 0.5) (drop 4 turns)))
+      (throw (ex-info "Turn 2 cache hit or turn 5 majority-cache threshold was not met"
+                      {:category :cache-threshold-not-met :cache_turns turns})))
+    {:cache_turns turns}))
+
+(defn streaming-tool-evidence [events response executions expected-result]
+  (let [end-index (first (keep-indexed #(when (and (= :tool_call_end (:type %2))
+                                                  (= "lookup_ticket" (get-in %2 [:tool_call :name]))
+                                                  (= {"ticket" "S7"} (get-in %2 [:tool_call :arguments]))) %1) events))
+        step-index (first (keep-indexed #(when (and (= :step_finish (:type %2))
+                                                   (some (fn [r] (and (not (:is_error r))
+                                                                      (= expected-result (:content r))))
+                                                         (get-in %2 [:step :tool_results]))) %1) events))
+        continuation (when (number? step-index) (drop (inc step-index) events))
+        streamed-text (apply str (map :delta (filter #(= :text_delta (:type %)) continuation)))]
+    (when-not (and (number? end-index) (number? step-index) (< end-index step-index)
+                   (= [{"ticket" "S7"}] executions)
+                   (str/includes? streamed-text expected-result)
+                   (str/includes? (get-in response [:message :text] "") expected-result))
+      (throw (ex-info "Streamed tool arguments, execution and continuation did not agree"
+                      {:category :missing-streamed-tool-evidence})))
+    {:tool_end_index end-index :step_finish_index step-index
+     :event_types (mapv :type events) :returned_value expected-result}))
+
+(defn overlapping-executor [started peer-started result timeout-ms]
+  (fn [_]
+    (deliver started true)
+    (when-not (= true (deref peer-started timeout-ms :not-started))
+      (throw (ex-info "Peer tool did not start before this tool finished"
+                      {:category :tools-not-concurrent})))
+    result))
+
+(defn parallel-evidence [response expected-results]
+  (let [first-step (first (:steps response))
+        actual (mapv :content (filter #(not (:is_error %)) (:tool_results first-step)))]
+    (when-not (and (= 2 (count (:tool_calls first-step)))
+                   (= 2 (count actual)) (= (set expected-results) (set actual))
+                   (every? #(str/includes? (or (:text response) "") %) expected-results))
+      (throw (ex-info "Parallel tools did not return both results together for the final answer"
+                      {:category :missing-parallel-results
+                       :tool_results (mapv :tool_results (:steps response))
+                       :response_text (:text response)})))
+    {:results actual :steps (count (:steps response)) :overlap_verified true}))
+
+(defn multi-round-evidence [response expected-results]
+  (let [steps (:steps response)
+        matched (mapv (fn [expected]
+                        (first (keep-indexed
+                                 (fn [index step]
+                                   (when (some #(and (not (:is_error %)) (= expected (:content %)))
+                                               (:tool_results step)) index)) steps)))
+                      expected-results)]
+    (when-not (and (= 3 (count expected-results))
+                   (every? number? matched)
+                   (apply < matched)
+                   (str/includes? (or (:text response) "") (last expected-results)))
+      (throw (ex-info "Dependent tool results did not span three rounds and reach the final answer"
+                      {:category :missing-tool-rounds :round_indices matched
+                       :tool_results (mapv :tool_results steps)
+                       :response_text (:text response)})))
+    {:round_indices matched :steps (count steps) :terminal_value (last expected-results)}))
+
+(defn reasoning-evidence
+  "The reasoning-token parity row requires actual reported token usage.
+   Correct arithmetic or nonempty reasoning text alone does not prove it."
+  [response]
+  (let [tokens (get-in response [:usage :reasoning_tokens])]
+    (when-not (and (number? tokens) (pos? tokens))
+      (throw (ex-info "No positive reasoning-token usage reported"
+                      {:category :missing-reasoning-usage :reported_usage (:usage response)})))
+    {:reasoning_tokens tokens
+     :reasoning_text_present (boolean (seq (:reasoning response)))}))

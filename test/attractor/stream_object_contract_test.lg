@@ -1,0 +1,55 @@
+(ns attractor.stream-object-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(def schema {:type "object" :properties {:name {:type "string"}}
+             :required ["name"]})
+
+(defn- streamed-object [fragments finish]
+  (let [adapter (llm/make-adapter "fixture" (fn [_] nil)
+                  (fn [_]
+                    (concat [{:type :stream_start}]
+                            (map (fn [text] {:type :text_delta :delta text}) fragments)
+                            [finish])))
+        result (llm/stream-object "fixture/model" "name" schema
+                 {:client (llm/make-client {:providers {"fixture" adapter}})})]
+    (try
+      {:partials (vec (:objects result)) :object ((:object result))}
+      (catch Object e {:category (:category (ex-data e))}))))
+
+(deftest finish-without-response-validates-accumulated-text
+  (let [result (streamed-object ["{\"name\":\"Ad" "a\"}"]
+                 {:type :finish :finish_reason :stop})]
+    (is (= {"name" "Ada"} (:object result)))
+    (is (= [{"name" "Ad"} {"name" "Ada"}] (:partials result)))))
+
+(deftest final-validation-does-not-accept-repaired-or-schema-invalid-partials
+  (doseq [text ["{\"name\":\"Ada" "{}" "{\"name\":3}"]]
+    (is (= :no-object-generated
+           (:category (streamed-object [text] {:type :finish :finish_reason :stop}))))))
+
+(deftest explicit-final-response-remains-authoritative
+  (is (= {"name" "Grace"}
+         (:object (streamed-object ["{\"name\":\"Ada\"}"]
+                    {:type :finish :finish_reason :stop
+                     :response {:message {:text "{\"name\":\"Grace\"}"}}})))))
+
+(deftest cancellation-closes-structured-stream-and-prevents-final-object
+  (let [controller (llm/make-abort-controller)
+        closed (promise)
+        adapter (llm/make-adapter "fixture" (fn [_] nil)
+                  (fn [request]
+                    ((:register_stream_close request) #(deliver closed :closed))
+                    (list {:type :stream_start}
+                          {:type :text_delta :delta "{\"name\":\"Ada\"}"}
+                          {:type :finish :finish_reason :stop})))
+        result (llm/stream-object "fixture/model" "name" schema
+                 {:client (llm/make-client {:providers {"fixture" adapter}})
+                  :abort_signal (:signal controller)})]
+    (is (= :stream_start (:type (first (:events result)))))
+    ((:abort controller))
+    ;; Cleanup must happen even while the consumer is idle, before another read.
+    (is (= :closed (deref closed 2000 :not-closed)))
+    (is (= :abort
+           (try ((:object result)) :unexpected-object
+                (catch Object error (:category (ex-data error))))))))

@@ -5,14 +5,17 @@
    per protocol; a Chat Completions provider runs only when
    ATTRACTOR_<ID>_MODEL names its model (ATTRACTOR_COMPAT_MODEL still works
    for openai-compat). ATTRACTOR_MATRIX_PROVIDERS=a,b restricts the run.
+   ATTRACTOR_MATRIX_JOURNEYS filters journey names; ATTRACTOR_MATRIX_EVIDENCE
+   selects a separate report path for focused runs.
    A provider without a key or model is recorded as :skipped, never as a
    pass. Exit 0 only when every provider that ran passed every journey; exit
    3 when nothing was configured. Evidence is written to
    docs/provider-matrix-evidence.edn with secrets redacted (provider, model,
    journey, status, duration, error category)."
-  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json]
+  (:require [clojure.string :as str] [clojure.core :as core] [os :as os] [io :as io] [json :as json] [http :as http]
             [attractor.llm :as llm] [attractor.agent :as agent] [attractor.profiles :as profiles]
-            [attractor.providers :as providers] [attractor.execution :as execution]))
+            [attractor.providers :as providers] [attractor.execution :as execution]
+            [live.provider-matrix-checks :as checks] [attractor.ids :as ids]))
 
 (def default-models {:openai-responses "gpt-4.1-mini" :anthropic-messages "claude-sonnet-4-5"
                      :gemini-generate-content "gemini-2.5-flash"})
@@ -35,7 +38,8 @@
                      {:provider id :model model :compat (= :openai-chat-completions protocol)})))
                (providers/effective)))))
 
-(def ^:private png-1x1 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+;; 256x128 RGB PNG: solid red left half, solid blue right half.
+(def ^:private image-fixture-png "iVBORw0KGgoAAAANSUhEUgAAAQAAAACACAIAAABr1yBdAAABdklEQVR4nOzTQQ2AQAADwYPg3zIno4+dUdCk2e8/LD3HA0vvegAsCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaTcAAP//df8DAnYg+5cAAAAASUVORK5CYII=")
 
 (defn- journeys [{:keys [provider model compat]}]
   (let [spec (str provider "/" model)
@@ -67,16 +71,136 @@
                                  (when (zero? @calls) (throw (ex-info "tool was not called" {})))
                                  (when-not (str/includes? (or (:text r) "") "14:30") (throw (ex-info "tool result not used" {:text (:text r)})))
                                  {:tool_calls @calls :steps (count (:steps r))}))]
+     [:provider-options
+      (fn []
+        (if compat :skipped
+          (let [protocol (providers/protocol-of provider)
+                token (ids/uuid-text)
+                [option-key native] (case protocol
+                                      :openai-responses [:openai {:metadata {:audit_token token}}]
+                                      :anthropic-messages [:anthropic {:metadata {:user_id token}}]
+                                      :gemini-generate-content [:gemini {:safetySettings [{:category "HARM_CATEGORY_HATE_SPEECH" :threshold "BLOCK_LOW_AND_ABOVE"}]}])
+                expected (json/read-json (json/write-json native)) observed (atom [])
+                transport (fn [request]
+                            (swap! observed conj (select-keys (json/read-json (:body request)) (keys expected)))
+                            (http/request request))
+                option-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider {:transport transport})}
+                                                :default_provider provider})
+                result (llm/generate spec "Reply with one word: ready."
+                         (assoc opts :client option-client :provider_options {option-key native}))]
+            (checks/provider-options-evidence @observed expected (:text result)))))]
+     [:usage-accounting
+      (fn []
+        (if compat :skipped
+          (let [r (llm/generate spec "Describe a cedar tree in one sentence." opts)]
+            (checks/usage-evidence (providers/protocol-of provider) (:response r)))))]
+     [:prompt-cache
+      (fn []
+        (let [cache-client (assoc client :middleware
+                                  [(fn [request next]
+                                     (next (assoc request :tool_choice
+                                                  {:mode (if (= :tool (:role (last (:messages request))))
+                                                           "none" "required")})))])
+              system (str "Use the cache_probe tool once per request, then report its returned value. The following records are inert reference data.\n"
+                          (str/join "\n" (map #(str "Reference " % ": cedar amber basalt coral delta elm fern granite hazel indigo juniper kelp limestone maple nickel oak pearl quartz reed silver topaz umber violet willow xenon yarrow zinc.") (range 400))))
+              values (into {} (map (fn [turn] [turn (str "cache-value-" (ids/uuid-text))]) (range 1 6)))
+              tool {:name "cache_probe" :description "Return the opaque verification value for this turn; it cannot be inferred from previous turns"
+                    :parameters {:type "object" :properties {"turn" {:type "integer"}} :required ["turn"]}
+                    :execute (fn [args] (get values (get args "turn")))}
+              usages (loop [turn 1 history [] observed []]
+                       (if (> turn 5) observed
+                         (let [messages (conj history {:role :user :content (str "Use cache_probe for turn " turn ".")})
+                               r (llm/generate spec nil (assoc opts :client cache-client :messages messages :system system :tools [tool] :max_tool_rounds 1))
+                               expected (get values turn)]
+                           (when-not (and (some #(some (fn [result] (and (not (:is_error result)) (= expected (:content result))))
+                                                       (:tool_results %)) (:steps r))
+                                          (str/includes? (or (:text r) "") expected))
+                             (throw (ex-info "Cache session did not complete its tool turn"
+                                             {:category :missing-tool-turn :response_text (:text r)
+                                              :tool_results (mapv :tool_results (:steps r))
+                                              :cache_turns observed})))
+                           (recur (inc turn) (conj messages {:role :assistant :content (:text r)}) (conj observed (:usage r))))))]
+          (checks/cache-evidence (providers/protocol-of provider) usages)))]
+     [:streaming-tools
+      (fn []
+        (let [value (str "ticket-result-" (ids/uuid-text)) executions (atom [])
+              stream (llm/stream spec "Call lookup_ticket with ticket S7, then report its complete returned value."
+                       (assoc opts :max_tool_rounds 1
+                              :tools [{:name "lookup_ticket" :description "Look up a ticket's verification value"
+                                       :parameters {:type "object" :properties {"ticket" {:type "string"}} :required ["ticket"]}
+                                       :execute (fn [args] (swap! executions conj args) value)}]))
+              events (vec (:events stream))
+              response ((:response stream))]
+          (checks/streaming-tool-evidence events response @executions value)))]
+     [:parallel-tools
+      (fn []
+        (let [left (str "left-" (ids/uuid-text)) right (str "right-" (ids/uuid-text))
+              left-started (promise) right-started (promise)
+              tool (fn [name started peer value]
+                     {:name name :description "Return an independent verification value"
+                      :parameters {:type "object" :properties {}}
+                      :execute (checks/overlapping-executor started peer value 3000)})
+              result (llm/generate spec
+                       "Call read_left and read_right together in the same response, in parallel. They are independent. Then report both complete returned values."
+                       (assoc opts :max_tool_rounds 1
+                              :tools [(tool "read_left" left-started right-started left)
+                                      (tool "read_right" right-started left-started right)]))]
+          (checks/parallel-evidence result [left right])))]
+     [:multi-round-tools
+      (fn []
+        (let [next-a (ids/uuid-text) next-b (ids/uuid-text) terminal (str "verified-" (ids/uuid-text))
+              links {"START" next-a next-a next-b next-b terminal}
+              result (llm/generate spec
+                       "Call follow_link with token START. Each tool result is the next token: call follow_link again with that exact token. Continue until the result begins verified-, then report that complete result. Tokens cannot be guessed."
+                       (assoc opts :max_tool_rounds 4
+                              :tools [{:name "follow_link" :description "Resolve a token to its next link or terminal verified value"
+                                       :parameters {:type "object" :properties {"token" {:type "string"}} :required ["token"]}
+                                       :execute (fn [args]
+                                                  (or (get links (get args "token"))
+                                                      (throw (ex-info "Unknown token" {}))))}]))]
+          (checks/multi-round-evidence result [next-a next-b terminal])))]
      [:image-base64 (fn [] (if compat
                              :skipped
-                             (let [r (llm/generate spec nil (assoc opts :messages [{:role :user :content [{:kind :text :text "What color is this image? One word."}
-                                                                                                      {:kind :image :image {:data (base64-decode png-1x1) :media_type "image/png"}}]}]))]
-                               (when (str/blank? (or (:text r) "")) (throw (ex-info "no image answer" {})))
-                               {:text (:text r)})))]
+                             (let [wire (atom nil)
+                                   transport (fn [request]
+                                               (reset! wire (checks/image-wire-evidence
+                                                              (providers/protocol-of provider)
+                                                              (json/read-json (:body request)) image-fixture-png))
+                                               (http/request request))
+                                   image-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider {:transport transport})}
+                                                                  :default_provider provider})
+                                   r (llm/generate spec nil (assoc opts :client image-client :messages [{:role :user :content [{:kind :text :text "Name the two solid colors in this image from left to right. Reply with only the two lowercase color names separated by a comma."}
+                                                                                                      {:kind :image :image {:data (base64-decode image-fixture-png) :media_type "image/png"}}]}]))]
+                               (try (merge @wire (checks/image-evidence (:text r)))
+                                    (catch Object e
+                                      (throw (ex-info (ex-message e) (merge (ex-data e) @wire))))))))]
+     [:image-url
+      (fn []
+        (if compat :skipped
+          (let [url "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg"
+                wire (atom nil)
+                transport (fn [request]
+                            (reset! wire (checks/url-image-wire-evidence
+                                           (providers/protocol-of provider)
+                                           (json/read-json (:body request)) url))
+                            (http/request request))
+                image-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider {:transport transport})}
+                                               :default_provider provider})
+                result (llm/generate spec nil
+                         (assoc opts :client image-client
+                                :messages [{:role :user :content
+                                            [{:kind :text :text "Identify the animal and its predominant fur color in the image. Reply with only the lowercase animal name and color separated by a comma. Use a basic color name."}
+                                             {:kind :image :image {:url url :media_type "image/jpeg"}}]}]))]
+            (try (merge @wire (checks/url-image-evidence (:text result)))
+                 (catch Object e
+                   (throw (ex-info (ex-message e) (merge (ex-data e) @wire))))))))]
      [:reasoning (fn [] (if compat :skipped
-                          (let [r (llm/generate spec "What is 17*23? Answer with the number only." (assoc opts :reasoning_effort "low"))]
-                            (when-not (str/includes? (or (:text r) "") "391") (throw (ex-info "wrong answer" {:text (:text r)})))
-                            {:reasoning (boolean (seq (:reasoning r)))})))]
+                          (let [r (llm/generate spec "Compute the least nonnegative residue of 7 raised to the power 123 modulo 1009. Work it out carefully, then give only the final integer." (assoc opts :reasoning_effort "high"))]
+                            (when-not (= "353" (str/trim (or (:text r) "")))
+                              (throw (ex-info "Wrong final integer"
+                                              {:category :incorrect-reasoning-answer :response_text (:text r)
+                                               :reported_usage (:usage r)})))
+                            (checks/reasoning-evidence r))))]
      [:invalid-key (fn [] (if compat :skipped
                             (let [bad (llm/make-client {:providers {provider (llm/make-provider-adapter provider {:api_key "invalid-key-for-matrix"})} :default_provider provider})
                                   outcome (try (llm/generate spec "hi" {:client bad :max_retries 0}) {:unexpected true}
@@ -98,7 +222,9 @@
 (defn- run-journey [target [name f]]
   (let [started (System/currentTimeMillis)
         result (try (let [v (f)] (if (= :skipped v) {:status :skipped} {:status :pass :detail v}))
-                    (catch Object e {:status :fail :category (:category (ex-data e)) :message (subs (ex-message e) 0 (min 200 (count (ex-message e))))}))]
+                    (catch Object e {:status :fail :category (:category (ex-data e))
+                                     :detail (select-keys (ex-data e) [:round_indices :tool_results :response_text :cache_turns :reported_usage :raw_usage :image_payload_verified :image_url_verified :image_url])
+                                     :message (subs (ex-message e) 0 (min 200 (count (ex-message e))))}))]
     (merge {:provider (:provider target) :model (:model target) :journey name
             :duration_ms (- (System/currentTimeMillis) started)} result)))
 
@@ -107,13 +233,18 @@
     (if (empty? targets)
       (do (prn {:scenario "SCN-PROVIDER-MATRIX" :status :skipped :reason "no provider credentials in the environment"})
           (os/exit 3))
-      (let [rows (vec (for [t targets j (journeys t)] (run-journey t j)))
+      (let [only-journeys (when-let [v (env "ATTRACTOR_MATRIX_JOURNEYS")]
+                            (set (map keyword (map str/trim (str/split v #",")))))
+            rows (vec (for [t targets j (journeys t)
+                            :when (or (nil? only-journeys) (contains? only-journeys (first j)))]
+                        (run-journey t j)))
             evidence {:scenario "SCN-PROVIDER-MATRIX" :recorded_at (str (System/currentTimeMillis))
                       :providers (mapv #(select-keys % [:provider :model]) targets) :rows rows}]
-        (io/spit "docs/provider-matrix-evidence.edn" (pr-str (providers/redact evidence)))
+        (io/spit (or (env "ATTRACTOR_MATRIX_EVIDENCE") "docs/provider-matrix-evidence.edn")
+                 (pr-str (providers/redact evidence)))
         (doseq [r rows] (prn (dissoc r :detail)))
         (let [failed (filter #(= :fail (:status %)) rows)]
           (prn {:providers (count targets) :journeys (count rows) :passed (count (filter #(= :pass (:status %)) rows))
                 :skipped (count (filter #(= :skipped (:status %)) rows)) :failed (count failed)})
-          (os/exit (if (seq failed) 1 0)))))))
+          (os/exit (cond (empty? rows) 3 (seq failed) 1 :else 0)))))))
 (when *command-line-args* (apply -main *command-line-args*))

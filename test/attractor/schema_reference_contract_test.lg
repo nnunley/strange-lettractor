@@ -1,0 +1,45 @@
+(ns attractor.schema-reference-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest reference-fragments-decode-before-pointer-tokens
+  (doseq [[reference key] [["#/$defs/a%20b" "a b"]
+                         ["#/$defs/caf%C3%A9" "café"]
+                         ["#/$defs/a+b" "a+b"]
+                         ["#/$defs/a%2Bb" "a+b"]
+                         ["#/$defs/%2520" "%20"]
+                         ["#/$defs/a~1b" "a/b"]
+                         ["#/$defs/~01" "~1"]
+                         ["#/$defs/%7E01" "~1"]
+                         ["#/$defs/" ""]]]
+    (is (true? (first (llm/validate-json-schema 3
+                       {:$defs {key {:const 3}} :$ref reference})))))
+  (is (true? (first (llm/validate-json-schema 3
+                     {:$defs {:nested {:value {:const 3}}}
+                      :$ref "#%2F$defs%2Fnested%2Fvalue"})))))
+
+(deftest malformed-reference-escapes-do-not-resolve-literal-keys
+  (doseq [key ["bad~2" "bad~" "bad%" "bad%2" "bad%GG"]]
+    (let [reference (str "#/$defs/" key)]
+      (is (= [false (str "Unresolved schema reference: " reference)]
+             (llm/validate-json-schema 3 {:$defs {key true} :$ref reference}))))))
+
+(deftest reference-and-sibling-constraints-both-apply
+  (let [schema {:$defs {:positive {:type "integer" :minimum 1}}
+                :$ref "#/$defs/positive" :maximum 5}]
+    (is (true? (first (llm/validate-json-schema 3 schema))))
+    (is (false? (first (llm/validate-json-schema 0 schema))))
+    (is (false? (first (llm/validate-json-schema 6 schema))))))
+
+(deftest array-reference-indices-must-be-canonical-and-in-range
+  (doseq [index ["00" "01" "99999999999999999999999999999999999999" "2" "-" "-1"]]
+    (let [reference (str "#/$defs/choices/" index)
+          result (try (llm/validate-json-schema 3
+                        {:$defs {:choices [true true]} :$ref reference})
+                      (catch Object _ :unexpected-exception))]
+      (is (= [false (str "Unresolved schema reference: " reference)] result))))
+  (doseq [index ["0" "1"]]
+    (is (true? (first (llm/validate-json-schema 3
+                       {:$defs {:choices [true true]}
+                        :$ref (str "#/$defs/choices/" index)})))))
+  (is (true? (first (llm/validate-json-schema 3
+                     {:$defs {"01" true} :$ref "#/$defs/01"})))))

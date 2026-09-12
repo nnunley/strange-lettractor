@@ -193,7 +193,7 @@
       (is (nil? info))))
   (testing "get-latest-model returns newest for provider"
     (let [latest (llm/get-latest-model "anthropic")]
-      (is (= "claude-opus-4-6" (:id latest)))))
+      (is (= "claude-fable-5-1" (:id latest)))))
   (testing "get-latest-model filters by capability"
     (let [reasoning (llm/get-latest-model "openai" "reasoning")]
       (is (true? (:supports_reasoning reasoning))))))

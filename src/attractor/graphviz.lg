@@ -1,0 +1,14 @@
+(ns attractor.graphviz
+  (:require [attractor.ids :as ids] [io :as io] [os :as os]))
+
+(defn render-svg [dot-source]
+  (let [dot-path (str (os/temp-dir) "/strange-lettractor-" (ids/uuid-text) ".dot")]
+    (try
+      (io/spit dot-path dot-source)
+      (let [result (os/sh "dot" "-Tsvg" dot-path)]
+        (if (zero? (:exit result))
+          (:out result)
+          (throw (ex-info (str "Graphviz failed: " (:err result))
+                          {:exit (:exit result)}))))
+      (finally
+        (os/sh "rm" "-f" dot-path)))))

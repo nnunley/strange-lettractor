@@ -1,0 +1,47 @@
+(ns attractor.anthropic-modern-model-contract-test
+  (:require [clojure.test :refer [deftest is]] [json :as json] [attractor.llm :as llm]))
+
+(defn- captured-request [invoke options]
+  (let [payload (atom nil)]
+    (try (invoke (merge {:model "claude-fable-5-1" :api_key "fixture-only" :messages []
+                         :transport (fn [request]
+                                      (reset! payload (json/read-json (:body request)))
+                                      (throw (ex-info "captured" {:category :fixture-capture})))} options))
+         (catch Object _ nil))
+    @payload))
+
+(deftest fable-rejects-incompatible-explicit-thinking
+  (doseq [thinking [{:type "disabled"} {:type "enabled" :budget_tokens 1024}]]
+    (let [error (try (llm/anthropic-complete
+                      {:model "claude-fable-5-1" :api_key "fixture-only" :messages []
+                       :provider_options {:anthropic {:thinking thinking}}
+                       :transport (fn [_] (throw (ex-info "transport reached" {:category :transport-reached})))})
+                     nil (catch Object e e))]
+      (is (= :invalid-request (:category (ex-data error))))
+      (is (false? (:retryable (ex-data error)))))))
+
+(deftest modern-models-use-adaptive-thinking-and-output-effort
+  (doseq [invoke [llm/anthropic-complete llm/anthropic-stream]
+          model ["claude-fable-5-1" "claude-opus-5" "claude-sonnet-5"]]
+    (let [payload (captured-request invoke {:model model :reasoning_effort "high" :max_tokens 512})]
+      (is (= {"type" "adaptive"} (get payload "thinking")))
+      (is (= "high" (get-in payload ["output_config" "effort"]))))))
+
+(deftest fable-forced-tool-choice-is-rejected-before-transport
+  (doseq [invoke [llm/anthropic-complete llm/anthropic-stream]
+          choice [{:mode "required"} {:mode "named" :tool_name "lookup"}]]
+    (let [error (try (invoke {:model "claude-fable-5-1" :api_key "fixture-only" :messages []
+                              :tool_choice choice
+                              :transport (fn [_] (throw (ex-info "transport reached" {:category :transport-reached})))})
+                     nil (catch Object e e))]
+      (is (= :unsupported-tool-choice (:category (ex-data error))))
+      (is (false? (:retryable (ex-data error)))))))
+
+(deftest explicit-native-options-retain-their-fields-and-effort
+  (let [payload (captured-request llm/anthropic-complete
+                  {:reasoning_effort "high"
+                   :provider_options {"anthropic" {"thinking" {"type" "adaptive" "display" "omitted"}
+                                                    "output_config" {"effort" "low" "format" {"type" "json_schema"}}}}})]
+    (is (= "omitted" (get-in payload ["thinking" "display"])))
+    (is (= "low" (get-in payload ["output_config" "effort"])))
+    (is (= {"type" "json_schema"} (get-in payload ["output_config" "format"])))))

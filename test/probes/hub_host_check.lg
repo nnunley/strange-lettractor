@@ -1,0 +1,81 @@
+(ns hub-host-check
+  (:require [attractor.execution :as execution] [attractor.ids :as ids]
+            [attractor.nrepl-client :as client] [os :as os] [io :as io]
+            [clojure.string :as str] [http :as http] [json :as json]))
+(defn ensure! [v m] (when-not v (throw (ex-info m {}))))
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn check-http! [binary root port connection]
+  (let [http-port (+ 30000 (rand-int 20000)) base (str "http://127.0.0.1:" http-port)
+        env (execution/make-local-environment {:working_dir root :env_policy :none :max_command_timeout_ms 30000})
+        worker (future ((:exec_command env)
+                         (str (quote-shell binary) " serve --connect " port " --port 127.0.0.1:" http-port)
+                         30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      (let [deadline (+ (System/nanoTime) 5000000000)]
+        (loop []
+          (ensure! (not (realized? worker)) (str "HTTP adapter exited: " (pr-str (deref worker 0 nil))))
+          (when-not (= 200 (try (:status (http/request {:url (str base "/pipelines") :timeout {:request 1}})) (catch Object _ nil)))
+            (ensure! (< (System/nanoTime) deadline) "HTTP adapter never became ready")
+            (sleep 20) (recur))))
+      (let [reply (http/request {:url (str base "/pipelines") :method :post :timeout {:request 3}
+                                 :body "digraph ViaHTTP { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }"})
+            id (get (json/read-json (:body reply)) "id")
+            snapshot (:value (client/request! connection {:op :workflow/inspect :run_id id}))]
+        (ensure! (= 201 (:status reply)) "Compiled HTTP adapter rejected submission")
+        (ensure! (= :published (:admission snapshot)) "HTTP adapter did not share hub admission")
+        (ensure! (= "ViaHTTP" (get-in snapshot [:publication :graph :id])) "HTTP submission reached a different owner"))
+      (finally
+        ((:cleanup env))
+        (ensure! (not= ::pending (deref worker 5000 ::pending)) "HTTP adapter process did not settle")))
+    (ensure! (nil? (:error (client/request! connection {:op :workflow/list}))) "HTTP adapter exit stopped the shared hub")))
+(defn check! []
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "hub-host"))
+        _ (io/mkdir root) port-file (str root "/port") input (str root "/input")
+        _ (io/spit input "/new\n/quit\n") binary (str (os/cwd) "/bin/attractor")
+        environment (execution/make-local-environment {:working_dir root :env_policy :none :max_command_timeout_ms 30000})
+        exec (fn [command] ((:exec_command environment) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))
+        worker (future (exec (str (quote-shell binary) " hub --mock --port 0 --port-file " (quote-shell port-file))))]
+    (try
+      (let [deadline (+ (System/nanoTime) 5000000000)]
+        (loop []
+          (when-not (os/stat port-file)
+            (let [state (deref worker 0 ::pending)]
+              (ensure! (= ::pending state) (str "Host exited before readiness: " (pr-str state))))
+            (ensure! (< (System/nanoTime) deadline) "Host did not publish its port")
+            (sleep 10) (recur))))
+      (let [port (parse-long (str/trim (io/slurp port-file)))
+            connection (client/connect! {:host "127.0.0.1" :port port})]
+        (try
+          (check-http! binary root port connection)
+          (let [console-result (exec (str (quote-shell binary) " console --connect " port " < " (quote-shell input)))
+                sessions (client/request! connection {:op :session/list})]
+            (ensure! (= 0 (:exit_code console-result)) (pr-str console-result))
+            (ensure! (some #(not (:closed %)) (:value sessions)) "Console did not preserve its session in host"))
+          (let [submitted (client/request! connection
+                            {:op :workflow/run :logs_root (str root "/workflow")
+                             :dot_source "digraph Hold { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Yes\"]; }"})
+                run-id (get-in submitted [:value :run_id])
+                deadline (+ (System/nanoTime) 5000000000)]
+            (ensure! (string? run-id) "Host did not accept waiting workflow")
+            (loop []
+              (let [questions (:value (client/request! connection {:op :question/list}))]
+                (when-not (some #(= run-id (:run_id %)) questions)
+                  (ensure! (< (System/nanoTime) deadline) "Workflow did not reach its human gate")
+                  (sleep 5) (recur))))
+            (let [inspection (:value (client/request! connection {:op :workflow/inspect :run_id run-id}))]
+              (ensure! (= :running (:state inspection)) "Waiting workflow was not inspectable")
+              (ensure! (= "Hold" (get-in inspection [:publication :graph :id])) "Published graph was lost over nREPL")
+              (ensure! (= "gate" (get-in inspection [:context "current_node"])) "Live workflow context was lost over nREPL")))
+          (let [stop-result (exec (str (quote-shell binary) " hub --stop " port))]
+            (ensure! (= 0 (:exit_code stop-result)) (pr-str stop-result)))
+          (let [result (deref worker 10000 ::pending)]
+            (ensure! (and (map? result) (= 0 (:exit_code result))) (str "Host did not shut down cleanly: " (pr-str result)))
+            (ensure! (not (os/stat port-file)) "Host retained stale port file")
+            (io/spit (str root "/host-result.edn") (pr-str result)))
+          (finally (client/close! connection))))
+      {:pass true :artifacts root :checks [:compiled-host :compiled-http-attachment :http-submission :http-exit-preserves-hub :compiled-console :session-survival :live-workflow-inspection :waiting-workflow-shutdown :compiled-stop :host-exit :port-cleanup]}
+      (finally
+        ((:cleanup environment))
+        (ensure! (not= ::pending (deref worker 5000 ::pending)) "Owned host process did not settle")))))
+(defn -main [& _] (prn (check!)))
+(when *command-line-args* (apply -main *command-line-args*))

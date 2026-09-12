@@ -1,0 +1,34 @@
+(ns attractor.array-schema-contract-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]))
+
+(deftest tuple-positions-and-tail-items-are-validated-independently
+  (doseq [schema [{:prefixItems [{:type "integer"} {:type "string"}] :items false}
+                  {:items [{:type "integer"} {:type "string"}] :additionalItems false}]]
+    (doseq [[value expected] [[[] true] [[1] true] [[1 "ok"] true]
+                              [["wrong"] false] [[1 2] false] [[1 "ok" nil] false]]]
+      (is (= expected (first (llm/validate-json-schema value schema))))))
+  (doseq [schema [{:prefixItems [{:type "integer"}] :items {:type "boolean"}}
+                  {:items [{:type "integer"}] :additionalItems {:type "boolean"}}]]
+    (is (true? (first (llm/validate-json-schema [1 false true] schema))))
+    (is (false? (first (llm/validate-json-schema [1 "wrong"] schema))))))
+
+(deftest unbounded-tuple-tail-and-ordinary-items-retain-their-semantics
+  (is (true? (first (llm/validate-json-schema [1 "extra"] {:prefixItems [{:type "integer"}]}))))
+  (is (true? (first (llm/validate-json-schema [1 "extra"] {:items [{:type "integer"}]}))))
+  (is (true? (first (llm/validate-json-schema [1 2] {:items {:type "integer"} :additionalItems false}))))
+  (is (false? (first (llm/validate-json-schema [1 "wrong"] {:items {:type "integer"}})))))
+
+(deftest contains-requires-matching-items-with-optional-bounds
+  (let [schema {:contains {:type "integer"}}]
+    (is (false? (first (llm/validate-json-schema [] schema))))
+    (is (false? (first (llm/validate-json-schema ["wrong"] schema))))
+    (is (true? (first (llm/validate-json-schema ["other" 1] schema))))
+    (doseq [[value expected] [[[1] false] [[1 2] true] [[1 2 3] true] [[1 2 3 4] false]]]
+      (is (= expected (first (llm/validate-json-schema value (assoc schema :minContains 2 :maxContains 3))))))
+    (is (true? (first (llm/validate-json-schema ["other"] (assoc schema :minContains 0)))))))
+
+(deftest contains-boolean-schemas-and-inactive-bounds
+  (is (false? (first (llm/validate-json-schema [1] {:contains false}))))
+  (is (true? (first (llm/validate-json-schema [1] {:contains false :minContains 0}))))
+  (is (false? (first (llm/validate-json-schema [1 2] {:contains true :maxContains 1}))))
+  (is (true? (first (llm/validate-json-schema [] {:minContains 2 :maxContains 0})))))

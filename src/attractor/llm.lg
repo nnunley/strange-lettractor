@@ -17,7 +17,12 @@
     (or (get headers header-name)
         (get headers lower-name)
         (get headers (keyword header-name))
-        (get headers (keyword lower-name)))))
+        (get headers (keyword lower-name))
+        (some (fn [[key value]]
+                (when (= lower-name
+                         (str/lower-case (if (keyword? key) (name key) (str key))))
+                  value))
+              headers))))
 
 (def default-adapter-timeout
   "Seconds. :connect bounds establishing the connection, :request the time
@@ -62,10 +67,54 @@
     (transport options)
     (catch Object e (throw (transport-failure e)))))
 
+(defn- http-date-delay [text]
+  (let [current (.UTC (now))
+        standard (re-matches #"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), ([0-9]{2}) ([A-Z][a-z]{2}) ([0-9]{4}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) GMT" text)
+        legacy (re-matches #"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), ([0-9]{2})-([A-Z][a-z]{2})-([0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) GMT" text)
+        ascii-date (re-matches #"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Z][a-z]{2}) ([ 0-9][0-9]) ([0-9]{2}:[0-9]{2}:[0-9]{2}) ([0-9]{4})" text)
+        parts (or (when standard (vec (rest standard)))
+                  (when legacy
+                    (let [year (.Year current)
+                          candidate (+ (* 100 (quot year 100)) (parse-long (get legacy 3)))
+                          resolved (if (> candidate (+ year 50)) (- candidate 100) candidate)]
+                      [(get legacy 1) (get legacy 2) (str resolved) (get legacy 4)]))
+                  (when ascii-date [(str/trim (get ascii-date 2)) (get ascii-date 1)
+                                    (get ascii-date 4) (get ascii-date 3)]))]
+    (when parts
+      (let [[day month year clock] parts
+            months {"Jan" 1 "Feb" 2 "Mar" 3 "Apr" 4 "May" 5 "Jun" 6
+                    "Jul" 7 "Aug" 8 "Sep" 9 "Oct" 10 "Nov" 11 "Dec" 12}
+            m (get months month)
+            d (parse-long day)
+            y (parse-long year)
+            pad (fn [n] (if (< n 10) (str "0" n) (str n)))
+            ;; Validate calendar fields through the runtime's ISO date parser.
+            ;; ISO parsing rejects leap seconds; preserve :60 in the arithmetic
+            ;; below while validating its date using the preceding second.
+            validation-clock (if (= clock "23:59:60") "23:59:59" clock)
+            _ (read-string (str "#inst \"" year "-" (pad m) "-" (pad d) "T" validation-clock "Z\""))
+            previous (dec y)
+            leap? (and (zero? (mod y 4)) (or (not (zero? (mod y 100))) (zero? (mod y 400))))
+            days (+ (* 365 previous) (quot previous 4) (- (quot previous 100))
+                    (quot previous 400) -719162
+                    (get [0 31 59 90 120 151 181 212 243 273 304 334] (dec m))
+                    (if (and leap? (> m 2)) 1 0) (dec d))
+            [hour minute second] (mapv parse-long (str/split clock #":"))
+            target (* 1000 (+ (* days 86400) (* hour 3600) (* minute 60) second))]
+        ;; A legacy date beyond fifty calendar years denotes the preceding
+        ;; century. That date is necessarily past, hence a zero retry delay.
+        (if (and legacy (> target (inst-ms (.AddDate current 50 0 0))))
+          0.0
+          (max 0.0 (/ (- target (inst-ms current)) 1000.0)))))))
+
 (defn- parse-retry-after [response]
   (when-let [value (response-header response "Retry-After")]
     (try
-      (double (parse-double (str/trim (str value))))
+      (let [text (str/trim (str value))]
+        (try (let [delay (double (parse-double text))]
+               ;; Infinity minus itself is NaN; finite values subtract to zero.
+               (when (and (>= delay 0.0) (zero? (- delay delay))) delay))
+             (catch Object _ (http-date-delay text))))
       (catch Object _ nil))))
 
 (defn- error-body-map [body]
@@ -81,8 +130,20 @@
   (let [message (str/lower-case
                   (str (or (error-field body-map "message") body-text "")))
         grpc-code (error-field body-map "status")
+        grpc-category (get {"NOT_FOUND" :not-found
+                            "INVALID_ARGUMENT" :invalid-request
+                            "UNAUTHENTICATED" :authentication
+                            "PERMISSION_DENIED" :access-denied
+                            "RESOURCE_EXHAUSTED" :rate-limit
+                            "UNAVAILABLE" :server
+                            "DEADLINE_EXCEEDED" :request-timeout
+                            "INTERNAL" :server} grpc-code)
         error-code (error-field body-map "code")]
     (cond
+      ;; Service names in an outage message do not turn a server failure into
+      ;; a client-side policy or billing rejection. Native status takes priority.
+      (or (= grpc-category :server)
+          (and (nil? grpc-category) (number? status) (<= 500 status 599))) :server
       (or (str/includes? message "context length")
           (str/includes? message "too many tokens")) :context-length
       (or (str/includes? message "content filter")
@@ -93,19 +154,19 @@
           (str/includes? message "insufficient credit")
           (str/includes? message "billing")) :quota-exceeded
       (and (= error-code "insufficient_quota") (= status 429)) :quota-exceeded
-      (or (= grpc-code "UNAUTHENTICATED") (= status 401)
+      grpc-category grpc-category
+      (or (= status 401)
           (str/includes? message "unauthorized")
           (str/includes? message "invalid key")) :authentication
-      (or (= grpc-code "PERMISSION_DENIED") (= status 403)) :access-denied
-      (or (= grpc-code "NOT_FOUND") (= status 404)
+      (= status 403) :access-denied
+      (or (= status 404)
           (str/includes? message "not found")
           (str/includes? message "does not exist")) :not-found
-      (or (= grpc-code "INVALID_ARGUMENT") (= status 400) (= status 422)) :invalid-request
-      (or (= grpc-code "DEADLINE_EXCEEDED") (= status 408)) :request-timeout
+      (or (= status 400) (= status 422)) :invalid-request
+      (= status 408) :request-timeout
       (= status 413) :context-length
-      (or (= grpc-code "RESOURCE_EXHAUSTED") (= status 429)) :rate-limit
-      (or (= grpc-code "UNAVAILABLE") (= grpc-code "INTERNAL")
-          (and (number? status) (>= status 500))) :server
+      (= status 429) :rate-limit
+      (and (number? status) (>= status 500)) :server
       :else :provider)))
 
 (def non-retryable-error-categories
@@ -127,7 +188,8 @@
        :provider provider
        :status_code status
        :status status
-       :error_code (error-field raw "code")
+       :error_code (or (error-field raw "code")
+                       (get (or (get raw "error") raw) "type"))
        :retryable retryable
        :retry_after (parse-retry-after response)
        :raw raw})))
@@ -660,6 +722,14 @@
       (assoc items index
              (assoc (get items index) :cache_control {:type "ephemeral"})))))
 
+(defn- contains-cache-control? [value]
+  (cond
+    (map? value) (or (contains? value :cache_control)
+                     (contains? value "cache_control")
+                     (boolean (some contains-cache-control? (vals value))))
+    (sequential? value) (boolean (some contains-cache-control? value))
+    :else false))
+
 (defn- cache-anthropic-prefix [messages]
   (let [items (vec messages)
         stable-index (- (count items) 2)]
@@ -838,7 +908,14 @@
 
 (defn- tool-choice-mode [request]
   (when-let [mode (field (:tool_choice request) :mode)]
-    (str/lower-case (name mode))))
+    (let [normalized (str/lower-case (name mode))
+          tool-name (field (:tool_choice request) :tool_name)]
+      (when (and (= "named" normalized)
+                 (or (not (string? tool-name)) (str/blank? tool-name)))
+        (throw (ex-info "Named tool choice requires a nonempty string tool_name"
+                        {:category :invalid-request :retryable false
+                         :tool_choice normalized})))
+      normalized)))
 
 (defn- tool-choice-name [request]
   (field (:tool_choice request) :tool_name))
@@ -1276,6 +1353,8 @@
 ;; Anthropic Adapter
 (defn- anthropic-request-data [request api-key base-url]
   (let [key (request-api-key request api-key "ANTHROPIC_API_KEY")
+        model-info (models/get-model-info (:model request))
+        adaptive? (= :adaptive (:reasoning_mode model-info))
         effort (portable-reasoning-effort request)
         url (resolve-anthropic-url (or base-url (:base_url request)))
         system-messages (filter (fn [m]
@@ -1324,10 +1403,10 @@
         max-tokens (or (:max_tokens request) 4096)
         portable-thinking
         (when (and (some? thinking-budget) (nil? explicit-thinking))
-          {:type "enabled" :budget_tokens thinking-budget})
+          (if adaptive? {:type "adaptive"}
+              {:type "enabled" :budget_tokens thinking-budget}))
         effective-thinking (or explicit-thinking portable-thinking)
-        explicit-cache? (or (contains? body-options :cache_control)
-                            (contains? body-options "cache_control"))
+        explicit-cache? (contains-cache-control? body-options)
         effective-beta-headers
         (vec (distinct
                (concat beta-headers
@@ -1361,8 +1440,27 @@
                     (some? (anthropic-metadata request))
                     (assoc :metadata (anthropic-metadata request)))
                   body-options)
+        output-config (field payload :output_config)
+        payload (if (and adaptive? effort (nil? (field output-config :effort)))
+                  (assoc (dissoc payload "output_config") :output_config
+                         (assoc (or output-config {}) :effort effort))
+                  payload)
+        _tool-choice-check
+        (when (and (= false (:forced_tool_choice model-info))
+                   (contains? #{"any" "tool"} (field (field payload :tool_choice) :type)))
+          (throw (ex-info "This model does not support forced tool choice"
+                          {:category :unsupported-tool-choice :retryable false
+                           :provider (or (:provider request) "anthropic")
+                           :model (:model request)})))
         final-thinking (field payload :thinking)
         final-thinking-type (field final-thinking :type)
+        _thinking-mode-check
+        (when (and (:adaptive_only model-info) (some? final-thinking)
+                   (not= "adaptive" final-thinking-type))
+          (throw (ex-info "This model requires adaptive thinking"
+                          {:category :invalid-request :retryable false
+                           :provider (or (:provider request) "anthropic")
+                           :model (:model request)})))
         final-thinking-budget (field final-thinking :budget_tokens)
         final-max-tokens (field payload :max_tokens)
         _thinking-budget-check
@@ -1739,7 +1837,7 @@
       :gemini-generate-content (gemini-complete req (:api_key opts) (:base_url opts))
       :mock (mock-complete req (:mock_handler opts))
       (throw (ex-info (str "Unsupported LLM provider: " provider)
-                      {:provider provider :category :configuration})))))
+                      {:provider provider :category :configuration :retryable false})))))
 
 (defn- sse-field-value [line prefix-length]
   (let [value (subs line prefix-length)]
@@ -2499,7 +2597,7 @@
       :anthropic-messages (anthropic-stream req (:api_key opts) (:base_url opts))
       :gemini-generate-content (gemini-stream req (:api_key opts) (:base_url opts))
       (throw (ex-info (str "Streaming is not implemented for provider: " provider)
-                      {:provider provider :category :configuration})))))
+                      {:provider provider :category :configuration :retryable false})))))
 
 (defn make-stream-accumulator []
   (atom {:started false
@@ -2565,7 +2663,7 @@
   (let [snapshot @accumulator]
     (or (:response snapshot)
         (when (or (:started snapshot)
-                  (not (str/blank? (:text snapshot)))
+                  (seq (:text snapshot))
                   (not (str/blank? (:reasoning snapshot)))
                   (seq (:tool_order snapshot)))
           (let [tool-calls
@@ -2578,7 +2676,7 @@
                     (when-not (str/blank? (:reasoning snapshot))
                       [{:kind :thinking
                         :thinking {:text (:reasoning snapshot)}}])
-                    (when-not (str/blank? (:text snapshot))
+                    (when (seq (:text snapshot))
                       [{:kind :text :text (:text snapshot)}])
                     (map (fn [call]
                            {:kind :tool_call :tool_call call})
@@ -2596,10 +2694,10 @@
 (defn make-adapter [name complete-fn stream-fn & [opts]]
   (when (str/blank? name)
     (throw (ex-info "Provider adapter name is required"
-                    {:category :configuration})))
+                    {:category :configuration :retryable false})))
   (when (nil? complete-fn)
     (throw (ex-info (str "Provider adapter " name " must implement complete")
-                    {:provider name :category :configuration})))
+                    {:provider name :category :configuration :retryable false})))
   {:name (str/lower-case name)
    :complete complete-fn
    :stream stream-fn
@@ -2636,12 +2734,12 @@
 (defn make-provider-adapter [provider & [opts]]
   (let [name (str/lower-case provider)
         options (or opts {})
-        gemini-call-names (when (= name "gemini") (atom {}))
+        protocol (providers/protocol-of name)
+        gemini-call-names (when (= protocol :gemini-generate-content) (atom {}))
         request-with-options
         (fn [request]
           (cond-> (merge options request)
             gemini-call-names (assoc :gemini_call_names gemini-call-names)))
-        protocol (providers/protocol-of name)
         ;; Configured providers resolve their key and base URL from the
         ;; registry once, so the protocol functions never fall back to the
         ;; built-in provider's environment names for a custom id.
@@ -2662,7 +2760,7 @@
               :gemini-generate-content (gemini-complete req (:api_key req) (:base_url req))
               :mock (mock-complete req (:mock_handler req))
               (throw (ex-info (str "Unsupported LLM provider: " name)
-                              {:provider name :category :configuration})))))
+                              {:provider name :category :configuration :retryable false})))))
         stream-fn
         (fn [request]
           (let [req (with-credentials (request-with-options request))]
@@ -2672,9 +2770,14 @@
               :anthropic-messages (anthropic-stream req (:api_key req) (:base_url req))
               :gemini-generate-content (gemini-stream req (:api_key req) (:base_url req))
               (throw (ex-info (str "Streaming is not implemented for provider: " name)
-                              {:provider name :category :configuration})))))]
+                              {:provider name :category :configuration :retryable false})))))]
     (make-adapter name complete-fn stream-fn
                   {:options options
+                   :supports_tool_choice
+                   (or (:supports_tool_choice options)
+                       (when (contains? #{:openai-responses :openai-chat-completions
+                                          :anthropic-messages :gemini-generate-content} protocol)
+                         (fn [mode] (contains? #{"auto" "none" "required" "named"} mode))))
                    :discover_context
                    (fn [request] (probe-context (assoc (request-with-options request) :provider name) nil))})))
 
@@ -2693,7 +2796,7 @@
     (when (and (some? default-provider)
                (nil? (get providers default-provider)))
       (throw (ex-info (str "Default provider is not registered: " default-provider)
-                      {:provider default-provider :category :configuration})))
+                      {:provider default-provider :category :configuration :retryable false})))
     (doseq [[_ adapter] providers]
       (when-let [initialize (:initialize adapter)]
         (initialize)))
@@ -2717,10 +2820,10 @@
         provider (or explicit (:provider prefixed) (normalize-provider-name (:default_provider client)))]
     (when (nil? provider)
       (throw (ex-info "No provider specified and Client has no default provider"
-                      {:category :configuration})))
+                      {:category :configuration :retryable false})))
     (when (nil? (get (:providers client) provider))
       (throw (ex-info (str "Provider is not registered: " provider)
-                      {:provider provider :category :configuration})))
+                      {:provider provider :category :configuration :retryable false})))
     (cond-> (assoc request :provider provider)
       (and prefixed (= provider (:provider prefixed))) (assoc :model (:model prefixed)))))
 
@@ -2735,22 +2838,50 @@
           terminal
           (reverse middleware)))
 
+(defn- middleware-provider [client request]
+  ;; Model-prefix normalization already ran before middleware. Only resolve
+  ;; the possibly changed provider here: native model names may contain '/'.
+  (let [[provider adapter] (client-provider client (dissoc request :model))]
+    (when-let [mode (tool-choice-mode request)]
+      (when-let [supports (:supports_tool_choice adapter)]
+        (when-not (supports mode)
+          (throw (ex-info (str "Provider does not support tool choice: " mode)
+                          {:provider provider :category :unsupported-tool-choice
+                           :tool_choice mode :retryable false})))))
+    ;; Choose omitted models only after middleware has selected the provider.
+    ;; Explicit requests and adapter configuration override the advisory catalog;
+    ;; custom providers without a catalog entry retain their own default behavior.
+    (let [model (or (:model request)
+                    (get-in adapter [:options :model])
+                    (:id (models/get-latest-model provider)))]
+      [provider adapter (cond-> (assoc request :provider provider)
+                          (some? model) (assoc :model model))])))
+
 (defn client-complete [client request]
-  (let [[_ adapter req] (client-provider client request)
+  (let [req (routed-request client request)
         invoke (middleware-chain
                  (:middleware client)
-                 (fn [r] ((:complete adapter) r)))]
+                 (fn [r]
+                   (let [[_ adapter routed] (middleware-provider client r)]
+                     ((:complete adapter) routed))))]
     (invoke req)))
 
-(defn client-stream [client request]
-  (let [[provider adapter req] (client-provider client request)
-        stream-fn (:stream adapter)]
-    (when (nil? stream-fn)
-      (throw (ex-info (str "Provider does not implement streaming: " provider)
-                      {:provider provider :category :configuration})))
+(defn- client-stream-with [client request wrap-events]
+  ;; High-level callers normalize adapter errors here, after routing. Keeping
+  ;; the wrapper explicit preserves the low-level client's raw event contract.
+  (let [req (routed-request client request)]
     ((middleware-chain (:middleware client)
-                       (fn [r] (stream-fn r)))
+                       (fn [r]
+                         (let [[provider adapter routed] (middleware-provider client r)
+                               stream-fn (:stream adapter)]
+                           (when (nil? stream-fn)
+                             (throw (ex-info (str "Provider does not implement streaming: " provider)
+                                             {:provider provider :category :configuration :retryable false})))
+                           (wrap-events (stream-fn routed) provider))))
      req)))
+
+(defn client-stream [client request]
+  (client-stream-with client request (fn [events _] events)))
 
 (defn client-discover-context [client request]
   (let [[provider adapter] (client-provider client request)
@@ -2813,10 +2944,17 @@
   client)
 
 (defn get-default-client []
-  (or @default-client
+  (loop []
+    (if-let [installed @default-client]
+      installed
       (let [client (client-from-env)]
-        (reset! default-client client)
-        client)))
+        (if (compare-and-set! default-client nil client)
+          client
+          (do
+            ;; An explicit setter or another initializer published first.
+            ;; This candidate was never exposed to a caller and is ours to close.
+            (client-close! client)
+            (recur)))))))
 
 (def default-retry-policy
   {:max_retries 2
@@ -3042,7 +3180,11 @@
                         (+ 0.5 (math/random)))]
     (* calculated jitter-factor)))
 
-(defn retry [operation & [policy-options]]
+(defn retry
+  "Retry an operation within policy bounds. Optional :should_retry receives the
+   original exception and overrides its :retryable classification. It does not
+   override :max_retries or the maximum accepted Retry-After delay."
+  [operation & [policy-options]]
   (let [policy (merge default-retry-policy (or policy-options {}))
         max-retries (max 0 (:max_retries policy))
         max-delay (double (:max_delay policy))
@@ -3056,9 +3198,11 @@
                      (catch Object e {:error e}))]
         (if-let [error (:error result)]
           (let [data (or (ex-data error) {})
-                retryable (if (contains? data :retryable)
-                            (:retryable data)
-                            true)
+                retryable (if-let [should-retry (:should_retry policy)]
+                            (should-retry error)
+                            (if (contains? data :retryable)
+                              (:retryable data)
+                              true))
                 retry-after (:retry_after data)
                 delay (if (some? retry-after)
                         (double retry-after)
@@ -3115,30 +3259,57 @@
 
 (declare validate-json-schema)
 
-(defn- execute-tool-call [tools tool-call]
+(defn- validated-tool-arguments [tool tool-call]
+  (let [arguments (parse-tool-arguments tool-call)
+        schema (:parameters tool)
+        [valid? reason] (if (some? schema)
+                          (validate-json-schema arguments schema)
+                          [true ""])]
+    (when-not valid?
+      (throw (ex-info reason {:category :invalid-tool-arguments
+                              :tool_name (high-level-tool-name tool-call)})))
+    arguments))
+
+(defn- repair-tool-arguments [tool tool-call repair control]
+  (let [validated (try {:arguments (validated-tool-arguments tool tool-call)}
+                       (catch Object error {:error error}))]
+    (if-let [error (:error validated)]
+      (if repair
+        (do
+          (check-operation! control)
+          (let [repaired (repair tool-call error)]
+            (check-operation! control)
+            (when-not (and (map? repaired)
+                          (= (high-level-tool-name tool-call) (high-level-tool-name repaired))
+                          (= (or (:id tool-call) (get tool-call "id") "")
+                             (or (:id repaired) (get repaired "id") "")))
+              (throw (ex-info "Repair must preserve the tool call ID and name"
+                              {:category :invalid-tool-arguments})))
+            ;; Exactly one repair attempt; invalid repairs become tool errors.
+            (validated-tool-arguments tool repaired)))
+        (throw error))
+      (:arguments validated))))
+
+(defn- execute-tool-call [tools tool-call repair control]
+  (check-operation! control)
   (let [tool-name (high-level-tool-name tool-call)
         tool (find-tool tools tool-name)]
     (if (nil? tool)
       (tool-error-result tool-call (str "Unknown tool: " tool-name))
       (try
-        (let [arguments (parse-tool-arguments tool-call)
-              schema (:parameters tool)
-              [valid? reason] (if (some? schema)
-                                (validate-json-schema arguments schema)
-                                [true ""])]
-          (when-not valid?
-            (throw (ex-info reason {:category :invalid-tool-arguments
-                                    :tool_name tool-name})))
+        (let [arguments (repair-tool-arguments tool tool-call repair control)]
+          (check-operation! control)
           {:tool_call_id (or (:id tool-call) (get tool-call "id") "")
            :tool_name tool-name
            :content ((:execute tool) arguments)
            :is_error false})
         (catch Object e
+          (check-operation! control)
           (tool-error-result tool-call (str "Tool error (" tool-name "): " e)))))))
 
 (def ^:private tool-dispatch-window 32)
 
-(defn- execute-tool-calls [tools tool-calls]
+(defn- execute-tool-calls [tools tool-calls repair control]
   ;; Dispatch calls eagerly from this frame, in bounded windows, so each worker
   ;; inherits the owning operation scope and cancellation reaches it. pmap
   ;; realizes its futures lazily, which detaches them from that scope
@@ -3147,7 +3318,7 @@
         (mapcat (fn [window]
                   (mapv deref
                         (mapv (fn [tool-call]
-                                (core/future (execute-tool-call tools tool-call)))
+                                (core/future (execute-tool-call tools tool-call repair control)))
                               window))))
         (partition-all tool-dispatch-window tool-calls)))
 
@@ -3181,6 +3352,19 @@
    :response response
    :output nil})
 
+(defn add-usage
+  "Add standard token fields. Optional counters remain nil when both sides
+   are unknown. Raw provider metadata stays on individual steps, not totals."
+  [left right]
+  (reduce (fn [total key]
+            (let [a (get left key) b (get right key)]
+              (assoc total key (when (or (some? a) (some? b))
+                                 (+ (or a 0) (or b 0))))))
+          {:input_tokens (+ (or (:input_tokens left) 0) (or (:input_tokens right) 0))
+           :output_tokens (+ (or (:output_tokens left) 0) (or (:output_tokens right) 0))
+           :total_tokens (+ (or (:total_tokens left) 0) (or (:total_tokens right) 0))}
+          [:reasoning_tokens :cache_read_tokens :cache_write_tokens]))
+
 ;; High-level generate API
 (defn generate [model prompt & [opts]]
   (let [options (or opts {})
@@ -3209,7 +3393,7 @@
                 :messages)
               :max_tool_rounds)
             :stop_when)
-          request (merge request-options {:model model :messages messages})
+          request (merge (dissoc request-options :repair_tool_call) {:model model :messages messages})
           client (generation-client options)
           tools (or (:tools options) [])
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
@@ -3250,11 +3434,11 @@
               tool-results (if can-execute
                              (controlled-invoke
                                control false
-                               #(execute-tool-calls tools tool-calls))
+                               #(execute-tool-calls tools tool-calls (:repair_tool_call options) control))
                              [])
               step (step-result response tool-results)
               next-steps (conj steps step)
-              next-total (merge-with + total-usage (or (:usage response) {}))
+              next-total (add-usage total-usage (:usage response))
               stop? (and can-execute (some? stop-when) (stop-when next-steps))]
           (check-operation! control)
           (if (and can-execute (not stop?))
@@ -3317,7 +3501,26 @@
 (defn- schema-key-name [key]
   (if (keyword? key) (name key) (str key)))
 
+(defn- schema-comparison-value [value]
+  ;; JSON has one numeric type. Preserve exact integers rather than rounding
+  ;; them through double, while making integral decimal values hash equally.
+  (cond
+    (integer? value) (bigint value)
+    (and (number? value) (= (double value) (math/floor (double value)))) (bigint value)
+    (vector? value) (mapv schema-comparison-value value)
+    (map? value) (into {} (map (fn [[key child]] [key (schema-comparison-value child)]) value))
+    :else value))
+
+(defn- schema-values-equal? [left right]
+  (= (schema-comparison-value left) (schema-comparison-value right)))
+
 (defn- resolve-local-schema-ref [root reference]
+  (let [reference (when (and (string? reference) (str/starts-with? reference "#"))
+                    ;; io/decode uses query decoding; protect literal plus signs
+                    ;; because a URI fragment does not use form-space encoding.
+                    (try (str "#" (io/decode :url
+                                    (str/replace (subs reference 1) "+" "%2B")))
+                         (catch Object _ nil)))]
   (cond
     (= reference "#") root
     (and (string? reference) (str/starts-with? reference "#/"))
@@ -3327,20 +3530,34 @@
                           (str/replace "~1" "/")
                           (str/replace "~0" "~"))]
           (cond
+            (not (re-matches #"(?:[^~]|~[01])*" segment)) nil
             (map? current)
             (let [entry (schema-value current decoded)]
               (when (:present entry) (:value entry)))
 
-            (and (vector? current) (re-matches #"[0-9]+" decoded))
-            (let [index (parse-long decoded)]
-              (when (< index (count current)) (get current index)))
+            (and (vector? current) (re-matches #"0|[1-9][0-9]*" decoded))
+            (let [index (try (parse-long decoded) (catch Object _ nil))]
+              (when (and (some? index) (<= 0 index) (< index (count current)))
+                (get current index)))
 
             :else nil)))
       root
       (str/split (subs reference 2) #"/"))
-    :else nil))
+    :else nil)))
 
 (declare validate-json-schema*)
+
+(defn- validate-schema-reference [value schema state reference]
+  (let [visit [reference value]]
+    (when (contains? (:active_refs state) visit)
+      ;; Propagate outside applicator boolean logic: `not` must not turn an
+      ;; invalid cyclic schema into successful instance validation.
+      (let [reason (str "Cyclic schema reference: " reference)]
+        (throw (ex-info reason {:category :cyclic-schema-reference
+                               :reason reason :reference reference}))))
+    ;; Immutable ancestry is local to this branch and validation call. Repeated
+    ;; sibling values and recursive references into smaller values remain valid.
+    (validate-json-schema* value schema (update state :active_refs conj visit))))
 
 (defn- validate-schema-list [value schemas root mode]
   (let [results (mapv (fn [candidate]
@@ -3358,22 +3575,61 @@
              [false "Value does not satisfy exactly one oneOf schema"]))))
 
 (defn- validate-object-schema [value schema root]
-  (let [required (or (field schema :required) [])
+  (let [active-dependencies (fn [entries]
+                              (filter (fn [[key _]] (:present (schema-value value key))) entries))
+        legacy-dependencies (active-dependencies (field schema :dependencies))
+        required (concat (or (field schema :required) [])
+                         (mapcat second (active-dependencies (field schema :dependentRequired)))
+                         (mapcat second (filter (fn [[_ dependency]] (sequential? dependency))
+                                                legacy-dependencies)))
+        dependent-schemas (concat (active-dependencies (field schema :dependentSchemas))
+                                  (remove (fn [[_ dependency]] (sequential? dependency))
+                                          legacy-dependencies))
+        dependency-failure
+        (first (keep (fn [[key dependency]]
+                       (let [[valid? reason] (validate-json-schema* value dependency root)]
+                         (when-not valid?
+                           [false (str "Dependency of " (schema-key-name key) ": " reason)])))
+                     dependent-schemas))
         missing (first (filter (fn [key]
                                  (not (:present (schema-value value key))))
                                required))
         properties (or (field schema :properties) {})
+        name-schema (schema-field-entry schema :propertyNames)
+        name-failure
+        (when (:present name-schema)
+          (first (keep (fn [[key _]]
+                         (let [property-name (schema-key-name key)
+                               [valid? reason]
+                               (validate-json-schema* property-name (:value name-schema) root)]
+                           (when-not valid?
+                             [false (str "Property name " property-name ": " reason)])))
+                       value)))
+        patterns (mapv (fn [[pattern child-schema]]
+                         [(re-pattern (schema-key-name pattern)) child-schema])
+                       (or (field schema :patternProperties) {}))
+        matching-patterns (fn [key]
+                            (filter (fn [[pattern _]]
+                                      (some? (re-find pattern (schema-key-name key))))
+                                    patterns))
+        pattern-entries (mapcat (fn [[key _]]
+                                  (map (fn [[_ child-schema]] [key child-schema])
+                                       (matching-patterns key)))
+                                value)
         property-names (set (map (fn [[key _]] (schema-key-name key))
                                  properties))
         additional-entry (schema-field-entry schema :additionalProperties)
         extra-entries (filter (fn [[key _]]
-                                (not (contains? property-names
-                                                (schema-key-name key))))
+                                (and (not (contains? property-names
+                                                     (schema-key-name key)))
+                                     (empty? (matching-patterns key))))
                               value)
         min-properties (field schema :minProperties)
         max-properties (field schema :maxProperties)]
     (cond
       missing [false (str "Missing required property: " missing)]
+      dependency-failure dependency-failure
+      name-failure name-failure
       (and (number? min-properties) (< (count value) min-properties))
       [false (str "Expected at least " min-properties " properties")]
       (and (number? max-properties) (> (count value) max-properties))
@@ -3383,7 +3639,7 @@
            (seq extra-entries))
       [false (str "Unexpected property: " (schema-key-name (first (first extra-entries))))]
       :else
-      (loop [entries (seq properties)]
+      (loop [entries (seq (concat properties pattern-entries))]
         (if (seq entries)
           (let [[key child-schema] (first entries)
                 child (schema-value value key)]
@@ -3413,25 +3669,40 @@
   (let [min-items (field schema :minItems)
         max-items (field schema :maxItems)
         unique-items (field schema :uniqueItems)
-        item-schema (field schema :items)]
+        item-schema (field schema :items)
+        prefix (or (field schema :prefixItems)
+                   (when (vector? item-schema) item-schema) [])
+        tail-entry (schema-field-entry schema (if (vector? item-schema) :additionalItems :items))
+        tail-schema (if (:present tail-entry) (:value tail-entry) true)
+        contains-entry (schema-field-entry schema :contains)
+        matching-count (when (:present contains-entry)
+                         (count (filter (fn [item]
+                                          (first (validate-json-schema* item (:value contains-entry) root)))
+                                        value)))
+        min-contains (or (field schema :minContains) 1)
+        max-contains (field schema :maxContains)]
     (cond
       (and (number? min-items) (< (count value) min-items))
       [false (str "Expected at least " min-items " items")]
       (and (number? max-items) (> (count value) max-items))
       [false (str "Expected at most " max-items " items")]
       (and (= true unique-items)
-           (not= (count value) (count (distinct value))))
+           (not= (count value) (count (distinct (map schema-comparison-value value)))))
       [false "Array items must be unique"]
-      (some? item-schema)
+      (and (:present contains-entry) (< matching-count min-contains))
+      [false (str "Expected at least " min-contains " matching items")]
+      (and (:present contains-entry) (number? max-contains) (> matching-count max-contains))
+      [false (str "Expected at most " max-contains " matching items")]
+      :else
       (loop [items (seq value) index 0]
         (if (seq items)
-          (let [[valid? reason]
-                (validate-json-schema* (first items) item-schema root)]
+          (let [position-schema (if (< index (count prefix)) (get prefix index) tail-schema)
+                [valid? reason]
+                (validate-json-schema* (first items) position-schema root)]
             (if valid?
               (recur (next items) (inc index))
               [false (str "Item " index ": " reason)]))
-          [true ""]))
-      :else [true ""])))
+          [true ""])))))
 
 (defn- validate-string-schema [value schema]
   (let [min-length (field schema :minLength)
@@ -3482,7 +3753,7 @@
     :else
     (let [reference-entry (schema-field-entry schema :$ref)
           reference (:value reference-entry)
-          resolved (when reference (resolve-local-schema-ref root reference))
+          resolved (when reference (resolve-local-schema-ref (:document root) reference))
           enum-entry (schema-field-entry schema :enum)
           const-entry (schema-field-entry schema :const)
           expected (field schema :type)
@@ -3490,15 +3761,16 @@
           any-of-entry (schema-field-entry schema :anyOf)
           one-of-entry (schema-field-entry schema :oneOf)
           not-entry (schema-field-entry schema :not)
+          if-entry (schema-field-entry schema :if)
           immediate-failure
           (cond
             (and (:present reference-entry) (nil? resolved))
             [false (str "Unresolved schema reference: " reference)]
             (and (:present enum-entry)
-                 (not (some (fn [candidate] (= value candidate))
+                 (not (some (fn [candidate] (schema-values-equal? value candidate))
                             (:value enum-entry))))
             [false "Value is not in enum"]
-            (and (:present const-entry) (not= value (:value const-entry)))
+            (and (:present const-entry) (not (schema-values-equal? value (:value const-entry))))
             [false "Value does not match const"]
             (not (schema-type-valid? value expected))
             [false (str "Expected " expected)]
@@ -3507,8 +3779,13 @@
         immediate-failure
         (let [checks
               (concat
+                (when (:present if-entry)
+                  (let [condition-valid? (first (validate-json-schema* value (:value if-entry) root))
+                        branch (schema-field-entry schema (if condition-valid? :then :else))]
+                    (when (:present branch)
+                      [(validate-json-schema* value (:value branch) root)])))
                 (when (:present reference-entry)
-                  [(validate-json-schema* value resolved root)])
+                  [(validate-schema-reference value resolved root reference)])
                 (when (:present all-of-entry)
                   [(validate-schema-list value (:value all-of-entry) root :all)])
                 (when (:present any-of-entry)
@@ -3529,7 +3806,12 @@
           (or failed [true ""]))))))
 
 (defn validate-json-schema [value schema]
-  (validate-json-schema* value schema schema))
+  (try
+    (validate-json-schema* value schema {:document schema :active_refs #{}})
+    (catch Object e
+      (if (= :cyclic-schema-reference (:category (ex-data e)))
+        [false (:reason (ex-data e))]
+        (throw e)))))
 
 (defn- unfenced-json
   "Models without a strict JSON mode often wrap the object in a Markdown code
@@ -3620,8 +3902,13 @@
                  #(let [provider (first (client-provider client request))
                         request (assoc request :register_stream_close
                                        (attempt-close-registration control))
+                        ;; The outer guard also handles streams synthesized or
+                        ;; truncated by middleware without a terminal adapter.
                         events (seq (terminal-stream-events
-                                      (client-stream client request) provider
+                                      (client-stream-with client request
+                                        (fn [events routed-provider]
+                                          (terminal-stream-events events routed-provider
+                                            (fn [] (close-active-stream! control))))) provider
                                       (fn [] (close-active-stream! control))))]
                     (if events
                       {:empty false
@@ -3650,7 +3937,7 @@
 
 (defn- high-level-stream-events
   [client request conversation tools round-number max-tool-rounds stop-when
-   steps retry-policy accumulator control]
+   steps retry-policy accumulator control repair]
   (lazy-seq
     (when-not (= :closed @(:terminal_reason control))
       (check-operation! control)
@@ -3684,7 +3971,7 @@
               (let [tool-results
                     (controlled-invoke
                       control false
-                      #(execute-tool-calls tools tool-calls))
+                      #(execute-tool-calls tools tool-calls repair control))
                     step (step-result response tool-results)
                     next-steps (conj steps step)
                     stop? (and (some? stop-when) (stop-when next-steps))
@@ -3702,7 +3989,7 @@
                       (streamed-continuation-messages
                         conversation response tool-calls tool-results)
                       tools (inc round-number) max-tool-rounds stop-when
-                      next-steps retry-policy accumulator control))))
+                      next-steps retry-policy accumulator control repair))))
               (do
                 (elect-terminal! control :complete)
                 (close-owner-quietly! control)
@@ -3739,7 +4026,7 @@
                 :stop_when)
               :retry_policy)
             :max_retries)
-          request (merge request-options {:model model :messages messages})
+          request (merge (dissoc request-options :repair_tool_call) {:model model :messages messages})
           client (generation-client options)
           tools (or (:tools options) [])
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
@@ -3753,7 +4040,7 @@
           events
           (high-level-stream-events
             client request messages tools 0 max-tool-rounds
-            (:stop_when options) [] retry-policy accumulator control)]
+            (:stop_when options) [] retry-policy accumulator control (:repair_tool_call options))]
       {:events events
        :text_stream
        (map :delta (filter (fn [event] (= :text_delta (:type event))) events))
@@ -3939,7 +4226,9 @@
         :finish
         (if (= :tool_calls (:finish_reason event))
           []
-          (let [final-text (response-text (:response event))]
+          (let [final-text (if (some? (:response event))
+                             (response-text (:response event))
+                             @(:text state))]
             (try
               (let [final-object (parse-validated-object final-text schema)]
                 (reset! (:error state) nil)

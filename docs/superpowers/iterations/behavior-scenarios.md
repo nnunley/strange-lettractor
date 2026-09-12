@@ -2,6 +2,53 @@
 
 Each scenario has a stable ID, an observable contract, and the strongest appropriate seam.
 
+### SCN-TASK-REVIEW-BINDINGS — Stylesheet-selected native reviews
+
+- DOT stylesheet selects models and custom budget properties by class/ID; invalid budgets fail before provider dispatch.
+- Each workflow receives a copied registry and fixed task-runner artifact paths relative to process cwd.
+- Public `cmd-run` reaches both parallel reviewers and adjudication, publishes critique and exits successfully on three valid approvals. Class defaults and ID model/output overrides are asserted. Git and engine are real; providers are scripted.
+- `resume` and `console` share the registry factory; their configured-review journeys have not yet been independently exercised.
+- Seam: `make run-task_review_bindings`.
+
+### SCN-REVIEW-PACKET — Native evidence collection
+
+- Include task, verification log, HEAD revision, staged/unstaged changes and untracked patches while excluding runner artifacts.
+- Preserve shell-sensitive filenames and represent symlinks without reading their targets. Reject missing/oversized artifacts, cancellation and mismatched successive observations.
+- Matching observations do not prove atomicity or verification-log freshness. Captured Git output is checked after collection, not bounded in memory during execution.
+- Seam: `make run-review_packet`.
+
+### SCN-DEVELOPMENT-DECOMPOSITION — Bounded recursive task admission
+
+- Given a request, stable requirements and explicit context/reserve budgets, recursively consult the planner and measure the exact packet for every proposed leaf.
+- Reject oversized leaves, non-shrinking oversized splits, unknown/missing requirement IDs, malformed tasks and exceeded depth/node/fan-out limits.
+- Preserve each parent's original acceptance and requirements as its integration obligation. This checks structural coverage, not semantic sufficiency.
+- Cancellation before/after callbacks stops further planning. No partial tree is returned on failure.
+- Seam: `development-plan/decompose`; `make run-development_plan`. Native model prompts have separate contract coverage; DOT/execution remain unfinished.
+
+### SCN-ULLM-TOOL-REPAIR — Repair invalid arguments before execution
+
+- Given an active tool call with malformed JSON or schema-invalid arguments and a repair callback, attempt repair once and revalidate before executing.
+- Preserve original call IDs, tool names, result order and continuation messages even when repairs overlap.
+- Absent, failed, identity-changing and invalid repairs return tool errors; unknown tools and execution failures do not trigger repair.
+- Cancellation during repair prevents execution and further model calls. The callback is not passed to provider requests.
+- Seam: public generate/stream with owned tool dispatch; `make run-tool_repair`.
+
+### SCN-STYLESHEET-SYNTAX — Complete stylesheet validation
+
+- Given model stylesheet rules, all non-whitespace input must conform to the rule and declaration grammar; surrounding garbage, incomplete strings, missing values and malformed declarations yield `stylesheet_syntax` errors during public preparation.
+- Invalid input applies no partial rule set during transforms.
+- Quoted property values preserve delimiters and escaped quotes; valid rules retain selector specificity and explicit-node override behavior.
+- Seam: stylesheet parser and public pipeline preparation.
+- Evidence: `make run-stylesheet`.
+
+### SCN-ULLM-RETRY-PREDICATE — Application retry classification
+
+- Given a retry policy with `:should_retry`, the original exception reaches the predicate and its decision overrides default retryability, including timeout opt-in and transient-error opt-out.
+- Retry counts, backoff and maximum accepted `Retry-After` remain enforced.
+- Public `generate` and `stream` preserve the predicate; streaming may retry opening failures but never replay after partial event delivery.
+- Seam: retry helper and public generation/streaming integration.
+- Evidence: `make run-retry_predicate` (4 tests / 28 assertions).
+
 ## Local sentinel scenarios
 
 ### SCN-ATTR-PARSE — DOT language compatibility
@@ -480,3 +527,73 @@ ATTR-ART-02; it is not established by the store/layout scenario below.
 - Run equivalent text, image URL/base64, structured output, stream, tool-call continuation, reasoning, mid-session steering, caching/usage, provider-options, invalid-key, rate-limit, and coding-loop profile/tool/subagent journeys against each configured provider
 - Record provider/model IDs and redact secrets
 - Seam: opt-in live provider contract
+
+### SCN-DEVELOPMENT-PLANNER — Bounded native planning
+
+- Trigger: a development task is supplied to the native planner callback.
+- Expected: small tasks use one structured call; large source context is fully
+  presented in bounded chunks followed by a decision from bounded notes.
+  Every request fits the configured input measure. Invalid outputs, oversized
+  fixed metadata/notes, exhausted calls and cancellation stop continuation.
+- Evidence: `make run-development_planner`, 8 tests / 37 assertions through the
+  native unified client with a scripted provider. Recursive admission integration
+  is covered; live model quality, compiler, workers and PAR are not.
+
+### SCN-DEVELOPMENT-WORKFLOW — Recursive captured development graphs
+
+- Trigger: compile an admitted task tree with a finite repair budget.
+- Expected: one captured graph per task; children run sequentially before parent
+  integration. Plan/code/test precede parallel reviews and adjudication; failed
+  tests never reach publication. Exhausted repairs and failed children stop the
+  task. Unconfigured controller stages fail. Task data cannot inject DOT syntax.
+- Evidence: `make run-development_workflow`, 8 tests / 38 assertions through
+  native captured execution with scripted tool-stage handlers. Three generated
+  files also pass Kilroy validation. Real verification/review handlers remain
+  a separate unfinished requirement.
+
+### SCN-IMPORTED-TASK-RUNNER — Reuse upstream development workflow
+
+- Trigger: run the adapted Amplifier task runner with a task and Bash verifier.
+- Expected: actual verification precedes critique; only an exact final SHIP
+  verdict reaches handoff. Repeated failures diagnose, critique stalls reach
+  postmortem, abandonment fails, budgets include interrupted attempts, and a new
+  run never deletes old state. Handoff does not instruct an automatic commit.
+- Evidence: `make run-imported_task_runner`, 7 tests / 23 assertions with real
+  shell gates and scripted model nodes. Live quality, paired review and context
+  budgeting are not established by these tests.
+
+### SCN-EMBEDDED-REVIEW — Bound let-go review and adjudication
+
+- Trigger: two native parallel reviewer handlers feed the embedded pair gate.
+- Expected: exact branch identity and successful execution, bounded valid reports
+  and all three approvals are required. Revisions fail the gate, malformed
+  evidence does not reach adjudication, cancellation wins over callback results,
+  and failure clears stale approval. Missing bindings cannot default to approval.
+- Evidence: `make run-embedded_review`, 8 tests / 39 assertions, including actual
+  execution of the shipped DOT example with bound functions. No live-model
+  quality, callback I/O cancellation, tool restrictions or import migration claim.
+
+### SCN-TASK-RUNNER-REVIEW — Embedded review in the imported development loop
+
+- Trigger: execute the primary task-runner graph with bound reviewers.
+- Expected: successful actual verification precedes paired review; two approvals
+  plus adjudication reach handoff. Refusals survive loop restarts and stall after
+  three. Invalid reports and readable-report publication failure reach postmortem
+  without packaging. The shell variant remains independently usable.
+- Evidence: `make run-task_runner_review`, 11 tests / 39 assertions including the
+  shell baseline; application callbacks are scripted, shell verification is real.
+
+### SCN-MODEL-REVIEW — Native bounded review of supplied evidence
+
+- Trigger: invoke a bound reviewer with an application-provided evidence packet.
+- Expected: fresh native structured call with no tools, explicit output limit,
+  measured input budget and cancellation. Oversized packets fail before dispatch;
+  JSON reports normalize to the embedded keyword contract.
+- Evidence: `make run-model_review`, 4 tests / 14 assertions using the actual
+  unified client and a scripted provider. Evidence collection and live review
+  quality are separate unproven requirements.
+
+Native adjudication follow-up: SCN-MODEL-REVIEW now includes task-plus-reports
+budgeting, execution-context forwarding and cancellation during a provider call
+(7/26). SCN-TASK-RUNNER-REVIEW includes the context-aware binding (12/41 with
+shell baseline). These extend the same scenarios; live evidence is still absent.

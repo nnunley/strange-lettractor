@@ -1,0 +1,125 @@
+(ns attractor.development-plan-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.development-plan :as plan]))
+
+(def root-task
+  {:objective "Implement both behaviors"
+   :requirements [{:id "R1" :text "Read files"} {:id "R2" :text "Write files"}]
+   :context "source material"
+   :acceptance ["Read/write integration passes"]})
+
+(def options {:context_window 2000 :reserve_tokens 200 :count_tokens count})
+
+(defn- child [objective ids context]
+  {:objective objective :requirement_ids ids :context context :acceptance ["Check behavior"]})
+
+(defn- error-reason [f]
+  (try (f) nil (catch Object error (:reason (ex-data error)))))
+
+(deftest admitted-leaf-uses-measured-packet-and-explicit-reserve
+  (let [seen (atom []) result (plan/decompose root-task
+                              (fn [request] (swap! seen conj request) {:kind :leaf}) options)]
+    (is (= :leaf (:kind result)))
+    (is (= "task" (:id result)))
+    (is (= (:requirements root-task) (get-in result [:task :requirements])))
+    (is (= 1800 (:input_budget (first @seen))))
+    (is (= (count (plan/task-packet root-task)) (:input_tokens result)))
+    (is (false? (:must_split (first @seen))))))
+
+(deftest recursive-split-preserves-requirements-and-parent-integration
+  (let [large (assoc root-task :context (apply str (repeat 3000 "x")))
+        seen (atom [])
+        result (plan/decompose large
+                 (fn [{:keys [id]}]
+                   (swap! seen conj id)
+                   (case id
+                     "task" {:kind :split :children [(child "Read" ["R1"] "read source")
+                                                     (child "Write" ["R2"] "write source")]}
+                     "task_1" {:kind :split :children [(child "Implement write" ["R2"] "write")
+                                                       (child "Check write" ["R2"] "test")]}
+                     {:kind :leaf})) options)]
+    (is (= ["task" "task_0" "task_1" "task_1_0" "task_1_1"] @seen))
+    (is (= :branch (:kind result)))
+    (is (= (:acceptance root-task) (get-in result [:task :acceptance])))
+    (is (= ["R1" "R2"] (mapv :id (get-in result [:task :requirements]))))
+    (is (= :leaf (get-in result [:children 1 :children 0 :kind])))))
+
+(deftest decomposition-rejects-unproved-coverage-and-nonprogress
+  (doseq [[decision reason]
+          [[{:kind :split :children [(child "Only read" ["R1"] "")]} :missing-requirements]
+           [{:kind :split :children [(child "Invented" ["R9"] "")]} :unknown-requirement]
+           [{:kind :split :children []} :invalid-children]
+           [{:kind :split :children [(assoc (child "Both" ["R1" "R2"] "") :acceptance [])]} :invalid-acceptance]
+           [{:kind :other} :invalid-decision]]]
+    (is (= reason (error-reason #(plan/decompose root-task (fn [_] decision) options)))))
+  (let [large (assoc root-task :context (apply str (repeat 3000 "x")))]
+    (is (= :leaf-over-budget (error-reason #(plan/decompose large (fn [_] {:kind :leaf}) options))))
+    (is (= :nonshrinking-split
+           (error-reason #(plan/decompose large
+                            (fn [_] {:kind :split :children [(child (:objective large) ["R1" "R2"] (str (:context large) (:context large)))]})
+                            options))))))
+
+(deftest decomposition-bounds-and-cancellation-stop-planner-calls
+  (let [calls (atom 0) split (fn [_] (swap! calls inc)
+                             {:kind :split :children [(child "Both" ["R1" "R2"] "")]})]
+    (is (= :depth-limit (error-reason #(plan/decompose root-task split (assoc options :max_depth 1)))))
+    (is (= 2 @calls))
+    (reset! calls 0)
+    (is (= :node-limit (error-reason #(plan/decompose root-task split (assoc options :max_nodes 1)))))
+    (is (= 1 @calls)))
+  (let [cancelled (atom false) calls (atom 0)]
+    (is (= :cancelled (error-reason
+                       #(plan/decompose root-task
+                          (fn [_] (swap! calls inc) (reset! cancelled true) {:kind :leaf})
+                          (assoc options :cancelled? (fn [] @cancelled))))))
+    (is (= 1 @calls))))
+
+(deftest invalid-budget-is-rejected-before-planning
+  (doseq [settings [{:context_window 100 :reserve_tokens 100}
+                    {:context_window 0 :reserve_tokens 0}
+                    {:context_window 100 :reserve_tokens -1}
+                    {:context_window 100}]]
+    (let [calls (atom 0)]
+      (is (= :invalid-budget (error-reason #(plan/decompose root-task
+                                           (fn [_] (swap! calls inc) {:kind :leaf}) settings))))
+      (is (zero? @calls)))))
+
+(deftest packet-boundaries-and-utf8-estimate-are-explicit
+  (let [task (assoc root-task :context "界é")
+        bytes-used (count (bytes (plan/task-packet task)))
+        leaf (fn [_] {:kind :leaf})
+        admitted (plan/decompose task leaf {:context_window (+ bytes-used 100) :reserve_tokens 100})]
+    (is (= :utf8-byte-estimate (:counter_kind admitted)))
+    (is (= bytes-used (:input_tokens admitted)))
+    (is (= :leaf (:kind admitted)))
+    (is (= :leaf-over-budget
+           (error-reason #(plan/decompose task leaf
+                            {:context_window (+ bytes-used 99) :reserve_tokens 100}))))))
+
+(deftest fanout-and-invalid-counts-are-rejected
+  (is (= :fanout-limit
+         (error-reason #(plan/decompose root-task
+                          (fn [_] {:kind :split :children [(child "Read" ["R1"] "")
+                                                          (child "Write" ["R2"] "")]})
+                          (assoc options :max_children 1)))))
+  (doseq [counter [(fn [_] -1) (fn [_] 1.5) (fn [_] nil)]]
+    (is (= :invalid-token-count
+           (error-reason #(plan/decompose root-task (fn [_] {:kind :leaf})
+                            (assoc options :count_tokens counter)))))))
+
+(deftest cancellation-before-entry-does-not-plan
+  (let [calls (atom 0)]
+    (is (= :cancelled
+           (error-reason #(plan/decompose root-task
+                            (fn [_] (swap! calls inc) {:kind :leaf})
+                            (assoc options :cancelled? (constantly true))))))
+    (is (zero? @calls))))
+
+(deftest malformed-root-requirements-fail-before-planning
+  (doseq [requirements [42 [] [{:id "R" :text "one"} {:id "R" :text "two"}]
+                        [{:id "" :text "missing ID"}]]]
+    (let [calls (atom 0)]
+      (is (= :invalid-requirements
+             (error-reason #(plan/decompose (assoc root-task :requirements requirements)
+                              (fn [_] (swap! calls inc) {:kind :leaf}) options))))
+      (is (zero? @calls)))))

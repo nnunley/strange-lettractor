@@ -212,6 +212,29 @@
         (deliver release-registration true)
         (remove-watch server/active-pipelines watch-key)))))
 
+(deftest late-completion-cannot-recreate-a-removed-registration
+  (reset! server/active-pipelines {})
+  (let [release (promise) updated (promise) watch-key (keyword (str "late-" (random-uuid)))]
+    (try
+      (with-redefs [pipeline/run
+                    (fn [source options]
+                      (let [prepared (pipeline/prepare source)
+                            manifest (workflow/publish! (:workflow prepared) (:logs-root options))]
+                        ((:on-published options) prepared manifest)
+                        @release
+                        {:status :success}))]
+        (let [response (server/handle-start-pipeline {:body server-dot})]
+          (is (= 201 (:status response)))
+          (reset! server/active-pipelines {})
+          (add-watch server/active-pipelines watch-key
+                     (fn [_ _ old-state new-state]
+                       (when (empty? old-state) (deliver updated new-state))))
+          (deliver release true)
+          (is (= {} (deref updated 1000 :timeout)))))
+      (finally
+        (deliver release true)
+        (remove-watch server/active-pipelines watch-key)))))
+
 (deftest timeout-that-wins-during-publication-verification-prevents-late-registration
   (reset! server/active-pipelines {})
   (let [verification-entered (promise)

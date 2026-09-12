@@ -39,18 +39,18 @@
     (is (= {:value nil :text ""} (i/ask queue {})))
     (is (= {:value "last" :text "last"} (i/ask queue {})))
     (is (= [] @state))
-    (is (= default (i/ask queue {:default default})))
+    (is (= :skipped (:value (i/ask queue {:default default}))))
     (is (= :skipped (:value (i/ask queue {}))))))
 
-(deftest concurrent-exhaustion-preserves-defaults-and-maps
+(deftest concurrent-exhaustion-skips-and-preserves-answer-maps
   (let [answers (mapv (fn [n] {:value n :metadata {:n n}}) (range 4))
         queue (i/make-queue-interviewer answers)
         default {:value :default}
         workers (mapv (fn [_] (core/future (i/ask queue {:default default}))) (range 12))]
     (try
       (let [results (mapv #(deref % 3000 :timeout) workers)]
-        (is (= (set answers) (set (remove #(= default %) results))))
-        (is (= 8 (count (filter #(= default %) results)))))
+        (is (= (set answers) (set (remove #(= :skipped (:value %)) results))))
+        (is (= 8 (count (filter #(= :skipped (:value %)) results)))))
       (finally (doseq [worker workers] (deref worker 3000 nil))))))
 
 (deftest public-parallel-human-gates-share-recorded-queue

@@ -1,0 +1,26 @@
+(ns attractor.stream-accumulator-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(deftest whitespace-text-is-preserved-in-partial-and-final-responses
+  (doseq [text [" " "\n" "\t\r\n"]]
+    (let [acc (llm/make-stream-accumulator)]
+      (llm/stream-accumulator-process! acc {:type :stream_start})
+      (llm/stream-accumulator-process! acc {:type :text_delta :delta text})
+      (let [partial (llm/stream-accumulator-response acc)]
+        (is (= text (get-in partial [:message :text])))
+        (is (= [{:kind :text :text text}] (get-in partial [:message :content])))
+        (is (= [{:kind :text :text text}] (get-in partial [:message :parts]))))
+      ;; A finish event may omit the full response (Unified LLM section 3.13).
+      (llm/stream-accumulator-process! acc
+        {:type :finish :finish_reason :stop :usage {:total_tokens 1}})
+      (let [response (llm/stream-accumulator-response acc)]
+        (is (= [{:kind :text :text text}] (get-in response [:message :content])))
+        (is (= :stop (:finish_reason response)))))))
+
+(deftest empty-stream-does-not-invent-a-text-block
+  (let [acc (llm/make-stream-accumulator)]
+    (is (nil? (llm/stream-accumulator-response acc)))
+    (llm/stream-accumulator-process! acc {:type :stream_start})
+    (llm/stream-accumulator-process! acc {:type :text_delta :delta ""})
+    (is (= [] (get-in (llm/stream-accumulator-response acc) [:message :content])))))

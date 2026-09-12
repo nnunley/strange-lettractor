@@ -1,0 +1,123 @@
+(ns nrepl-hub-check
+  (:require [net :as net] [bencode :as bencode] [clojure.edn :as edn]
+            [attractor.nrepl-server :as server] [attractor.hub :as hub]
+            [attractor.nrepl-client :as client] [attractor.console.session :as console]
+            [attractor.hub-http :as hub-http] [json :as json]
+            [clojure.string :as str] [os :as os] [io :as io] [attractor.ids :as ids]
+            [attractor.execution :as execution] [attractor.profiles :as profiles]))
+(defn ensure! [v message] (when-not v (throw (ex-info message {}))))
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn request [conn data]
+  (bencode/write! conn {"id" "probe" "op" "attractor/request" "payload" (pr-str data)})
+  (let [reply (bencode/read! conn 2000)]
+    (ensure! (= "probe" (get reply "id")) "Request correlation lost")
+    (let [result (edn/read-string (get reply "value"))]
+      (ensure! (nil? (:error result)) (str "Hub error: " (pr-str result)))
+      (:value result))))
+(defn check! []
+  (let [entered (promise) release (promise)
+        h (hub/start! {:session_options
+           {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+            :execution_env (execution/make-environment {:file_exists (fn [_] false)
+                                                      :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+            :project_docs []
+            :complete_fn (fn [r]
+              (let [text (:content (last (:messages r)))]
+                (when (= text "held") (deliver entered true) (deref release 5000 nil))
+                {:message {:role :assistant :content text}}))}})
+        transport (server/start! h {:allow_stop true})
+        address (:address transport)
+        sockets (atom [])
+        connect (fn [] (let [c (net/dial (:host address) (:port address))] (swap! sockets conj c) c))]
+    (try
+      (let [embedded (server/start! h {})]
+        (try
+          (ensure! (= :stop-rejected
+                      (try (client/stop-host! (:address embedded)) nil
+                           (catch Object e (:category (ex-data e)))))
+                   "Embedded adapter unexpectedly allowed host stop")
+          (ensure! (not (realized? (:stop_requested embedded))) "Rejected stop signaled the host")
+          (finally (server/close! embedded))))
+      (let [a (connect) b (connect)
+            client (request a {:op :client/attach})
+            session (:session_id (request a {:op :session/open}))
+            submitted (request a {:op :session/submit :session_id session :text "held"})
+            lookup {:op :session/result :session_id session :turn_id (:turn_id submitted)}]
+        (ensure! (true? (deref entered 2000 false)) "Submitted turn did not start")
+        (net/close! a)
+        (ensure! (= :running (:state (request b lookup))) "Disconnect cancelled the turn")
+        (ensure! (some #(= session (:session_id %)) (request b {:op :session/list})) "Clients do not share sessions")
+        (deliver release true)
+        (let [deadline (+ (System/nanoTime) 3000000000)
+              outcome (loop [] (let [v (request b lookup)]
+                        (if (or (= :completed (:state v)) (>= (System/nanoTime) deadline)) v
+                            (do (sleep 5) (recur)))))
+              c (connect)
+              events (request c {:op :events/since :client_id (:client_id client) :cursor (:cursor client)})]
+          (ensure! (= {:value "held"} (:result outcome)) "Disconnected turn did not complete")
+          (ensure! (= outcome (request c lookup)) "Reconnected client lost result")
+          (ensure! (some #(= session (:session_id %)) (:events events)) "Reconnected client lost events")
+          (request c {:op :client/detach :client_id (:client_id client)}))
+        (let [remote (client/connect! address)
+              c (console/open! nil (client/console-options remote))]
+          (try
+            (console/handle! c {:type :line :text "from console"})
+            (let [deadline (+ (System/nanoTime) 3000000000)
+                  lines (loop [lines []]
+                          (let [all (into lines (:lines (console/drain! c)))]
+                            (if (or (some #(str/includes? % "from console") all) (>= (System/nanoTime) deadline)) all
+                                (do (sleep 5) (recur all)))))]
+              (ensure! (some #(str/includes? % "from console") lines) "Remote console did not render assistant output"))
+            (console/handle! c {:type :line :text ": (println \"eval stdout\") (+ 40 2)"})
+            (let [deadline (+ (System/nanoTime) 3000000000)
+                  lines (loop [lines []]
+                          (let [all (into lines (:lines (console/drain! c)))]
+                            (if (or (some #{"[eval] => 42"} all) (>= (System/nanoTime) deadline)) all
+                                (do (sleep 5) (recur all)))))]
+              (ensure! (some #{"[eval] => 42"} lines) "Remote console did not render evaluation value")
+              (ensure! (some #{"eval stdout"} lines) "Remote console lost evaluation output"))
+            (finally (console/close! c) (client/close! remote))))
+        (let [root (str (os/temp-dir) "/" (ids/prefixed "nrepl-cli"))
+              _ (io/mkdir root)
+              input (str root "/input.txt")
+              _ (io/spit input "/new\n/quit\n")
+              binary (str (os/cwd) "/bin/attractor")
+              before (set (map :session_id (request b {:op :session/list})))
+              environment (execution/make-local-environment {:working_dir root :env_policy :none :max_command_timeout_ms 10000})]
+          (try
+            (let [result ((:exec_command environment)
+                           (str (quote-shell binary) " console --connect " (:port address) " < " (quote-shell input))
+                           10000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"})
+                  after (request b {:op :session/list})]
+              (io/spit (str root "/result.edn") (pr-str result))
+              (ensure! (= 0 (:exit_code result)) (str "Attached CLI failed: " (pr-str result)))
+              (ensure! (some #(and (not (contains? before (:session_id %))) (not (:closed %))) after)
+                       "Attached CLI did not leave its new session in the remote hub"))
+            (finally ((:cleanup environment)))))
+        (bencode/write! b {"id" "host-stop" "op" "attractor/stop"})
+        (ensure! (= {"id" "host-stop" "status" ["done"]} (bencode/read! b 1000)) "Host stop was not acknowledged")
+        (ensure! (true? (deref (:stop_requested transport) 1000 false)) "Host stop was not signaled")
+        (let [remote (client/connect! address)
+              handler (hub-http/make-handler #(client/request! remote %))]
+          (try
+            (ensure! (= 200 (:status (handler {:request-method :get :path "/pipelines"}))) "HTTP control was not connected")
+            (server/close! transport)
+            (let [reply (handler {:request-method :post :path "/pipelines" :body "digraph Lost {}"})
+                  error (json/read-json (:body reply))]
+              (ensure! (= 503 (:status reply)) "Peer closure was not reported as unavailable")
+              (ensure! (true? (get error "outcome_unknown")) "Lost response did not preserve uncertainty")
+              (ensure! (string? (get error "request_id")) "Lost response has no request correlation"))
+            (ensure! (= 503 (:status (handler {:request-method :get :path "/pipelines"}))) "Closed connection was reused")
+            (finally (client/close! remote))))
+        (server/close! transport)
+        (ensure! (nil? (bencode/read! b 1000)) "Adapter close left connection open")
+        (ensure! (nil? (:error (deref (hub/request! h {:id "alive" :op :session/list}) 1000 {})))
+                 "Adapter close stopped hub"))
+      {:pass true :checks [:two-clients :shared-session :disconnect-survival :reconnect-result :event-replay :remote-console :remote-evaluation :compiled-console-attach :http-peer-closure :adapter-cleanup]}
+      (finally
+        (deliver release true)
+        (doseq [c @sockets] (net/close! c))
+        (server/close! transport)
+        (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+(defn -main [& _] (prn (check!)))
+(when *command-line-args* (apply -main *command-line-args*))

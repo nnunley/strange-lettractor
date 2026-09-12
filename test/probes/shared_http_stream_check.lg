@@ -1,0 +1,119 @@
+(ns shared-http-stream-check
+  (:require [attractor.hub :as hub] [attractor.hub-http :as adapter]
+            [attractor.handlers :as handlers] [attractor.nrepl-server :as nserver]
+            [attractor.nrepl-client :as client] [attractor.execution :as execution]
+            [attractor.ids :as ids] [http :as http] [json :as json]
+            [io :as io] [os :as os] [clojure.string :as str]))
+
+(defn ensure! [ok message] (when-not ok (throw (ex-info message {}))))
+(defn quote-shell [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn await-value [f pred]
+  (let [deadline (+ (System/nanoTime) 5000000000)]
+    (loop []
+      (let [v (f)]
+        (cond (pred v) v
+              (>= (System/nanoTime) deadline) (throw (ex-info "Probe deadline exceeded" {}))
+              :else (do (sleep 20) (recur)))))))
+(defn serve [port token root]
+  (let [h (hub/start! {:workflow_registry_fn #(handlers/make-handler-registry (:interviewer %) nil {})})
+        n (nserver/start! h {:port 0})
+        http-nrepl (nserver/start! h {:port 0})
+        remote (client/connect! (:address http-nrepl))
+        last-poll (atom nil)
+        request! (fn [r]
+                   (when (= :workflow/events (:op r)) (reset! last-poll (System/nanoTime)))
+                   (client/request! remote (cond-> r
+                                           (and (= :workflow/run (:op r)) (nil? (:logs_root r)))
+                                           (assoc :logs_root (str root "/" (ids/uuid-text))))))
+        handler (adapter/make-handler request!)]
+    (try
+      (http/serve
+        (fn [req]
+          (case (:path req)
+            "/ready" {:status 200 :body (json/write-json {:token token :port (get-in n [:address :port])})}
+            "/activity" {:status 200 :body (json/write-json {:last_poll (str @last-poll)})}
+            "/disconnect" (do (nserver/close! http-nrepl) {:status 200 :body "{}"})
+            (handler req)))
+        (str "127.0.0.1:" port))
+      (finally (client/close! remote) (nserver/close! http-nrepl) (nserver/close! n)
+               (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+(defn fetch [base path]
+  (json/read-json (:body (http/request {:url (str base path) :timeout {:request 1}}))))
+(defn run-check []
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "shared-http-wire"))
+        _ (io/mkdir root) token (ids/uuid-text) port (+ 30000 (rand-int 20000))
+        base (str "http://127.0.0.1:" port)
+        runtime (str (os/cwd) "/.worktrees/let-go-http-cancellation/build/lg")
+        env (execution/make-local-environment {:working_dir (os/cwd) :env_policy :none :max_command_timeout_ms 30000})
+        command (str (quote-shell runtime) " -source-paths src test/probes/shared_http_stream_check.lg serve "
+                     port " " (quote-shell token) " " (quote-shell root))
+        worker (future ((:exec_command env) command 30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))
+        connection (atom nil)]
+    (try
+      (let [ready (await-value #(do (ensure! (not (realized? worker)) (str "Fixture exited: " (pr-str (deref worker 0 nil))))
+                                    (try (fetch base "/ready") (catch Object _ nil))) some?)]
+        (ensure! (= token (get ready "token")) "Fixture port collision")
+        (reset! connection (client/connect! {:host "127.0.0.1" :port (get ready "port")})))
+      (let [request! #(client/request! @connection %)
+            run (request! {:op :workflow/run :logs_root (str root "/run")
+                           :dot_source "digraph Wire { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Yes\"]; }"})
+            id (get-in run [:value :run_id])
+            question (first (await-value #(:value (request! {:op :question/list})) seq))
+            stream (http/request {:url (str base "/pipelines/" id "/events") :as :stream
+                                  :timeout {:request 2 :stream_read 3}})]
+        (ensure! (= 200 (:status stream)) "SSE request failed")
+        (try
+          (ensure! (some #(= ": keep-alive" %) (take 200 (io/line-seq (:body stream))))
+                   "Idle SSE heartbeat missing")
+          (finally (io/close (:body stream))))
+        ;; Observe request activity, not a manufactured test count. The human
+        ;; gate stays open throughout so workflow completion cannot stop polling.
+        (sleep 1500)
+        (let [settled (get (fetch base "/activity") "last_poll")]
+          (ensure! (not= "" settled) "Stream never queried hub history")
+          (sleep 1500)
+          (ensure! (= settled (get (fetch base "/activity") "last_poll")) "Closed SSE stream still polls hub"))
+        (ensure! (= :running (get-in (request! {:op :workflow/result :run_id id}) [:value :state]))
+                 "Disconnect terminated workflow")
+        (request! {:op :question/answer :question_id (:question_id question) :value "Y"})
+        (let [done (await-value #(request! {:op :workflow/result :run_id id})
+                                #(= :completed (get-in % [:value :state])))]
+          (ensure! (= :success (get-in done [:value :result :value :status])) "nREPL answer did not complete run"))
+        (let [response (http/request {:url (str base "/pipelines") :method :post :timeout {:request 3}
+                                      :body "digraph Submitted { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit; }"})
+              admitted (json/read-json (:body response)) id (get admitted "id")
+              snapshot (:value (request! {:op :workflow/inspect :run_id id}))]
+          (ensure! (= 201 (:status response)) "HTTP submission failed")
+          (ensure! (= :published (:admission snapshot)) "HTTP response preceded hub publication")
+          (ensure! (= "Submitted" (get-in snapshot [:publication :graph :id])) "HTTP and nREPL inspected different graphs")
+          (ensure! (= :success (get-in (await-value #(request! {:op :workflow/result :run_id id})
+                                                   #(= :completed (get-in % [:value :state]))) [:value :result :value :status]))
+                   "HTTP-submitted workflow did not finish in hub"))
+        (let [run (request! {:op :workflow/run :logs_root (str root "/interrupted-stream")
+                            :dot_source "digraph Interrupted { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Yes\"]; }"})
+              id (get-in run [:value :run_id])
+              _ (await-value #(:value (request! {:op :question/list})) seq)
+              response (http/request {:url (str base "/pipelines/" id "/events") :as :stream
+                                      :timeout {:request 2 :stream_read 3}})]
+          (try
+            (let [lines (io/line-seq (:body response))
+                  idle (drop-while #(not= ": keep-alive" %) lines)]
+              (ensure! (= ": keep-alive" (first idle)) "Stream did not reach idle state")
+              (fetch base "/disconnect")
+              (let [tail (vec (rest idle))]
+                (ensure! (some #{"event: stream.error"} tail) "Midstream failure was not delivered over HTTP")
+                (ensure! (not-any? #{"event: end"} tail) "Transport failure fabricated workflow completion")))
+            (finally (io/close (:body response))))
+          (ensure! (= :running (get-in (request! {:op :workflow/result :run_id id}) [:value :state]))
+                   "Closing the stream transport stopped the workflow")
+          (request! {:op :workflow/cancel :run_id id})))
+      {:pass true :checks [:wire-heartbeat :idle-disconnect-stops-polling :workflow-survives :nrepl-answer :http-submission-nrepl-result :midstream-peer-failure]}
+      (finally
+        (when @connection (client/close! @connection))
+        ((:cleanup env))
+        (ensure! (not= ::pending (deref worker 5000 ::pending)) "Owned fixture did not settle")
+        (os/sh "rm" "-rf" "--" root)))))
+(case (first *command-line-args*)
+  "serve" (serve (parse-long (second *command-line-args*)) (nth *command-line-args* 2) (nth *command-line-args* 3))
+  "run" (prn (run-check))
+  (println "shared_http_stream_check.lg run"))

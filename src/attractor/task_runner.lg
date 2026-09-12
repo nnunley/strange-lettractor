@@ -1,0 +1,76 @@
+(ns attractor.task-runner
+  (:require [attractor.embedded-review :as review]
+            [attractor.context :as context]
+            [attractor.ids :as ids]
+            [clojure.string :as str] [io :as io] [os :as os]))
+
+(defn- report-text [outcome]
+  (let [updates (:context_updates outcome)]
+    (str "# Paired review\n\n"
+         (apply str (map (fn [{:keys [reviewer report]}]
+                           (str "## " reviewer "\nVerdict: " (name (:verdict report)) "\n"
+                                (str/join "\n" (:findings report)) "\nEvidence:\n"
+                                (str/join "\n" (:evidence report)) "\n\n"))
+                         (get updates "review.reports")))
+         "Adjudication:\n" (pr-str (get updates "review.adjudication")) "\n"
+         "Result: " (name (:status outcome)) "\n"
+         (or (:failure_reason outcome) "Both reviewers and adjudication approved") "\n")))
+
+(defn- reviewer-handler [options callback-key handler-key]
+  (when (and (contains? options callback-key) (contains? options handler-key))
+    (throw (ex-info "Specify one reviewer binding per role" {:category :configuration_error})))
+  (if (contains? options handler-key)
+    (let [handler (get options handler-key)]
+      (when-not (fn? handler)
+        (throw (ex-info "Reviewer handler must be callable" {:category :configuration_error})))
+      handler)
+    (review/make-reviewer (get options callback-key))))
+
+(defn bind-reviews
+  "Return a copied registry with native task-runner review bindings. Options:
+   :correctness and :requirements receive [node ctx graph logs-root]; :adjudicate
+   receives ordered structured reports. Alternatively :adjudicate_with_context
+   receives [reports node ctx graph logs-root]. :state_dir names the task-runner state
+   directory created by setup. Native :correctness_handler/:requirements_handler
+   may replace the corresponding report callback. Does not mutate the registry."
+  [registry options]
+  (when (and (contains? options :adjudicate) (contains? options :adjudicate_with_context))
+    (throw (ex-info "Specify one adjudicator binding" {:category :configuration_error})))
+  (let [state-dir (get options :state_dir "attractor_runs/task-runner/state")
+        a (reviewer-handler options :correctness :correctness_handler)
+        b (reviewer-handler options :requirements :requirements_handler)
+        pair (if (contains? options :adjudicate_with_context)
+               (review/make-contextual-pair-gate ["review_correctness" "review_requirements"]
+                                                 (:adjudicate_with_context options))
+               (review/make-pair-gate ["review_correctness" "review_requirements"] (:adjudicate options)))]
+    (when-not (and (string? state-dir) (not (str/blank? state-dir)))
+      (throw (ex-info "state_dir must be a nonblank path" {:category :configuration_error})))
+    (let [gate
+          (fn [node ctx graph logs-root]
+            (let [outcome (pair node ctx graph logs-root)]
+              (if (= :cancelled (:status outcome)) outcome
+                (try
+                  (let [prior (context/ctx-get ctx "task.review.refusals" 0)
+                        _ (when-not (and (integer? prior) (>= prior 0))
+                            (throw (ex-info "Invalid review counter" {})))
+                        refused? (= :review_changes_requested (:category outcome))
+                        count (if refused? (inc prior) prior)
+                        route (cond (= :success (:status outcome)) "ship"
+                                    refused? (if (>= count 3) "stall" "revise")
+                                    :else "invalid")
+                        temp (str state-dir "/critique-" (ids/uuid-text) ".tmp")]
+                    ;; The engine status/checkpoint carries structured evidence;
+                    ;; the maker gets a readable report without parsing it as a gate.
+                    (io/spit temp (report-text outcome))
+                    (os/rename temp (str state-dir "/critique.md"))
+                    (if (and (:cancelled? node) ((:cancelled? node)))
+                      {:status :cancelled :context_updates {"review.approved" false}
+                       :failure_reason "Review cancelled"}
+                      (update outcome :context_updates merge
+                              {"task.review.route" route "task.review.refusals" count})))
+                  (catch Object _
+                    {:status :fail :retryable false :category :review_artifact_failed
+                     :failure_reason "Could not publish review evidence or update its counter"
+                     :context_updates {"review.approved" false "task.review.route" "invalid"}})))))]
+      (atom (assoc @registry "task.review.correctness" a "task.review.requirements" b
+                            "task.review.adjudicate" gate)))))

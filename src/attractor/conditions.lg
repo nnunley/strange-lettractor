@@ -1,18 +1,11 @@
 (ns attractor.conditions
-  (:require [clojure.string :as str]))
-
-;; Split string once by separator
-(defn- split-once [s sep]
-  (let [idx (str/index-of s sep)]
-    (if idx
-      [(subs s 0 idx) (subs s (+ idx (count sep)))]
-      [s ""])))
+  (:require [clojure.string :as str] [attractor.parser :as parser]))
 
 ;; Parse a condition literal (strips surrounding quotes if present)
 (defn parse-literal [v]
   (let [v (str/trim (str v))]
     (if (and (str/starts-with? v "\"") (str/ends-with? v "\"") (>= (count v) 2))
-      (subs v 1 (dec (count v)))
+      (parser/unescape-string (subs v 1 (dec (count v))))
       v)))
 
 (defn- lookup-context-value [values key]
@@ -41,90 +34,69 @@
 
       (str/starts-with? k "context.")
       (let [short-k (subs k 8)
-            qualified-present? (or (contains? ctx-vals k)
-                                   (contains? ctx-vals (keyword k)))
-            value (if qualified-present?
-                    (lookup-context-value ctx-vals k)
-                    (lookup-context-value ctx-vals short-k))]
+            qualified (lookup-context-value ctx-vals k)
+            value (if (nil? qualified) (lookup-context-value ctx-vals short-k) qualified)]
         (if (nil? value) "" (str value)))
 
       :else
       (let [value (lookup-context-value ctx-vals k)]
         (if (nil? value) "" (str value))))))
 
-;; Evaluate a single clause (e.g. "outcome=success" or "context.count!=0" or "is_ready")
-(defn evaluate-clause [clause outcome context]
-  (let [c (str/trim clause)]
+(defn- syntax-error! [message]
+  (throw (ex-info message {:category :condition_syntax})))
+
+(defn- split-clauses [source]
+  (loop [index 0 start 0 quoted? false escaped? false clauses []]
+    (if (= index (count source))
+      (if quoted?
+        (syntax-error! "Unterminated quoted condition literal")
+        (conj clauses (subs source start)))
+      (let [ch (subs source index (inc index))]
+        (cond
+          escaped? (recur (inc index) start quoted? false clauses)
+          (and quoted? (= ch "\\")) (recur (inc index) start true true clauses)
+          (= ch "\"") (recur (inc index) start (not quoted?) false clauses)
+          (and (not quoted?) (str/starts-with? (subs source index) "&&"))
+          (recur (+ index 2) (+ index 2) false false (conj clauses (subs source start index)))
+          :else (recur (inc index) start quoted? false clauses))))))
+
+(defn- parse-clause [source]
+  (let [source (str/trim source)]
     (cond
-      (str/includes? c "!=")
-      (let [[k v] (split-once c "!=")
-            resolved (resolve-key k outcome context)
-            expected (parse-literal v)]
-        (not= (str/trim resolved) (str/trim expected)))
-
-      (str/includes? c "=")
-      (let [[k v] (split-once c "=")
-            resolved (resolve-key k outcome context)
-            expected (parse-literal v)]
-        (= (str/trim resolved) (str/trim expected)))
-
+      (str/blank? source) nil
+      (re-matches #"^[A-Za-z_][A-Za-z0-9_.]*$" source) {:key source}
       :else
-      ;; Bare key: check if truthy (non-empty string, not "false", not "0")
-      (let [val (str/trim (resolve-key c outcome context))]
-        (and (not (str/blank? val))
-             (not= val "false")
-             (not= val "0"))))))
+      (if-let [parts (re-matches #"(?s)^([A-Za-z_][A-Za-z0-9_.]*)\s*(!=|=)\s*(.+)$" source)]
+        (let [value (str/trim (nth parts 3))]
+          (when-not (or (re-matches #"^\"(?:\\.|[^\"\\])*\"$" value)
+                        (re-matches #"^(?:-?[0-9]+|[A-Za-z_][A-Za-z0-9_.:-]*)$" value))
+            (syntax-error! (str "Invalid condition literal: " value)))
+          {:key (nth parts 1) :operator (nth parts 2) :literal (parse-literal value)})
+        (syntax-error! (str "Invalid condition clause: " source))))))
 
-;; Evaluate a full condition expression against an outcome and context
-(defn evaluate-condition [cond-str outcome context]
-  (if (str/blank? cond-str)
+(defn- evaluate-parsed-clause [clause outcome context]
+  (if (nil? clause)
     true
-    (let [clauses (str/split cond-str #"&&")]
-      (every? (fn [clause]
-                (let [c (str/trim clause)]
-                  (if (str/blank? c)
-                    true
-                    (evaluate-clause c outcome context))))
-              clauses))))
+    (let [resolved (resolve-key (:key clause) outcome context)]
+      (case (:operator clause)
+        "=" (= resolved (:literal clause))
+        "!=" (not= resolved (:literal clause))
+        ;; Preserve the existing bare-key extension separately from comparison.
+        (let [value (str/trim resolved)]
+          (and (not (str/blank? value)) (not= value "false") (not= value "0")))))))
 
-;; Validate condition expression syntax
-;; Returns nil if valid, or an error string if invalid
-(defn validate-condition-syntax [cond-str]
-  (if (str/blank? cond-str)
+(defn evaluate-clause [clause outcome context]
+  (evaluate-parsed-clause (parse-clause clause) outcome context))
+
+(defn evaluate-condition [condition outcome context]
+  (if (str/blank? condition)
+    true
+    (let [clauses (mapv parse-clause (split-clauses condition))]
+      (every? #(evaluate-parsed-clause % outcome context) clauses))))
+
+(defn validate-condition-syntax [condition]
+  (try
+    (when-not (str/blank? condition)
+      (doseq [clause (split-clauses condition)] (parse-clause clause)))
     nil
-    (let [clauses (str/split cond-str #"&&")]
-      (loop [remaining clauses]
-        (if (empty? remaining)
-          nil
-          (let [c (str/trim (first remaining))]
-            (cond
-              (str/blank? c)
-              (recur (rest remaining))
-
-              ;; Check for invalid operators like ==, <=, >=, <, >
-              (or (str/includes? c "==") (str/includes? c "<=") (str/includes? c ">=")
-                  (str/includes? c "<") (str/includes? c ">"))
-              (str "Unsupported operator in condition: '" c "'")
-
-              (str/includes? c "!=")
-              (let [[k v] (split-once c "!=")
-                    k (str/trim k)
-                    v (str/trim v)]
-                (if (or (str/blank? k) (str/blank? v))
-                  (str "Malformed clause in condition: '" c "'")
-                  (recur (rest remaining))))
-
-              (str/includes? c "=")
-              (let [[k v] (split-once c "=")
-                    k (str/trim k)
-                    v (str/trim v)]
-                (if (or (str/blank? k) (str/blank? v))
-                  (str "Malformed clause in condition: '" c "'")
-                  (recur (rest remaining))))
-
-              ;; Bare key should be valid identifier / path
-              (re-matches #"^[A-Za-z_][A-Za-z0-9_.]*$" c)
-              (recur (rest remaining))
-
-              :else
-              (str "Invalid clause in condition: '" c "'"))))))))
+    (catch Object e (ex-message e))))

@@ -1,0 +1,57 @@
+(ns attractor.schema-recursion-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.llm :as llm]))
+
+(deftest non-descending-reference-cycles-reject-the-whole-validation
+  (doseq [schema [{:$ref "#"}
+                  {:not {:$ref "#"}}
+                  {:if {:$ref "#"} :then true :else true}
+                  {:anyOf [true {:$ref "#"}]}
+                  {:$defs {:a {:allOf [{:$ref "#/$defs/b"}]}
+                           :b {:allOf [{:$ref "#/$defs/a"}]}}
+                   :$ref "#/$defs/a"}]]
+    (let [[valid? reason] (llm/validate-json-schema {} schema)]
+      (is (false? valid?))
+      (is (str/includes? reason "Cyclic schema reference")))))
+
+(def tree-schema
+  {:type "object"
+   :required ["label"]
+   :properties {"label" {:type "string"}
+                "children" {:type "array" :items {:$ref "#"}}}})
+
+(deftest finite-recursive-data-and-repeated-siblings-remain-valid
+  (doseq [[value valid?] [[{"label" "root" "children" [{"label" "leaf"}
+                                                       {"label" "leaf"}]} true]
+                         [{"label" "root" "children" [{"label" "branch"
+                                                        "children" [{"label" "leaf"}]}]} true]
+                         [{"label" "root" "children" [{"label" 42}]} false]
+                         [{"label" "root" "children" [{}]} false]]]
+    (is (= valid? (first (llm/validate-json-schema value tree-schema)))))
+  (is (true? (first (llm/validate-json-schema 3
+                     {:$defs {:number {:type "integer"}}
+                      :allOf [{:$ref "#/$defs/number"}
+                              {:$ref "#/$defs/number"}]})))))
+
+(deftest unvisited-cycles-do-not-reject-an-instance
+  (doseq [schema [{:$defs {:unused {:$ref "#/$defs/unused"}} :type "object"}
+                  {:type "object" :properties {"absent" {:$ref "#"}}}
+                  {:if false :then {:$ref "#"} :else true}]]
+    (is (true? (first (llm/validate-json-schema {} schema))))))
+
+(deftest cyclic-final-output-is-reported-as-no-object-generated
+  (let [adapter (llm/make-adapter "fixture"
+                  (fn [_] {:message {:role :assistant :content "{}"}
+                           :tool_calls [] :usage {} :finish_reason :stop})
+                  (fn [_] [{:type :stream_start}
+                           {:type :text_delta :delta "{}"}
+                           {:type :finish :finish_reason :stop}]))
+        client (llm/make-client {:providers {"fixture" adapter}})
+        schema {:not {:$ref "#"}}]
+    (doseq [invoke [(fn [] (llm/generate-object "fixture/model" "object" schema {:client client}))
+                    (fn [] ((:object (llm/stream-object "fixture/model" "object" schema
+                                       {:client client}))))]]
+      (let [error (try (invoke) nil (catch Object e e))]
+        (is (= :no-object-generated (:category (ex-data error))))
+        (is (str/includes? (:reason (ex-data error)) "Cyclic schema reference"))))))

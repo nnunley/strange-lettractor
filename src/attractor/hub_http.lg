@@ -1,0 +1,153 @@
+(ns attractor.hub-http
+  "HTTP controls over a supplied hub request function; no execution registry."
+  (:require [attractor.ids :as ids] [clojure.string :as str] [json :as json]
+            [attractor.graphviz :as graphviz]))
+
+(defn- response [value & [status]]
+  {:status (or status 200)
+   :headers {"Content-Type" "application/json" "Access-Control-Allow-Origin" "*"}
+   :body (json/write-json value)})
+(defn- ask [request! op fields]
+  (let [reply (request! (merge {:id (ids/uuid-text) :op op} fields))]
+    (if-let [error (:error reply)]
+      (throw (ex-info (or (:message error) (name (:category error)))
+                      (cond-> error (= :request-timeout (:category error))
+                        (assoc :outcome_unknown true :request_id (:id reply)))))
+      (:value reply))))
+(defn- status [snapshot]
+  (cond (:cancelled snapshot) :cancelled
+        (= :running (:state snapshot)) :running
+        (get-in snapshot [:result :error]) :fail
+        :else (or (get-in snapshot [:result :value :status]) :fail)))
+(defn- questions [request! id]
+  (filter #(= id (:run_id %)) (ask request! :question/list {})))
+(defn- question-data [entries]
+  (into {} (map (fn [entry]
+                  [(:question_id entry)
+                   (assoc (select-keys (:question entry) [:text :options :default :timeout_seconds :stage :metadata])
+                          :type (name (get-in entry [:question :type])))]) entries)))
+(defn- read-answer [body]
+  (let [value (try (get (json/read-json (or body "{}")) "answer")
+                   (catch Object _ nil))]
+    (when-not (string? value) (throw (ex-info "Expected a string answer" {:category :invalid-request})))
+    value))
+
+(defn- submit [request! req]
+  (let [body (:body req)
+        parsed (try (if (and (string? body) (str/starts-with? (str/trim body) "{"))
+                      (json/read-json body) body)
+                    (catch Object _ (throw (ex-info "Invalid submission JSON" {:category :invalid-request}))))
+        source (if (string? parsed) parsed (or (get parsed "dot") (get parsed :dot)))
+        run (ask request! :workflow/run {:dot_source source
+                                         :preparation_timeout_ms (get req :preparation-timeout-ms 30000)})
+        id (:run_id run)]
+    (loop []
+      (let [snapshot (ask request! :workflow/inspect {:run_id id})]
+        (case (:admission snapshot)
+          :published (response {:id id :status "started" :graph_id (get-in snapshot [:publication :graph :id])} 201)
+          :timed_out (response {:error "Failed to start pipeline: preparation timed out"} 400)
+          :failed (response {:error (str "Failed to start pipeline: "
+                                        (get-in snapshot [:result :error :message] "preparation failed"))} 400)
+          :pending (do (sleep 10) (recur))
+          (throw (ex-info "Hub returned an invalid admission state" {:category :hub-error})))))))
+
+(defn- event-cursor [req event-count]
+  (if-let [raw (or (get-in req [:headers "Last-Event-ID"]) (get-in req [:headers "last-event-id"]))]
+    (let [last-id (try (parse-long (str/trim raw)) (catch Object _ nil))]
+      (when-not (and (integer? last-id) (<= -1 last-id) (< last-id event-count))
+        (throw (ex-info "Invalid event cursor" {:category :invalid-cursor})))
+      (inc last-id))
+    0))
+
+(defn- event-body [request! id from]
+  (lazy-seq
+   (try
+    (loop [heartbeat-at (+ (System/nanoTime) 1000000000)]
+      (let [history (ask request! :workflow/events {:run_id id :from from}) events (:events history)]
+        (if (seq events)
+          (concat
+            (map-indexed (fn [index event]
+                           (str "id: " (+ from index) "\nevent: " (name (or (:type event) :event))
+                                "\ndata: " (json/write-json event) "\n\n")) events)
+            (event-body request! id (:event_count history)))
+          (let [snapshot (ask request! :workflow/inspect {:run_id id})]
+            (cond
+              ;; Completion can race the first history read. Fetch the final
+              ;; events before emitting end; cancellation requested is not done.
+              (> (:event_count snapshot) from) (recur heartbeat-at)
+              (= :completed (:state snapshot))
+              (list (str "event: end\ndata: " (json/write-json {:status (str (status snapshot))
+                                                               :event_count (:event_count snapshot)}) "\n\n"))
+              ;; Yield an SSE comment so the HTTP writer can observe a closed
+              ;; connection even when the workflow has no new events.
+              (>= (System/nanoTime) heartbeat-at)
+              (cons ": keep-alive\n\n" (event-body request! id from))
+              :else (do (sleep 25) (recur heartbeat-at)))))))
+    (catch Object e
+      (list (str "event: stream.error\ndata: "
+                 (json/write-json
+                   (merge {:run_id id :next_event_id from
+                           :category (name (or (:category (ex-data e)) :stream-error))
+                           :error (ex-message e)}
+                          (select-keys (ex-data e) [:request_id :outcome_unknown])))
+                 "\n\n"))))))
+
+(defn make-handler [request!]
+  (fn [req]
+    (try
+      (let [path (or (:path req) "") raw-method (or (:request-method req) :get)
+            method (keyword (str/lower-case (if (keyword? raw-method) (name raw-method) (str raw-method))))]
+        (cond
+          (and (= :post method) (= "/pipelines" path))
+          (submit request! req)
+          (= :options method)
+          {:status 200 :headers {"Access-Control-Allow-Origin" "*"
+                                "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
+                                "Access-Control-Allow-Headers" "Content-Type"} :body ""}
+          (and (= :get method) (= "/pipelines" path))
+          (response (vec (keep (fn [run]
+                                (let [snapshot (ask request! :workflow/inspect {:run_id (:run_id run)})]
+                                  (when (:publication snapshot)
+                                    {:id (:run_id run) :status (str (status snapshot))
+                                     :graph_id (get-in snapshot [:publication :graph :id])})))
+                              (ask request! :workflow/list {}))))
+          (str/starts-with? path "/pipelines/")
+          (let [parts (str/split (subs path 11) #"/") id (first parts) route (second parts)
+                snapshot (ask request! :workflow/inspect {:run_id id})]
+            (if-not (:publication snapshot)
+              (response {:error "Pipeline not found"} 404)
+              (cond
+                (and (= :get method) (= 1 (count parts)))
+                (response {:id id :status (str (status snapshot))
+                           :completed_nodes (or (get-in snapshot [:result :value :completed_nodes]) [])
+                           :event_count (:event_count snapshot)})
+                (and (= :get method) (= "context" route) (= 2 (count parts)))
+                (response (:context snapshot))
+                (and (= :get method) (= "graph" route) (= 2 (count parts)))
+                {:status 200 :headers {"Content-Type" "image/svg+xml" "Access-Control-Allow-Origin" "*"}
+                 :body (graphviz/render-svg (:dot_source snapshot))}
+                (and (= :get method) (= "checkpoint" route) (= 2 (count parts)))
+                (response (or (ask request! :workflow/checkpoint {:run_id id}) {:status "no_checkpoint_yet"}))
+                (and (= :get method) (= "events" route) (= 2 (count parts)))
+                (let [from (event-cursor req (:event_count snapshot))]
+                  {:status 200 :headers {"Content-Type" "text/event-stream" "Cache-Control" "no-cache"
+                                        "Access-Control-Allow-Origin" "*"}
+                   :body (event-body request! id from)})
+                (and (= :get method) (= "questions" route) (= 2 (count parts)))
+                (response (question-data (questions request! id)))
+                (and (= :post method) (= "cancel" route) (= 2 (count parts)))
+                (do (ask request! :workflow/cancel {:run_id id}) (response {:id id :status "cancelled"}))
+                (and (= :post method) (= "questions" route) (= 4 (count parts)) (= "answer" (nth parts 3)))
+                (let [qid (nth parts 2) answer (read-answer (:body req))]
+                  (if (some #(= qid (:question_id %)) (questions request! id))
+                    (do (ask request! :question/answer {:question_id qid :value answer})
+                        (response {:status "answer_submitted" :question_id qid}))
+                    (response {:error "Question not found"} 404)))
+                :else (response {:error "Unknown sub-route"} 404))))
+          :else (response {:error "Endpoint not found"} 404)))
+      (catch Object e
+        (response (merge {:error (ex-message e)} (select-keys (ex-data e) [:request_id :outcome_unknown]))
+                  (case (:category (ex-data e))
+                    :unknown-run 404 :unknown-question 404 :invalid-request 400 :invalid-cursor 400
+                    :request-timeout 503 :stopped 503 :connection-closed 503 :transport-error 503
+                    :protocol-error 502 500))))))

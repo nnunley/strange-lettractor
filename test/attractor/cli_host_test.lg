@@ -1,0 +1,28 @@
+(ns attractor.cli-host-test
+  (:require [clojure.test :refer [deftest is]] [io :as io] [os :as os]
+            [attractor.ids :as ids] [attractor.cli :as cli] [attractor.hub :as hub]
+            [attractor.nrepl-server :as server]))
+
+(deftest invalid-host-options-fail-before-hub-startup
+  (doseq [args [["--port"] ["--port" "-1"] ["--port" "65536"] ["--stop" "0"]
+                ["--stop" "12" "--port" "13"] ["--port-file"]]]
+    (with-redefs [hub/start! (fn [_] (throw (ex-info "Unexpected hub startup" {:category :wrong-startup})))]
+      (is (= :configuration_error (try (cli/cmd-hub args) nil (catch Object e (:category (ex-data e)))))))))
+
+(deftest existing-port-file-is-preserved
+  (let [path (str (os/temp-dir) "/" (ids/prefixed "host-port"))]
+    (io/spit path "existing-owner\n")
+    (try
+      (is (= :configuration_error (try (cli/cmd-hub ["--port" "0" "--port-file" path]) nil
+                                      (catch Object e (:category (ex-data e))))))
+      (is (= "existing-owner\n" (io/slurp path)))
+      (finally (os/sh "rm" "-f" "--" path)))))
+
+(deftest listener-startup-failure-stops-the-owned-hub
+  (let [h (hub/start! {})]
+    (try
+      (with-redefs [hub/start! (fn [_] h)
+                    server/start! (fn [_ _] (throw (ex-info "Bind failed" {:category :bind-failed})))]
+        (is (= :bind-failed (try (cli/cmd-hub ["--port" "0"]) nil (catch Object e (:category (ex-data e)))))))
+      (is (= :stopped (get-in (deref (hub/request! h {:id "after-failure" :op :session/list}) 1000 {}) [:error :category])))
+      (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))

@@ -22,6 +22,22 @@
                              (str (os/cwd) "/test/fixtures/codex_app_server.lg")]}
    :allow_agent_scenario true})
 (defn- stop [h] (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil))
+
+(deftest console-can-use-an-external-request-and-event-transport
+  (let [h (hub/start! (hub-options))
+        c (console/open! nil {:request_fn (fn [request] (deref (hub/request! h request) 3000 {}))
+                              :events_fn (fn [client cursor] (hub/events-since h client cursor))})]
+    (try
+      (console/handle! c {:type :line :text "external"})
+      (let [deadline (+ (System/nanoTime) 3000000000)
+            lines (loop [lines []]
+                    (let [all (into lines (:lines (console/drain! c)))]
+                      (if (or (some #(str/includes? % "echo: external") all) (>= (System/nanoTime) deadline)) all
+                          (do (core/sleep 5) (recur all)))))]
+        (is (some #(str/includes? % "echo: external") lines)))
+      (console/close! c)
+      (is (nil? (:error (deref (hub/request! h {:id "alive" :op :session/list}) 1000 {}))))
+      (finally (console/close! c) (stop h)))))
 (defn- line [c text] (:lines (console/handle! c {:type :line :text text})))
 (defn- drain-until [c pred ms]
   (let [deadline (+ (System/currentTimeMillis) ms)]
@@ -42,8 +58,26 @@
         (is (has rendered "session started"))
         (is (has rendered "echo: hello there"))
         (is (has rendered "turn complete"))
-        (is (every? #(str/starts-with? % "[session ") rendered) (pr-str rendered)))
+        ;; The focused session is the one the user is talking to: its lines carry
+        ;; no [session <id>] tag. Unfocused sessions, runs and agent jobs keep
+        ;; theirs, so output from elsewhere stays attributable.
+        (is (not-any? #(str/starts-with? % "[session ") rendered) (pr-str rendered)))
       (finally (console/close! c) (stop h)))))
+
+(deftest a-failed-request-names-its-category-once
+  ;; The hub's fail! uses the category as the ex-message, so rendering the
+  ;; category and the message repeated the same word at the user:
+  ;; "submit failed: busy busy", "submit failed: session-closed session-closed".
+  (let [release (promise)
+        opts (assoc-in (hub-options) [:session_options :complete_fn]
+                       (fn [request] (deref release 3000 nil) (answer request)))
+        h (hub/start! opts) c (console/open! h)]
+    (try
+      (is (has (line c "hello") "→ agent"))
+      (let [rejected (line c "again")]
+        (is (has rejected "submit failed: busy") (pr-str rejected))
+        (is (not (has rejected "busy busy")) (pr-str rejected)))
+      (finally (deliver release true) (console/close! c) (stop h)))))
 
 (deftest eval-routes-render-values-errors-and-bind-focus
   (let [h (hub/start! (hub-options)) c (console/open! h)]

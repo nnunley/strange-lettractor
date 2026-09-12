@@ -1,0 +1,84 @@
+(ns http-questions-check
+  (:require [attractor.execution :as execution] [attractor.ids :as ids]
+            [attractor.nrepl-client :as nrepl]
+            [http :as http] [json :as json] [io :as io] [os :as os]
+            [clojure.string :as str]))
+
+(defn ensure! [ok message]
+  (when-not ok (throw (ex-info message {}))))
+(defn quote-shell [value] (str "'" (str/replace value "'" "'\"'\"'") "'"))
+(defn request [base path & [body]]
+  (let [response (http/request
+                   (cond-> {:url (str base path) :method (if body :post :get)
+                            :timeout {:request 2.0}}
+                     body (assoc :body (if (string? body) body (json/write-json body))
+                                 :headers {"Content-Type" "application/json"})))]
+    (ensure! (contains? #{200 201} (:status response)) (str "HTTP request failed: " path))
+    (json/read-json (:body response))))
+(defn await-value [fetch ready? worker]
+  (let [deadline (+ (System/nanoTime) 5000000000)]
+    (loop []
+      (ensure! (= ::pending (deref worker 0 ::pending)) "Owned server exited during probe")
+      (let [value (fetch)]
+        (cond (ready? value) value
+              (>= (System/nanoTime) deadline) (throw (ex-info "HTTP probe deadline exceeded" {}))
+              :else (do (sleep 10) (recur)))))))
+(defn completed [base id worker]
+  (let [result (await-value #(request base (str "/pipelines/" id))
+                           #(not= ":running" (get % "status")) worker)]
+    (ensure! (= ":success" (get result "status")) "Pipeline did not succeed")
+    result))
+
+(defn run-check [port]
+  (let [root (str (os/temp-dir) "/" (ids/prefixed "http-questions"))
+        binary (str (os/cwd) "/bin/attractor")
+        _ (ensure! (os/stat binary) "Build bin/attractor before running the probe")
+        _ (io/mkdir root)
+        base (str "http://127.0.0.1:" port)
+        nrepl-port (+ 30000 (rand-int 20000)) connection (atom nil)
+        environment (execution/make-local-environment
+                      {:working_dir root :env_policy :none :max_command_timeout_ms 30000})
+        worker (future ((:exec_command environment)
+                         (str (quote-shell binary) " serve --mock --nrepl-port " nrepl-port " --port 127.0.0.1:" port)
+                         30000 nil {"PATH" "/usr/bin:/bin:/usr/sbin:/sbin"}))]
+    (try
+      (let [initial (await-value #(try (request base "/pipelines") (catch Object _ nil)) some? worker)]
+        (ensure! (empty? initial) (str "Unexpected initial pipelines response: " (pr-str initial))))
+      (reset! connection (nrepl/connect! {:host "127.0.0.1" :port nrepl-port}))
+      (let [dot "digraph Web { start [shape=Mdiamond]; gate [shape=hexagon, label=Approve, human.timeout_seconds=\"3\"]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Proceed\"]; }"
+            id (get (request base "/pipelines" dot) "id")
+            questions (await-value #(request base (str "/pipelines/" id "/questions")) seq worker)
+            qid (first (keys questions))]
+        (ensure! (and (string? qid) (re-matches #"[a-z]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" qid))
+                 "Question ID was corrupted in JSON")
+        (ensure! (= "gate" (get-in questions [qid "stage"])) "Question stage was lost")
+        (let [snapshot (:value (nrepl/request! @connection {:op :workflow/inspect :run_id id}))]
+          (ensure! (= "Web" (get-in snapshot [:publication :graph :id])) "Standalone HTTP and nREPL used different owners")
+          (ensure! (= "gate" (get-in snapshot [:context "current_node"])) "nREPL did not see HTTP workflow activity"))
+        (request base (str "/pipelines/" id "/questions/" qid "/answer") {"answer" "Y"})
+        (completed base id worker)
+        (ensure! (= "Y" (get (request base (str "/pipelines/" id "/context")) "human.gate.selected"))
+                 "Answer did not route or context JSON key was corrupted")
+        (ensure! (empty? (request base (str "/pipelines/" id "/questions"))) "Answered question was retained"))
+      (let [dot "digraph Web { start [shape=Mdiamond]; gate [shape=hexagon, human.timeout_seconds=\"0.02\", human.default_choice=right]; left [shape=box]; right [shape=box]; exit [shape=Msquare]; start -> gate; gate -> left [label=\"[L] Left\"]; gate -> right [label=\"[R] Right\"]; left -> exit; right -> exit; }"
+            id (get (request base "/pipelines" dot) "id")]
+        (completed base id worker)
+        (ensure! (= "R" (get (request base (str "/pipelines/" id "/context")) "human.gate.selected"))
+                 "HTTP timeout did not select its default route"))
+      {:pass true :artifacts root :checks [:shared-standalone-owner :question-id :stage :answer-route :context-keys :question-cleanup :timeout-default]}
+      (finally
+        (when @connection (nrepl/close! @connection))
+        ((:cleanup environment))
+        (let [closed (deref worker 5000 ::pending)]
+          (ensure! (not= ::pending closed) "Owned HTTP server did not settle")
+          (io/spit (str root "/server-result.edn") (pr-str closed)))))))
+
+(defn -main [& args]
+  (if (= ["--help"] (vec args))
+    (println "http_questions_check.lg run [PORT] — native let-go client with an owned compiled HTTP server; no model calls")
+    (let [port (if (second args) (parse-long (second args)) (+ 30000 (rand-int 20000)))]
+      (ensure! (and (= "run" (first args)) (integer? port) (<= 1024 port 65535)) "Expected run and optional nonprivileged port")
+      (let [result (run-check port)]
+        (io/spit "docs/http-question-wire-evidence.edn" (pr-str result))
+        (prn result)))))
+(when *command-line-args* (apply -main *command-line-args*))

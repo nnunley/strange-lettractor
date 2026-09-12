@@ -1,0 +1,119 @@
+// Adapted from microsoft/amplifier-bundle-attractor, MIT licensed.
+// Pinned original and LICENSE: ../upstream/amplifier/; see README.md here.
+// Run from the target worktree with task.md and task.verify.sh under
+// attractor_runs/task-runner/. This workflow returns an uncommitted handoff.
+// Every model stage uses fresh context; no per-subagent clear/compact is claimed.
+
+digraph TaskRunner {
+    graph [
+        goal="Complete the task described in attractor_runs/task-runner/task.md to its full definition of done: the task's DoD script passes, and the work survives a strict doctrine critique against the task's judgment criteria.",
+
+        default_max_retries=2,
+        default_fidelity="truncate",
+
+        retry_target="abandon"
+    ]
+
+    node [timeout="20m"]
+    start [shape=Mdiamond]
+    done  [shape=Msquare]
+
+    setup [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="if [ -e attractor_runs/task-runner/state ]; then printf 'State directory already exists; use another worktree or archive it before a new run.' >&2; exit 1; fi; B=${ATTRACTOR_TASK_MAX_ITERATIONS:-6}; case \"$B\" in ''|*[!0-9]*) printf missing; exit 0;; esac; if [ \"$B\" -lt 1 ] || [ \"$B\" -gt 15 ]; then printf missing; exit 0; fi; if [ ! -f attractor_runs/task-runner/task.md ] || [ ! -f attractor_runs/task-runner/task.verify.sh ]; then printf missing; exit 0; fi; mkdir attractor_runs/task-runner/state || exit 1; mkdir -p attractor_runs/task-runner/state/feedback attractor_runs/task-runner/state/postmortem || exit 1; echo \"$B\" > attractor_runs/task-runner/state/budget; printf ok"]
+
+    bad_input [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="echo 'FATAL: task_file or its sibling .verify.sh not found' >&2; exit 1"]
+
+    orient [shape=box, class="maker",
+        prompt="You are starting a task. Read the task file at attractor_runs/task-runner/task.md IN FULL, and any doctrine docs it references. Then survey the current state of the target repository at the current working directory: git status, the files and areas the task names. Write attractor_runs/task-runner/state/brief.md containing: (1) the goal in your own words, as an end-state of the world; (2) the definition of done — both the mechanical DoD script and the judgment criteria; (3) the quality dimensions that matter and the risks you foresee; (4) the repo's current state, including any partial or dirty work this run must be robust to. Capture understanding, not a step-by-step plan."]
+
+    attempt [shape=box, class="maker", fidelity="truncate",
+        prompt="Advance the task's goal. Sources of truth: the task file at attractor_runs/task-runner/task.md, your brief at attractor_runs/task-runner/state/brief.md, and ALL files in attractor_runs/task-runner/state/feedback/ — accumulated critique from prior iterations; read them FIRST and address them. If attractor_runs/task-runner/state/verify.log exists it holds the DoD script's latest output — if it was failing, fix exactly what it reports. If attractor_runs/task-runner/state/postmortem/diagnosis.md exists, honor its change of course. Work in the target repository at the current working directory with your file and shell tools; make real changes; honor the repo's own conventions (AGENTS.md, PR templates, design docs) and the task's stated non-goals. Never fabricate evidence or game the DoD script — your work is verified by code, then critiqued against the task's judgment criteria."]
+
+    verify [shape=parallelogram, timeout="30m", class="gate", max_retries=0,
+        goal_gate=true,
+        tool_command="n=$(cat attractor_runs/task-runner/state/iter 2>/dev/null); n=$((${n:-0}+1)); echo $n > attractor_runs/task-runner/state/iter; B=$(cat attractor_runs/task-runner/state/budget 2>/dev/null); B=${B:-6}; if [ \"$n\" -gt \"$B\" ]; then printf '{\"iteration\": %s, \"gate\": \"verify\", \"budget\": \"exhausted\"}\n' \"$n\" >> attractor_runs/task-runner/state/convergence.jsonl; printf exhausted; else VF=\"attractor_runs/task-runner/task.md\"; VF=\"${VF%.md}.verify.sh\"; bash \"$VF\" > attractor_runs/task-runner/state/verify.log 2>&1; rc=$?; printf '{\"iteration\": %s, \"gate\": \"verify\", \"pass\": %s}\n' \"$n\" \"$([ $rc -eq 0 ] && echo true || echo false)\" >> attractor_runs/task-runner/state/convergence.jsonl; [ $rc -eq 0 ] && { rm -f attractor_runs/task-runner/state/critique.md; printf green; } || { printf red; exit 1; }; fi"]
+
+    triage [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="B=$(cat attractor_runs/task-runner/state/budget 2>/dev/null); B=${B:-6}; n=$(cat attractor_runs/task-runner/state/iter 2>/dev/null || echo 0); sig=$(tail -20 attractor_runs/task-runner/state/verify.log 2>/dev/null | sed -E 's|/tmp/[A-Za-z0-9._-]+|TMPPATH|g; s/[0-9]+\\.[0-9]+s?//g' | shasum -a 256 | cut -d' ' -f1); prev=$(cat attractor_runs/task-runner/state/last-fail-sig 2>/dev/null || echo none); echo $sig > attractor_runs/task-runner/state/last-fail-sig; if [ \"$n\" -ge \"$B\" ]; then printf exhausted; elif [ \"$sig\" = \"$prev\" ]; then printf repeat; else printf novel; fi"]
+
+    diagnose [shape=box, class="gate",
+        prompt="Verification failed twice with the SAME failure signature. Stop patching — find the root cause. Read attractor_runs/task-runner/state/verify.log, the task file at attractor_runs/task-runner/task.md, and the relevant code and docs in the current working directory. Determine what is actually wrong: (a) the current approach, (b) the environment or tooling, (c) the DoD script itself, or (d) the task's assumptions. Write attractor_runs/task-runner/state/postmortem/diagnosis.md with the root cause, the evidence, and the single change of course for the next attempt. An attractor absorbs model drift, not deterministic bugs — do not recommend another blind retry. If the blocker cannot be resolved from inside this run (missing access, a genuinely broken DoD script, a contradictory task), include the word BLOCKED on its own line and explain."]
+
+    diagnose_gate [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="rm -f attractor_runs/task-runner/state/last-fail-sig; grep -qE '^BLOCKED' attractor_runs/task-runner/state/postmortem/diagnosis.md && printf blocked || printf continue"]
+
+    critique [shape=box, class="gate",
+        prompt="The mechanical DoD script passed. Now judge the work against the task's FULL definition of done — especially the judgment criteria the script cannot check. Read the task file at attractor_runs/task-runner/task.md, the brief at attractor_runs/task-runner/state/brief.md, and review the ACTUAL changes in the current working directory (git diff, new and changed files; attractor_runs/task-runner/state/verify.log for what was verified). Apply the doctrine: evidence over claims — verify that claimed evidence is real; no test-gaming or DoD-script-gaming; docs and paired guides updated; repo conventions honored; non-goals respected; exemplar quality where the task demands it. Write attractor_runs/task-runner/state/critique.md: specific findings with file references, then a final line reading exactly 'VERDICT: SHIP' or 'VERDICT: ITERATE'. Be strict — a wrong-but-plausible result that ships is worse than another iteration."]
+
+    verdict [shape=parallelogram, timeout="30s", class="gate", max_retries=0,
+        goal_gate=true,
+        tool_command="n=$(cat attractor_runs/task-runner/state/iter 2>/dev/null || echo 0); tail -1 attractor_runs/task-runner/state/critique.md 2>/dev/null | grep -qx 'VERDICT: SHIP'; ok=$?; printf '{\"iteration\": %s, \"gate\": \"critique\", \"ship\": %s}\\n' \"$n\" \"$([ $ok -eq 0 ] && echo true || echo false)\" >> attractor_runs/task-runner/state/convergence.jsonl; [ $ok -eq 0 ] && printf ship || { sc=$(($(cat attractor_runs/task-runner/state/stall-count 2>/dev/null || echo 0)+1)); echo $sc > attractor_runs/task-runner/state/stall-count; if [ \"$sc\" -ge 3 ]; then printf stall; else printf iterate; exit 1; fi; }"]
+
+    feedback [shape=box, class="maker",
+        prompt="Read attractor_runs/task-runner/state/critique.md (and attractor_runs/task-runner/state/verify.log if relevant). Distill the SINGLE highest-leverage change for the next iteration into a new file in attractor_runs/task-runner/state/feedback/ — read attractor_runs/task-runner/state/iter for the current iteration number N and name the file N-next.md. Format: Key finding / What to change / Why it matters. Then curate the channel: consolidate or delete earlier feedback files that are now stale or addressed. Accumulated critique must descend toward the goal, not pile up into sludge."]
+
+    package [shape=box, class="maker",
+        prompt="Both gates passed. Prepare an uncommitted handoff. Read the current task, attractor_runs/task-runner/state/brief.md, attractor_runs/task-runner/state/critique.md and attractor_runs/task-runner/state/verify.log. Inspect the actual diff and write attractor_runs/task-runner/state/SHIPPED.md describing changed files, checks actually run, evidence locations, remaining uncertainty and review instructions. Do not commit, push, deploy, change branches or alter git configuration. Preserve unrelated work."]
+
+    ship_check [shape=parallelogram, timeout="30s", class="gate", max_retries=0,
+        tool_command="[ -s attractor_runs/task-runner/state/SHIPPED.md ] && printf shipped || printf dirty"]
+
+    postmortem [shape=box, class="gate",
+        must_write="attractor_runs/task-runner/state/postmortem/report.md",
+        prompt="The run has hit a decision point without convergence: either the iteration budget is exhausted (repeated verification failures) or the quality loop has stalled (repeated critique refusals on mechanically-green work). Read attractor_runs/task-runner/state/convergence.jsonl (the descent record), attractor_runs/task-runner/state/critique.md, attractor_runs/task-runner/state/verify.log, and attractor_runs/task-runner/state/feedback/. Write attractor_runs/task-runner/state/postmortem/report.md: what each iteration attempted, whether the loop was DESCENDING, OSCILLATING, or WANDERING (cite the convergence record), your best hypothesis for why it has not converged, and the options (continue with more budget / change approach / split the task / abandon). Be honest — this report is the value salvaged from a non-converging run."]
+
+    pm_gate [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="[ -s attractor_runs/task-runner/state/postmortem/report.md ] && printf ok || { echo 'POSTMORTEM REPORT MISSING — the postmortem node completed without writing it. Salvage from attractor_runs/task-runner/state/convergence.jsonl, attractor_runs/task-runner/state/verify.log, attractor_runs/task-runner/state/feedback/.' > attractor_runs/task-runner/state/postmortem/report.md; printf stub; }"]
+
+    escalate [shape=hexagon,
+        prompt="The runner could not converge within budget, or could not package cleanly. Review attractor_runs/task-runner/state/postmortem/ and attractor_runs/task-runner/state/convergence.jsonl before choosing.", label="Review the postmortem and choose whether to abandon or add iteration budget"]
+
+    bump_budget [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="B=$(cat attractor_runs/task-runner/state/budget) || exit 1; [ \"$B\" -lt 15 ] || exit 1; N=$((B+3)); [ $N -gt 15 ] && N=15; echo $N > attractor_runs/task-runner/state/budget; rm -f attractor_runs/task-runner/state/last-fail-sig; printf continue"]
+
+    abandon [shape=parallelogram, timeout="30s", class="glue", max_retries=0,
+        tool_command="echo 'ABANDONED: see attractor_runs/task-runner/state/postmortem/report.md and attractor_runs/task-runner/state/convergence.jsonl' >&2; exit 1"]
+
+    start -> setup
+    setup -> bad_input [condition="outcome=fail"]
+    setup -> orient    [condition="context.tool.output=ok"]
+    setup -> bad_input [condition="context.tool.output=missing"]
+
+    orient  -> attempt
+    attempt -> verify
+
+    verify -> critique [condition="context.tool.output=green && outcome=success"]
+    verify -> triage   [condition="outcome=fail"]
+    verify -> postmortem [condition="context.tool.output=exhausted && outcome=success", label="budget exhausted"]
+
+    triage -> attempt    [condition="context.tool.output=novel",     label="fix"]
+    triage -> diagnose   [condition="context.tool.output=repeat",    label="same failure twice"]
+    triage -> postmortem [condition="context.tool.output=exhausted", label="budget spent"]
+
+    diagnose -> diagnose_gate
+    diagnose_gate -> attempt  [condition="context.tool.output=continue", label="change course"]
+    diagnose_gate -> escalate [condition="context.tool.output=blocked"]
+
+    critique -> verdict
+    verdict  -> package   [condition="context.tool.output=ship && outcome=success"]
+    verdict  -> feedback  [condition="outcome=fail",                                    label="iterate"]
+    verdict  -> postmortem [condition="context.tool.output=stall && outcome=success", label="quality loop stalled — decision point"]
+    feedback -> attempt  [loop_restart="true", fidelity="truncate", label="fresh iteration, kept learning"]
+
+    critique -> verify [condition="outcome=fail", label="transient — re-enter via cheap gate"]
+    feedback -> verify [condition="outcome=fail", label="transient — re-enter via cheap gate"]
+    package  -> verify [condition="outcome=fail", label="transient — re-enter via cheap gate"]
+
+    package    -> ship_check
+    ship_check -> done     [condition="context.tool.output=shipped"]
+    ship_check -> escalate [condition="context.tool.output=dirty"]
+
+    postmortem -> pm_gate
+    pm_gate -> escalate
+    escalate -> abandon     [label="[A] Abandon — keep the postmortem"]
+    escalate -> bump_budget [label="[C] Continue — raise the budget"]
+    bump_budget -> abandon [condition="outcome=fail"]
+    bump_budget -> attempt
+
+}

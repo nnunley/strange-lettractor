@@ -72,6 +72,9 @@
             outcome (deref (:completion run) 10000 {:error {:category :test-timeout}})]
         (is (string? (:run_id run)))
         (is (= :success (get-in outcome [:value :status])) (pr-str outcome))
+        (is (= {:run_id (:run_id run) :state :completed :result outcome}
+               (:value (req h :workflow/result {:run_id (:run_id run)}))))
+        (is (= :unknown-run (get-in (req h :workflow/result {:run_id "missing"}) [:error :category])))
         (let [evs (filter #(= :workflow (:source %)) (events h client))]
           (is (every? #(= (:run_id run) (:run_id %)) evs))
           (is (some #(= :pipeline.started (get-in % [:event :type])) evs))
@@ -116,10 +119,15 @@
     (try
       (let [run (:value (req h :workflow/run {:dot_source dot :source_path (dot-file root) :logs_root (str root "/logs")}))]
         (is (true? (deref entered 3000 false)))
+        (let [reply (deref (hub/request! h {:id "inspect-running" :op :workflow/result :run_id (:run_id run)}) 1000 {})]
+          (is (= "inspect-running" (:id reply)))
+          (is (= {:run_id (:run_id run) :state :running} (:value reply))))
         (let [cancel (req h :workflow/cancel {:run_id (:run_id run)})
               outcome (deref (:completion run) 5000 {:error {:category :test-timeout}})]
           (is (nil? (:error cancel)) (pr-str cancel))
           (is (not= :test-timeout (get-in outcome [:error :category])) (pr-str outcome))
+          (is (= {:run_id (:run_id run) :state :completed :result outcome}
+                 (:value (req h :workflow/result {:run_id (:run_id run)}))))
           (is (not= :success (get-in outcome [:value :status])) (pr-str outcome)))
         (is (= 42 (get-in (eval! h {:code "42"}) [:value :value])) "hub still serves requests"))
       (finally (deliver release true) (stop h) (os/sh "/bin/rm" "-rf" "--" root)))))
@@ -132,13 +140,18 @@
             result (deref (:completion ok) 5000 {:error {:category :test-timeout}})]
         (is (string? (:agent_id ok)))
         (is (= "hello" (get-in result [:value :text])) (pr-str result))
+        (is (= {:agent_id (:agent_id ok) :state :completed :result result}
+               (:value (req h :agent/result {:agent_id (:agent_id ok)}))))
+        (is (= :unknown-agent-job (get-in (req h :agent/result {:agent_id "missing"}) [:error :category])))
         (let [evs (filter #(= :agent (:source %)) (events h client))]
           (is (every? #(= (:agent_id ok) (:agent_id %)) evs))
           (is (= ["héλ🙂"] (mapv #(get-in % [:event :text]) (filter #(= :text_delta (get-in % [:event :type])) evs)))
               (pr-str (mapv #(select-keys (:event %) [:type :text]) evs))))
         (let [bad (:value (req h :agent/run {:agent :claude :prompt "x" :scenario "error" :timeout_ms 3000}))
               failure (deref (:completion bad) 5000 {:error {:category :test-timeout}})]
-          (is (= :claude-result (get-in failure [:error :category])) (pr-str failure)))
+          (is (= :claude-result (get-in failure [:error :category])) (pr-str failure))
+          (is (= {:agent_id (:agent_id bad) :state :completed :result failure}
+                 (:value (req h :agent/result {:agent_id (:agent_id bad)})))))
         (is (= :unknown-agent (get-in (req h :agent/run {:agent :gemini :prompt "x"}) [:error :category])))
         (let [codex (:value (req h :agent/run {:agent :codex :prompt "via hub" :scenario "agent" :timeout_ms 5000}))
               result (deref (:completion codex) 8000 {:error {:category :test-timeout}})]
@@ -153,6 +166,8 @@
       (let [client (:value (req h :client/attach {}))
             w (:value (req h :agent/run {:agent :claude :prompt gate :scenario "gated" :timeout_ms 10000}))]
         (is (true? (await-true #(some (fn [e] (= :text_delta (get-in e [:event :type]))) (events h client)) 3000)))
+        (is (= {:agent_id (:agent_id w) :state :running}
+               (:value (req h :agent/result {:agent_id (:agent_id w)}))))
         (is (nil? (:error (req h :agent/cancel {:agent_id (:agent_id w)}))))
         (let [outcome (deref (:completion w) 5000 {:error {:category :test-timeout}})]
           (is (contains? #{:cancelled :claude-exit :claude-protocol} (get-in outcome [:error :category])) (pr-str outcome))))

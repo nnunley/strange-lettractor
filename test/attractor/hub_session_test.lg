@@ -25,8 +25,13 @@
         (let [client (:value (req h :client/attach {})) id (open-session h)
               first (submit h id "first")]
           (is (= "first" (:value (deref (:completion first) 3000 {}))))
+          (is (= {:session_id id :turn_id (:turn_id first) :state :completed :result {:value "first"}}
+                 (:value (req h :session/result {:session_id id :turn_id (:turn_id first)}))))
+          (is (= :unknown-turn (get-in (req h :session/result {:session_id id}) [:error :category])))
+          (is (= :unknown-session (get-in (req h :session/result {:session_id "missing" :turn_id (:turn_id first)}) [:error :category])))
           (let [second (submit h id "second")]
             (is (= "second" (:value (deref (:completion second) 3000 {}))))
+            (is (= :unknown-turn (get-in (req h :session/result {:session_id id :turn_id (:turn_id first)}) [:error :category])))
             (is (not= (:turn_id first) (:turn_id second))))
           (is (= ["first" "second"] (mapv :content (filter #(= :user (:role %)) (:messages (second @requests))))))
           (let [events (:events (hub/events-since h (:client_id client) (:cursor client)))]
@@ -53,6 +58,8 @@
                        (is (= true (deref entered 3000 false)))
                        (req h :client/detach {:client_id (:client_id client)}) turn))]
           (is (= :busy (get-in (req h :session/submit {:session_id a :text "duplicate"}) [:error :category])))
+          (is (= {:session_id a :turn_id (:turn_id turn) :state :running}
+                 (:value (req h :session/result {:session_id a :turn_id (:turn_id turn)}))))
           (let [fast (submit h b "fast")]
           (is (= "fast" (:value (deref (:completion fast) 3000 {}))))
           (is (= :pending (deref (:completion turn) 20 :pending)))
@@ -88,6 +95,7 @@
           (is (= "sibling" (:value (deref (:completion (submit h b "sibling")) 3000 {}))))
           (deliver release true)
           (is (= :cancelled (get-in (deref (:completion turn) 3000 {}) [:error :category])))
+          (is (= :cancelled (get-in (req h :session/result {:session_id a :turn_id (:turn_id turn)}) [:value :result :error :category])))
           (is (= :session-closed (get-in (req h :session/submit {:session_id a :text "again"}) [:error :category])))
           (let [failed (submit h b "fail")]
             (is (= :authentication (get-in (deref (:completion failed) 3000 {}) [:error :category])))
