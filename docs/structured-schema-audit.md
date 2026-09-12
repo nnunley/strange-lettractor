@@ -218,6 +218,33 @@ This addresses local-reference cycles; named anchors, dynamic references,
 resource scope, full dialect conformance, and deep finite-input stack bounds
 remain outside this evidence.
 
+## Exact numeric multiples
+
+`multipleOf` previously converted both operands to double and accepted quotients
+near an integer using a tolerance. That accepted `0.1000000000000001` as a
+multiple of `0.1`, erased odd parity above double's exact integer range, and
+accepted tiny nonzero quotients near zero. Double overflow also rejected valid
+large quotients. These violate the integer-quotient rule in
+[JSON Schema validation section 6.2.1](https://json-schema.org/draft/2020-12/json-schema-validation#section-6.2.1).
+
+The validator now uses native let-go `rationalize` on each operand and requires
+their exact quotient to be an integer. The primitive preserves integer values
+and uses the shortest decimal representation for floats, so `0.3` remains a
+multiple of `0.1` without rounding a nearby different value into acceptance.
+Non-finite numeric inputs cannot be rationalized and fail this constraint.
+
+Ten assertions failed before repair. `numeric_schema_contract_test.lg` passes
+4 tests/20 assertions after it, covering near-misses, negative instances, zero,
+large integers, extreme scales, invalid divisors, and rejection through both
+completion and streaming object generation. Equality tests (2/17), LLM tests
+(83/496), structured-stream tests (4/9), build, and whitespace checks pass.
+Log: `/tmp/attractor-numeric-schema-checks.log`.
+
+This removes arithmetic approximation within this constraint; it cannot recover
+precision already lost while decoding JSON. Arbitrary-precision JSON decoding
+and complete schema meta-validation remain separate gaps. The integrated
+1141/10264 suite result above predates this focused repair.
+
 Integrated verification after the recursion guard: `make test` exited 0 with
 1141 tests, 10264 assertions, and zero failures.
 Log: `/tmp/attractor-recursion-integration-suite.log`.

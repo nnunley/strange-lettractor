@@ -3719,12 +3719,13 @@
 
 (defn- json-multiple-of? [value divisor]
   (when (and (number? divisor) (pos? divisor))
-    (let [quotient (/ (double value) (double divisor))
-          nearest (math/round quotient)
-          tolerance (min 1.0e-7
-                         (max 1.0e-12
-                              (* 1.0e-12 (math/abs quotient))))]
-      (<= (math/abs (- quotient nearest)) tolerance))))
+    ;; rationalize preserves integers and interprets a float's shortest decimal
+    ;; representation exactly. No tolerance may erase a nonzero remainder, and
+    ;; converting the operands to doubles loses large integer parity.
+    (try
+      (integer? (/ (rationalize value) (rationalize divisor)))
+      ;; Non-finite values are not JSON numbers and cannot be rationalized.
+      (catch Object _ false))))
 
 (defn- validate-number-schema [value schema]
   (let [minimum (field schema :minimum)

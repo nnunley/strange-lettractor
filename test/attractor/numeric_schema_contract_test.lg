@@ -1,0 +1,41 @@
+(ns attractor.numeric-schema-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(deftest multiple-of-does-not-round-away-remainders
+  (doseq [[value divisor] [[0.1000000000000001 0.1]
+                           [-0.1000000000000001 0.1]
+                           [9007199254740993 2]
+                           [(bigint "100000000000000000000000000000000000001") 2]
+                           [1e-200 1e100]
+                           [1e-320 1e-200]]]
+    (is (false? (first (llm/validate-json-schema value {:multipleOf divisor}))))))
+
+(deftest exact-multiples-survive-decimal-representation-and-extreme-scales
+  (doseq [[value divisor] [[0.3 0.1] [-0.3 0.1] [0 0.1]
+                           [0.0075 0.0001]
+                           [9007199254740994 2]
+                           [(bigint "100000000000000000000000000000000000002") 2]
+                           [1e300 1e-100]
+                           [1e-300 1e-300]]]
+    (is (true? (first (llm/validate-json-schema value {:multipleOf divisor}))))))
+
+(deftest zero-negative-and-nonfinite-divisors-do-not-validate-numbers
+  (doseq [divisor [0 -1 (parse-double "Inf") (parse-double "NaN")]]
+    (is (false? (first (llm/validate-json-schema 1 {:multipleOf divisor}))))))
+
+(deftest generated-numeric-output-is-rejected-when-a-remainder-exists
+  (let [adapter (llm/make-adapter "fixture"
+                  (fn [_] {:message {:role :assistant :content "{\"amount\":0.1000000000000001}"}
+                           :tool_calls [] :usage {} :finish_reason :stop})
+                  (fn [_] [{:type :stream_start}
+                           {:type :text_delta :delta "{\"amount\":0.1000000000000001}"}
+                           {:type :finish :finish_reason :stop}]))
+        client (llm/make-client {:providers {"fixture" adapter}})
+        schema {:type "object" :properties {"amount" {:multipleOf 0.1}}}]
+    (doseq [invoke [(fn [] (llm/generate-object "fixture/model" "amount" schema {:client client}))
+                    (fn [] ((:object (llm/stream-object "fixture/model" "amount" schema
+                                       {:client client}))))]]
+      (is (= :no-object-generated
+             (try (invoke) :unexpected-success
+                  (catch Object e (:category (ex-data e)))))))))
