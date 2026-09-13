@@ -3514,6 +3514,41 @@
 (defn- schema-values-equal? [left right]
   (= (schema-comparison-value left) (schema-comparison-value right)))
 
+(defn- local-schema-children [schema]
+  ;; Only schema-valued keyword locations participate in identifier discovery.
+  ;; Objects inside defaults, examples, enum values, and annotations are data.
+  (filter map?
+    (concat
+      (mapcat (fn [key]
+                (let [entries (field schema key)]
+                  (when (map? entries) (vals entries))))
+              [:$defs :definitions :properties :patternProperties
+               :dependentSchemas :dependencies])
+      (map (fn [key] (field schema key))
+           [:items :additionalItems :contains :additionalProperties :propertyNames
+            :unevaluatedItems :unevaluatedProperties :not :if :then :else :contentSchema])
+      (mapcat (fn [key]
+                (let [entries (field schema key)]
+                  (when (vector? entries) entries)))
+              [:items :prefixItems :allOf :anyOf :oneOf]))))
+
+(defn- resolve-local-schema-anchor [root anchor]
+  (loop [pending [root] matches []]
+    (if (empty? pending)
+      (first matches)
+      (let [schema (peek pending)
+            matches (if (and (map? schema)
+                             (or (= anchor (field schema :$anchor))
+                                 (= anchor (field schema :$dynamicAnchor))))
+                      (conj matches schema) matches)]
+        ;; Duplicate names are ambiguous; never select by map iteration order.
+        (when (< (count matches) 2)
+          (recur (into (pop pending)
+                       (when (map? schema)
+                         (remove (fn [child] (:present (schema-field-entry child :$id)))
+                                 (local-schema-children schema))))
+                 matches))))))
+
 (defn- resolve-local-schema-ref [root reference]
   (let [reference (when (and (string? reference) (str/starts-with? reference "#"))
                     ;; io/decode uses query decoding; protect literal plus signs
@@ -3522,13 +3557,17 @@
                                     (str/replace (subs reference 1) "+" "%2B")))
                          (catch Object _ nil)))]
   (cond
-    (= reference "#") root
+    (= reference "#") {:schema root :document root}
     (and (string? reference) (str/starts-with? reference "#/"))
     (reduce
-      (fn [current segment]
-        (let [decoded (-> segment
+      (fn [location segment]
+        (let [current (:schema location)
+              document (if (and (map? current) (string? (field current :$id)))
+                         current (:document location))
+              decoded (-> segment
                           (str/replace "~1" "/")
-                          (str/replace "~0" "~"))]
+                          (str/replace "~0" "~"))
+              child
           (cond
             (not (re-matches #"(?:[^~]|~[01])*" segment)) nil
             (map? current)
@@ -3540,15 +3579,19 @@
               (when (and (some? index) (<= 0 index) (< index (count current)))
                 (get current index)))
 
-            :else nil)))
-      root
+            :else nil)]
+          (when (some? child) {:schema child :document document})))
+      {:schema root :document root}
       (str/split (subs reference 2) #"/"))
+    (and (string? reference) (re-matches #"#[A-Za-z_][A-Za-z0-9_.-]*" reference))
+    (when-let [schema (resolve-local-schema-anchor root (subs reference 1))]
+      {:schema schema :document root})
     :else nil)))
 
 (declare validate-json-schema*)
 
 (defn- validate-schema-reference [value schema state reference]
-  (let [visit [reference value]]
+  (let [visit [(:document state) reference value]]
     (when (contains? (:active_refs state) visit)
       ;; Propagate outside applicator boolean logic: `not` must not turn an
       ;; invalid cyclic schema into successful instance validation.
@@ -3752,7 +3795,8 @@
     (= schema false) [false "Schema rejects this value"]
     (not (map? schema)) [false "Schema must be an object or boolean"]
     :else
-    (let [reference-entry (schema-field-entry schema :$ref)
+    (let [root (if (string? (field schema :$id)) (assoc root :document schema) root)
+          reference-entry (schema-field-entry schema :$ref)
           reference (:value reference-entry)
           resolved (when reference (resolve-local-schema-ref (:document root) reference))
           enum-entry (schema-field-entry schema :enum)
@@ -3786,7 +3830,8 @@
                     (when (:present branch)
                       [(validate-json-schema* value (:value branch) root)])))
                 (when (:present reference-entry)
-                  [(validate-schema-reference value resolved root reference)])
+                  [(validate-schema-reference value (:schema resolved)
+                     (assoc root :document (:document resolved)) reference)])
                 (when (:present all-of-entry)
                   [(validate-schema-list value (:value all-of-entry) root :all)])
                 (when (:present any-of-entry)

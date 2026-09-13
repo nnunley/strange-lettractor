@@ -250,3 +250,30 @@ Integrated verification after the recursion guard: `make test` exited 0 with
 Log: `/tmp/attractor-recursion-integration-suite.log`.
 A focused independent review found no blocking correctness issues in the guard
 or omitted-model routing; it did not claim exhaustive schema or provider coverage.
+
+## Named anchors and embedded resource scope
+
+Fragment-local `$ref` now resolves `$anchor` and static `$dynamicAnchor` targets
+after URI decoding. Discovery visits schema-valued keyword locations, ignores
+annotation data, and stops at embedded `$id` resource boundaries. Invalid names,
+missing targets, and duplicate anchors fail resolution. Ordinary reference
+siblings still apply. These rules follow
+[JSON Schema core section 8.2.2](https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.2).
+
+Direct evaluation and JSON Pointer traversal both preserve the nearest embedded
+resource as the base for subsequent local references. Cycle detection includes
+that resource alongside the reference and instance value.
+
+Twelve anchor assertions failed before implementation; six additional embedded
+resource assertions failed before the scope repair. The final anchor namespace
+passes 6 tests/36 assertions, pointer references 4/27, recursion 4/22, LLM 83/496,
+and structured streaming 4/9. Build and whitespace checks pass. A focused
+independent review found no important issues within this local-reference scope.
+Log: `/tmp/attractor-schema-anchor-final-checks.log`.
+
+Absolute and relative URI references, dynamic `$dynamicRef` scope, dialect
+selection, and full schema meta-validation remain unimplemented. Static use of
+`$dynamicAnchor` does not provide dynamic-reference support.
+
+Integrated verification: `make test` exited 0 with 1153 tests, 10330 assertions,
+and zero failures. Log: `/tmp/attractor-schema-anchor-suite.log`.

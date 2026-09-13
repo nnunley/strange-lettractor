@@ -1,0 +1,66 @@
+(ns attractor.schema-anchor-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.llm :as llm]))
+
+(deftest named-references-resolve-anchors-and-apply-siblings
+  (doseq [anchor-key [:$anchor :$dynamicAnchor]
+          reference ["#positive" "#posit%69ve"]]
+    (let [schema {:$defs {:number {anchor-key "positive" :type "integer" :minimum 1}}
+                  :$ref reference :maximum 5}]
+      (is (true? (first (llm/validate-json-schema 3 schema))))
+      (is (false? (first (llm/validate-json-schema 0 schema))))
+      (is (false? (first (llm/validate-json-schema 6 schema)))))))
+
+(deftest anchors-are-found-in-recognized-nested-schema-locations
+  (doseq [location [{:$defs {:deep {:properties {"value" {:$anchor "target" :const 7}}}}}
+                    {:definitions {:deep {:items [{:$anchor "target" :const 7}]}}}
+                    {:allOf [{:if {:not {:$anchor "target" :const 7}}}]}
+                    {:dependentSchemas {"unused" {:contains {:$anchor "target" :const 7}}}}]]
+    ;; The location's other constraints need not apply to find its anchor.
+    (is (true? (first (llm/validate-json-schema 7 (assoc location :$ref "#target")))))))
+
+(deftest annotation-data-and-other-resources-do-not-supply-local-anchors
+  (doseq [location [{:default {:$anchor "target"}}
+                    {:examples [{:$anchor "target"}]}
+                    {:unknown {:$anchor "target"}}
+                    {:$defs {:inner {:$id "inner.json" :$anchor "target"}}}]]
+    (is (= [false "Unresolved schema reference: #target"]
+           (llm/validate-json-schema {} (assoc location :$ref "#target")))))
+  (is (true? (first (llm/validate-json-schema 7
+                     {:$id "https://example.invalid/root.json"
+                      :$defs {:outer {:$anchor "target" :const 7}
+                              :inner {:$id "inner.json" :$anchor "target" :const 8}}
+                      :$ref "#target"})))))
+
+(deftest malformed-and-ambiguous-anchor-names-do-not-resolve
+  (doseq [anchor ["1bad" "bad name" "bad+name" "bad/name"]]
+    (is (false? (first (llm/validate-json-schema 3
+                        {:$defs {:entry {:$anchor anchor}}
+                         :$ref (str "#" anchor)})))))
+  (is (false? (first (llm/validate-json-schema 3
+                      {:$defs {:a {:$anchor "duplicate"}
+                               :b {:$anchor "duplicate"}}
+                       :$ref "#duplicate"})))))
+
+(deftest references-use-the-nearest-enclosing-resource
+  (let [inner {:$id "inner.json"
+               :$defs {:target {:$anchor "target" :const 8}
+                       :use {:$ref "#target"}}
+               :$ref "#target"}
+        root {:$defs {:outer {:$anchor "target" :const 7} :inner inner}}]
+    (doseq [child [inner {:$ref "#/$defs/inner"}
+                   {:$ref "#/$defs/inner/$defs/use"}]]
+      (let [schema (assoc root :properties {"value" child})]
+        (is (true? (first (llm/validate-json-schema {"value" 8} schema))))
+        (is (false? (first (llm/validate-json-schema {"value" 7} schema))))))))
+
+(deftest root-anchors-preserve-finite-recursion-and-reject-cycles
+  (let [schema {"$anchor" "node" "type" "object" "required" ["name"]
+                "properties" {"name" {"type" "string"}
+                              "child" {"$ref" "#node"}}}]
+    (is (true? (first (llm/validate-json-schema {"name" "root" "child" {"name" "leaf"}} schema))))
+    (is (false? (first (llm/validate-json-schema {"name" "root" "child" {"name" 7}} schema)))))
+  (let [[valid? reason] (llm/validate-json-schema {} {:$anchor "cycle" :not {:$ref "#cycle"}})]
+    (is (false? valid?))
+    (is (str/includes? reason "Cyclic schema reference"))))
