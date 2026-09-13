@@ -35,7 +35,7 @@ help: ## Show this help
 
 check-runtime: ## Fail unless LGX_LG names an executable let-go runtime
 	@test -x "$(LG)" || { echo "LGX_LG is not an executable runtime: '$(LG)'"; \
-	  echo "Build let-go from the fix/http-scope-cancellation bookmark and set LGX_LG (see README)."; exit 1; }
+	  echo "Build the pinned, patched let-go runtime and set LGX_LG (see README)."; exit 1; }
 	@"$(LG)" -e '(println (str "let-go " (or (System/getProperty "lg.version") "ok")))' >/dev/null 2>&1 || true
 
 install: check-runtime ## Fetch pinned dependencies (tiny-tui) with lgx

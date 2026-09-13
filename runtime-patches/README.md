@@ -1,5 +1,11 @@
 # Local runtime patches
 
+For the complete pinned build recipe, follow [the project README](../README.md#build-and-run).
+Both patches apply to fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755`;
+a fresh clone with them passes the Attractor suite and native transport probes.
+See [runtime build evidence](../docs/runtime-build-audit.md) for commands,
+patch hashes, and the distinction from an upstream release.
+
 ## Owned TCP listeners
 
 `net-listener.patch` adds native `net/listen`, `net/local-address`, and

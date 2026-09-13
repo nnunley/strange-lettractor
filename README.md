@@ -17,44 +17,49 @@ does both, in let-go:
 
 | Upstream README item | Where it lives here | Evidence |
 |---|---|---|
-| Attractor Specification | `src/attractor/{parser,engine,handlers,server,...}.lg` | all 33 stories done or proved: [ledger](docs/superpowers/iterations/requirements/attractor.md) |
-| Coding Agent Loop Specification | `src/attractor/{agent,profiles,execution,subagent}.lg` (own loop, no external agent SDK) | 8 of 13 stories done at component level, 5 partial with named residuals: [ledger](docs/superpowers/iterations/requirements/coding-agent-loop.md) |
-| Unified LLM Client Specification | `src/attractor/llm.lg` (own SDK: native OpenAI, Anthropic, Gemini adapters plus `openai-compat`) | 10 of 12 stories done at component level; release gate credential-gated: [ledger](docs/superpowers/iterations/requirements/unified-llm.md) |
+| Attractor Specification | `src/attractor/{parser,engine,handlers,server,...}.lg` | [Runtime requirements and evidence](docs/superpowers/iterations/requirements/attractor.md) |
+| Coding Agent Loop Specification | `src/attractor/{agent,profiles,execution,subagent}.lg` (own loop, no external agent SDK) | [Component, native-wire, and live evidence](docs/superpowers/iterations/requirements/coding-agent-loop.md) |
+| Unified LLM Client Specification | `src/attractor/llm.lg` (own SDK: native OpenAI, Anthropic, Gemini adapters plus `openai-compat`) | [Component checks and remaining schema/provider gaps](docs/superpowers/iterations/requirements/unified-llm.md) |
 | "Build your own software factory" | `bin/attractor run`, `console`, `agent`, `serve` | [tutorial](docs/tutorial.md), [behavior corpus](docs/superpowers/iterations/behavior-corpus.md) |
 
-Every claim in the ledgers is backed by a runnable check in the behavior
-corpus; the full suite is `lgx test`. What is not closed is stated in the
-ledgers rather than implied: live OpenAI/Anthropic/Gemini parity needs real
-API keys for `test/live/provider_matrix.lg`, and the partial coding-loop rows
-list their residuals. Full specification conformance is therefore claimed at
-component level, not as a live release.
+The ledgers and audits distinguish tested behavior from remaining requirements;
+the full suite is `lgx test`. Native-provider live coverage and full schema
+conformance remain incomplete. See the [current specification audit](docs/original-spec-status.md)
+for verified results and remaining gaps. Historical story counts alone do not
+establish full specification conformance.
 
-It is built with [lgx](https://github.com/abogoyavlensky/lgx) and requires let-go 1.12.2 or newer.
+It is built with [lgx](https://github.com/abogoyavlensky/lgx) and uses the pinned,
+patched let-go runtime described below.
 
 ## Build and run
 
 Prerequisites:
 
 - [lgx](https://github.com/abogoyavlensky/lgx) 0.1.0-rc2 or newer.
-- A let-go 1.12.2+ executable with local runtime fixes that upstream has not
-  released yet (nooga/let-go [#816](https://github.com/nooga/let-go/issues/816),
-  [#830](https://github.com/nooga/let-go/issues/830), [#831](https://github.com/nooga/let-go/issues/831),
-  [#832](https://github.com/nooga/let-go/issues/832), [#833](https://github.com/nooga/let-go/issues/833),
-  [#844](https://github.com/nooga/let-go/issues/844), [#845](https://github.com/nooga/let-go/issues/845)).
-  Build it from the
-  [`fix/http-scope-cancellation`](https://github.com/nnunley/let-go/tree/fix/http-scope-cancellation)
-  branch of the let-go fork and point `LGX_LG` at the result:
+- Go 1.26.5 to build the runtime. From this Attractor checkout, clone the pinned
+  [let-go fork revision](https://github.com/nnunley/let-go/commit/46244c4fa8169b8138aa1c29f31c8a6102ed1755),
+  apply the tracked TCP-listener and JSON-key patches, then point `LGX_LG` at
+  the resulting executable:
 
   ```sh
-  git clone -b fix/http-scope-cancellation https://github.com/nnunley/let-go.git
-  cd let-go && go build -o build/lg .
-  export LGX_LG=$PWD/build/lg
+  git clone https://github.com/nnunley/let-go.git .worktrees/let-go-pinned
+  git -C .worktrees/let-go-pinned checkout --detach 46244c4fa8169b8138aa1c29f31c8a6102ed1755
+  git -C .worktrees/let-go-pinned apply --check \
+    "$PWD/runtime-patches/net-listener.patch" \
+    "$PWD/runtime-patches/json-string-keys.patch"
+  git -C .worktrees/let-go-pinned apply \
+    "$PWD/runtime-patches/net-listener.patch" \
+    "$PWD/runtime-patches/json-string-keys.patch"
+  (cd .worktrees/let-go-pinned && go build -o build/lg .)
+  export LGX_LG="$PWD/.worktrees/let-go-pinned/build/lg"
   ```
 
-  A
-  stock release runs most of the suite, but the console's evaluation capture
-  and held-stream cancellation depend on those fixes; see
-  [let-go follow-ups](docs/let-go-followups.md).
+  The pinned revision supplies the evaluation, reader, cancellation, and timeout
+  fixes. The two additional patches supply the native nREPL listener and correct
+  JSON object keys. Run the clone/apply steps once in a new destination; reuse
+  the resulting binary for subsequent Attractor builds. See
+  [runtime build evidence](docs/runtime-build-audit.md) and
+  [upstream follow-ups](docs/let-go-followups.md) for release status.
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
   OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for

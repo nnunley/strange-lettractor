@@ -8,12 +8,15 @@ and validation. It is now fixed with failing-before/passing-after and compiled
 CLI evidence. See [runtime-execution-audit.md](runtime-execution-audit.md).
 The status ledger must not be used as proof that no implementation gaps remain.
 
-Latest integrated verification: `make test` passes 1141 tests and 10264 assertions
+Latest integrated verification: `make test` passes 1145 tests and 10284 assertions
 with zero failures. This includes current Anthropic request compatibility and
 omitted-model selection after middleware routing, and recursive-schema cycle
-rejection; see `default-model-audit.md` and `structured-schema-audit.md`.
+rejection and exact numeric multiples; see `default-model-audit.md` and
+`structured-schema-audit.md`. This run uses a fresh clone of the documented
+pinned runtime with both tracked patches; its build and native nREPL probes
+also pass, as recorded in `runtime-build-audit.md`.
 It does not close the live-provider, schema-conformance, or release-runtime gaps
-below. Log: `/tmp/attractor-recursion-integration-suite.log`.
+below. Log: `/tmp/attractor-pinned-runtime-suite.log`.
 
 The subsequent parsing, condition and human-interaction audits are recorded in
 `runtime-parsing-validation-audit.md`, `runtime-condition-audit.md` and
@@ -65,11 +68,14 @@ Remaining original-scope closure work:
   OpenAI Responses and Anthropic Messages protocol runs, plus a Gemini model run
   through OpenRouter; that last file does not establish Gemini native-protocol
   parity. Existing artifacts still require requirement-by-requirement assessment.
-- Runtime compatibility remains tied to the patched local let-go build. Verify
-  reader, cancellation and HTTP timeout behavior on the intended release runtime.
-  `let-go-followups.md` records residuals and proposed upstream fixes; its historical
-  restoration instructions also need reconciliation. This is not a claim that
-  those fixes are absent in the configured local runtime.
+- Runtime build reproducibility is now verified from a fresh clone of pinned
+  fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755` plus the two tracked
+  patches. The full suite, build, listener probe, and compiled nREPL attachment
+  pass. A stock upstream release containing the required changes remains
+  unavailable; recheck reader, cancellation, and HTTP timeout behavior when
+  moving to one. `let-go-followups.md` records the remaining upstream items and
+  historical restoration notes; `runtime-build-audit.md` records the supported
+  build that no longer depends on the old ignored source snapshot.
 
 Scope distinction: recursive context-budgeted development planning/execution,
 automatic local-to-frontier escalation, paired development review, CSS custom

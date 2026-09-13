@@ -1,5 +1,13 @@
 # Upstream let-go follow-ups
 
+2026-09-12 release recheck: GitHub's latest release remains
+[v1.12.2](https://github.com/nooga/let-go/releases/tag/v1.12.2), published July 20.
+PRs #848–#855 have merged, while #856 remains open. The earlier statement below
+that those eight PRs still await merging is historical. Merged changes are not
+yet evidence of a released runtime containing them. The reproducible build now
+pins fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755` and applies both
+tracked runtime patches; see [runtime build evidence](runtime-build-audit.md).
+
 2026-09-12: the configured local runtime also needs the JSON string-key fix in
 [`runtime-patches/README.md`](../runtime-patches/README.md). HTTP question IDs and
 context keys previously included reader quotes. The native compiled-server probe
