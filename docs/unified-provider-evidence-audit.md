@@ -20,14 +20,14 @@ claimed by this audit.
 | --- | --- |
 | Simple text | Recorded text journeys check requested response content |
 | Streaming text | Text-delta and reconstructed-response checks exist |
-| Base64 image | Spatial color check passes through Messages gateway; Responses GPT-4.1 mini gives wrong colors; Gemini native pending. See image-content evidence below. |
+| Base64 image | Spatial color check and exact wire payload pass through Messages/Opus 4.6 and Responses/GPT-5.2 gateways. Earlier GPT-4.1 mini failures remain retained; Gemini native pending. |
 | URL image | Exact URL serialization and subject/color answers pass through Responses and Messages gateways; Gemini native pending |
 | Single tool plus execution | Checks execution and incorporation of supplied result |
 | Multiple parallel tools | Passes locally and through Responses/Messages gateway endpoints; Gemini native pending |
 | Three or more tool rounds | Passes locally and through Responses/Messages gateway endpoints; Gemini native pending |
 | Streaming tools | Passes locally and through Responses/Messages gateway endpoints; Gemini native pending |
 | Structured output | Checks required city/country string values |
-| Reasoning-token reporting | Responses GPT-5.2 gateway reports 1183 tokens; Messages reports a positive estimate but fails the arithmetic journey; Gemini native pending |
+| Reasoning-token reporting | Responses GPT-5.2 gateway passes. Messages/Opus 4.6 reports a positive estimate and correct residue but fails the requested final-answer format; Haiku's earlier arithmetic failure remains retained. Gemini native pending. |
 | Invalid key | Authentication category recorded through Responses/Messages gateway endpoints |
 | Rate limiting | No live journey in this runner; transport fixtures are distinct evidence |
 | Accurate usage | Live normalized/raw comparisons pass for Responses and Messages gateways; Gemini native pending. Optional/raw aggregation fixed; see `usage-aggregation.md`. |
@@ -219,3 +219,51 @@ This proves option transmission and request acceptance, not undocumented
 server-side effects of metadata. Existing adapter tests separately cover
 portable-setting overrides and beta headers. Combined verifier checks pass
 8 tests/43 assertions.
+
+## Stronger-model follow-up
+
+The existing image and reasoning predicates were rerun without relaxing them.
+`provider-capable-image-followup.edn` records base64-image passes for both
+`or-responses/openai/gpt-5.2` and `or-messages/anthropic/claude-opus-4.6`.
+Both serialized image payloads match the fixture and both answers are
+`red, blue`. This supplies successful live evidence for each native adapter's
+image path through the gateway while preserving the earlier Mini failures.
+
+`provider-capable-model-followup.edn` contains reasoning-only results:
+GPT-5.2 passes with 1172 reported reasoning tokens. Opus 4.6 returns the correct
+residue 353 and an estimated 296 reasoning tokens, but also supplies an
+explanation despite the requested final-integer-only response. The strict
+journey therefore remains failed under its existing `incorrect-reasoning-answer`
+category; the retained text demonstrates a format violation, not wrong arithmetic.
+No hidden thinking blocks are retained in the report.
+
+A direct Anthropic preflight using the configured `claude-gw` alias reaches
+`api.anthropic.com` and fails with the low-credit-balance response, classified as
+`quota-exceeded`: `provider-direct-anthropic-preflight.edn`. The sandbox DNS
+failure was followed by this network-authorized check. Direct first-party
+completion is still not established. OpenAI and Gemini built-ins have no
+configured credentials in this environment.
+
+## Reject misspelled journey selections
+
+The runner silently ignored unknown names in `ATTRACTOR_MATRIX_JOURNEYS`.
+For example, `image,reasoning` executed only reasoning because the image journey
+is named `image-base64`. A mixed selection could therefore report successful
+execution without running everything the caller requested.
+
+Configured-provider runs now reject unknown names before executing a journey or
+writing a report, listing the available names. The selection helper preserves
+declared order and action functions; nil selects all, and an empty set selects
+none. Verifier tests pass 14 tests/85 assertions, including mixed valid/invalid
+selection. An actual runner invocation with `image,reasoning` exits 1 with the
+unknown-name diagnostic and creates no evidence file. Log:
+`/tmp/attractor-invalid-journey-check.log`. The previous 1145-test integrated
+result predates this focused runner change.
+
+Reproduce the retained successful image rows using the credential-free
+`test/live/openrouter_protocols.edn` overlay, provider filter
+`or-responses,or-messages`, model overrides `openai/gpt-5.2` and
+`anthropic/claude-opus-4.6`, and journey filter `image-base64`. Reasoning is a
+separate `reasoning` selection. Keep separate evidence paths so later runs do
+not overwrite earlier failures. Native Gemini, first-party completion, live
+rate limiting, and the other open release requirements remain unproved.

@@ -1,6 +1,19 @@
 (ns live.provider-matrix-checks
   (:require [clojure.string :as str]))
 
+(defn select-journeys [entries selected]
+  (let [available (mapv first entries)
+        known (set available)
+        unknown (vec (sort (remove known selected)))]
+    (when (seq unknown)
+      (throw (ex-info (str "Unknown provider-matrix journeys: " (pr-str unknown)
+                          "; available: " (pr-str available))
+                      {:category :invalid-journey-selection
+                       :unknown_journeys unknown :available_journeys available})))
+    (if (nil? selected)
+      (vec entries)
+      (vec (filter (fn [[name _]] (contains? selected name)) entries)))))
+
 (defn url-image-wire-evidence [protocol body url]
   (let [[images expected]
         (case protocol

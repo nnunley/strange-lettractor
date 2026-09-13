@@ -5,7 +5,8 @@
    per protocol; a Chat Completions provider runs only when
    ATTRACTOR_<ID>_MODEL names its model (ATTRACTOR_COMPAT_MODEL still works
    for openai-compat). ATTRACTOR_MATRIX_PROVIDERS=a,b restricts the run.
-   ATTRACTOR_MATRIX_JOURNEYS filters journey names; ATTRACTOR_MATRIX_EVIDENCE
+   ATTRACTOR_MATRIX_JOURNEYS filters journey names (unknown names are errors
+   before any configured-provider journey runs); ATTRACTOR_MATRIX_EVIDENCE
    selects a separate report path for focused runs.
    A provider without a key or model is recorded as :skipped, never as a
    pass. Exit 0 only when every provider that ran passed every journey; exit
@@ -235,8 +236,8 @@
           (os/exit 3))
       (let [only-journeys (when-let [v (env "ATTRACTOR_MATRIX_JOURNEYS")]
                             (set (map keyword (map str/trim (str/split v #",")))))
-            rows (vec (for [t targets j (journeys t)
-                            :when (or (nil? only-journeys) (contains? only-journeys (first j)))]
+            rows (vec (for [t targets
+                            j (checks/select-journeys (journeys t) only-journeys)]
                         (run-journey t j)))
             evidence {:scenario "SCN-PROVIDER-MATRIX" :recorded_at (str (System/currentTimeMillis))
                       :providers (mapv #(select-keys % [:provider :model]) targets) :rows rows}]

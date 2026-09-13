@@ -3,6 +3,24 @@
             [clojure.core :as core]
             [live.provider-matrix-checks :as checks]))
 
+(deftest journey-selection-rejects-unknown-names-including-mixed-selections
+  (let [entries [[:text (fn [] "pong")] [:image-base64 (fn [] "red, blue")]]]
+    (doseq [selected [#{:image} #{:text :image}]]
+      (let [error (try (checks/select-journeys entries selected) nil
+                       (catch Object e e))]
+        (is (= :invalid-journey-selection (:category (ex-data error))))
+        (is (= [:image] (:unknown_journeys (ex-data error))))
+        (is (= [:text :image-base64] (:available_journeys (ex-data error))))))))
+
+(deftest journey-selection-retains-actions-and-declared-order
+  (let [entries [[:text (fn [] "pong")] [:image-base64 (fn [] "red, blue")]]]
+    (is (= entries (checks/select-journeys entries nil)))
+    (is (= [] (checks/select-journeys entries #{})))
+    (is (= [:text :image-base64]
+           (mapv first (checks/select-journeys entries #{:image-base64 :text}))))
+    (is (= "red, blue"
+           ((second (first (checks/select-journeys entries #{:image-base64}))))))))
+
 (deftest url-image-evidence-requires-subject-and-visible-color
   (is (= "cat, orange" (:response_text (checks/url-image-evidence "cat, orange"))))
   (doseq [text [nil "" "cat" "cat, black" "dog, orange"]]
