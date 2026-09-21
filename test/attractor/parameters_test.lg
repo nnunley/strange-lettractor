@@ -1,0 +1,53 @@
+(ns attractor.parameters-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.parameters :as parameters]
+            [attractor.validation]))
+
+(deftest parameter-names-are-lowercase-identifiers
+  (doseq [good ["editable" "run_cmd" "max_iterations" "a1"]]
+    (is (true? (parameters/valid-name? good)) good))
+  (doseq [bad ["Editable" "run-cmd" "1st" "_leading" ""]]
+    (is (false? (parameters/valid-name? bad)) bad)))
+
+(deftest declarations-parse-into-records-with-defaults
+  (let [res (parameters/parse-declarations
+              "[{:name :editable :type :string :default \"solve.lg\" :export true}
+                {:name :direction :type [:enum \"min\" \"max\"] :default \"min\" :delegable true}]")]
+    (is (= [] (:errors res)))
+    (is (= 2 (count (:declarations res))))
+    (let [d (first (:declarations res))]
+      (is (= "editable" (:name d)))
+      (is (= :string (:type d)))
+      (is (= "solve.lg" (:default d)))
+      (is (true? (:export d)))
+      (is (false? (:delegable d))))))
+
+(deftest absent-params-attribute-declares-nothing
+  (is (= {:declarations [] :errors []} (parameters/parse-declarations nil)))
+  (is (= {:declarations [] :errors []} (parameters/parse-declarations "  "))))
+
+(deftest duplicate-name-is-an-error
+  (let [res (parameters/parse-declarations
+              "[{:name :editable :type :string} {:name :editable :type :int}]")]
+    (is (some #(clojure.string/includes? % "duplicate") (:errors res)))))
+
+(deftest default-must-match-declared-type
+  (let [res (parameters/parse-declarations
+              "[{:name :max_iterations :type :int :default \"many\"}]")]
+    (is (some #(clojure.string/includes? % "max_iterations") (:errors res)))))
+
+(deftest unknown-type-is-an-error
+  (let [res (parameters/parse-declarations "[{:name :x :type :duration}]")]
+    (is (some #(clojure.string/includes? % "duration") (:errors res)))))
+
+(deftest legacy-comma-separated-form-names-the-declaration-form
+  (let [res (parameters/parse-declarations "task_file, target_dir, max_iterations")]
+    (is (some #(clojure.string/includes? % "comma-separated") (:errors res)))
+    (is (some #(clojure.string/includes? % ":name") (:errors res)))))
+
+(deftest validation-reports-declaration-errors
+  (let [graph {:nodes {} :edges [] :attrs {:params "[{:name :x :type :duration}]"}}
+        diags (filter #(= "parameter_declaration" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (= :error (:severity (first diags))))))

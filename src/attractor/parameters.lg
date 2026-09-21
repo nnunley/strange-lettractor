@@ -1,0 +1,79 @@
+(ns attractor.parameters
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]))
+
+(def ^:private name-pattern #"[a-z][a-z0-9_]*")
+
+(defn valid-name? [s]
+  (boolean (and (string? s) (re-matches name-pattern s))))
+
+(defn- enum-type? [t]
+  (and (vector? t) (= :enum (first t)) (seq (rest t))
+       (every? string? (rest t))))
+
+(defn- known-type? [t]
+  (or (= :string t) (= :int t) (enum-type? t)))
+
+(defn- default-matches? [t v]
+  (cond
+    (= :string t) (string? v)
+    (= :int t) (integer? v)
+    (enum-type? t) (contains? (set (rest t)) v)
+    :else false))
+
+(defn- legacy-form? [text]
+  ;; Upstream spells params as a bare comma-separated name list.
+  (boolean (re-matches #"\s*[a-z][a-z0-9_]*(\s*,\s*[a-z][a-z0-9_]*)*\s*" text)))
+
+(defn- read-one [raw]
+  (let [nm (:name raw)
+        nm (cond (keyword? nm) (name nm) (string? nm) nm :else nil)
+        t (:type raw)]
+    (cond
+      (not (valid-name? nm))
+      {:error (str "invalid parameter name: " (pr-str (:name raw)))}
+
+      (not (known-type? t))
+      {:error (str "parameter '" nm "' has unknown type " (pr-str t))}
+
+      (and (contains? raw :default) (not (default-matches? t (:default raw))))
+      {:error (str "parameter '" nm "' default " (pr-str (:default raw))
+                   " is not a " (pr-str t))}
+
+      :else
+      {:declaration {:name nm :type t
+                     :default (get raw :default)
+                     :has_default (contains? raw :default)
+                     :doc (or (:doc raw) "")
+                     :export (true? (:export raw))
+                     :delegable (true? (:delegable raw))}})))
+
+(defn parse-declarations [attr-value]
+  (let [text (str (or attr-value ""))]
+    (if (str/blank? text)
+      {:declarations [] :errors []}
+      (if (legacy-form? text)
+        {:declarations []
+         :errors [(str "'params' is a comma-separated name list; this runtime "
+                       "expects a vector of declarations, e.g. "
+                       "[{:name :task_file :type :string}]")]}
+        (let [parsed (try (edn/read-string text) (catch Object e {::bad (str e)}))]
+          (cond
+            (and (map? parsed) (contains? parsed ::bad))
+            {:declarations [] :errors [(str "'params' is not readable EDN: " (::bad parsed))]}
+
+            (not (vector? parsed))
+            {:declarations [] :errors ["'params' must be a vector of declarations"]}
+
+            :else
+            (let [results (mapv read-one parsed)
+                  decls (vec (keep :declaration results))
+                  errs (vec (keep :error results))
+                  dup (->> (map :name decls)
+                           frequencies
+                           (filter (fn [[_ n]] (> n 1)))
+                           (map first)
+                           sort)]
+              {:declarations decls
+               :errors (vec (concat errs
+                                    (map #(str "duplicate parameter name '" % "'") dup)))})))))))
