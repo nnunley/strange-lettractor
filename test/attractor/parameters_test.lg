@@ -131,3 +131,22 @@
                :nodes {"n" {:id "n" :class "r" :shape "box" :attrs {}}}}
         out (attractor.transforms/apply-transforms graph [] {"model" "haiku"})]
     (is (= "haiku" (get-in out [:nodes "n" :llm_model])))))
+
+(deftest undeclared-references-are-validation-errors
+  (let [graph {:attrs {:params "[{:name :editable :type :string}]"}
+               :nodes {"guard" {:id "guard" :tool_command "sh ar.sh {{editble}}"
+                                :attrs {:tool_command "sh ar.sh {{editble}}"}}}
+               :edges []}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "editble"))
+    (is (clojure.string/includes? (:message (first diags)) "guard"))))
+
+(deftest a-declared-but-unsupplied-reference-is-not-a-validation-error
+  (let [graph {:attrs {:params "[{:name :editable :type :string}]"}
+               :nodes {"guard" {:id "guard" :tool_command "sh ar.sh {{editable}}"
+                                :attrs {:tool_command "sh ar.sh {{editable}}"}}}
+               :edges []}]
+    (is (empty? (filter #(= "parameter_reference" (:rule %))
+                        (attractor.validation/validate graph))))))

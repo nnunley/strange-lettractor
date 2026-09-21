@@ -132,3 +132,36 @@
                   (or (:edges graph) []))]
       (assoc top :attrs attrs :nodes nodes :edges (vec edges)
                  :parameter_references refs))))
+
+(defn- refs-in [text]
+  (if-not (string? text)
+    []
+    (loop [i 0 found []]
+      (let [open (str/index-of text "{{" i)]
+        (if (nil? open)
+          found
+          (if (and (<= (+ open 4) (count text)) (= "{{{{" (subs text open (+ open 4))))
+            (recur (+ open 4) found)
+            (let [close (str/index-of text "}}" (+ open 2))
+                  nm (when close (subs text (+ open 2) close))]
+              (if (and close (valid-name? nm))
+                (recur (+ close 2) (conj found nm))
+                (recur (+ open 2) found)))))))))
+
+(defn find-references [graph]
+  (let [scan (fn [m where]
+               (mapcat (fn [[k v]]
+                         (map (fn [nm] (merge {:name nm :attr k} where)) (refs-in v)))
+                       m))]
+    (vec (concat
+           (scan (dissoc graph :nodes :edges :attrs :parameter_references) {})
+           (scan (dissoc (or (:attrs graph) {}) :params) {})
+           (mapcat (fn [[nid node]]
+                     (concat (scan (dissoc node :attrs) {:node_id nid})
+                             (scan (or (:attrs node) {}) {:node_id nid})))
+                   (or (:nodes graph) {}))
+           (mapcat (fn [edge]
+                     (let [where {:edge [(:from edge) (:to edge)]}]
+                       (concat (scan (dissoc edge :attrs) where)
+                               (scan (or (:attrs edge) {}) where))))
+                   (or (:edges graph) []))))))
