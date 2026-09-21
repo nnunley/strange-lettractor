@@ -186,3 +186,78 @@
     (is (nil? (:edge (first diags))))
     (is (clojure.string/includes? (:message (first diags)) "issue"))
     (is (clojure.string/includes? (:message (first diags)) "graph attribute"))))
+
+(def ^:private decls
+  (:declarations
+    (parameters/parse-declarations
+      "[{:name :editable :type :string :default \"solve.lg\"}
+        {:name :run_cmd :type :string}
+        {:name :direction :type [:enum \"min\" \"max\"] :default \"min\"}
+        {:name :max_iterations :type :int :default 0}]")))
+
+(deftest a-flag-beats-the-file-which-beats-the-default
+  (let [res (parameters/resolve-values
+              decls {:file {"direction" "max" "max_iterations" 7}
+                     :flags {"direction" "min" "run_cmd" "sh bench.sh"}})]
+    (is (= [] (:errors res)))
+    (is (= "min" (get-in res [:values "direction"])))
+    (is (= :flag (get-in res [:sources "direction"])))
+    (is (= "7" (get-in res [:values "max_iterations"])))
+    (is (= :file (get-in res [:sources "max_iterations"])))
+    (is (= "solve.lg" (get-in res [:values "editable"])))
+    (is (= :default (get-in res [:sources "editable"])))))
+
+(deftest a-parameter-with-no-default-and-no-value-is-an-error
+  (let [res (parameters/resolve-values decls {:file {} :flags {}})]
+    (is (some #(and (= "parameter_missing" (:rule %))
+                    (clojure.string/includes? (:message %) "run_cmd"))
+              (:errors res)))))
+
+(deftest flag-text-is-coerced-to-the-declared-type
+  (let [ok (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" "-1"}})]
+    (is (= [] (:errors ok)))
+    (is (= -1 (get-in ok [:typed "max_iterations"])))
+    (is (= "-1" (get-in ok [:values "max_iterations"]))))
+  (doseq [bad ["7.5" "many"]]
+    (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" bad}})]
+      (is (some #(and (= "parameter_type" (:rule %))
+                      (clojure.string/includes? (:message %) "max_iterations"))
+                (:errors res)) bad))))
+
+(deftest an-enum-error-names-the-allowed-values
+  (doseq [bad ["Max" "middle"]]
+    (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "direction" bad}})
+          msg (:message (first (filter #(clojure.string/includes? (:message %) "direction")
+                                       (:errors res))))]
+      (is (some? msg) bad)
+      (is (clojure.string/includes? msg "min") bad)
+      (is (clojure.string/includes? msg "max") bad))))
+
+(deftest a-supplied-name-that-is-not-declared-is-an-error
+  ;; The brief's own version of this test checked
+  ;; `(clojure.string/includes? % "editble")` against `(:errors res)` directly,
+  ;; but resolve-values errors are maps ({:rule ... :message ...}), not
+  ;; strings, per this task's error-shape contract. Checking :message instead.
+  (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "editble" "y"}})]
+    (is (some #(and (= "parameter_undeclared" (:rule %))
+                    (clojure.string/includes? (:message %) "editble"))
+              (:errors res)))))
+
+(deftest a-file-supplied-float-is-rejected-for-an-int-parameter
+  ;; Coverage gap deferred from Task 1: default-matches? (reused by
+  ;; check-typed) must reject a float for :int, exercised here through a
+  ;; file-supplied value rather than a declared default.
+  (let [res (parameters/resolve-values
+              decls {:file {"max_iterations" 7.5} :flags {"run_cmd" "x"}})]
+    (is (some #(and (= "parameter_type" (:rule %))
+                    (clojure.string/includes? (:message %) "max_iterations"))
+              (:errors res)))))
+
+(deftest a-file-supplied-value-outside-the-enum-is-rejected
+  ;; Coverage gap deferred from Task 1: default-matches? must reject a value
+  ;; outside an [:enum ...] list, exercised here through a file-supplied value.
+  (let [res (parameters/resolve-values
+              decls {:file {"direction" "sideways"} :flags {"run_cmd" "x"}})]
+    (is (some #(and (= "parameter_type" (:rule %))
+                    (clojure.string/includes? (:message %) "direction"))
+              (:errors res)))))

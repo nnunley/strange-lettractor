@@ -148,6 +148,63 @@
                 (recur (+ close 2) (conj found nm))
                 (recur (+ open 2) found)))))))))
 
+(defn render [v]
+  (if (integer? v) (str v) (str v)))
+
+(defn- allowed-values [t] (vec (rest t)))
+
+(defn- coerce-text [t text nm]
+  (cond
+    (= :string t) {:value text}
+    (= :int t) (if (re-matches #"[-+]?[0-9]+" text)
+                 {:value (edn/read-string text)}
+                 {:error {:rule "parameter_type"
+                          :message (str "parameter '" nm "' expects an :int, got "
+                                        (pr-str text))}})
+    (enum-type? t) (if (contains? (set (allowed-values t)) text)
+                     {:value text}
+                     {:error {:rule "parameter_type"
+                              :message (str "parameter '" nm "' expects one of "
+                                            (str/join ", " (allowed-values t))
+                                            ", got " (pr-str text))}})
+    :else {:error {:rule "parameter_type"
+                   :message (str "parameter '" nm "' has unknown type")}}))
+
+(defn- check-typed [t v nm]
+  (if (default-matches? t v)
+    {:value v}
+    {:error {:rule "parameter_type"
+             :message (str "parameter '" nm "' value " (pr-str v)
+                           " is not a " (pr-str t))}}))
+
+(defn resolve-values [declarations supplied]
+  (let [flags (or (:flags supplied) {})
+        file (or (:file supplied) {})
+        by-name (into {} (map (fn [d] [(:name d) d]) declarations))
+        unknown (sort (remove #(contains? by-name %)
+                              (distinct (concat (keys flags) (keys file)))))
+        base {:values {} :typed {} :sources {}
+              :errors (mapv (fn [u] {:rule "parameter_undeclared"
+                                     :message (str "'" u "' names no declared parameter")})
+                            unknown)}]
+    (reduce
+      (fn [acc d]
+        (let [nm (:name d) t (:type d)
+              r (cond
+                  (contains? flags nm) (assoc (coerce-text t (str (get flags nm)) nm) :source :flag)
+                  (contains? file nm) (assoc (check-typed t (get file nm) nm) :source :file)
+                  (:has_default d) {:value (:default d) :source :default}
+                  :else {:error {:rule "parameter_missing"
+                                 :message (str "'" nm "' is required and was not supplied")}})]
+          (if (:error r)
+            (update acc :errors conj (:error r))
+            (-> acc
+                (assoc-in [:values nm] (render (:value r)))
+                (assoc-in [:typed nm] (:value r))
+                (assoc-in [:sources nm] (:source r))))))
+      base
+      declarations)))
+
 (defn find-references [graph]
   ;; :attrs is scanned exclusively (never the promoted top-level copies): it is
   ;; a superset of every promoted field, and some promoted fields (e.g.
