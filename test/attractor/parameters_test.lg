@@ -51,3 +51,24 @@
                       (attractor.validation/validate graph))]
     (is (= 1 (count diags)))
     (is (= :error (:severity (first diags))))))
+
+(deftest substitution-replaces-references-and-leaves-shell-alone
+  (let [vals {"editable" "solve.lg"}]
+    (is (= "edit solve.lg" (:text (parameters/substitute-string "edit {{editable}}" vals))))
+    (is (= "solve.lgsolve.lg"
+           (:text (parameters/substitute-string "{{editable}}{{editable}}" vals))))
+    (is (= "\"${LG:-lg}\" bench.lg"
+           (:text (parameters/substitute-string "\"${LG:-lg}\" bench.lg" vals))))
+    (is (= "$goal" (:text (parameters/substitute-string "$goal" vals))))
+    (is (= "cost is {50}" (:text (parameters/substitute-string "cost is {50}" vals))))))
+
+(deftest doubled-open-brace-is-an-escape
+  (is (= "{{editable}}"
+         (:text (parameters/substitute-string "{{{{editable}}" {"editable" "solve.lg"})))))
+
+(deftest an-unsupplied-reference-is-left-in-place
+  (is (= "edit {{editable}}" (:text (parameters/substitute-string "edit {{editable}}" {})))))
+
+(deftest substitution-reports-which-names-it-used
+  (is (= #{"editable"}
+         (:used (parameters/substitute-string "a {{editable}} b" {"editable" "x"})))))

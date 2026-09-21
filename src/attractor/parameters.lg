@@ -77,3 +77,26 @@
               {:declarations decls
                :errors (vec (concat errs
                                     (map #(str "duplicate parameter name '" % "'") dup)))})))))))
+
+;; Scan once, left to right. "{{{{" emits a literal "{{" and consumes four
+;; characters, so an escape can never be re-read as a reference.
+(defn substitute-string [text values]
+  (if-not (string? text)
+    {:text text :used #{}}
+    (loop [i 0 out [] used #{}]
+      (cond
+        (>= i (count text))
+        {:text (apply str out) :used used}
+
+        (and (<= (+ i 4) (count text)) (= "{{{{" (subs text i (+ i 4))))
+        (recur (+ i 4) (conj out "{{") used)
+
+        (and (<= (+ i 2) (count text)) (= "{{" (subs text i (+ i 2))))
+        (let [close (str/index-of text "}}" (+ i 2))
+              nm (when close (subs text (+ i 2) close))]
+          (if (and close (valid-name? nm) (contains? values nm))
+            (recur (+ close 2) (conj out (get values nm)) (conj used nm))
+            (recur (+ i 2) (conj out "{{") used)))
+
+        :else
+        (recur (inc i) (conj out (subs text i (inc i))) used)))))
