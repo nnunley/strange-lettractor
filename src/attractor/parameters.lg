@@ -223,3 +223,28 @@
            (mapcat (fn [edge]
                      (scan (or (:attrs edge) {}) {:edge [(:from edge) (:to edge)]}))
                    (or (:edges graph) []))))))
+
+(def ^:private sensitive-attrs
+  #{:tool_command :subpipeline.dotfile :model_stylesheet})
+
+(defn sensitive-attr? [k] (contains? sensitive-attrs k))
+
+(defn closed-type? [t]
+  (or (= :int t) (enum-type? t)))
+
+;; A launch may lower its own trust and never raise it.
+(defn effective-trust [parent requested]
+  (let [req (or requested :trusted)]
+    (if (= :delegated parent) :delegated req)))
+
+(defn check-delegation [declarations supplied trust]
+  (if (not= :delegated trust)
+    []
+    (let [by-name (into {} (map (fn [d] [(:name d) d]) declarations))
+          names (distinct (concat (keys (or (:flags supplied) {}))
+                                  (keys (or (:file supplied) {}))))]
+      (vec (keep (fn [nm]
+                   (when-let [d (get by-name nm)]
+                     (when-not (:delegable d)
+                       (str "'" nm "' may not be supplied by a delegated launch"))))
+                 (sort names))))))

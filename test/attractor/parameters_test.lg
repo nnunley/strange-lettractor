@@ -261,3 +261,45 @@
     (is (some #(and (= "parameter_type" (:rule %))
                     (clojure.string/includes? (:message %) "direction"))
               (:errors res)))))
+
+(deftest trust-never-increases-along-a-chain
+  (is (= :trusted (parameters/effective-trust nil :trusted)))
+  (is (= :delegated (parameters/effective-trust :trusted :delegated)))
+  (is (= :delegated (parameters/effective-trust :delegated :delegated)))
+  (is (= :delegated (parameters/effective-trust :delegated :trusted))))
+
+(deftest a-delegated-launch-may-set-only-delegable-parameters
+  (let [ds (:declarations
+             (parameters/parse-declarations
+               "[{:name :run_cmd :type :string}
+                 {:name :direction :type [:enum \"min\" \"max\"] :delegable true}]"))]
+    (is (= [] (parameters/check-delegation ds {:flags {"run_cmd" "sh evil.sh"}} :trusted)))
+    (is (= [] (parameters/check-delegation ds {:flags {"direction" "max"}} :delegated)))
+    (let [errs (parameters/check-delegation ds {:flags {"run_cmd" "sh evil.sh"}} :delegated)]
+      (is (= 1 (count errs)))
+      (is (clojure.string/includes? (first errs) "run_cmd")))))
+
+(deftest a-delegable-string-may-not-reach-a-command-a-path-or-the-stylesheet
+  (doseq [attr [:tool_command :subpipeline.dotfile]]
+    (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"}
+                 :nodes {"n" {:id "n" :attrs {attr "{{p}}"}}} :edges []
+                 :parameter_references {"p" #{attr}}}
+          diags (filter #(= "parameter_delegable_open" (:rule %))
+                        (attractor.validation/validate graph))]
+      (is (= 1 (count diags)) (str attr))))
+  (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"
+                       :model_stylesheet "{{p}}"}
+               :nodes {} :edges [] :parameter_references {"p" #{:model_stylesheet}}}]
+    (is (= 1 (count (filter #(= "parameter_delegable_open" (:rule %))
+                            (attractor.validation/validate graph)))))))
+
+(deftest a-closed-type-or-a-non-delegable-parameter-may-reach-a-command
+  (doseq [decl ["[{:name :p :type :int :delegable true}]"
+                "[{:name :p :type [:enum \"a\" \"b\"] :delegable true}]"
+                "[{:name :p :type :string}]"]]
+    (let [graph {:attrs {:params decl}
+                 :nodes {"n" {:id "n" :attrs {:tool_command "{{p}}"}}} :edges []
+                 :parameter_references {"p" #{:tool_command}}}]
+      (is (empty? (filter #(= "parameter_delegable_open" (:rule %))
+                          (attractor.validation/validate graph)))
+          decl))))
