@@ -2,6 +2,7 @@
   (:require [attractor.ids :as ids] [attractor.engine :as engine]
             [attractor.capture :as capture]
             [attractor.context :as context]
+            [attractor.parameters :as parameters]
             [attractor.parser :as parser]
             [attractor.status :as status]
             [attractor.transforms :as transforms]
@@ -10,19 +11,36 @@
             [clojure.string :as str]
             [os :as os]))
 
+(defn- tagged-diagnostics [errors]
+  ;; resolve-values already carries the spec's rule name on each error.
+  (mapv (fn [e] {:rule (:rule e) :severity :error :message (:message e)}) errors))
+
+(defn- parameter-diagnostics [rule messages]
+  (mapv (fn [m] {:rule rule :severity :error :message m}) messages))
+
 (defn prepare
-  "Parse, transform, and validate the complete source closure without execution."
+  "Parse, resolve parameters, transform, and validate without execution."
   ([dot-source] (prepare dot-source {}))
   ([dot-source options]
    (capture/prepare-closure
      dot-source options
      (fn [source]
        (let [graph (parser/parse-dot source)
+             supplied (or (:parameters options) {})
+             trust (parameters/effective-trust (:parent-trust options) (:trust options))
+             decl (parameters/parse-declarations (get-in graph [:attrs :params]))
+             delegation (parameters/check-delegation (:declarations decl) supplied trust)
+             resolved (parameters/resolve-values (:declarations decl) supplied)
              prepared-graph (transforms/apply-transforms
-                              graph (or (:custom-transforms options) []))
-             diagnostics (validation/validate
-                           prepared-graph (or (:custom-rules options) []))]
-         {:graph prepared-graph :diagnostics diagnostics})))))
+                              graph (or (:custom-transforms options) [])
+                              (:values resolved))
+             diagnostics (vec (concat
+                                (validation/validate
+                                  prepared-graph (or (:custom-rules options) []))
+                                (parameter-diagnostics "parameter_not_delegable" delegation)
+                                (tagged-diagnostics (:errors resolved))))]
+         {:graph prepared-graph :diagnostics diagnostics
+          :parameters resolved :trust trust})))))
 
 (def ^:private wrapper-option-keys
   [:custom-transforms
@@ -361,6 +379,12 @@
    (let [prepared (prepare dot-source options)
          diagnostics (:diagnostics prepared)
          diagnostics (validation/raise-on-errors diagnostics)
+         ctx (or (:context options) (context/make-context))
+         _ (context/ctx-apply-updates!
+             ctx
+             (into {} (map (fn [[k v]] [(str "param." k) v])
+                           (get-in prepared [:parameters :values]))))
+         options (assoc options :context ctx)
          _ (when-let [on-prepared (:on-prepared options)]
              (on-prepared prepared))
          logs-root (or (:logs-root options) (fresh-logs-root))

@@ -356,7 +356,7 @@
                           :prompt "Created by prepare transform"}}
           expected-graph (assoc-in
                            (transforms/apply-transforms
-                             (parser/parse-dot lifecycle-dot))
+                             (parser/parse-dot lifecycle-dot) [] {})
                            [:nodes "orphan"] orphan)
           custom-diagnostics
           [{:rule "prepare_warning"

@@ -179,5 +179,6 @@
       (visit root-record (assoc root-prepared :captured-plan
                                 (get-in root-bundle [:plans workflow/root-plan-id]))
              [workflow/root-plan-id])
-      {:graph (:graph root-prepared) :diagnostics @diagnostics
-       :workflow (workflow/captured-bundle (vec (vals @records)) @plans (:workflow-roots root-bundle))})))
+      (merge (select-keys root-prepared [:parameters :trust])
+             {:graph (:graph root-prepared) :diagnostics @diagnostics
+              :workflow (workflow/captured-bundle (vec (vals @records)) @plans (:workflow-roots root-bundle))}))))

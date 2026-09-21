@@ -1,0 +1,62 @@
+(ns attractor.parameters-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.pipeline :as pipeline]
+            [attractor.context :as context]))
+
+(def ^:private source
+  "digraph P {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     echo [shape=parallelogram, tool_command=\"printf {{direction}}\"]
+     exit [shape=Msquare]
+     start -> echo
+     echo -> exit
+   }")
+
+(deftest prepare-substitutes-a-flag-value-into-a-tool-command
+  (let [res (pipeline/prepare source {:parameters {:flags {"direction" "max"}}})]
+    (is (= [] (filter #(= :error (:severity %)) (:diagnostics res))))
+    (is (= "printf max" (get-in res [:graph :nodes "echo" :attrs :tool_command])))
+    (is (= "max" (get-in res [:parameters :values "direction"])))))
+
+(deftest prepare-uses-the-declared-default-when-nothing-is-supplied
+  (let [res (pipeline/prepare source {})]
+    (is (= "printf min" (get-in res [:graph :nodes "echo" :attrs :tool_command])))))
+
+(deftest a-missing-required-value-is-an-error-diagnostic
+  (let [src (str/replace source ":default \\\"min\\\"" "")
+        res (pipeline/prepare src {})]
+    (is (some #(= "parameter_missing" (:rule %)) (:diagnostics res)))))
+
+(deftest resolved-parameters-are-seeded-into-the-run-context
+  (let [ctx (context/make-context)
+        _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
+                                :context ctx
+                                :logs-root "/tmp/attractor-param-ctx"})]
+    (is (= "max" (context/ctx-get-string ctx "param.direction")))))
+
+;; Proves the R-context-mirror ruling: a caller that does NOT supply :context
+;; must still get an engine-created context seeded with param.<name>, so an
+;; edge condition can read it. We prove this by routing on the parameter
+;; through an edge condition rather than inspecting engine internals.
+(def ^:private branching-source
+  "digraph B {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     go_min [shape=box, tool_command=\"printf took-min\"]
+     go_max [shape=box, tool_command=\"printf took-max\"]
+     exit [shape=Msquare]
+     start -> go_min [condition=\"context.param.direction=min\"]
+     start -> go_max [condition=\"context.param.direction=max\"]
+     go_min -> exit
+     go_max -> exit
+   }")
+
+(deftest no-explicit-context-still-seeds-parameters-for-edge-conditions
+  (let [outcome (pipeline/run branching-source
+                  {:parameters {:flags {"direction" "max"}}
+                   :logs-root "/tmp/attractor-param-no-ctx"})]
+    (is (= [] (filter #(= :error (:severity %)) (:diagnostics outcome))))
+    (is (contains? (set (:completed_nodes outcome)) "go_max"))
+    (is (not (contains? (set (:completed_nodes outcome)) "go_min")))))

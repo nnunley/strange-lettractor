@@ -297,6 +297,8 @@
                        (not (and (integer? timeout) (<= 0 timeout)))) (fail! :invalid-request))
           deadline (when timeout (+ (System/nanoTime) (* timeout 1000000)))
           ctx (context/make-context)
+          params {:file (or (:params_file request) {})
+                  :flags (or (:params request) {})}
           logs-root (or (:logs_root request) (str "attractor_runs/" (fresh-id "run")))]
       (when-not (string? source) (fail! :invalid-request))
       (start-workflow! hub (assoc request :logs_root logs-root)
@@ -304,6 +306,7 @@
           (pipeline/run source
             {:logs-root logs-root :source-path (:source_path request) :context ctx :on-published (:published observers)
              :on-restarted (:restarted observers)
+             :parameters params :trust (:trust request)
              :registry registry :on-event emit :cancelled? cancelled?}))
         {:context ctx :logs_root logs-root :preparation_deadline deadline}))
     :workflow/resume
