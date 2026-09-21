@@ -34,7 +34,7 @@ digraph AutoResearch {
     begin   [shape=parallelogram, timeout="1m", tool_command="sh autoresearch/ar.sh begin"]
 
     propose [shape=box, class="researcher", fidelity="truncate", timeout="20m",
-             prompt="You are an autonomous researcher. Read autoresearch/program.md and follow it exactly. Read research.env for the goal, the files you may edit (EDITABLE), and the metric. Read results.tsv to see every experiment so far and what was kept or discarded; do not repeat a discarded idea. Make ONE experimental change, editing only the EDITABLE files. Write a single-line description of the idea to .autoresearch/description. Do not run the experiment, do not use git, do not edit any other file: the workflow does those."]
+             prompt="You are an autonomous researcher. Read autoresearch/program.md and follow it exactly. Read research.env for the goal, the files you may edit (EDITABLE), the metric, and DIRECTION: whether a lower (min) or a higher (max) metric is better. Read results.tsv to see every experiment so far and what was kept or discarded; do not repeat a discarded idea. Make ONE experimental change, editing only the EDITABLE files. Write a single-line description of the idea to .autoresearch/description. Do not run the experiment, do not use git, do not edit any other file: the workflow does those."]
 
     guard   [shape=parallelogram, timeout="1m",  tool_command="sh autoresearch/ar.sh guard"]
     run     [shape=parallelogram, timeout="10m", tool_command="sh autoresearch/ar.sh run"]

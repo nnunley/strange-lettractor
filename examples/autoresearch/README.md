@@ -15,7 +15,7 @@ that must hold is a tool node, so it holds whatever the model does:
 | `grep "^val_bpb:"` | `measure` with `METRIC_REGEX`; no metric is a crash |
 | Fix a dumb crash, else give up | `can_repair` → `repair` → `amend`, at most `MAX_REPAIRS` times, then `give_up` |
 | Keep if improved, else `git reset` | `decide`: better than best by more than `EPSILON` keeps; a tie keeps only a simplification (more lines removed than added) |
-| `results.tsv`, untracked | `commit metric status description`, excluded via `.git/info/exclude` |
+| `results.tsv`, untracked | `commit metric status description`, excluded via `.git/info/exclude`; the header says which way is better, and a crashed or rejected row has no metric |
 | The first run is the baseline | `baseline_run` → `baseline_measure` → `baseline_keep` |
 | LOOP FOREVER | `again -> begin` with `loop_restart=true` (a fresh run segment per iteration); `MAX_ITERATIONS=0` never stops |
 
@@ -50,7 +50,9 @@ The demos stop after `MAX_ITERATIONS=3`.
 
 1. Copy `ar.sh`, `autoresearch.dot`, `program.md` into `<repo>/autoresearch/`.
 2. Write `<repo>/research.env` from `research.env.sample`: `EDITABLE`, `RUN_CMD`,
-   `METRIC_REGEX`, `DIRECTION` (`min`/`max`), a fresh `TAG`.
+   `METRIC_REGEX`, `DIRECTION` (`min` or `max`, anything else is refused, and
+   `setup` refuses a `GOAL` that says maximize under `min` or the reverse), a
+   fresh `TAG`.
 3. Make the experiment print its metric on one line and **exit non-zero on a
    wrong result**, so a fast wrong answer is a crash, not a win.
 4. Optionally add `notes.md`: what the researcher needs to know about the

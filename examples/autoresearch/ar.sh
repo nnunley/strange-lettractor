@@ -15,6 +15,10 @@ DIRECTION=${DIRECTION:-min}        # min: lower is better; max: higher is better
 EPSILON=${EPSILON:-0}              # improvements no larger than this count as ties
 MAX_ITERATIONS=${MAX_ITERATIONS:-0} # 0 = never stop
 MAX_REPAIRS=${MAX_REPAIRS:-2}      # crash-fix attempts per idea
+case "$DIRECTION" in
+  min|max) ;;
+  *) echo "DIRECTION must be min or max, not '$DIRECTION'" >&2; exit 2 ;;
+esac
 STATE=.autoresearch
 RESULTS=results.tsv
 
@@ -26,12 +30,17 @@ on_research_branch() {
 }
 short() { git rev-parse --short=7 "${1:-HEAD}"; }
 description() { head -n 1 "$STATE/description" 2>/dev/null | tr '\t' ' ' || true; }
-row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS"; }
+row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS"; }  # metric is empty when nothing was measured
 discard_work() { git reset -q --hard "$(cat "$STATE/base")"; git clean -qfd; }
 
 case "${1:-}" in
 setup)
   git rev-parse --git-dir >/dev/null
+  # The researcher reads GOAL; decide reads DIRECTION. Catch the two disagreeing.
+  case "$DIRECTION:$(printf '%s' "${GOAL:-}" | tr '[:upper:]' '[:lower:]')" in
+    min:*maximi[sz]e*|max:*minimi[sz]e*)
+      echo "GOAL says \"$GOAL\" but DIRECTION=$DIRECTION: fix one of them" >&2; exit 1 ;;
+  esac
   branch="autoresearch/$TAG"
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     echo "branch $branch already exists: pick a fresh TAG" >&2; exit 1
@@ -43,7 +52,8 @@ setup)
   [ -z "$(git status --porcelain)" ] || { echo "working tree is dirty: commit or stash first" >&2; exit 1; }
   git checkout -q -b "$branch"
   mkdir -p "$STATE"
-  printf 'commit\tmetric\tstatus\tdescription\n' > "$RESULTS"
+  better=lower; [ "$DIRECTION" = max ] && better=higher
+  printf 'commit\tmetric (%s is better)\tstatus\tdescription\n' "$better" > "$RESULTS"
   rm -f "$STATE/best" "$STATE/repairs"; echo 0 > "$STATE/iterations"
   echo "baseline" > "$STATE/description"
   short > "$STATE/base"
@@ -70,7 +80,7 @@ guard)   # the agent may touch EDITABLE only; the commit is made here, not by th
     done
     if [ "$ok" = 0 ]; then
       echo "forbidden edit: $file (allowed: $EDITABLE)" >&2
-      row "$(short)" 0 discard "rejected: touched $file"
+      row "$(short)" "" discard "rejected: touched $file"
       discard_work; exit 1
     fi
   done
@@ -130,7 +140,7 @@ amend)   # fold a crash fix into the experiment commit, under the same guard
 
 give-up)
   on_research_branch
-  row "$(short)" 0 crash "$(description)"
+  row "$(short)" "" crash "$(description)"
   discard_work; echo "crash logged, reverted"
   ;;
 
