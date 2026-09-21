@@ -60,3 +60,25 @@
     (is (= [] (filter #(= :error (:severity %)) (:diagnostics outcome))))
     (is (contains? (set (:completed_nodes outcome)) "go_max"))
     (is (not (contains? (set (:completed_nodes outcome)) "go_min")))))
+
+(def ^:private export-source
+  "digraph P {
+     graph [params=\"[{:name :editable :type :string :export true}
+                      {:name :secret_note :type :string}]\"]
+     start [shape=Mdiamond]
+     probe [shape=parallelogram, timeout=\"30s\",
+            tool_command=\"env | grep '^ATTRACTOR_PARAM_' | sort\"]
+     exit [shape=Msquare]
+     start -> probe
+     probe -> exit
+   }")
+
+(deftest only-exported-parameters-reach-a-tool-node
+  (let [ctx (context/make-context)
+        _ (pipeline/run export-source
+                        {:parameters {:flags {"editable" "solve.lg" "secret_note" "hidden"}}
+                         :context ctx
+                         :logs-root "/tmp/attractor-param-env"})
+        out (context/ctx-get-string ctx "tool.output")]
+    (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
+    (is (not (str/includes? out "SECRET_NOTE")))))

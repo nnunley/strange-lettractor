@@ -5,6 +5,7 @@
             [os :as os]
             [attractor.execution :as execution]
             [attractor.context :as context]
+            [attractor.parameters :as parameters]
             [attractor.composition :as composition]
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
@@ -68,6 +69,18 @@
   {"tool.output" (or stdout "")
    "tool.error" (or stderr "")})
 
+(defn- exported-environment [graph ctx]
+  (let [decls (:declarations (parameters/parse-declarations (get-in graph [:attrs :params])))]
+    (into {} (keep (fn [d]
+                     (when (:export d)
+                       (let [v (context/ctx-get-string ctx (str "param." (:name d)) nil)]
+                         (when (some? v)
+                           [(str "ATTRACTOR_PARAM_" (str/upper-case (:name d))) v]))))
+                   decls))))
+
+;; Note: handle-unbounded-tool shells out through os/sh directly and has no
+;; environment seam, so a tool node without a `timeout` attribute never
+;; receives exported parameters — only handle-timed-tool does.
 (defn- handle-unbounded-tool [cmd]
   (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
     (if (zero? (:exit res))
@@ -79,7 +92,7 @@
        :context_updates {"tool.output" (:out res)
                          "tool.error" (:err res)}})))
 
-(defn- handle-timed-tool [node cmd timeout-ms]
+(defn- handle-timed-tool [node cmd timeout-ms env-vars]
   (let [environment (*tool-environment-factory*
                       (tool-environment-options timeout-ms))
         cancelled? (:cancelled? node)
@@ -97,7 +110,7 @@
                         (core/sleep 2)
                         (recur)))))]
     (try
-      (let [res ((:exec_command environment) cmd timeout-ms (os/cwd) nil)
+      (let [res ((:exec_command environment) cmd timeout-ms (os/cwd) env-vars)
             context-updates (tool-context-updates (:stdout res) (:stderr res))]
         (cond
           (or (and cancelled? (cancelled?)) (:cancelled res))
@@ -131,14 +144,15 @@
           ((:cleanup environment))
           (catch Object _ nil))))))
 
-(defn handle-tool [node _context _graph _logs-root]
+(defn handle-tool [node context graph _logs-root]
   (try
     (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
-          timeout-ms (parsed-tool-timeout-ms node)]
+          timeout-ms (parsed-tool-timeout-ms node)
+          env-vars (exported-environment graph context)]
       (if (str/blank? cmd)
         {:status :fail :failure_reason "No tool_command specified"}
         (if timeout-ms
-          (handle-timed-tool node cmd timeout-ms)
+          (handle-timed-tool node cmd timeout-ms env-vars)
           (handle-unbounded-tool cmd))))
     (catch Object e
       (merge {:status :fail
