@@ -72,3 +72,20 @@
 (deftest substitution-reports-which-names-it-used
   (is (= #{"editable"}
          (:used (parameters/substitute-string "a {{editable}} b" {"editable" "x"})))))
+
+(deftest unterminated-reference-left-in-place-and-does-not-loop
+  (let [vals {"editable" "solve.lg"}
+        result (parameters/substitute-string "edit {{editable" vals)]
+    (is (= "edit {{editable" (:text result)))
+    (is (= #{} (:used result)))))
+
+(deftest invalid-parameter-name-left-in-place
+  (let [vals {"valid_name" "value"}]
+    (is (= "{{Not-A-Name}}"
+           (:text (parameters/substitute-string "{{Not-A-Name}}" vals))))
+    (is (= #{}
+           (:used (parameters/substitute-string "{{Not-A-Name}}" vals))))
+    (is (= "{{1st}}"
+           (:text (parameters/substitute-string "{{1st}}" vals))))
+    (is (= #{}
+           (:used (parameters/substitute-string "{{1st}}" vals))))))
