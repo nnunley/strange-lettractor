@@ -100,3 +100,35 @@
 
         :else
         (recur (inc i) (conj out (subs text i (inc i))) used)))))
+
+(defn- rewrite-map [m values skip refs]
+  (reduce (fn [[acc r] [k v]]
+            (if (or (contains? skip k) (not (string? v)))
+              [(assoc acc k v) r]
+              (let [{:keys [text used]} (substitute-string v values)]
+                [(assoc acc k text)
+                 (reduce (fn [rr nm] (update rr nm (fnil conj #{}) k)) r used)])))
+          [{} refs]
+          m))
+
+(defn substitution-transform [values]
+  (fn [graph]
+    (let [skip #{:params}
+          [top refs] (rewrite-map (dissoc graph :nodes :edges :attrs) values #{} {})
+          [attrs refs] (rewrite-map (or (:attrs graph) {}) values skip refs)
+          [nodes refs]
+          (reduce (fn [[acc r] [nid node]]
+                    (let [[n r1] (rewrite-map (dissoc node :attrs) values #{} r)
+                          [na r2] (rewrite-map (or (:attrs node) {}) values skip r1)]
+                      [(assoc acc nid (assoc n :attrs na)) r2]))
+                  [{} refs]
+                  (or (:nodes graph) {}))
+          [edges refs]
+          (reduce (fn [[acc r] edge]
+                    (let [[e r1] (rewrite-map (dissoc edge :attrs) values #{} r)
+                          [ea r2] (rewrite-map (or (:attrs edge) {}) values skip r1)]
+                      [(conj acc (assoc e :attrs ea)) r2]))
+                  [[] refs]
+                  (or (:edges graph) []))]
+      (assoc top :attrs attrs :nodes nodes :edges (vec edges)
+                 :parameter_references refs))))

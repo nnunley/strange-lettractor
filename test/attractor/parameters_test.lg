@@ -1,7 +1,8 @@
 (ns attractor.parameters-test
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.parameters :as parameters]
-            [attractor.validation]))
+            [attractor.validation]
+            [attractor.transforms]))
 
 (deftest parameter-names-are-lowercase-identifiers
   (doseq [good ["editable" "run_cmd" "max_iterations" "a1"]]
@@ -89,3 +90,44 @@
            (:text (parameters/substitute-string "{{1st}}" vals))))
     (is (= #{}
            (:used (parameters/substitute-string "{{1st}}" vals))))))
+
+(deftest substitution-transform-rewrites-graph-node-and-edge-attributes
+  (let [graph {:model_stylesheet ".r { llm_model: {{model}}; }"
+               :goal "make {{editable}} fast"
+               :attrs {:params "[{:name :model :type :string}]"
+                       :model_stylesheet ".r { llm_model: {{model}}; }"}
+               :nodes {"run" {:id "run" :timeout "{{budget}}"
+                              :tool_command "sh ar.sh {{editable}}"
+                              :attrs {:tool_command "sh ar.sh {{editable}}"}}}
+               :edges [{:from "run" :to "exit" :condition "param.direction = {{direction}}"
+                        :attrs {:condition "param.direction = {{direction}}"}}]}
+        out ((parameters/substitution-transform
+               {"model" "haiku" "editable" "solve.lg" "budget" "30s" "direction" "max"})
+             graph)]
+    (is (= ".r { llm_model: haiku; }" (:model_stylesheet out)))
+    (is (= "make solve.lg fast" (:goal out)))
+    (is (= "30s" (get-in out [:nodes "run" :timeout])))
+    (is (= "sh ar.sh solve.lg" (get-in out [:nodes "run" :tool_command])))
+    (is (= "sh ar.sh solve.lg" (get-in out [:nodes "run" :attrs :tool_command])))
+    (is (= "param.direction = max" (:condition (first (:edges out)))))))
+
+(deftest the-params-attribute-is-never-substituted-into
+  (let [graph {:attrs {:params "[{:name :x :type :string :default \"{{x}}\"}]"}
+               :nodes {} :edges []}
+        out ((parameters/substitution-transform {"x" "boom"}) graph)]
+    (is (= "[{:name :x :type :string :default \"{{x}}\"}]" (get-in out [:attrs :params])))))
+
+(deftest substitution-records-where-each-parameter-was-used
+  (let [graph {:attrs {} :nodes {"a" {:id "a" :tool_command "{{p}}" :attrs {:tool_command "{{p}}"}}}
+               :edges []}
+        out ((parameters/substitution-transform {"p" "v"}) graph)]
+    (is (contains? (get-in out [:parameter_references "p"]) :tool_command))))
+
+(deftest substitution-runs-before-the-stylesheet-transform
+  ;; The stylesheet transform resolves llm_model onto nodes. If substitution
+  ;; ran after it, the node would carry the literal reference instead.
+  (let [graph {:model_stylesheet ".r { llm_model: {{model}}; }"
+               :attrs {} :edges []
+               :nodes {"n" {:id "n" :class "r" :shape "box" :attrs {}}}}
+        out (attractor.transforms/apply-transforms graph [] {"model" "haiku"})]
+    (is (= "haiku" (get-in out [:nodes "n" :llm_model])))))
