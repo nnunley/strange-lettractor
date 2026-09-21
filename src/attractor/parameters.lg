@@ -149,19 +149,20 @@
                 (recur (+ open 2) found)))))))))
 
 (defn find-references [graph]
+  ;; :attrs is scanned exclusively (never the promoted top-level copies): it is
+  ;; a superset of every promoted field, and some promoted fields (e.g.
+  ;; :max_retries, :goal_gate) are coerced from strings to ints/booleans at
+  ;; the top level, so a {{name}} reference in one of those survives only in
+  ;; :attrs. Scanning both would double-report every promoted string field.
   (let [scan (fn [m where]
                (mapcat (fn [[k v]]
                          (map (fn [nm] (merge {:name nm :attr k} where)) (refs-in v)))
                        m))]
     (vec (concat
-           (scan (dissoc graph :nodes :edges :attrs :parameter_references) {})
            (scan (dissoc (or (:attrs graph) {}) :params) {})
            (mapcat (fn [[nid node]]
-                     (concat (scan (dissoc node :attrs) {:node_id nid})
-                             (scan (or (:attrs node) {}) {:node_id nid})))
+                     (scan (or (:attrs node) {}) {:node_id nid}))
                    (or (:nodes graph) {}))
            (mapcat (fn [edge]
-                     (let [where {:edge [(:from edge) (:to edge)]}]
-                       (concat (scan (dissoc edge :attrs) where)
-                               (scan (or (:attrs edge) {}) where))))
+                     (scan (or (:attrs edge) {}) {:edge [(:from edge) (:to edge)]}))
                    (or (:edges graph) []))))))

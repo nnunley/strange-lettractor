@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [attractor.parameters :as parameters]
             [attractor.validation]
-            [attractor.transforms]))
+            [attractor.transforms]
+            [attractor.parser :as parser]))
 
 (deftest parameter-names-are-lowercase-identifiers
   (doseq [good ["editable" "run_cmd" "max_iterations" "a1"]]
@@ -150,3 +151,38 @@
                :edges []}]
     (is (empty? (filter #(= "parameter_reference" (:rule %))
                         (attractor.validation/validate graph))))))
+
+(deftest an-undeclared-reference-on-an-edge-names-the-edge
+  (let [graph {:attrs {}
+               :nodes {}
+               :edges [{:from "a" :to "b" :condition "{{missing}}"
+                        :attrs {:condition "{{missing}}"}}]}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (= [["a" "b"]] (mapv :edge diags)))
+    (is (clojure.string/includes? (:message (first diags)) "edge a -> b"))
+    (is (not (clojure.string/includes? (:message (first diags)) "graph attribute")))))
+
+(deftest a-promoted-node-field-referencing-an-undeclared-parameter-is-reported-once
+  (let [graph (parser/parse-dot
+                (str "digraph G { start [shape=Mdiamond]; "
+                     "guard [type=codergen, prompt=\"do the {{thing}}\"]; "
+                     "exit [shape=Msquare]; start -> guard -> exit; }"))
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "thing"))
+    (is (clojure.string/includes? (:message (first diags)) "guard"))))
+
+(deftest a-graph-level-undeclared-reference-reports-without-a-node-id
+  (let [graph {:attrs {:goal "solve {{issue}}"}
+               :nodes {}
+               :edges []}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (nil? (:node_id (first diags))))
+    (is (nil? (:edge (first diags))))
+    (is (clojure.string/includes? (:message (first diags)) "issue"))
+    (is (clojure.string/includes? (:message (first diags)) "graph attribute"))))

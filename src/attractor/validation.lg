@@ -147,15 +147,17 @@
     (vec (keep (fn [ref]
                  (when-not (contains? declared (:name ref))
                    (merge {:rule "parameter_reference" :severity :error
-                           :message (str (if (:node_id ref)
-                                           (str "node '" (:node_id ref) "' ")
-                                           "graph ")
+                           :message (str (cond
+                                           (:node_id ref) (str "node '" (:node_id ref) "' ")
+                                           (:edge ref) (str "edge " (first (:edge ref))
+                                                             " -> " (second (:edge ref)) " ")
+                                           :else "graph ")
                                          "attribute '" (name (:attr ref))
                                          "' references undeclared parameter '"
                                          (:name ref) "'")}
                           (when (:node_id ref) {:node_id (:node_id ref)})
                           (when (:edge ref) {:edge (:edge ref)}))))
-               (distinct (parameters/find-references graph))))))
+               (parameters/find-references graph)))))
 
 ;; Rule: type_known (WARNING)
 (defn rule-type-known
