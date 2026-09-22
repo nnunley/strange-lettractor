@@ -104,3 +104,34 @@
 (deftest an-unknown-trust-level-is-rejected
   (let [res (cli/parse-parameter-args ["run" "wf.dot" "--trust" "root"])]
     (is (some #(clojure.string/includes? % "root") (:errors res)))))
+
+(deftest a-checkpoint-records-the-resolved-parameters
+  (let [cp {:timestamp 1 :current_node "echo" :completed_nodes [] :node_retries {}
+            :node_outcomes {} :context_values {} :logs []
+            :parameters {"direction" "max"}}
+        path "/tmp/attractor-param-cp.edn"]
+    (context/save-checkpoint cp path)
+    (is (= {"direction" "max"} (:parameters (context/load-checkpoint path))))))
+
+(deftest resume-refuses-parameters
+  (let [path "/tmp/attractor-param-cp.edn"
+        thrown (try (pipeline/resume path {:parameters {:flags {"direction" "min"}}})
+                    nil
+                    (catch Object e (ex-data e)))]
+    (is (= :workflow_configuration_error (:category thrown)))
+    (is (= :--param (:option thrown)))))
+
+(deftest resume-refuses-trust
+  (let [path "/tmp/attractor-param-cp.edn"
+        thrown (try (pipeline/resume path {:trust :delegated})
+                    nil
+                    (catch Object e (ex-data e)))]
+    (is (= :workflow_configuration_error (:category thrown)))
+    (is (= :--trust (:option thrown)))))
+
+(deftest a-live-run-checkpoint-records-resolved-parameters
+  (let [logs-root "/tmp/attractor-param-live-cp"
+        _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
+                                :logs-root logs-root})
+        cp (context/load-checkpoint (str logs-root "/checkpoint.edn"))]
+    (is (= "max" (get (:parameters cp) "direction")))))

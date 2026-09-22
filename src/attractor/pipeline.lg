@@ -94,7 +94,8 @@
                 :workflow-fingerprint (:fingerprint bundle)
                 :attractor.engine/publish-restart
                 (fn [root] (publish-restart! bundle root options))
-                :workflow-manifest workflow/manifest-relative-path)
+                :workflow-manifest workflow/manifest-relative-path
+                :workflow-parameters (get-in prepared [:parameters :values]))
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
 
@@ -324,6 +325,11 @@
    context before execution; it cannot replace that context through options."
   ([checkpoint-path] (resume checkpoint-path {}))
   ([checkpoint-path options]
+   (doseq [[k flag] [[:parameters :--param] [:trust :--trust]]]
+     (when (contains? options k)
+       (throw (ex-info (str "option " (name flag) " is not permitted on resume")
+                       {:category :workflow_configuration_error
+                        :option flag}))))
    (let [resolved-checkpoint-path (resolve-checkpoint-path! checkpoint-path)
          checkpoint (load-pinned-checkpoint! resolved-checkpoint-path)
          expected-fingerprint (require-checkpoint-identity! checkpoint)
@@ -355,7 +361,8 @@
                                             :fingerprint expected-fingerprint}})))
                 :attractor.engine/publish-restart
                 (fn [root] (publish-restart! (:captured-bundle verified) root options))
-                :workflow-manifest workflow/manifest-relative-path)
+                :workflow-manifest workflow/manifest-relative-path
+                :workflow-parameters (:parameters checkpoint))
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected
                                :changes changes}))

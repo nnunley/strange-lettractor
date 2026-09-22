@@ -506,7 +506,10 @@
           (assoc :workflow_manifest (:workflow_manifest checkpoint))
 
           (contains? checkpoint :workflow_plan_id)
-          (assoc :workflow_plan_id (:workflow_plan_id checkpoint)))]
+          (assoc :workflow_plan_id (:workflow_plan_id checkpoint))
+
+          (some? (:parameters checkpoint))
+          (assoc :parameters (:parameters checkpoint)))]
     (io/spit path (pr-str checkpoint-data))
     checkpoint))
 
@@ -544,4 +547,7 @@
 
       (or (contains? data :workflow_plan_id)
           (contains? data "workflow_plan_id"))
-      (assoc :workflow_plan_id (checkpoint-field data :workflow_plan_id)))))
+      (assoc :workflow_plan_id (checkpoint-field data :workflow_plan_id))
+
+      (some? (checkpoint-field data :parameters))
+      (assoc :parameters (checkpoint-field data :parameters)))))
