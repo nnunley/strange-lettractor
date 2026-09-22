@@ -411,7 +411,7 @@ The resolved parameters of a run MUST be recorded in its checkpoint.
 $ attractor run wf.dot --param direction=max --param run_cmd='sh bench.sh'
 stage failed: run
 $ grep -o ':parameters {[^}]*}' run/checkpoint.edn
-:parameters {:direction "max" :run_cmd "sh bench.sh" :editable "solve.lg" :max_iterations 0}
+:parameters {"direction" "max" "run_cmd" "sh bench.sh" "editable" "solve.lg" "max_iterations" "0"}
 $ attractor resume --checkpoint run/checkpoint.edn
 parameters: direction=max run_cmd=sh bench.sh (from checkpoint)
 ```
