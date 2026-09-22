@@ -177,6 +177,29 @@
     (is (= :workflow_configuration_error (:category thrown)))
     (is (= :--trust (:option thrown)))))
 
+;; The library guard is only honest if the CLI reaches it. cmd-resume never
+;; parsed the parameter flags and the hub builds resume options from a fixed
+;; set, so `attractor resume --checkpoint ... --param x=y` used to discard the
+;; flag silently.
+(deftest the-cli-resume-path-refuses-launch-scoped-parameter-flags
+  (let [cp "/tmp/attractor-param-cli-resume-cp.edn"
+        pf "/tmp/attractor-param-cli-resume.edn"]
+    (io/spit cp (pr-str {:timestamp 1 :current_node "echo" :completed_nodes []
+                         :node_retries {} :node_outcomes {} :context_values {}
+                         :logs [] :parameters {"direction" "max"}}))
+    (io/spit pf "{:direction \"min\"}")
+    (doseq [[flag argv] [["--param" ["--checkpoint" cp "--param" "direction=max"]]
+                         ["--params-file" ["--checkpoint" cp "--params-file" pf]]
+                         ["--trust" ["--checkpoint" cp "--trust" "delegated"]]]]
+      (let [exits (atom [])
+            printed (with-redefs [os/exit (fn [code] (swap! exits conj code))]
+                      (with-out-str (cli/cmd-resume argv)))]
+        (is (= [1] @exits) flag)
+        (is (str/includes? printed
+                           (str "workflow_configuration_error: option " flag
+                                " is not permitted on resume"))
+            flag)))))
+
 (deftest a-live-run-checkpoint-records-resolved-parameters
   (let [logs-root "/tmp/attractor-param-live-cp"
         _ (pipeline/run source {:parameters {:flags {"direction" "max"}}

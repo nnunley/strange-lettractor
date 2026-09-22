@@ -588,16 +588,36 @@
           (os/exit 0)
           (os/exit 1))))))
 
+(defn- resume-forbidden-flags
+  "The launch-scoped flags a resume must refuse. The checkpoint's recorded
+   values are authoritative, and the resume path admits a fixed set of runtime
+   options and discards the rest, so accepting these would silently ignore
+   them."
+  [args]
+  (filterv (fn [flag] (boolean (some #{flag} args)))
+           ["--param" "--params-file" "--trust"]))
+
 (defn cmd-resume [args]
   (let [first-arg (first args)
         dot-file (when (and (string? first-arg)
                             (not (str/starts-with? first-arg "--")))
                    first-arg)
-        cp-path (find-arg-val args "--checkpoint")]
-    (if (or (str/blank? cp-path) (not (os/stat cp-path)))
+        cp-path (find-arg-val args "--checkpoint")
+        forbidden (resume-forbidden-flags args)]
+    (cond
+      (seq forbidden)
+      (do
+        (doseq [flag forbidden]
+          (println (str "workflow_configuration_error: option " flag
+                        " is not permitted on resume")))
+        (os/exit 1))
+
+      (or (str/blank? cp-path) (not (os/stat cp-path)))
       (do
         (println "Error: Valid --checkpoint path required.")
         (os/exit 1))
+
+      :else
       (let [outcome (run-through-hub! args :workflow/resume
                       (cond-> {:checkpoint_path cp-path :auto_approve false}
                         (not (str/blank? dot-file)) (assoc :current_source_path dot-file))
