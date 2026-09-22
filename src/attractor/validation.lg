@@ -277,7 +277,9 @@
         ;; Static, per the spec: the index is built from the authored text, so
         ;; the check fires for a delegable parameter whose value a delegated
         ;; caller has yet to supply -- exactly the case it exists for.
-        refs (or (:parameter_references graph) (parameters/reference-index graph))]
+        refs (parameters/reference-index
+               (or (:parameter_authored_references graph)
+                   (parameters/find-references graph)))]
     (vec (mapcat
            (fn [d]
              (let [used (get refs (:name d) #{})

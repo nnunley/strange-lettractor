@@ -112,13 +112,16 @@
 (declare find-references)
 
 (defn reference-index
-  "Parameter name -> the set of attribute keys that name is written in.
-   Derived from the AUTHORED graph, so it is the same whether or not a value
-   was supplied for the name."
-  [graph]
+  "Fold a reference vector from find-references into
+   parameter name -> the set of attribute keys that name is written in.
+   Its input is scanned from the AUTHORED graph, so the index is the same
+   whether or not a value was supplied for the name. It is derived on demand
+   rather than carried on the graph: plan-fingerprint hashes the whole graph,
+   so a second derived view of the same scan would inflate every plan digest."
+  [references]
   (reduce (fn [acc r] (update acc (:name r) (fnil conj #{}) (:attr r)))
           {}
-          (find-references graph)))
+          references))
 
 (defn substitution-transform [values]
   (fn [graph]
@@ -143,7 +146,6 @@
                         []
                         (or (:edges graph) []))]
       (assoc top :attrs attrs :nodes nodes :edges (vec edges)
-                 :parameter_references (reference-index graph)
                  :parameter_authored_references authored))))
 
 (defn- refs-in [text]

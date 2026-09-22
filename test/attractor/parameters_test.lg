@@ -122,7 +122,8 @@
   (let [graph {:attrs {} :nodes {"a" {:id "a" :tool_command "{{p}}" :attrs {:tool_command "{{p}}"}}}
                :edges []}
         out ((parameters/substitution-transform {"p" "v"}) graph)]
-    (is (contains? (get-in out [:parameter_references "p"]) :tool_command))))
+    (is (contains? (set (:parameter_authored_references out))
+                   {:name "p" :attr :tool_command :node_id "a"}))))
 
 (deftest substitution-runs-before-the-stylesheet-transform
   ;; The stylesheet transform resolves llm_model onto nodes. If substitution
@@ -366,14 +367,13 @@
 (deftest a-delegable-string-may-not-reach-a-command-a-path-or-the-stylesheet
   (doseq [attr [:tool_command :subpipeline.dotfile]]
     (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"}
-                 :nodes {"n" {:id "n" :attrs {attr "{{p}}"}}} :edges []
-                 :parameter_references {"p" #{attr}}}
+                 :nodes {"n" {:id "n" :attrs {attr "{{p}}"}}} :edges []}
           diags (filter #(= "parameter_delegable_open" (:rule %))
                         (attractor.validation/validate graph))]
       (is (= 1 (count diags)) (str attr))))
   (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"
                        :model_stylesheet "{{p}}"}
-               :nodes {} :edges [] :parameter_references {"p" #{:model_stylesheet}}}]
+               :nodes {} :edges []}]
     (is (= 1 (count (filter #(= "parameter_delegable_open" (:rule %))
                             (attractor.validation/validate graph)))))))
 
@@ -382,8 +382,7 @@
                 "[{:name :p :type [:enum \"a\" \"b\"] :delegable true}]"
                 "[{:name :p :type :string}]"]]
     (let [graph {:attrs {:params decl}
-                 :nodes {"n" {:id "n" :attrs {:tool_command "{{p}}"}}} :edges []
-                 :parameter_references {"p" #{:tool_command}}}]
+                 :nodes {"n" {:id "n" :attrs {:tool_command "{{p}}"}}} :edges []}]
       (is (empty? (filter #(= "parameter_delegable_open" (:rule %))
                           (attractor.validation/validate graph)))
           decl))))
