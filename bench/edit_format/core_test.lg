@@ -15,7 +15,9 @@
     (doseq [triple (partition 3 runs)]
       (is (= 1 (count (set (map :seed triple)))))
       (is (= 1 (count (set (map #(get-in % [:task :id]) triple))))))))
-(let [out (with-out-str (t/run-tests)) counters t/*report-counters*]
-  (prn counters)
-  (when (pos? (+ (:fail counters) (:error counters))) (println out))
-  (os/exit (if (zero? (+ (:fail counters) (:error counters))) 0 1)))
+(let [summary (atom nil)
+      out (with-out-str (reset! summary (t/run-tests)))
+      ok (t/successful? @summary)]
+  (prn @summary)
+  (when-not ok (println out))
+  (os/exit (if ok 0 1)))

@@ -5,9 +5,12 @@
             [attractor.codex-framing-test]))
 
 (defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+  (let [summary (atom nil)
+        output (with-out-str
+                 (reset! summary (clojure.test/run-tests 'attractor.codex-framing-test)))
+        ok (clojure.test/successful? @summary)]
+    (prn @summary)
+    (when-not ok (println output))
+    (os/exit (if ok 0 1))))
 
 (when *command-line-args* (apply -main *command-line-args*))

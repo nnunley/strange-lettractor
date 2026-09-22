@@ -1,5 +1,5 @@
 (ns edit-format.fixtures-test
-  (:require [clojure.test :refer [deftest is run-tests *test-result*]]
+  (:require [clojure.test :refer [deftest is run-tests successful?]]
             [clojure.string :as str]
             [io :as io]
             [os :as os]
@@ -32,6 +32,5 @@
                      (if (= passes? (= 0 (:exit result))) "" (str " " (:err result))))))))
       (finally (os/delete-tree root)))))
 
-(do
-  (run-tests)
-  (os/exit (if *test-result* 0 1)))
+(let [summary (run-tests)]
+  (os/exit (if (successful? summary) 0 1)))
