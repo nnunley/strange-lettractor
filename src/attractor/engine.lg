@@ -832,7 +832,7 @@
     (contains? options :attractor.engine/plan-id)
     (assoc :workflow_plan_id (:attractor.engine/plan-id options))
 
-    (some? (:workflow-parameters options))
+    (seq (:workflow-parameters options))
     (assoc :parameters (:workflow-parameters options))))
 
 ;; Main execution loop (Section 3.2)

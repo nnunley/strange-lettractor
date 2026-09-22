@@ -88,14 +88,16 @@
          logs-root (or (:logs-root options) (fresh-logs-root))
          _ (workflow/publish! bundle logs-root)
          engine-options
-         (assoc (merge (apply dissoc options wrapper-option-keys)
-                       (captured-handoff bundle plan-id))
-                :logs-root logs-root
-                :workflow-fingerprint (:fingerprint bundle)
-                :attractor.engine/publish-restart
-                (fn [root] (publish-restart! bundle root options))
-                :workflow-manifest workflow/manifest-relative-path
-                :workflow-parameters (get-in prepared [:parameters :values]))
+         (cond->
+           (assoc (merge (apply dissoc options wrapper-option-keys)
+                         (captured-handoff bundle plan-id))
+                  :logs-root logs-root
+                  :workflow-fingerprint (:fingerprint bundle)
+                  :attractor.engine/publish-restart
+                  (fn [root] (publish-restart! bundle root options))
+                  :workflow-manifest workflow/manifest-relative-path)
+           (seq (get-in prepared [:parameters :values]))
+           (assoc :workflow-parameters (get-in prepared [:parameters :values])))
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
 
@@ -344,25 +346,27 @@
          changes (workflow/current-drift (:workflow verified) options)
          caller-on-event (or (:on-event options) (fn [_] nil))
          engine-options
-         (assoc (merge (select-keys options resume-runtime-option-keys)
-                       (captured-handoff bundle plan-id))
-                :logs-root run-root
-                :on-event caller-on-event
-                :workflow-fingerprint expected-fingerprint
-                :attractor.engine/on-resume-context
-                (fn [ctx]
-                  (when-let [observe (:on-resumed options)]
-                    (observe {:context ctx :logs_root run-root
-                              :dot_source (:source (first (filter #(= plan-id (:logical-id %))
-                                                                  (:source-records bundle))))
-                              :publication {:graph graph
-                                            :diagnostics (if (seq changes) [(drift-diagnostic changes)] [])
-                                            :manifest (str run-root "/" workflow/manifest-relative-path)
-                                            :fingerprint expected-fingerprint}})))
-                :attractor.engine/publish-restart
-                (fn [root] (publish-restart! (:captured-bundle verified) root options))
-                :workflow-manifest workflow/manifest-relative-path
-                :workflow-parameters (:parameters checkpoint))
+         (cond->
+           (assoc (merge (select-keys options resume-runtime-option-keys)
+                         (captured-handoff bundle plan-id))
+                  :logs-root run-root
+                  :on-event caller-on-event
+                  :workflow-fingerprint expected-fingerprint
+                  :attractor.engine/on-resume-context
+                  (fn [ctx]
+                    (when-let [observe (:on-resumed options)]
+                      (observe {:context ctx :logs_root run-root
+                                :dot_source (:source (first (filter #(= plan-id (:logical-id %))
+                                                                    (:source-records bundle))))
+                                :publication {:graph graph
+                                              :diagnostics (if (seq changes) [(drift-diagnostic changes)] [])
+                                              :manifest (str run-root "/" workflow/manifest-relative-path)
+                                              :fingerprint expected-fingerprint}})))
+                  :attractor.engine/publish-restart
+                  (fn [root] (publish-restart! (:captured-bundle verified) root options))
+                  :workflow-manifest workflow/manifest-relative-path)
+           (seq (:parameters checkpoint))
+           (assoc :workflow-parameters (:parameters checkpoint)))
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected
                                :changes changes}))
