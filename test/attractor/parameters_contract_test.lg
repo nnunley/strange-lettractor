@@ -145,6 +145,13 @@
     (is (= 7 (get-in res [:file "max_iterations"])))
     (is (= :delegated (:trust res)))))
 
+(deftest a-param-value-containing-an-equals-sign-survives-intact
+  ;; The split is on the FIRST '=' precisely so a value may carry its own.
+  (let [res (cli/parse-parameter-args
+              ["run" "wf.dot" "--param" "run_cmd=sh a.sh --flag=1"])]
+    (is (= [] (:errors res)))
+    (is (= {"run_cmd" "sh a.sh --flag=1"} (:flags res)))))
+
 (deftest a-malformed-param-flag-is-rejected
   (let [res (cli/parse-parameter-args ["run" "wf.dot" "--param" "novalue"])]
     (is (some #(clojure.string/includes? % "novalue") (:errors res)))))

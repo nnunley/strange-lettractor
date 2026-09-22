@@ -147,12 +147,13 @@
 (defn handle-tool [node context graph _logs-root]
   (try
     (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
-          timeout-ms (parsed-tool-timeout-ms node)
-          env-vars (exported-environment graph context)]
+          timeout-ms (parsed-tool-timeout-ms node)]
       (if (str/blank? cmd)
         {:status :fail :failure_reason "No tool_command specified"}
         (if timeout-ms
-          (handle-timed-tool node cmd timeout-ms env-vars)
+          ;; Only the timed path takes an environment; the unbounded path
+          ;; would discard it.
+          (handle-timed-tool node cmd timeout-ms (exported-environment graph context))
           (handle-unbounded-tool cmd))))
     (catch Object e
       (merge {:status :fail
