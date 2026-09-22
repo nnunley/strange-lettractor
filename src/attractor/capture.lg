@@ -100,9 +100,14 @@
 
 (defn prepare-closure
   "Capture a depth-first closure using a caller-owned single-source preparer.
-   Physical plans are prepared once; logical aliases reuse their captured bytes."
+   Physical plans are prepared once; logical aliases reuse their captured bytes.
+
+   prepare-source is called as (prepare-source source root?). root? is true
+   exactly once, for the source the caller launched; every child sub-pipeline
+   source is prepared with root? false, so a preparer can keep launch-scoped
+   input (workflow parameters, trust) off the children."
   [source options prepare-source]
-  (let [root-prepared (prepare-source source)
+  (let [root-prepared (prepare-source source true)
         root-bundle (workflow/root-bundle source (:graph root-prepared) options)
         root-record (first (:source-records root-bundle))
         options (assoc options :workflow-roots (:workflow-roots root-bundle))
@@ -165,7 +170,7 @@
                             id)))
                       :else
                       (let [result (try
-                                     (let [prepared (prepare-source (:source record))
+                                     (let [prepared (prepare-source (:source record) false)
                                            plan (workflow/captured-plan (:source record) (:graph prepared) id [])]
                                        {:prepared (assoc prepared :captured-plan plan)})
                                         (catch Exception e {:error e}))]

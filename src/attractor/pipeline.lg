@@ -24,13 +24,22 @@
   ([dot-source options]
    (capture/prepare-closure
      dot-source options
-     (fn [source]
+     (fn [source root?]
+       ;; Only the launched (root) source sees the caller's --param/--params-file.
+       ;; A child sub-pipeline is reached through input_map, never through the
+       ;; parent's launch, so resolving the parent's supplied values against the
+       ;; child's declarations would report the parent's names as undeclared on
+       ;; the child and demand the child's required parameters of the parent.
        (let [graph (parser/parse-dot source)
-             supplied (or (:parameters options) {})
+             supplied (if root? (or (:parameters options) {}) {})
              trust (parameters/effective-trust (:parent-trust options) (:trust options))
              decl (parameters/parse-declarations (get-in graph [:attrs :params]))
-             delegation (parameters/check-delegation (:declarations decl) supplied trust)
-             resolved (parameters/resolve-values (:declarations decl) supplied)
+             delegation (if root?
+                          (parameters/check-delegation (:declarations decl) supplied trust)
+                          [])
+             resolved (if root?
+                        (parameters/resolve-values (:declarations decl) supplied)
+                        {:values {} :typed {} :sources {} :errors []})
              prepared-graph (transforms/apply-transforms
                               graph (or (:custom-transforms options) [])
                               (:values resolved))

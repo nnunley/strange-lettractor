@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [io :as io]
+            [os :as os]
             [attractor.pipeline :as pipeline]
             [attractor.context :as context]
             [attractor.cli :as cli]))
@@ -84,6 +85,53 @@
         out (context/ctx-get-string ctx "tool.output")]
     (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
     (is (not (str/includes? out "SECRET_NOTE")))))
+
+;; A parent's --param belongs to the parent alone. Implicit inheritance is out
+;; of scope and input_map is the sanctioned path into a child, so a child
+;; sub-pipeline must neither receive the parent's supplied values nor be judged
+;; against them: neither the parent's names nor the child's own required
+;; parameters may turn the parent's launch into an error.
+(def ^:private parent-source
+  "digraph Parent {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     echo [shape=parallelogram, tool_command=\"printf {{direction}}\"]
+     child [type=subpipeline, subpipeline.dotfile=\"child.dot\",
+            input_map=\"{\\\"payload\\\" \\\"payload\\\"}\"]
+     exit [shape=Msquare]
+     start -> echo
+     echo -> child
+     child -> exit
+   }")
+
+(def ^:private child-source
+  "digraph Child {
+     graph [params=\"[{:name :child_only :type :string}]\"]
+     begin [shape=Mdiamond]
+     work [shape=parallelogram, tool_command=\"printf {{child_only}}\"]
+     finish [shape=Msquare]
+     begin -> work
+     work -> finish
+   }")
+
+(deftest a-parents-parameters-are-not-resolved-against-a-child-sub-pipeline
+  (let [dir (str (os/temp-dir) "/attractor-param-child-" (random-uuid))
+        _ (io/mkdir dir)
+        _ (io/spit (str dir "/parent.dot") parent-source)
+        _ (io/spit (str dir "/child.dot") child-source)
+        res (pipeline/prepare parent-source
+              {:source-path (str dir "/parent.dot")
+               :parameters {:flags {"direction" "max"}}})
+        errors (filter #(= :error (:severity %)) (:diagnostics res))]
+    ;; The parent's own flag still lands, and nothing about the child objects.
+    (is (= [] errors))
+    (is (= "printf max" (get-in res [:graph :nodes "echo" :attrs :tool_command])))
+    (is (= {"direction" "max"} (:values (:parameters res))))
+    (is (not (some #(= "parameter_undeclared" (:rule %)) (:diagnostics res))))
+    (is (not (some #(= "parameter_missing" (:rule %)) (:diagnostics res))))
+    ;; Nothing the child declares is demanded of the parent's launch.
+    (is (not (some #(str/includes? (str (:message %)) "child_only")
+                   (:diagnostics res))))))
 
 (deftest parameter-flags-parse-with-repetition-and-a-file
   (io/spit "/tmp/attractor-params.edn" "{:direction \"max\" :max_iterations 7}")
