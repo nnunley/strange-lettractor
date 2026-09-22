@@ -37,9 +37,16 @@
              delegation (if root?
                           (parameters/check-delegation (:declarations decl) supplied trust)
                           [])
+             ;; A child still resolves against its OWN declarations with nothing
+             ;; supplied, so a default it declares is substituted into its plan.
+             ;; Its errors are discarded: with no supplied values there is
+             ;; nothing to report but parameter_missing for the child's
+             ;; required-but-unsupplied names, which input_map, not the
+             ;; parent's launch, is responsible for.
              resolved (if root?
                         (parameters/resolve-values (:declarations decl) supplied)
-                        {:values {} :typed {} :sources {} :errors []})
+                        (assoc (parameters/resolve-values (:declarations decl) {})
+                               :errors []))
              prepared-graph (transforms/apply-transforms
                               graph (or (:custom-transforms options) [])
                               (:values resolved))

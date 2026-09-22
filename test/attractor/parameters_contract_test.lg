@@ -133,6 +133,38 @@
     (is (not (some #(str/includes? (str (:message %)) "child_only")
                    (:diagnostics res))))))
 
+;; The child is shielded from the PARENT's supplied values, not from its own
+;; declarations: a default the child declares must still be substituted into the
+;; child's plan. Skipping resolve-values entirely shipped the literal
+;; "{{child_opt}}" into the executed plan with no diagnostic, because the name
+;; IS declared and so the undeclared-reference rule stayed silent.
+(def ^:private defaulting-child-source
+  "digraph Child {
+     graph [params=\"[{:name :child_opt :type :string :default \\\"fallback\\\"}]\"]
+     begin [shape=Mdiamond]
+     work [shape=parallelogram, tool_command=\"printf {{child_opt}}\"]
+     finish [shape=Msquare]
+     begin -> work
+     work -> finish
+   }")
+
+(deftest a-childs-own-declared-default-is-substituted-into-the-childs-plan
+  (let [dir (str (os/temp-dir) "/attractor-param-child-default-" (random-uuid))
+        _ (io/mkdir dir)
+        _ (io/spit (str dir "/parent.dot") parent-source)
+        _ (io/spit (str dir "/child.dot") defaulting-child-source)
+        res (pipeline/prepare parent-source
+              {:source-path (str dir "/parent.dot")
+               :parameters {:flags {"direction" "max"}}})
+        child-plan (first (keep (fn [[id plan]]
+                                  (when (str/includes? (str id) "child") plan))
+                                (:plans (:workflow res))))]
+    (is (some? child-plan))
+    (is (= "printf fallback"
+           (get-in child-plan [:graph :nodes "work" :attrs :tool_command])))
+    ;; The parent's own names must still not be judged against the child.
+    (is (not (some #(= "parameter_undeclared" (:rule %)) (:diagnostics res))))))
+
 (deftest parameter-flags-parse-with-repetition-and-a-file
   (io/spit "/tmp/attractor-params.edn" "{:direction \"max\" :max_iterations 7}")
   (let [res (cli/parse-parameter-args
