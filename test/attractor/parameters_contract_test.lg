@@ -36,7 +36,7 @@
   (let [ctx (context/make-context)
         _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
                                 :context ctx
-                                :logs-root "/tmp/attractor-param-ctx"})]
+                                :logs-root (str (os/temp-dir) "/attractor-param-ctx-" (random-uuid))})]
     (is (= "max" (context/ctx-get-string ctx "param.direction")))))
 
 ;; Proves the R-context-mirror ruling: a caller that does NOT supply :context
@@ -59,7 +59,7 @@
 (deftest no-explicit-context-still-seeds-parameters-for-edge-conditions
   (let [outcome (pipeline/run branching-source
                   {:parameters {:flags {"direction" "max"}}
-                   :logs-root "/tmp/attractor-param-no-ctx"})]
+                   :logs-root (str (os/temp-dir) "/attractor-param-no-ctx-" (random-uuid))})]
     (is (= [] (filter #(= :error (:severity %)) (:diagnostics outcome))))
     (is (contains? (set (:completed_nodes outcome)) "go_max"))
     (is (not (contains? (set (:completed_nodes outcome)) "go_min")))))
@@ -81,7 +81,7 @@
         _ (pipeline/run export-source
                         {:parameters {:flags {"editable" "solve.lg" "secret_note" "hidden"}}
                          :context ctx
-                         :logs-root "/tmp/attractor-param-env"})
+                         :logs-root (str (os/temp-dir) "/attractor-param-env-" (random-uuid))})
         out (context/ctx-get-string ctx "tool.output")]
     (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
     (is (not (str/includes? out "SECRET_NOTE")))))
@@ -240,7 +240,7 @@
             flag)))))
 
 (deftest a-live-run-checkpoint-records-resolved-parameters
-  (let [logs-root "/tmp/attractor-param-live-cp"
+  (let [logs-root (str (os/temp-dir) "/attractor-param-live-cp-" (random-uuid))
         _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
                                 :logs-root logs-root})
         cp (context/load-checkpoint (str logs-root "/checkpoint.edn"))]
