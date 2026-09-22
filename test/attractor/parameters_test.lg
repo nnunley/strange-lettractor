@@ -187,6 +187,79 @@
     (is (clojure.string/includes? (:message (first diags)) "issue"))
     (is (clojure.string/includes? (:message (first diags)) "graph attribute"))))
 
+(deftest an-escaped-reference-survives-substitution-and-validation
+  ;; The escape exists so a prompt can carry a literal brace pair for a model
+  ;; to read. Validation used to run on the substituted graph, where the
+  ;; escape's own output "{{thing}}" read as an undeclared reference.
+  (let [graph (parser/parse-dot
+                (str "digraph G { start [shape=Mdiamond]; "
+                     "guard [type=codergen, prompt=\"emit {{{{thing}}\"]; "
+                     "exit [shape=Msquare]; start -> guard -> exit; }"))
+        prepared (attractor.transforms/apply-transforms graph [] {})
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate prepared))]
+    (is (= "emit {{thing}}" (get-in prepared [:nodes "guard" :prompt])))
+    (is (= [] diags))))
+
+(deftest a-reference-in-an-eagerly-coerced-attribute-is-rejected
+  ;; The parser collapses these to a boolean (or, for a weight, a number)
+  ;; before substitution can run, so the reference is destroyed and the
+  ;; attribute silently takes a fixed value -- a parameterized goal gate
+  ;; would simply always fire.
+  (doseq [[attr source]
+          [[:goal_gate (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                            "start [shape=Mdiamond]; "
+                            "guard [type=codergen, goal_gate=\"{{p}}\", retry_target=start]; "
+                            "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:auto_status (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                              "start [shape=Mdiamond]; "
+                              "guard [type=codergen, auto_status=\"{{p}}\"]; "
+                              "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:allow_partial (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                                "start [shape=Mdiamond]; "
+                                "guard [type=codergen, allow_partial=\"{{p}}\"]; "
+                                "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:loop_restart (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                               "start [shape=Mdiamond]; exit [shape=Msquare]; "
+                               "start -> exit [loop_restart=\"{{p}}\"]; }")]
+           [:weight (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                         "start [shape=Mdiamond]; exit [shape=Msquare]; "
+                         "start -> exit [weight=\"{{p}}\"]; }")]]]
+    (let [prepared (attractor.transforms/apply-transforms (parser/parse-dot source) [] {})
+          diags (filter #(= "parameter_reference_coerced" (:rule %))
+                        (attractor.validation/validate prepared))]
+      (is (= 1 (count diags)) (str attr))
+      (is (clojure.string/includes? (:message (first diags)) (name attr)) (str attr))
+      (is (clojure.string/includes? (:message (first diags)) "'p'") (str attr)))))
+
+(deftest an-integer-attribute-is-not-in-the-coerced-family
+  ;; typed-integer passes a non-numeric string through unchanged, so
+  ;; substitution still reaches max_retries.
+  (let [source (str "digraph G { graph [params=\"[{:name :p :type :int :default 3}]\"]; "
+                    "start [shape=Mdiamond]; "
+                    "guard [type=codergen, max_retries=\"{{p}}\"]; "
+                    "exit [shape=Msquare]; start -> guard -> exit; }")
+        prepared (attractor.transforms/apply-transforms
+                   (parser/parse-dot source) [] {"p" "3"})]
+    (is (= [] (filter #(= "parameter_reference_coerced" (:rule %))
+                      (attractor.validation/validate prepared))))
+    (is (= "3" (get-in prepared [:nodes "guard" :attrs :max_retries])))))
+
+(deftest the-delegable-check-is-static-and-does-not-need-a-value
+  ;; The rule reads an index built from the authored text, so it fires for a
+  ;; delegable parameter with no default and no supplied value -- exactly the
+  ;; parameter a delegated caller is meant to supply.
+  (let [source (str "digraph G { graph [params=\""
+                    "[{:name :p :type :string :delegable true}]\"]; "
+                    "start [shape=Mdiamond]; "
+                    "run [shape=parallelogram, tool_command=\"sh {{p}}\"]; "
+                    "exit [shape=Msquare]; start -> run -> exit; }")
+        prepared (attractor.transforms/apply-transforms (parser/parse-dot source) [] {})
+        diags (filter #(= "parameter_delegable_open" (:rule %))
+                      (attractor.validation/validate prepared))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "tool_command"))))
+
 (def ^:private decls
   (:declarations
     (parameters/parse-declarations
@@ -218,7 +291,13 @@
     (is (= [] (:errors ok)))
     (is (= -1 (get-in ok [:typed "max_iterations"])))
     (is (= "-1" (get-in ok [:values "max_iterations"]))))
-  (doseq [bad ["7.5" "many"]]
+  ;; A leading + is accepted by the :int pattern, and render normalizes it
+  ;; away, so the rendered value is what a substituted command sees.
+  (let [plus (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" "+7"}})]
+    (is (= [] (:errors plus)))
+    (is (= 7 (get-in plus [:typed "max_iterations"])))
+    (is (= "7" (get-in plus [:values "max_iterations"]))))
+  (doseq [bad ["7.5" "many" ""]]
     (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" bad}})]
       (is (some #(and (= "parameter_type" (:rule %))
                       (clojure.string/includes? (:message %) "max_iterations"))
@@ -239,6 +318,11 @@
   ;; but resolve-values errors are maps ({:rule ... :message ...}), not
   ;; strings, per this task's error-shape contract. Checking :message instead.
   (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "editble" "y"}})]
+    (is (some #(and (= "parameter_undeclared" (:rule %))
+                    (clojure.string/includes? (:message %) "editble"))
+              (:errors res))))
+  ;; The same holds for a name that only a --params-file supplies.
+  (let [res (parameters/resolve-values decls {:file {"editble" "y"} :flags {"run_cmd" "x"}})]
     (is (some #(and (= "parameter_undeclared" (:rule %))
                     (clojure.string/includes? (:message %) "editble"))
               (:errors res)))))

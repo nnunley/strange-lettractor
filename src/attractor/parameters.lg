@@ -101,37 +101,50 @@
         :else
         (recur (inc i) (conj out (subs text i (inc i))) used)))))
 
-(defn- rewrite-map [m values skip refs]
-  (reduce (fn [[acc r] [k v]]
+(defn- rewrite-map [m values skip]
+  (reduce (fn [acc [k v]]
             (if (or (contains? skip k) (not (string? v)))
-              [(assoc acc k v) r]
-              (let [{:keys [text used]} (substitute-string v values)]
-                [(assoc acc k text)
-                 (reduce (fn [rr nm] (update rr nm (fnil conj #{}) k)) r used)])))
-          [{} refs]
+              (assoc acc k v)
+              (assoc acc k (:text (substitute-string v values)))))
+          {}
           m))
+
+(declare find-references)
+
+(defn reference-index
+  "Parameter name -> the set of attribute keys that name is written in.
+   Derived from the AUTHORED graph, so it is the same whether or not a value
+   was supplied for the name."
+  [graph]
+  (reduce (fn [acc r] (update acc (:name r) (fnil conj #{}) (:attr r)))
+          {}
+          (find-references graph)))
 
 (defn substitution-transform [values]
   (fn [graph]
+    ;; The reference scan runs on the authored graph, before substitution. Two
+    ;; things depend on that: an escaped "{{{{name}}" becomes a literal
+    ;; "{{name}}" that a post-substitution scan would misread as a reference,
+    ;; and a name with no supplied value is substituted nowhere yet is still
+    ;; statically referenced.
     (let [skip #{:params}
-          [top refs] (rewrite-map (dissoc graph :nodes :edges :attrs) values #{} {})
-          [attrs refs] (rewrite-map (or (:attrs graph) {}) values skip refs)
-          [nodes refs]
-          (reduce (fn [[acc r] [nid node]]
-                    (let [[n r1] (rewrite-map (dissoc node :attrs) values #{} r)
-                          [na r2] (rewrite-map (or (:attrs node) {}) values skip r1)]
-                      [(assoc acc nid (assoc n :attrs na)) r2]))
-                  [{} refs]
-                  (or (:nodes graph) {}))
-          [edges refs]
-          (reduce (fn [[acc r] edge]
-                    (let [[e r1] (rewrite-map (dissoc edge :attrs) values #{} r)
-                          [ea r2] (rewrite-map (or (:attrs edge) {}) values skip r1)]
-                      [(conj acc (assoc e :attrs ea)) r2]))
-                  [[] refs]
-                  (or (:edges graph) []))]
+          authored (find-references graph)
+          top (rewrite-map (dissoc graph :nodes :edges :attrs) values #{})
+          attrs (rewrite-map (or (:attrs graph) {}) values skip)
+          nodes (reduce (fn [acc [nid node]]
+                          (assoc acc nid
+                                 (assoc (rewrite-map (dissoc node :attrs) values #{})
+                                        :attrs (rewrite-map (or (:attrs node) {}) values skip))))
+                        {}
+                        (or (:nodes graph) {}))
+          edges (reduce (fn [acc edge]
+                          (conj acc (assoc (rewrite-map (dissoc edge :attrs) values #{})
+                                           :attrs (rewrite-map (or (:attrs edge) {}) values skip))))
+                        []
+                        (or (:edges graph) []))]
       (assoc top :attrs attrs :nodes nodes :edges (vec edges)
-                 :parameter_references refs))))
+                 :parameter_references (reference-index graph)
+                 :parameter_authored_references authored))))
 
 (defn- refs-in [text]
   (if-not (string? text)
@@ -207,10 +220,14 @@
 
 (defn find-references [graph]
   ;; :attrs is scanned exclusively (never the promoted top-level copies): it is
-  ;; a superset of every promoted field, and some promoted fields (e.g.
-  ;; :max_retries, :goal_gate) are coerced from strings to ints/booleans at
-  ;; the top level, so a {{name}} reference in one of those survives only in
-  ;; :attrs. Scanning both would double-report every promoted string field.
+  ;; a superset of every promoted field, so scanning both would double-report
+  ;; every promoted string field. :attrs is also the only place some references
+  ;; survive at all: the boolean-coerced family (:goal_gate, :auto_status,
+  ;; :allow_partial, edge :loop_restart) is collapsed to true/false by the
+  ;; parser before substitution runs, which destroys the reference. That is what
+  ;; coerced-attr? and the parameter_reference_coerced rule are for;
+  ;; typed-integer fields such as :max_retries are NOT in that family, because
+  ;; typed-integer passes a non-numeric string through unchanged.
   (let [scan (fn [m where]
                (mapcat (fn [[k v]]
                          (map (fn [nm] (merge {:name nm :attr k} where)) (refs-in v)))
@@ -228,6 +245,19 @@
   #{:tool_command :subpipeline.dotfile :model_stylesheet})
 
 (defn sensitive-attr? [k] (contains? sensitive-attrs k))
+
+;; Attributes the parser coerces eagerly, before substitution can run, so a
+;; {{name}} reference in one of them is destroyed instead of substituted: the
+;; booleans collapse any non-empty string to true, and an edge's :weight
+;; collapses any non-number to 0. An author would be silently misled -- a
+;; parameterized goal gate would simply always fire -- so the reference is
+;; rejected instead. typed-integer fields (:max_retries and friends) are not
+;; in this family: typed-integer passes a non-numeric string through unchanged,
+;; so substitution still reaches them.
+(def ^:private coerced-attrs
+  #{:goal_gate :auto_status :allow_partial :loop_restart :weight})
+
+(defn coerced-attr? [k] (contains? coerced-attrs k))
 
 (defn closed-type? [t]
   (or (= :int t) (enum-type? t)))

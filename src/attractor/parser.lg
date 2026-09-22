@@ -383,13 +383,16 @@
                 [attrs next-idx] (parse-attr-block-tokens tokens curr-idx)
                 defaults (or (get-in state [:current-subgraph :scoped-edge-defaults]) (:edge-defaults state))
                 merged-edge-attrs (merge defaults attrs)
-                merged-edge-attrs (update merged-edge-attrs :weight (fn [w] (if (number? w) w 0)))
+                ;; The promoted :weight is coerced, but :attrs keeps what the
+                ;; author wrote, so a "{{name}}" reference there is still
+                ;; visible to the reference scan (see parameters/coerced-attr?).
+                edge-weight (let [w (:weight merged-edge-attrs)] (if (number? w) w 0))
                 new-edges (map (fn [[from to]]
                                  {:from from
                                   :to to
                                   :label (or (:label merged-edge-attrs) "")
                                   :condition (or (:condition merged-edge-attrs) "")
-                                  :weight (or (:weight merged-edge-attrs) 0)
+                                  :weight edge-weight
                                   :fidelity (:fidelity merged-edge-attrs)
                                   :thread_id (:thread_id merged-edge-attrs)
                                   :loop_restart (boolean (:loop_restart merged-edge-attrs))

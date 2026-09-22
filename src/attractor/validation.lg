@@ -143,7 +143,13 @@
 ;; Rule: parameter_reference
 (defn rule-parameter-reference [graph]
   (let [declared (set (map :name (:declarations (parameters/parse-declarations
-                                                  (get-in graph [:attrs :params])))))]
+                                                  (get-in graph [:attrs :params])))))
+        ;; Substitution records what the AUTHORED text referenced. Rescanning
+        ;; the substituted text here would read an escaped "{{{{name}}" — which
+        ;; substitution has already turned into the literal "{{name}}" the
+        ;; author asked for — as an undeclared reference.
+        refs (or (:parameter_authored_references graph)
+                 (parameters/find-references graph))]
     (vec (keep (fn [ref]
                  (when-not (contains? declared (:name ref))
                    (merge {:rule "parameter_reference" :severity :error
@@ -157,7 +163,34 @@
                                          (:name ref) "'")}
                           (when (:node_id ref) {:node_id (:node_id ref)})
                           (when (:edge ref) {:edge (:edge ref)}))))
-               (parameters/find-references graph)))))
+               refs))))
+
+;; Rule: parameter_reference_coerced
+;; The parser turns a handful of attributes into booleans (or, for an edge's
+;; weight, a number) while parsing, which is before substitution runs, so a
+;; reference written in one of them never reaches substitution: goal_gate="{{p}}"
+;; becomes goal_gate=true and the gate always fires, with nothing to see. Tell
+;; the author rather than mislead them.
+(defn rule-parameter-reference-coerced [graph]
+  (let [refs (or (:parameter_authored_references graph)
+                 (parameters/find-references graph))]
+    (vec (keep (fn [ref]
+                 (when (parameters/coerced-attr? (:attr ref))
+                   (merge {:rule "parameter_reference_coerced" :severity :error
+                           :message (str (cond
+                                           (:node_id ref) (str "node '" (:node_id ref) "' ")
+                                           (:edge ref) (str "edge " (first (:edge ref))
+                                                            " -> " (second (:edge ref)) " ")
+                                           :else "graph ")
+                                         "attribute '" (name (:attr ref))
+                                         "' references parameter '" (:name ref)
+                                         "', but '" (name (:attr ref))
+                                         "' is coerced while parsing, before substitution "
+                                         "runs; the reference would be discarded and the "
+                                         "attribute would take a fixed value")}
+                          (when (:node_id ref) {:node_id (:node_id ref)})
+                          (when (:edge ref) {:edge (:edge ref)}))))
+               refs))))
 
 ;; Rule: type_known (WARNING)
 (defn rule-type-known
@@ -241,7 +274,10 @@
 ;; Rule: parameter_delegable_open
 (defn rule-parameter-delegable-open [graph]
   (let [decls (:declarations (parameters/parse-declarations (get-in graph [:attrs :params])))
-        refs (or (:parameter_references graph) {})]
+        ;; Static, per the spec: the index is built from the authored text, so
+        ;; the check fires for a delegable parameter whose value a delegated
+        ;; caller has yet to supply -- exactly the case it exists for.
+        refs (or (:parameter_references graph) (parameters/reference-index graph))]
     (vec (mapcat
            (fn [d]
              (let [used (get refs (:name d) #{})
@@ -281,6 +317,7 @@
                          rule-subpipeline-config
                          rule-parameter-declaration
                          rule-parameter-reference
+                         rule-parameter-reference-coerced
                          rule-parameter-delegable-open]
          all-rules (concat built-in-rules custom-rules)]
      (vec (mapcat (fn [r] (r graph)) all-rules)))))
