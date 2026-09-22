@@ -37,6 +37,60 @@
       (= (first rem) flag) (second rem)
       :else (recur (rest rem)))))
 
+(defn parse-parameter-args
+  "Parses repeatable --param name=value flags, an optional --params-file EDN
+   map and a --trust level out of a raw CLI argument vector. Returns
+   {:flags {...} :file {...} :trust :trusted|:delegated :errors [...]}."
+  [args]
+  (loop [rem (vec args) flags {} file {} trust nil errors []]
+    (cond
+      (empty? rem) {:flags flags :file file :trust (or trust :trusted) :errors errors}
+
+      (= "--param" (first rem))
+      (let [v (second rem)
+            idx (when (string? v) (str/index-of v "="))]
+        (if (and v idx (pos? idx))
+          (recur (subvec rem 2) (assoc flags (subs v 0 idx) (subs v (inc idx)))
+                 file trust errors)
+          (recur (if v (subvec rem 2) (subvec rem 1)) flags file trust
+                 (conj errors (str "--param expects name=value, got " (pr-str v))))))
+
+      (= "--params-file" (first rem))
+      (let [p (second rem)
+            parsed (try (edn/read-string (io/slurp p)) (catch Object e {::bad (str e)}))]
+        (cond
+          (nil? p) (recur (subvec rem 1) flags file trust
+                          (conj errors "--params-file expects a path"))
+          (and (map? parsed) (contains? parsed ::bad))
+          (recur (subvec rem 2) flags file trust
+                 (conj errors (str "--params-file " p " is not readable EDN: " (::bad parsed))))
+          (not (map? parsed))
+          (recur (subvec rem 2) flags file trust
+                 (conj errors (str "--params-file " p " must contain an EDN map")))
+          :else
+          (recur (subvec rem 2) flags
+                 (into file (map (fn [[k v]] [(name k) v]) parsed))
+                 trust errors)))
+
+      (= "--trust" (first rem))
+      (let [v (second rem)]
+        (if (contains? #{"trusted" "delegated"} v)
+          (recur (subvec rem 2) flags file (keyword v) errors)
+          (recur (if v (subvec rem 2) (subvec rem 1)) flags file trust
+                 (conj errors (str "--trust expects trusted or delegated, got " (pr-str v))))))
+
+      :else (recur (subvec rem 1) flags file trust errors))))
+
+(defn- parameter-args-or-exit
+  "Parses --param/--params-file/--trust from args, printing every error and
+   exiting non-zero before anything runs when parsing fails."
+  [args]
+  (let [res (parse-parameter-args args)]
+    (when (seq (:errors res))
+      (doseq [err (:errors res)] (println (str "Error: " err)))
+      (os/exit 2))
+    res))
+
 (def ^:private agent-option-flags
   #{"--prompt-file" "--cwd" "--model" "--tools" "--timeout-ms" "--permission-mode"
     "--sandbox" "--approval-policy" "--env-file"})
@@ -364,9 +418,9 @@
   (println "Usage: attractor <command> [options] [args]")
   (println "")
   (println "Commands:")
-  (println "  run <dotfile> [--logs-root <dir>] [--auto-approve]   Execute a DOT pipeline")
-  (println "  validate <dotfile>                                  Validate pipeline structure & syntax")
-  (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
+  (println "  run <dotfile> [--logs-root <dir>] [--auto-approve] [--param k=v]... [--params-file <path>] [--trust trusted|delegated]   Execute a DOT pipeline")
+  (println "  validate <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]  Validate pipeline structure & syntax")
+  (println "  graph <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]      Inspect graph nodes, edges, and flow")
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
   (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Shared HTTP/nREPL server")
   (println "  hub [--port PORT] [--port-file PATH] [--mock|--llm]  Start a persistent loopback nREPL hub")
@@ -400,7 +454,8 @@
          (:message diagnostic))))
 
 (defn cmd-validate [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (str/blank? dot-file)
       (do
         (println "Error: Please provide a DOT file to validate.")
@@ -412,7 +467,10 @@
           (os/exit 1))
         (try
           (let [dot-content (io/slurp dot-file)
-                prepared (pipeline/prepare dot-content {:source-path dot-file})
+                prepared (pipeline/prepare dot-content
+                           {:source-path dot-file
+                            :parameters {:flags (:flags params) :file (:file params)}
+                            :trust (:trust params)})
                 graph (:graph prepared)
                 diags (:diagnostics prepared)]
             (if (empty? diags)
@@ -433,12 +491,16 @@
             (os/exit 1)))))))
 
 (defn cmd-graph [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (or (str/blank? dot-file) (not (os/stat dot-file)))
       (do
         (println "Error: Valid DOT file required.")
         (os/exit 1))
-      (let [prepared (pipeline/prepare (io/slurp dot-file) {:source-path dot-file})
+      (let [prepared (pipeline/prepare (io/slurp dot-file)
+                       {:source-path dot-file
+                        :parameters {:flags (:flags params) :file (:file params)}
+                        :trust (:trust params)})
             graph (:graph prepared)
             start-node (parser/find-start-node graph)
             exit-node (parser/find-exit-node graph)]
@@ -484,7 +546,8 @@
           (:value result))))))
 
 (defn cmd-run [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (or (str/blank? dot-file) (not (os/stat dot-file)))
       (do
         (println "Error: Valid DOT file required.")
@@ -515,7 +578,9 @@
                          nil))
             outcome (run-through-hub! args :workflow/run
                       {:dot_source (io/slurp dot-file) :logs_root logs-root
-                       :source_path dot-file :auto_approve auto-approve?}
+                       :source_path dot-file :auto_approve auto-approve?
+                       :params (:flags params) :params_file (:file params)
+                       :trust (:trust params)}
                       on-event)]
         (println (str "\nExecution finished with status: " (:status outcome)))
         (println (str "Artifacts and checkpoints saved in: " logs-root))

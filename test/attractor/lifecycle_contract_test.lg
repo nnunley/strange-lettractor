@@ -697,7 +697,10 @@
             [pipeline/prepare
              (fn [source options]
                (swap! prepare-calls conj source)
-               (is (= {:source-path dot-path} options))
+               (is (= {:source-path dot-path
+                       :parameters {:flags {} :file {}}
+                       :trust :trusted}
+                      options))
                (real-prepare source options))
              os/exit (fn [_] nil)]
             (str (with-out-str (cli/cmd-validate [dot-path]))

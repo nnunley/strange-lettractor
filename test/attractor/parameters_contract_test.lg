@@ -1,8 +1,10 @@
 (ns attractor.parameters-contract-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [io :as io]
             [attractor.pipeline :as pipeline]
-            [attractor.context :as context]))
+            [attractor.context :as context]
+            [attractor.cli :as cli]))
 
 (def ^:private source
   "digraph P {
@@ -82,3 +84,23 @@
         out (context/ctx-get-string ctx "tool.output")]
     (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
     (is (not (str/includes? out "SECRET_NOTE")))))
+
+(deftest parameter-flags-parse-with-repetition-and-a-file
+  (io/spit "/tmp/attractor-params.edn" "{:direction \"max\" :max_iterations 7}")
+  (let [res (cli/parse-parameter-args
+              ["run" "wf.dot" "--params-file" "/tmp/attractor-params.edn"
+               "--param" "direction=min" "--param" "run_cmd=sh bench.sh"
+               "--trust" "delegated"])]
+    (is (= [] (:errors res)))
+    (is (= {"direction" "min" "run_cmd" "sh bench.sh"} (:flags res)))
+    (is (= "max" (get-in res [:file "direction"])))
+    (is (= 7 (get-in res [:file "max_iterations"])))
+    (is (= :delegated (:trust res)))))
+
+(deftest a-malformed-param-flag-is-rejected
+  (let [res (cli/parse-parameter-args ["run" "wf.dot" "--param" "novalue"])]
+    (is (some #(clojure.string/includes? % "novalue") (:errors res)))))
+
+(deftest an-unknown-trust-level-is-rejected
+  (let [res (cli/parse-parameter-args ["run" "wf.dot" "--trust" "root"])]
+    (is (some #(clojure.string/includes? % "root") (:errors res)))))
