@@ -434,6 +434,7 @@ workflow_configuration_error: option --param is not permitted on resume
 |-----------------------------|------------------------------------------------------|------------------------------------------------------------|
 | `parameter_declaration`     | duplicate name; default of the wrong type            | Reject at validate; the graph never runs                   |
 | `parameter_reference`       | `{{editble}}` with no such declaration               | Reject at validate; name the node and attribute            |
+| `parameter_reference_coerced` | `goal_gate="{{gate}}"`                             | Reject at validate; the attribute is coerced before substitution, so move the reference to an uncoerced attribute |
 | `parameter_undeclared`      | `--param editble=x`                                  | Reject before the run; list declared names                 |
 | `parameter_missing`         | `run_cmd` has no default and no value                | Reject before the run; name the parameter                  |
 | `parameter_type`            | `--param max_iterations=many`                        | Reject before the run; name the type and allowed values    |
