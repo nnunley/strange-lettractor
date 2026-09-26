@@ -1,7 +1,9 @@
 (ns attractor.session-error-http-bounded-test
-  (:require [clojure.test :refer [deftest is]] [probes.session-error-http-bounded :as bounded]))
+  (:require [clojure.test :refer [deftest is]] [harness.runtime :as runtime]
+            [probes.session-error-http-bounded :as bounded]))
 (deftest bounded-command-validation
-  (let [base "/Users/ndn/development/let-go/lg -source-paths src:test test/probes/session_error_http_check.lg run"]
+  (let [base (str (bounded/quote-shell (runtime/lg-path))
+                  " -source-paths src:test test/probes/session_error_http_check.lg run")]
     (is (= base (bounded/command [])))
     (is (= (str base " 31001") (bounded/command ["31001"])))
     (doseq [args [["0"] ["65536"] ["bad"] ["31001; echo bad"] ["31001" "extra"]]]
