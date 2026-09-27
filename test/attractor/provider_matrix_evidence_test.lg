@@ -140,16 +140,27 @@
               :unexpected-pass (catch Object e (:category (ex-data e)))))))
 
 (deftest parallel-result-evidence-rejects-separated-or-unused-results
-  (let [left {:content "left"} right {:content "right"}
-        valid {:text "left right" :steps [{:tool_calls [{:name "left"} {:name "right"}]
-                                           :tool_results [left right]}]}]
-    (is (= ["left" "right"] (:results (checks/parallel-evidence valid ["left" "right"]))))
+  (let [left {:content "left" :tool_call_id "call-left"}
+        right {:content "right" :tool_call_id "call-right"}
+        valid {:text "left right" :steps [{:tool_calls [{:name "left" :id "call-left"}
+                                                       {:name "right" :id "call-right"}]
+                                           :tool_results [left right]}
+                                          {:tool_calls [] :tool_results []
+                                           :finish_reason :stop}]}]
+    (is (= ["left" "right"] (:results (checks/parallel-evidence valid {"left" "left" "right" "right"}))))
     (doseq [invalid [(assoc valid :text "left")
                      (assoc-in valid [:steps 0 :tool_results 1 :is_error] true)
+                     (assoc-in valid [:steps 0 :tool_calls 1 :id] "call-left")
+                     (assoc-in valid [:steps 0 :tool_results 1 :tool_call_id] "wrong")
+                     (assoc-in (assoc-in valid [:steps 0 :tool_results 0 :content] "right")
+                               [:steps 0 :tool_results 1 :content] "left")
+                     (update-in valid [:steps 0 :tool_results]
+                                conj {:tool_call_id "call-left" :content "failed" :is_error true})
+                     (update valid :steps subvec 0 1)
                      (assoc valid :steps [{:tool_calls [{:name "left"}] :tool_results [left]}
                                           {:tool_calls [{:name "right"}] :tool_results [right]}])]]
       (is (= :missing-parallel-results
-             (try (checks/parallel-evidence invalid ["left" "right"]) :unexpected-pass
+             (try (checks/parallel-evidence invalid {"left" "left" "right" "right"}) :unexpected-pass
                   (catch Object e (:category (ex-data e)))))))))
 
 (deftest multi-round-evidence-rejects-batched-missing-and-unused-results
@@ -177,3 +188,51 @@
          (checks/reasoning-evidence {:text "391" :usage {:reasoning_tokens 12}})))
   (is (= {:reasoning_tokens 8 :reasoning_text_present true}
          (checks/reasoning-evidence {:reasoning "calculation" :usage {:reasoning_tokens 8}}))))
+
+(deftest basic-generation-proves-text-usage-and-stop-in-one-result
+  (let [predicate (ns-resolve 'live.provider-matrix-checks 'basic-generation-evidence)
+        good {:text "pong" :usage {:input_tokens 5 :output_tokens 2}
+              :finish_reason :stop}]
+    (is (some? predicate))
+    (when predicate
+      (is (= 5 (get-in (predicate good) [:usage :input_tokens])))
+      (doseq [bad [(assoc good :text "")
+                   (assoc-in good [:usage :input_tokens] 0)
+                   (assoc-in good [:usage :output_tokens] nil)
+                   (assoc good :finish_reason :tool_calls)]]
+        (is (= :incomplete-basic-generation
+               (try (predicate bad) :unexpected-pass
+                    (catch Object e (:category (ex-data e))))))))))
+
+(deftest streaming-proves-concatenated-deltas-equal-final-answer
+  (let [predicate (ns-resolve 'live.provider-matrix-checks 'basic-stream-evidence)
+        good [{:type :text_delta :delta "1,"} {:type :text_delta :delta "2,3"}]]
+    (is (some? predicate))
+    (when predicate
+      (is (= "1,2,3" (:response_text (predicate good "1,2,3"))))
+      (doseq [[events text] [[[] "1,2,3"] [good "1,2,3,4"] [good ""]]]
+        (is (= :stream-text-mismatch
+               (try (predicate events text) :unexpected-pass
+                    (catch Object e (:category (ex-data e))))))))))
+
+(deftest structured-extraction-requires-exact-alice-and-integer-age
+  (let [predicate (ns-resolve 'live.provider-matrix-checks 'alice-extraction-evidence)]
+    (is (some? predicate))
+    (when predicate
+      (is (= {"name" "Alice" "age" 30}
+             (:output (predicate {"name" "Alice" "age" 30}))))
+      (doseq [output [{"name" "Bob" "age" 30}
+                      {"name" "Alice" "age" 31}
+                      {"name" "Alice" "age" "30"}]]
+        (is (= :incorrect-extraction
+               (try (predicate output) :unexpected-pass
+                    (catch Object e (:category (ex-data e))))))))))
+
+(deftest cache-tool-choice-respects-catalog-forced-choice-capability
+  (let [choice (ns-resolve 'live.provider-matrix-checks 'cache-tool-choice)]
+    (is (some? choice))
+    (when choice
+      (is (= {:mode "auto"} (choice {:forced_tool_choice false} false)))
+      (is (= {:mode "required"} (choice {:forced_tool_choice true} false)))
+      (is (= {:mode "required"} (choice nil false)))
+      (is (= {:mode "none"} (choice {:forced_tool_choice false} true))))))

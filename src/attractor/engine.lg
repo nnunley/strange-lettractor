@@ -125,6 +125,29 @@
     (when (seq matching)
       (best-by-weight-then-lexical matching))))
 
+(defn- transition-record [graph node next-edge kind]
+  (let [from (:id node)
+        to (:to next-edge)]
+    (case kind
+      :edge
+      (let [index (first (keep-indexed
+                           (fn [index edge]
+                             (when (identical? edge next-edge) index))
+                           (:edges graph)))
+            ;; Edge selection normally returns the original graph map. Equality
+            ;; also covers callers that reconstruct an equivalent edge.
+            index (or index (first (keep-indexed
+                                     (fn [index edge]
+                                       (when (= edge next-edge) index))
+                                     (:edges graph))))]
+        {:kind :edge :from from :to to :edge_index index})
+
+      :override {:kind :override :from from :to to}
+      :retry {:kind :retry :from from :to to}
+      :goal_gate {:kind :goal_gate :from from :to to}
+      :failed_none {:kind :failed_none :from from :to nil}
+      {:kind :none :from from :to nil})))
+
 ;; Check if a node is terminal (shape=Msquare or id matches exit/end/done)
 (defn terminal-node? [node]
   (or (= (:shape node) "Msquare")
@@ -275,7 +298,7 @@
 
 (defn- normalize-handler-outcome [value]
   (when-let [contract (and (map? value)
-                           (status/normalize-contract value :status))]
+                           (status/normalize-runtime-outcome value))]
     ;; Handler outcomes may contain engine-only details such as artifacts or a
     ;; failure reason. Preserve those while canonicalizing contract fields.
     (merge (dissoc value
@@ -521,6 +544,11 @@
             (on-event (stage-event stage-index (elapsed) {:type :stage.completed :node_id node-id :status st :outcome outcome}))
             outcome)
 
+          (= st :skipped)
+          (do
+            (on-event (stage-event stage-index (elapsed) {:type :stage.completed :node_id node-id :status st :outcome outcome}))
+            outcome)
+
           ;; Retry requested
           (= st :retry)
           (if (< attempt max-attempts)
@@ -588,7 +616,7 @@
           (first (filter (fn [edge] (= start-node-id (:to edge)))
                          (:edges graph))))]
    (loop [current-node (parser/find-node graph start-node-id)
-         last-outcome {:status :success}
+         last-outcome {:status :skipped}
          step-count 0
          incoming-edge incoming-branch-edge
          completed-nodes []
@@ -624,10 +652,12 @@
                                         on-event (assoc retry-options :stage-index step-count))
             node-id (:id current-node)
             next-completed (conj completed-nodes node-id)
-            next-outcomes (assoc node-outcomes node-id outcome)]
+            skipped? (= :skipped (:status outcome))
+            next-outcomes (if skipped? node-outcomes (assoc node-outcomes node-id outcome))]
         (if (= :cancelled (:status outcome))
           (clear-attempt-status! logs-root current-node)
-          (write-stage-status! logs-root current-node outcome))
+          (when-not skipped?
+            (write-stage-status! logs-root current-node outcome)))
         (context/ctx-apply-updates! ctx (:context_updates outcome))
         (context/ctx-set! ctx "outcome"
                           (if (keyword? (:status outcome))
@@ -635,21 +665,23 @@
                             (str (:status outcome))))
         (let [next-edge (if (= :fail (:status outcome))
                           (select-failure-edge current-node outcome ctx graph)
-                          (select-edge current-node outcome ctx graph))]
+                          (if-let [next-node-id (:next_node_id outcome)]
+                            {:to next-node-id}
+                            (select-edge current-node outcome ctx graph)))]
           (if (nil? next-edge)
             (if (= :fail (:status outcome))
               (let [retry-target (resolve-node-retry-target current-node)]
                 (if (and retry-target (parser/find-node graph retry-target))
                   (recur (parser/find-node graph retry-target)
-                         outcome
+                         (if skipped? last-outcome outcome)
                          (inc step-count)
                          nil
                          next-completed
                          next-outcomes)
-                  outcome))
-              outcome)
+                  (if skipped? last-outcome outcome)))
+              (if skipped? last-outcome outcome))
             (recur (parser/find-node graph (:to next-edge))
-                   outcome
+                   (if skipped? last-outcome outcome)
                    (inc step-count)
                    next-edge
                    next-completed
@@ -749,7 +781,7 @@
                :stage.started
                (swap! state assoc :active_stage (:node_id event))
                :stage.completed
-               (do
+               (when-not (= :skipped (:status event))
                  (swap! state assoc-in [:node_outcomes (:node_id event)]
                         (:outcome event))
                  (when-let [artifacts (get-in event [:outcome :artifacts])]
@@ -924,7 +956,8 @@
             completed-nodes (or (:completed-nodes options) [])
             node-outcomes (normalize-node-outcomes (:node-outcomes options))
             incoming-edge (:initial-incoming-edge options)
-            step-count 0]
+            step-count 0
+            transition-history (vec (or (:transition-history options) []))]
 
        (cond
          (cancelled?)
@@ -961,7 +994,13 @@
                                 completed-nodes
                                 node-outcomes
                                 nil
-                                (inc step-count)))
+                                (inc step-count)
+                                (if (seq transition-history)
+                                  (assoc transition-history (dec (count transition-history))
+                                         (transition-record graph
+                                           (parser/find-node graph (last completed-nodes))
+                                           {:to retry-id} :goal_gate))
+                                  transition-history)))
                        (let [fail-res {:status :fail
                                        :failure_reason "Goal gate unsatisfied and no retry target"
                                        :unsatisfied_gate (:id failed-gate)
@@ -981,6 +1020,10 @@
                             :completed_nodes (conj completed-nodes node-id)
                             :node_retries @retry-counts
                             :node_outcomes node-outcomes
+                            :selected_transition {:kind :none :from node-id :to nil}
+                            :transition_history
+                            (conj transition-history {:kind :none :from node-id :to nil})
+                            :transition_history_start (or (:transition-history-start options) 0)
                             :context_values (context/ctx-snapshot ctx)
                             :logs (:logs @ctx)}
                            options
@@ -1011,7 +1054,8 @@
                ;; including no-op, human, tool, and custom handlers.
                (if (= :cancelled st)
                  (clear-attempt-status! logs-root current-node)
-                 (write-stage-status! logs-root current-node outcome))
+                 (when-not (= :skipped st)
+                   (write-stage-status! logs-root current-node outcome)))
 
                (if (= st :cancelled)
                  (let [cancelled-result
@@ -1027,7 +1071,9 @@
 
                  ;; Step 3: Record completion
                  (let [new-completed (conj completed-nodes node-id)
-                       new-outcomes (assoc node-outcomes node-id outcome)]
+                       new-outcomes (if (= st :skipped)
+                                      node-outcomes
+                                      (assoc node-outcomes node-id outcome))]
 
                  ;; Step 4: Apply context updates from outcome
                  (context/ctx-apply-updates! ctx (:context_updates outcome))
@@ -1035,8 +1081,27 @@
                  (when-not (str/blank? (:preferred_label outcome))
                    (context/ctx-set! ctx "preferred_label" (:preferred_label outcome)))
 
-                 ;; Step 5: Save checkpoint
-                 (let [current-fidelity (:resolved_fidelity prepared-node)
+                 ;; Select the transition before checkpointing so a resumed run
+                 ;; never has to infer routing from a prior recorded visit.
+                 (let [override-id (when (not= st :fail) (:next_node_id outcome))
+                       next-edge (if (= st :fail)
+                                   (select-failure-edge current-node outcome ctx graph)
+                                   (if override-id
+                                     {:to override-id}
+                                     (select-edge current-node outcome ctx graph)))
+                       retry-target (when (and (= st :fail) (nil? next-edge))
+                                      (resolve-node-retry-target current-node))
+                       selected (transition-record graph current-node
+                                    (or next-edge (when (and retry-target
+                                                             (parser/find-node graph retry-target))
+                                                    {:to retry-target}))
+                                    (cond override-id :override
+                                          next-edge :edge
+                                          (and retry-target (parser/find-node graph retry-target)) :retry
+                                          (= st :fail) :failed_none
+                                          :else :none))
+                       new-history (conj transition-history selected)
+                       current-fidelity (:resolved_fidelity prepared-node)
                        cp
                        (with-checkpoint-identity
                          {:timestamp (str (System/currentTimeMillis))
@@ -1044,19 +1109,17 @@
                           :completed_nodes new-completed
                           :node_retries @retry-counts
                           :node_outcomes new-outcomes
+                          :selected_transition selected
+                          :transition_history new-history
+                          :transition_history_start (or (:transition-history-start options) 0)
                           :context_values (context/ctx-snapshot ctx)
                           :logs (:logs @ctx)}
                          options
                          current-fidelity)]
                    (context/save-checkpoint cp (str logs-root "/checkpoint.edn"))
-                   (on-event {:type :checkpoint.saved :node_id node-id}))
+                   (on-event {:type :checkpoint.saved :node_id node-id})
 
-                 ;; Step 6: Select next edge
-                 (let [next-edge (if (= st :fail)
-                                   (select-failure-edge current-node outcome ctx graph)
-                                   (if-let [next-node-id (:next_node_id outcome)]
-                                     {:to next-node-id}
-                                     (select-edge current-node outcome ctx graph)))]
+                 ;; Step 6: Follow the saved transition.
                    (if (nil? next-edge)
                      ;; No edge selected: handle failure routing or exit
                      (if (= st :fail)
@@ -1067,7 +1130,8 @@
                                   new-completed
                                   new-outcomes
                                   nil
-                                  (inc step-count))
+                                  (inc step-count)
+                                  new-history)
                            (let [fail-res (merge (select-keys outcome [:category :retryable :notes :mapping :cause-category :path])
                                           {:status :fail
                                            :failure_reason (or (:failure_reason outcome) "Stage failed and no route found")
@@ -1101,7 +1165,8 @@
                                   new-completed
                                   new-outcomes
                                   next-edge
-                                  (inc step-count)))))))))))))))))
+                                  (inc step-count)
+                                  new-history))))))))))))))))
 
 (defn- close-fidelity-threads! [threads]
   (let [first-error (atom nil)]
@@ -1150,6 +1215,8 @@
             :node-outcomes
             :node-retries
             :retry-counts
+            :transition-history
+            :transition-history-start
             :first-node-fidelity-override)
     :start-at target
     :logs-root logs-root
@@ -1249,20 +1316,31 @@
               (context/resolve-fidelity last-incoming-edge last-node graph)))
         node-outcomes (normalize-node-outcomes (:node_outcomes checkpoint))
         saved-outcome (get node-outcomes last-node-id)
+        selected? (contains? checkpoint :selected_transition)
+        selected (:selected_transition checkpoint)
         outcome (or saved-outcome
                     {:status (keyword
                                (context/ctx-get-string ctx "outcome" "success"))
                      :preferred_label
                      (context/ctx-get-string ctx "preferred_label" "")})
-        failed? (= :fail (:status outcome))
+        failed? (if selected?
+                  (= :failed_none (:kind selected))
+                  (= :fail (:status outcome)))
         saved-next-id (:next_node_id saved-outcome)
-        next-edge (when (and last-node (nil? saved-next-id))
-                    (if failed?
-                      (select-failure-edge last-node outcome ctx graph)
-                      (select-edge last-node outcome ctx graph)))
-        retry-target (when (and (nil? saved-next-id) failed? (nil? next-edge))
+        next-edge (if selected?
+                    (case (:kind selected)
+                      :edge (get (vec (:edges graph)) (:edge_index selected))
+                      :override {:to (:to selected)}
+                      nil)
+                    (when (and last-node (nil? saved-next-id))
+                      (if failed?
+                        (select-failure-edge last-node outcome ctx graph)
+                        (select-edge last-node outcome ctx graph))))
+        retry-target (when (and (not selected?) (nil? saved-next-id) failed? (nil? next-edge))
                        (resolve-node-retry-target last-node))
-        next-id (or saved-next-id (:to next-edge) retry-target)]
+        next-id (if selected?
+                  (:to selected)
+                  (or saved-next-id (:to next-edge) retry-target))]
 
     (cond
       (and next-id (parser/find-node graph next-id))
@@ -1275,6 +1353,11 @@
                  :completed-nodes completed-nodes
                  :node-outcomes node-outcomes
                  :node-retries (:node_retries checkpoint)
+                 :transition-history (or (:transition_history checkpoint) [])
+                 :transition-history-start
+                 (if (contains? checkpoint :transition_history_start)
+                   (:transition_history_start checkpoint)
+                   (count completed-nodes))
                  :initial-incoming-edge next-edge)
           (:loop_restart next-edge)
           (assoc :attractor.engine/resume-restart next-edge)

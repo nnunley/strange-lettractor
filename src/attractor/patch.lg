@@ -205,35 +205,65 @@
 (defn- join-content [lines trailing-newline]
   (str (str/join "\n" lines) (when trailing-newline "\n")))
 
-(defn apply-patch [working-dir patch]
+(defn apply-patch-with-files
+  "Apply v4a operations through caller-owned file access. Paths are relative
+   to that filesystem's working directory; read_file must return full raw
+   text. Raw reads are needed only by update operations; delete_file is needed
+   only by delete and move operations. Required capabilities are checked
+   before any operation mutates the filesystem."
+  [files patch]
   (let [operations (parse-patch patch)]
+    ;; Reject unavailable capabilities before any writes. The standard
+    ;; ExecutionEnvironment has no delete_file operation; never substitute
+    ;; a host filesystem operation for a missing environment capability.
+    (when (and (not (:read_file files))
+               (some (fn [operation] (= :update (:op operation))) operations))
+      (throw (ex-info "Execution environment does not support raw file reads required by this patch"
+                      {:category :unsupported-operation :operation :read_file})))
+    (when (and (not (:delete_file files))
+               (some (fn [operation]
+                       (or (= :delete (:op operation))
+                           (and (:move_to operation)
+                                (not= (:path operation) (:move_to operation)))))
+                     operations))
+      (throw (ex-info "Execution environment does not support file deletion required by this patch"
+                      {:category :unsupported-operation :operation :delete_file})))
     (doseq [operation operations]
-      (let [source (resolve-path working-dir (:path operation))]
+      (let [source (safe-relative-path (:path operation))]
         (case (:op operation)
           :add
           (do
-            (when (os/stat source)
+            (when ((:file_exists files) source)
               (invalid-patch (str "file already exists: " (:path operation))))
-            (when-let [parent (parent-path source)] (io/mkdir parent))
-            (io/spit source (:content operation)))
+            ((:write_file files) source (:content operation)))
 
           :delete
           (do
-            (when-not (os/stat source)
+            (when-not ((:file_exists files) source)
               (invalid-patch (str "file does not exist: " (:path operation))))
-            (os/sh "rm" "-f" source))
+            ((:delete_file files) source))
 
           :update
           (do
-            (when-not (os/stat source)
+            (when-not ((:file_exists files) source)
               (invalid-patch (str "file does not exist: " (:path operation))))
-            (let [original (io/slurp source)
+            (let [original ((:read_file files) source)
                   split (split-content original)
                   updated-lines (reduce apply-hunk (:lines split) (:hunks operation))
                   target (if-let [move-to (:move_to operation)]
-                           (resolve-path working-dir move-to)
+                           (safe-relative-path move-to)
                            source)]
-              (when-let [parent (parent-path target)] (io/mkdir parent))
-              (io/spit target (join-content updated-lines (:trailing_newline split)))
-              (when (not= target source) (os/sh "rm" "-f" source)))))))
+              ((:write_file files) target (join-content updated-lines (:trailing_newline split)))
+              (when (not= target source) ((:delete_file files) source)))))))
     (str "Applied " (count operations) " operation(s)")))
+
+(defn apply-patch [working-dir patch]
+  (apply-patch-with-files
+    {:file_exists (fn [path] (some? (os/stat (resolve-path working-dir path))))
+     :read_file (fn [path] (io/slurp (resolve-path working-dir path)))
+     :write_file (fn [path content]
+                   (let [target (resolve-path working-dir path)]
+                     (when-let [parent (parent-path target)] (io/mkdir parent))
+                     (io/spit target content)))
+     :delete_file (fn [path] (io/delete-file (resolve-path working-dir path)))}
+    patch))

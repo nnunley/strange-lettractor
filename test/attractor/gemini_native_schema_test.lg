@@ -1,0 +1,42 @@
+(ns attractor.gemini-native-schema-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.profiles :as profiles]
+            [attractor.llm :as llm]
+            [json :as json]))
+
+(deftest read-many-files-declares-string-path-items
+  (let [profile (profiles/create-gemini-profile "gemini-test")
+        tool (profiles/registry-get (:tool_registry profile) "read_many_files")]
+    (is (= {:type "array" :items {:type "string"}}
+           (get-in tool [:definition :parameters :properties :paths])))))
+
+(defn- array-schemas [value]
+  (cond
+    (map? value) (concat (when (= "array" (get value "type")) [value])
+                         (mapcat array-schemas (vals value)))
+    (sequential? value) (mapcat array-schemas value)
+    :else []))
+
+(deftest native-gemini-request-preserves-complete-array-schemas
+  (let [captured (atom nil)
+        profile (profiles/create-gemini-profile "gemini-test")
+        response (llm/gemini-complete
+                   {:provider "gemini" :model "gemini-test" :api_key "test-key"
+                    :messages [{:role :user :content "Read the files"}]
+                    :tools (profiles/registry-definitions (:tool_registry profile))
+                    :transport (fn [request]
+                                 (reset! captured request)
+                                 {:status 200
+                                  :body (json/write-json
+                                          {:candidates [{:finishReason "STOP"
+                                                         :content {:role "model"
+                                                                   :parts [{:text "done"}]}}]})})})
+        body (json/read-json (:body @captured))
+        declarations (get-in body ["tools" 0 "functionDeclarations"])
+        read-many (first (filter #(= "read_many_files" (get % "name")) declarations))
+        arrays (vec (array-schemas declarations))]
+    (is (= "done" (get-in response [:message :text])))
+    (is (= "string" (get-in read-many ["parameters" "properties" "paths" "items" "type"])))
+    (is (seq arrays))
+    (doseq [schema arrays]
+      (is (map? (get schema "items")) "Every native Gemini array declares its item schema"))))

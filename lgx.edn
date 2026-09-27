@@ -10,13 +10,48 @@
 
  ;; Every entry point lives here; the Makefile only forwards to these tasks.
  :tasks
- {suite {:doc "Run the full Attractor test suite"
-         :with [:test]
-         :do  {:run ["test/runner.lg" "--all"]}}
+ {suite {:doc "Run the full Attractor test suite (lgx 0.3.2+)"
+         :do  {:sh ["lgx" "test"]}}
   test-ns {:doc "Run one test namespace, e.g. attractor.providers-test"
            :args [{:name :ns :type :string}]
            :with [:test]
            :do  {:run ["test/runner.lg" :arg/ns]}}
+  audit-coding-loop
+  {:doc "Audit the original coding-loop spec: deterministic contracts, native wire tests and repair regressions (no live providers)"
+   :with [:test]
+   :do {:run ["test/runner.lg" "--deadline-ms" "240000"
+              "attractor.agent-test"
+              "attractor.agent-loop-contract-test"
+              "attractor.agent-loop-wire-test"
+              "attractor.agent-error-wire-test"
+              "attractor.agent-parity-matrix-wire-test"
+              "attractor.agent-subagent-wire-test"
+              "attractor.agent-event-origin-test"
+              "attractor.profiles-test"
+              "attractor.gemini-native-schema-test"
+              "attractor.tool-contract-test"
+              "attractor.tool-output-contract-test"
+              "attractor.environment-contract-test"
+              "attractor.environment-edit-portability-test"
+              "attractor.execution-test"
+              "attractor.execution-scope-test"
+              "attractor.execution-cwd-test"
+              "attractor.execution-env-test"
+              "attractor.execution-env-collision-test"
+              "attractor.execution-stdin-test"
+              "attractor.patch-test"
+              "attractor.project-docs-contract-test"
+              "attractor.prompt-metadata-test"
+              "attractor.read-file-agent-contract-test"
+              "attractor.subagent-lifecycle-test"
+              "attractor.turn-ownership-test"
+              "attractor.session-error-contract-test"
+              "attractor.event-families-test"
+              "attractor.parity-matrix-journeys-test"
+              "attractor.parity-matrix-evidence-test"
+              "attractor.coding-loop-audit-test"
+              "attractor.coding-smoke-journey-test"
+              "attractor.coding-conformance-suite-test"]}}
   runners {:doc "Run every test namespace in its own process, one summary line each"
            :do  {:sh ["bash" "test/runners.sh"]}}
 
@@ -50,6 +85,9 @@
   live-parity {:doc "Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL"
                :with [:test]
                :do  {:run ["test/live/parity_matrix.lg" "run"]}}
+  live-coding-conformance {:doc "Coding-agent live parity and shared-session smoke for native providers or explicit gateway aliases"
+                           :with [:test]
+                           :do {:run ["test/live/coding_conformance.lg" "run"]}}
   live-smoke {:doc "Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL"
               :with [:test]
               :do  {:run ["test/live/attractor_smoke.lg" "run"]}}

@@ -9,6 +9,8 @@
             [attractor.context-discovery :as capacity]
             [attractor.models :as models]
             [attractor.providers :as providers]
+            [attractor.schema.dialects :as schema-dialects]
+            [attractor.schema.resources :as schema-resources]
             [attractor.operation-owner :as owner]))
 
 (defn- response-header [response header-name]
@@ -605,7 +607,8 @@
 (declare provider-tool-result-content tool-result-images)
 
 (defn- openai-content-part [role part]
-  (if (some? (:provider_data part))
+  (if (and (some? (:provider_data part))
+           (not= :gemini (:provider_data_source part)))
     (:provider_data part)
     (if (some? (get part "type"))
     part
@@ -626,7 +629,8 @@
         (unsupported-content! "openai" kind))))))
 
 (defn- anthropic-content-part [part]
-  (if (some? (:provider_data part))
+  (if (and (some? (:provider_data part))
+           (not= :gemini (:provider_data_source part)))
     (:provider_data part)
     (if (some? (get part "type"))
     part
@@ -982,10 +986,20 @@
     (str "Return only valid JSON matching this JSON Schema: "
          (json/write-json (json-safe schema)))))
 
+(defn- gemini-25-thinking-budget [model effort]
+  ;; Our portable policy for Gemini 2.5: these are valid token budgets, not
+  ;; equivalences prescribed by Google. Gemini 3 and unknown models retain
+  ;; the existing thinkingLevel mapping.
+  (when (and effort
+             (re-matches #"(?:models/)?gemini-2\.5-(?:pro|flash(?:-lite)?)(?:[-.].*)?"
+                         (str/lower-case (str model))))
+    (case effort "low" 1024 "medium" 8192 "high" 24576 nil)))
+
 (defn- gemini-generation-config [request]
   (let [format (:response_format request)
         format-type (field format :type)
-        effort (portable-reasoning-effort request)]
+        effort (portable-reasoning-effort request)
+        budget (gemini-25-thinking-budget (:model request) effort)]
     (cond-> {}
       (some? (:temperature request))
       (assoc :temperature (:temperature request))
@@ -996,7 +1010,9 @@
       (some? (:stop_sequences request))
       (assoc :stopSequences (:stop_sequences request))
       (some? effort)
-      (assoc :thinkingConfig {:thinkingLevel effort})
+      (assoc :thinkingConfig (if (some? budget)
+                              {:thinkingBudget budget}
+                              {:thinkingLevel effort}))
       (or (= format-type "json") (= format-type "json_schema"))
       (assoc :responseMimeType "application/json")
       (= format-type "json_schema")
@@ -1114,7 +1130,8 @@
       (or output []))))
 
 (defn- openai-compatible-content-part [part]
-  (if (some? (:provider_data part))
+  (if (and (some? (:provider_data part))
+           (not= :gemini (:provider_data_source part)))
     (:provider_data part)
     (let [kind (content-kind part)]
       (case kind
@@ -1597,7 +1614,9 @@
 
 ;; Gemini native generateContent adapter.
 (defn- gemini-content-part [part]
-  (if (some? (:provider_data part))
+  (if (and (some? (:provider_data part))
+           (or (nil? (:provider_data_source part))
+               (= :gemini (:provider_data_source part))))
     (:provider_data part)
     (if (or (some? (get part "text"))
           (some? (get part "inlineData"))
@@ -1675,7 +1694,8 @@
             embeds-tool-calls
             (some (fn [part]
                     (or (= :tool_call (content-kind part))
-                        (some? (get part "functionCall"))))
+                        (some? (get part "functionCall"))
+                        (some? (get-in part [:provider_data "functionCall"]))))
                   source-parts)]
         {:role "model"
          :parts (vec
@@ -1758,16 +1778,22 @@
               call {:id (or (get native "id") (str "call_" (ids/uuid-text)))
                     :name (or (get native "name") "")
                     :arguments (or (get native "args") {})}]
-          [(conj parts {:kind :tool_call :tool_call call})
+          [(conj parts (cond-> {:kind :tool_call :tool_call call}
+                         (contains? part "thoughtSignature")
+                         (assoc :provider_data part :provider_data_source :gemini)))
            (conj calls call)])
 
         (some? (get part "text"))
         (if (get part "thought")
-          [(conj parts {:kind :thinking
-                        :thinking {:text (or (get part "text") "")
-                                   :redacted false}})
+          [(conj parts (cond-> {:kind :thinking
+                               :thinking {:text (or (get part "text") "")
+                                          :redacted false}}
+                         (contains? part "thoughtSignature")
+                         (assoc :provider_data part :provider_data_source :gemini)))
            calls]
-          [(conj parts {:kind :text :text (or (get part "text") "")}) calls])
+          [(conj parts (cond-> {:kind :text :text (or (get part "text") "")}
+                         (contains? part "thoughtSignature")
+                         (assoc :provider_data part :provider_data_source :gemini))) calls])
 
         (some? (get part "inlineData"))
         (let [inline (get part "inlineData")
@@ -2485,16 +2511,27 @@
   (let [snapshot @state
         tool-calls (:tool_calls snapshot)
         usage (gemini-usage (:usage snapshot))
-        parts (vec
-                (concat
-                  (when-not (str/blank? (:reasoning snapshot))
-                    [{:kind :thinking
-                      :thinking {:text (:reasoning snapshot)
-                                 :redacted false}}])
-                  (when-not (str/blank? (:text snapshot))
-                    [{:kind :text :text (:text snapshot)}])
-                  (map (fn [call] {:kind :tool_call :tool_call call})
-                       tool-calls)))]
+        signed? (some #(contains? % "thoughtSignature") (:native_parts snapshot))
+        parts (if signed?
+                (first
+                  (reduce
+                    (fn [[parts remaining] part]
+                      (if (= :tool_call (:kind part))
+                        [(conj parts (assoc part :tool_call (first remaining)))
+                         (rest remaining)]
+                        [(conj parts part) remaining]))
+                    [[] tool-calls]
+                    (first (normalize-gemini-parts (:native_parts snapshot)))))
+                (vec
+                  (concat
+                    (when-not (str/blank? (:reasoning snapshot))
+                      [{:kind :thinking
+                        :thinking {:text (:reasoning snapshot)
+                                   :redacted false}}])
+                    (when-not (str/blank? (:text snapshot))
+                      [{:kind :text :text (:text snapshot)}])
+                    (map (fn [call] {:kind :tool_call :tool_call call})
+                         tool-calls))))]
     {:id (:id snapshot)
      :model (or (:model snapshot) (:model request))
      :provider "gemini"
@@ -2537,6 +2574,7 @@
     (when-let [id (get body "responseId")] (swap! state assoc :id id))
     (when-let [model (get body "modelVersion")] (swap! state assoc :model model))
     (when-let [usage (get body "usageMetadata")] (swap! state update :usage merge usage))
+    (when (seq parts) (swap! state update :native_parts (fnil into []) parts))
     (when first-text? (swap! state assoc :text_started true))
     (when first-reasoning? (swap! state assoc :reasoning_started true))
     (doseq [part text-parts]
@@ -3528,84 +3566,21 @@
 (defn- schema-values-equal? [left right]
   (= (schema-comparison-value left) (schema-comparison-value right)))
 
-(defn- local-schema-children [schema]
-  ;; Only schema-valued keyword locations participate in identifier discovery.
-  ;; Objects inside defaults, examples, enum values, and annotations are data.
-  (filter map?
-    (concat
-      (mapcat (fn [key]
-                (let [entries (field schema key)]
-                  (when (map? entries) (vals entries))))
-              [:$defs :definitions :properties :patternProperties
-               :dependentSchemas :dependencies])
-      (map (fn [key] (field schema key))
-           [:items :additionalItems :contains :additionalProperties :propertyNames
-            :unevaluatedItems :unevaluatedProperties :not :if :then :else :contentSchema])
-      (mapcat (fn [key]
-                (let [entries (field schema key)]
-                  (when (vector? entries) entries)))
-              [:items :prefixItems :allOf :anyOf :oneOf]))))
-
-(defn- resolve-local-schema-anchor [root anchor]
-  (loop [pending [root] matches []]
-    (if (empty? pending)
-      (first matches)
-      (let [schema (peek pending)
-            matches (if (and (map? schema)
-                             (or (= anchor (field schema :$anchor))
-                                 (= anchor (field schema :$dynamicAnchor))))
-                      (conj matches schema) matches)]
-        ;; Duplicate names are ambiguous; never select by map iteration order.
-        (when (< (count matches) 2)
-          (recur (into (pop pending)
-                       (when (map? schema)
-                         (remove (fn [child] (:present (schema-field-entry child :$id)))
-                                 (local-schema-children schema))))
-                 matches))))))
-
-(defn- resolve-local-schema-ref [root reference]
-  (let [reference (when (and (string? reference) (str/starts-with? reference "#"))
-                    ;; io/decode uses query decoding; protect literal plus signs
-                    ;; because a URI fragment does not use form-space encoding.
-                    (try (str "#" (io/decode :url
-                                    (str/replace (subs reference 1) "+" "%2B")))
-                         (catch Object _ nil)))]
-  (cond
-    (= reference "#") {:schema root :document root}
-    (and (string? reference) (str/starts-with? reference "#/"))
-    (reduce
-      (fn [location segment]
-        (let [current (:schema location)
-              document (if (and (map? current) (string? (field current :$id)))
-                         current (:document location))
-              decoded (-> segment
-                          (str/replace "~1" "/")
-                          (str/replace "~0" "~"))
-              child
-          (cond
-            (not (re-matches #"(?:[^~]|~[01])*" segment)) nil
-            (map? current)
-            (let [entry (schema-value current decoded)]
-              (when (:present entry) (:value entry)))
-
-            (and (vector? current) (re-matches #"0|[1-9][0-9]*" decoded))
-            (let [index (try (parse-long decoded) (catch Object _ nil))]
-              (when (and (some? index) (<= 0 index) (< index (count current)))
-                (get current index)))
-
-            :else nil)]
-          (when (some? child) {:schema child :document document})))
-      {:schema root :document root}
-      (str/split (subs reference 2) #"/"))
-    (and (string? reference) (re-matches #"#[A-Za-z_][A-Za-z0-9_.-]*" reference))
-    (when-let [schema (resolve-local-schema-anchor root (subs reference 1))]
-      {:schema schema :document root})
-    :else nil)))
-
 (declare validate-json-schema*)
 
+(defn- merge-schema-annotations [results]
+  ;; Results carry only coverage at their own instance location. Child value
+  ;; validators never donate their property names/indices to the parent.
+  (reduce (fn [annotations result]
+            (if (first result)
+              (let [covered (get result 2)]
+                {:properties (into (:properties annotations) (:properties covered))
+                 :items (into (:items annotations) (:items covered))})
+              annotations))
+          {:properties #{} :items #{}} results))
+
 (defn- validate-schema-reference [value schema state reference]
-  (let [visit [(:document state) reference value]]
+  (let [visit [(:base_uri state) schema value (mapv :base_uri (:dynamic_scope state))]]
     (when (contains? (:active_refs state) visit)
       ;; Propagate outside applicator boolean logic: `not` must not turn an
       ;; invalid cyclic schema into successful instance validation.
@@ -3623,12 +3598,12 @@
         valid-count (count (filter first results))]
     (case mode
       :all (if (= valid-count (count results))
-             [true ""]
+             [true "" (merge-schema-annotations results)]
              (or (first (filter (fn [result] (not (first result))) results))
                  [false "Value does not satisfy allOf"]))
-      :any (if (pos? valid-count) [true ""]
+      :any (if (pos? valid-count) [true "" (merge-schema-annotations results)]
              [false "Value does not satisfy anyOf"])
-      :one (if (= 1 valid-count) [true ""]
+      :one (if (= 1 valid-count) [true "" (merge-schema-annotations results)]
              [false "Value does not satisfy exactly one oneOf schema"]))))
 
 (defn- validate-object-schema [value schema root]
@@ -3642,12 +3617,13 @@
         dependent-schemas (concat (active-dependencies (field schema :dependentSchemas))
                                   (remove (fn [[_ dependency]] (sequential? dependency))
                                           legacy-dependencies))
-        dependency-failure
-        (first (keep (fn [[key dependency]]
-                       (let [[valid? reason] (validate-json-schema* value dependency root)]
-                         (when-not valid?
-                           [false (str "Dependency of " (schema-key-name key) ": " reason)])))
-                     dependent-schemas))
+        dependency-results
+        (mapv (fn [[key dependency]]
+                (let [result (validate-json-schema* value dependency root)]
+                  (if (first result) result
+                    [false (str "Dependency of " (schema-key-name key) ": " (second result))])))
+              dependent-schemas)
+        dependency-failure (first (filter (fn [result] (not (first result))) dependency-results))
         missing (first (filter (fn [key]
                                  (not (:present (schema-value value key))))
                                required))
@@ -3682,7 +3658,15 @@
                                      (empty? (matching-patterns key))))
                               value)
         min-properties (field schema :minProperties)
-        max-properties (field schema :maxProperties)]
+        max-properties (field schema :maxProperties)
+        covered-properties (set (map (comp schema-key-name first)
+                                    (filter (fn [[key _]]
+                                              (or (contains? property-names (schema-key-name key))
+                                                  (seq (matching-patterns key))
+                                                  (:present additional-entry))) value)))
+        success [true "" (merge-schema-annotations
+                            (conj dependency-results
+                                  [true "" {:properties covered-properties}]))]]
     (cond
       missing [false (str "Missing required property: " missing)]
       dependency-failure dependency-failure
@@ -3719,8 +3703,8 @@
                   (if valid?
                     (recur (next extras))
                     [false (str "Property " (schema-key-name key) ": " reason)]))
-                [true ""]))
-            [true ""]))))))
+                success))
+            success))))))
 
 (defn- validate-array-schema [value schema root]
   (let [min-items (field schema :minItems)
@@ -3732,10 +3716,12 @@
         tail-entry (schema-field-entry schema (if (vector? item-schema) :additionalItems :items))
         tail-schema (if (:present tail-entry) (:value tail-entry) true)
         contains-entry (schema-field-entry schema :contains)
-        matching-count (when (:present contains-entry)
-                         (count (filter (fn [item]
-                                          (first (validate-json-schema* item (:value contains-entry) root)))
-                                        value)))
+        matching-indices (when (:present contains-entry)
+                           (set (keep-indexed
+                                  (fn [index item]
+                                    (when (first (validate-json-schema* item (:value contains-entry) root))
+                                      index)) value)))
+        matching-count (count matching-indices)
         min-contains (or (field schema :minContains) 1)
         max-contains (field schema :maxContains)]
     (cond
@@ -3759,7 +3745,29 @@
             (if valid?
               (recur (next items) (inc index))
               [false (str "Item " index ": " reason)]))
-          [true ""])))))
+          [true "" {:items (into (set (range (if (:present tail-entry)
+                                               (count value)
+                                               (min (count prefix) (count value)))))
+                                  matching-indices)}])))))
+
+(defn- validate-unevaluated [value schema root annotations]
+  (let [object? (map? value)
+        entry (schema-field-entry schema (if object? :unevaluatedProperties :unevaluatedItems))
+        coverage-key (if object? :properties :items)
+        entries (if object? value (map-indexed vector value))
+        location-key (if object? schema-key-name identity)]
+    (if-not (:present entry)
+      [true "" annotations]
+      (loop [remaining (seq entries) covered (get annotations coverage-key)]
+        (if-let [[key child] (first remaining)]
+          (if (contains? covered (location-key key))
+            (recur (next remaining) covered)
+            (let [[valid? reason] (validate-json-schema* child (:value entry) root)]
+              (if valid?
+                (recur (next remaining) (conj covered (location-key key)))
+                [false (str (if object? "Unevaluated property " "Unevaluated item ")
+                            key ": " reason)])))
+          [true "" (assoc annotations coverage-key covered)])))))
 
 (defn- validate-string-schema [value schema]
   (let [min-length (field schema :minLength)
@@ -3809,10 +3817,15 @@
     (= schema false) [false "Schema rejects this value"]
     (not (map? schema)) [false "Schema must be an object or boolean"]
     :else
-    (let [root (if (string? (field schema :$id)) (assoc root :document schema) root)
+    (let [root (schema-resources/enter root schema)
+          schema (schema-dialects/active-schema schema root)
           reference-entry (schema-field-entry schema :$ref)
           reference (:value reference-entry)
-          resolved (when reference (resolve-local-schema-ref (:document root) reference))
+          resolved (when (:present reference-entry) (schema-resources/resolve-reference root reference false))
+          dynamic-entry (schema-field-entry schema :$dynamicRef)
+          dynamic-reference (:value dynamic-entry)
+          dynamic-resolved (when (:present dynamic-entry)
+                             (schema-resources/resolve-reference root dynamic-reference true))
           enum-entry (schema-field-entry schema :enum)
           const-entry (schema-field-entry schema :const)
           expected (field schema :type)
@@ -3824,7 +3837,11 @@
           immediate-failure
           (cond
             (and (:present reference-entry) (nil? resolved))
-            [false (str "Unresolved schema reference: " reference)]
+            (let [reason (str "Unresolved schema reference: " reference)]
+              (throw (ex-info reason {:category :invalid-schema-reference :reason reason})))
+            (and (:present dynamic-entry) (nil? dynamic-resolved))
+            (let [reason (str "Unresolved dynamic schema reference: " dynamic-reference)]
+              (throw (ex-info reason {:category :invalid-schema-reference :reason reason})))
             (and (:present enum-entry)
                  (not (some (fn [candidate] (schema-values-equal? value candidate))
                             (:value enum-entry))))
@@ -3839,13 +3856,18 @@
         (let [checks
               (concat
                 (when (:present if-entry)
-                  (let [condition-valid? (first (validate-json-schema* value (:value if-entry) root))
+                  (let [condition-result (validate-json-schema* value (:value if-entry) root)
+                        condition-valid? (first condition-result)
                         branch (schema-field-entry schema (if condition-valid? :then :else))]
-                    (when (:present branch)
-                      [(validate-json-schema* value (:value branch) root)])))
+                    (concat (when condition-valid? [condition-result])
+                            (when (:present branch)
+                              [(validate-json-schema* value (:value branch) root)]))))
                 (when (:present reference-entry)
                   [(validate-schema-reference value (:schema resolved)
-                     (assoc root :document (:document resolved)) reference)])
+                     (:state resolved) reference)])
+                (when (:present dynamic-entry)
+                  [(validate-schema-reference value (:schema dynamic-resolved)
+                     (:state dynamic-resolved) dynamic-reference)])
                 (when (:present all-of-entry)
                   [(validate-schema-list value (:value all-of-entry) root :all)])
                 (when (:present any-of-entry)
@@ -3863,13 +3885,28 @@
                    (number? value) (validate-number-schema value schema)
                    :else [true ""])])
               failed (first (filter (fn [result] (not (first result))) checks))]
-          (or failed [true ""]))))))
+          (or failed
+              (let [annotations (merge-schema-annotations checks)]
+                (if (or (map? value) (vector? value))
+                  (validate-unevaluated value schema root annotations)
+                  [true "" annotations]))))))))
 
-(defn validate-json-schema [value schema]
+(defn validate-json-schema
+  "Validate an instance, returning [valid? reason]. Options: :schema_base_uri
+   gives the retrieval URI; :schema_registry maps known URIs to schemas;
+   :schema_default_dialect selects a dialect for undeclared documents.
+   Resource identifiers are never downloaded implicitly."
+  [value schema & [options]]
   (try
-    (validate-json-schema* value schema {:document schema :active_refs #{}})
+    (let [options (assoc (or options {}) :schema_active_keyword?
+                         (schema-dialects/resource-keyword-selector options))
+          state (schema-resources/initial-state schema options)
+          state (schema-dialects/preflight state options validate-json-schema*)
+          [valid? reason] (validate-json-schema* value schema state)]
+      [valid? reason])
     (catch Object e
-      (if (= :cyclic-schema-reference (:category (ex-data e)))
+      (if (contains? #{:cyclic-schema-reference :invalid-schema-reference
+                       :invalid-schema-dialect} (:category (ex-data e)))
         [false (:reason (ex-data e))]
         (throw e)))))
 
@@ -3888,7 +3925,7 @@
       (and start end (< start end)) (subs candidate start (inc end))
       :else candidate)))
 
-(defn- parse-validated-object [text schema]
+(defn- parse-validated-object [text schema & [options]]
   (let [parsed (try
                  (try (json/read-json text)
                       (catch Object _ (json/read-json (unfenced-json text))))
@@ -3896,7 +3933,7 @@
                    (throw (ex-info "No object generated: response was not valid JSON"
                                    {:category :no-object-generated
                                     :cause (str e)}))))
-        [valid? reason] (validate-json-schema parsed schema)]
+        [valid? reason] (validate-json-schema parsed schema options)]
     (when-not valid?
       (throw (ex-info (str "No object generated: " reason)
                       {:category :no-object-generated :reason reason})))
@@ -3905,11 +3942,12 @@
 (defn generate-object [model prompt schema & [opts]]
   (let [result (generate
                  model prompt
-                 (assoc (or opts {})
+                 (assoc (dissoc (or opts {}) :schema_base_uri :schema_registry
+                                          :schema_default_dialect)
                         :response_format {:type "json_schema"
                                           :json_schema schema
                                           :strict true}))]
-    (assoc result :output (parse-validated-object (:text result) schema))))
+    (assoc result :output (parse-validated-object (:text result) schema opts))))
 
 (defn- streamed-continuation-messages [conversation response tool-calls tool-results]
   (let [assistant-message
@@ -4261,7 +4299,7 @@
       (when-not (= invalid-partial-value partial) partial))
     (catch Object _ nil)))
 
-(defn- stream-object-updates [events schema state]
+(defn- stream-object-updates [events schema state options]
   (mapcat
     (fn [event]
       (case (:type event)
@@ -4290,9 +4328,11 @@
                              (response-text (:response event))
                              @(:text state))]
             (try
-              (let [final-object (parse-validated-object final-text schema)]
+              (let [final-object (parse-validated-object final-text schema options)]
                 (reset! (:error state) nil)
-                (reset! (:object state) final-object)
+                ;; The envelope distinguishes completed JSON null/false from
+                ;; the initial state without relying on the value's truthiness.
+                (reset! (:object state) {:value final-object})
                 (if (= final-object @(:partial state))
                   []
                   (do (reset! (:partial state) final-object) [final-object])))
@@ -4307,7 +4347,8 @@
   (let [stream-result
         (high-level-stream
           model prompt
-          (assoc (or opts {})
+          (assoc (dissoc (or opts {}) :schema_base_uri :schema_registry
+                                   :schema_default_dialect)
                  :response_format {:type "json_schema"
                                    :json_schema schema
                                    :strict true}))
@@ -4315,7 +4356,7 @@
                :partial (atom nil)
                :object (atom nil)
                :error (atom nil)}
-        objects (stream-object-updates (:events stream-result) schema state)]
+        objects (stream-object-updates (:events stream-result) schema state opts)]
     {:objects objects
      :events (:events stream-result)
      :partial_object (fn [] @(:partial state))
@@ -4325,6 +4366,7 @@
        (doall objects)
        (when-let [error @(:error state)]
          (throw error))
-       (or @(:object state)
-           (throw (ex-info "No object generated: stream did not finish"
-                           {:category :no-object-generated}))))}))
+       (if-let [completed @(:object state)]
+         (:value completed)
+         (throw (ex-info "No object generated: stream did not finish"
+                         {:category :no-object-generated}))))}))

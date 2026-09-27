@@ -1,9 +1,63 @@
 # Iterative Delivery Roadmap
 
+OpenRouter follow-up: user-requested `or-responses/openai/gpt-5.2` checks use
+the OpenAI Responses adapter/profile with gateway provenance. Combined parity
+coverage is 15/15 across initial, targeted and final runs; the final strengthened
+same-session smoke passes 7/7. Report `1790550366776` completes its selected
+reasoning-change plus smoke scope (exit 0). This supplements accepted first-party OpenAI wire evidence without
+claiming direct OpenAI live access. See the current provider evidence.
+
+2026-09-27 live follow-up: `lgx live-coding-conformance` now combines all
+fifteen parity rows and the implemented seven-step same-session smoke, with
+explicit provider/check/row scope and native-origin validation. Anthropic has
+15/15 parity coverage across an initial 13-row pass and a targeted two-row rerun
+after clarifying exact-output prompts (assertions unchanged). Gemini also covers
+15/15 across its repaired full run and targeted loop-warning rerun. Strengthened
+Anthropic smoke passes five steps before quota-exceeded in the subagent step;
+timeout remains unrun. Gemini strengthened smoke passes all seven steps. Initial
+weaker smoke evidence is excluded. First-party OpenAI is wire verified, direct live not run, and
+explicitly accepted by the user for publication without a push blocker. See
+[current provider
+evidence](../../provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+The current named audit includes these follow-ups. The earlier full-suite count
+below remains dated repair evidence, not final publication verification.
+
+Current original-spec closure is tracked in [spec-closure.md](spec-closure.md).
+
+Closure follow-up, 2026-09-27: CAL-AUDIT-01 through CAL-AUDIT-04 from the
+[coding-loop audit](../../coding-loop-audit-2026-09-27.md) are repaired with
+regular regressions. `lgx audit-coding-loop` passes 261 tests / 2529 assertions,
+zero failures/errors; earlier repair full suite passed 1566 tests / 14159 assertions with zero failures. Custom
+environments need optional `:fork_scope` for independently owned child
+cancellation. Patch targeting and the specification's event/state ambiguities
+still need explicit disposition, alongside full live parity and shared-session
+smoke evidence. This does not replace the user's existing catalog/integration
+priority order.
+User priority update, 2026-09-24: finish review/integration of ITER-0020, then
+the provider-journey batch. Next implement the approved offline model-catalog
+extraction before the shared-session integration smoke. Native-provider evidence
+and the final original-spec audit follow; locally testable work continues while
+provider access is unresolved. Gemini and Anthropic basic native access were
+restored after user funding on 2026-09-24; their full journeys remain unproved.
+Native OpenAI credentials are still unavailable. Keep Luna on the bounded
+catalog task and Sol on provider integration.
+
+The 2026-09-23 audit found additional schema, stream completion and custom
+environment gaps despite historical completed story labels. ITER-0014 repairs
+those gaps and records fresh evidence; the full original-spec audit remains open.
+
 The repository already has a walking skeleton: DOT parse → transform/validate through supported entry points → deterministic handler execution → routing → EDN checkpoint/artifact persistence. `ITER-0000` records that imported baseline and the completed timeout hardening slice. Follow-on iterations close observable gaps in risk order.
 
 | Iteration | Status | Scope | Stories | Scenarios |
 |---|---|---|---|---|
+| ITER-0021 Shared provider journeys | done:repair, 2026-09-24 (gpt-6-sol; full suite1526/13863/0, paired reviews/audits, compiled CLI gates) | Shared CLI/test journeys, generation/stream/parallel/extraction and404/429 contracts, preserved rows/routing, capability-aware cache/defaults and cleanup; Gemini original signatures and Anthropic signed-thinking history. Focused62/673/0; bounded native subsets pass on Gemini/Anthropic,429 remains unobserved. Batch2 in parity-evidence-plan.md | ULLM-CORE-01, ULLM-ADAPTER-01, ULLM-COMPLETE-01, ULLM-TOOLS-01, ULLM-ERROR-01, ULLM-QUIRKS-01, ULLM-RELEASE-01 | SCN-PROVIDER-JOURNEYS, SCN-GEMINI-SIGNATURES, SCN-PROVIDER-MATRIX |
+| ITER-0020 Shared agent parity journeys | done:repair, 2026-09-24 (gpt-6-sol; final suite 1498/13585/0, paired reviews/audit, compiled CLI gates) | Factor reusable live/session journeys, add five missing parallel/steering/reasoning/subagent/loop-warning rows, and prove the same orchestration through all three native scripted protocols with real local tools and failure controls; preserve ten existing rows and CLI selection. Repair the discovered Gemini 2.5 budget serialization dependency. Batch 1 in parity-evidence-plan.md | CAL-PARITY-01, CAL-LOOP-01, CAL-REASON-01, CAL-STEER-01, CAL-SUBAGENT-01, ULLM-QUIRKS-01 | SCN-CAL-PARITY-JOURNEYS, SCN-CAL-PARITY-MATRIX, SCN-CAL-PARITY-LIVE |
+| ITER-0019 Current model catalog | done:repair, 2026-09-23 (gpt-6-luna) | Sourced Opus/Sol/Luna metadata, preserved defaults/aliases, capability-driven Anthropic completion/stream behavior and prompt cutoffs; root focused 137/822/0, paired spec/quality approval, full suite 1485/13406/0 and fresh CLI validation; plan in catalog-refresh-plan.md | ULLM-CORE-01, ULLM-QUIRKS-01, CAL-SYSTEM-01 | SCN-CATALOG-REFRESH, SCN-ULLM-CLIENT, SCN-SYSTEM-PROMPT-BOUND |
+| ITER-0018 Schema dialect and meta-validation | done:repair, 2026-09-23 (gpt-6-sol; fixture alignment gpt-6-luna) | Explicit 2020-12 and registered vocabulary semantics, resource-local dialects, schema preflight and all 1301 mandatory official cases; focused 20/88/0, fixture/LLM regression 108/616/0, paired spec/quality approval, full suite 1481/13376/0, six standalone probes and CLI validation; documented support contract in schema-dialect-plan.md | ULLM-STRUCTURED-01 | SCN-SCHEMA-DIALECTS, SCN-SCHEMA-REFERENCES |
+| ITER-0017 Preparation contracts | done:repair, 2026-09-23 (gpt-6-luna) | Hyphenated DOT BareValue with strict keys/IDs, stylesheet reasoning enum, named custom lint objects and function/Var compatibility; root focused 40/327/0, paired spec/quality approval, full suite 1460/11894/0 and fresh CLI validation | ATTR-DOT-01, ATTR-VAL-01 | SCN-PREPARATION-CONTRACTS, SCN-ATTR-PARSE, SCN-STYLESHEET-SYNTAX, SCN-VALIDATION |
+| ITER-0016 Runtime SKIPPED outcomes | done:repair, 2026-09-23 | Separate runtime/file status contracts; preserve routing, revisits, checkpoint transitions, branch and manager semantics. Focused 19/138/0, impacted 208/1506/0; paired reviews clean; integrated suite 1453/11844/0 and CLI validation pass | ATTR-ENG-01, ATTR-CP-01, ATTR-STATUS-01 | SCN-SKIPPED-OUTCOME |
+| ITER-0015 Schema resource references | done:repair, 2026-09-23 (dialects/meta-validation remain partial) | RFC 3986 resolution, explicit registries, bundled resources, dynamic references/scopes and unresolved-reference failures; focused 61/716/0, including all 323 official reference/unevaluated cases; paired review clean; integrated suite 1453/11844/0 | ULLM-STRUCTURED-01 | SCN-SCHEMA-REFERENCES, SCN-SCHEMA-UNEVALUATED |
+| ITER-0014 Original-spec closure repairs | done:repair 2026-09-23 (overall specification remains partial) | Unevaluated schema annotations, completed false/null stream values, standard execution-environment editing and raw/display separation, lgx 0.3.2 full suite 1417/11275/0 | ULLM-STRUCTURED-01, CAL-ENV-01, CAL-TOOLS-01 | SCN-SCHEMA-UNEVALUATED, SCN-CAL-ENV-EDIT, SCN-ULLM-HIGHLEVEL |
 | ITER-0000 Walking skeleton and deadline safety | complete | Existing end-to-end mock journey plus cooperative deadlines, nested cancellation, process-group termination, and AOT | ATTR-DOT-01/02, ATTR-ENG-01/02, ATTR-CP-01, CAL-ENGINE-01 | SCN-ATTR-PARSE, SCN-ATTR-ENGINE, SCN-TIMEOUT, SCN-CHECKPOINT |
 | ITER-0001 Status-file contract | done | Before each main/subgraph attempt: stale-file isolation; all specified JSON field types/outcome validation; unknown-field tolerance; file-over-handler precedence; handler fallback; exact auto synthesis; explicit-false inheritance; routing/event/checkpoint parity | ATTR-STATUS-01/02 | SCN-STATUS-FILE, SCN-AUTO-STATUS |
 | ITER-0002 Public lifecycle preparation | done | Order-independent subgraph classes; one DOT-source public prepare/run lifecycle; built-in then custom transform order with input isolation; canonical diagnostics, custom rules, and validation gate shared by CLI/server | ATTR-DOT-03, ATTR-ENG-03, ATTR-VAL-01, ATTR-XFORM-01 | SCN-SUBGRAPH-LABEL, SCN-PUBLIC-LIFECYCLE, SCN-TRANSFORM-ORDER, SCN-VALIDATION, SCN-ATTR-ENGINE |

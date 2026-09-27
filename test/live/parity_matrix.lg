@@ -11,123 +11,10 @@
             [attractor.agent :as agent] [attractor.execution :as execution]
             [attractor.llm :as llm] [attractor.providers :as providers]
             [attractor.profiles :as profiles]
-            [live.parity-matrix-checks :as checks]
+            [live.parity-matrix-journeys :as journeys]
             [live.provider-matrix-checks :as selection]))
 
 (defn- env [k] (let [v (os/getenv k)] (when-not (str/blank? v) v)))
-
-(defn- fresh-dir []
-  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-live-matrix-"
-                  (System/currentTimeMillis) "-" (rand-int 100000))]
-    (io/mkdir root)
-    root))
-
-(defn- session [spec dir events]
-  (let [[provider model] (let [i (str/index-of spec "/")] [(subs spec 0 i) (subs spec (inc i))])
-        client (llm/make-client {:default_provider provider
-                                 :providers {provider (llm/make-provider-adapter provider {})}})]
-    (agent/make-session
-      {:model spec :llm_client client
-       :provider_profile (checks/profile-for (providers/protocol-of provider) provider model)
-       :execution_env (execution/make-local-environment {:working_dir dir :default_command_timeout_ms 10000})
-       :project_docs [] :max_subagent_depth 0 :max_tool_rounds_per_input 12
-       :retry_policy {:max_retries 1}
-       :on_event #(swap! events conj %)})))
-
-(defn- tool-ends [events] (filter #(= :tool_call_end (:type %)) events))
-(defn- tool-starts [events] (filter #(= :tool_call_start (:type %)) events))
-(defn- used? [events tool] (some #(= tool (:tool_name %)) (tool-starts events)))
-(defn- file [dir name] (let [p (str dir "/" name)] (when (os/stat p) (io/slurp p))))
-
-(def rows
-  [{:row :file-creation
-    :prompt "Create a file named hello.txt in the current directory containing exactly the text hello (no newline). Use the write_file tool."
-    :check (fn [dir events _ _] (= "hello" (some-> (file dir "hello.txt") str/trim)))}
-   {:row :read-then-edit
-    :setup (fn [dir] (io/spit (str dir "/greet.txt") "hello\n"))
-    :prompt "Read greet.txt, then change the word hello in it to HELLO using the edit tool. Do not rewrite the whole file."
-    :check (fn [dir events _ _] (and (used? events "read_file")
-                                   (= "HELLO" (some-> (file dir "greet.txt") str/trim))))}
-   {:row :multi-file-edit
-    :setup (fn [dir] (io/spit (str dir "/a.txt") "alpha\n") (io/spit (str dir "/b.txt") "beta\n"))
-    :prompt "In a.txt replace alpha with ALPHA, and in b.txt replace beta with BETA. Edit both files."
-    :check (fn [dir events _ _] (and (= "ALPHA" (some-> (file dir "a.txt") str/trim))
-                                   (= "BETA" (some-> (file dir "b.txt") str/trim))))}
-   {:row :shell-execution
-    :prompt "Run the shell command `printf matrix-ok` and tell me its exact output."
-    :check (fn [dir events answer _] (and (used? events "shell")
-                                        (some #(str/includes? (str (:output %)) "matrix-ok") (tool-ends events))
-                                        (str/includes? (str answer) "matrix-ok")))}
-   {:row :shell-timeout
-    :prompt "Run the shell command `sleep 5` with timeout_ms set to 200. Report whether it timed out."
-    :check (fn [dir events _ _] (some #(str/includes? (str (:output %) (:error %)) "timed out") (tool-ends events)))}
-   {:row :grep-and-glob
-    :setup (fn [dir] (io/mkdir (str dir "/src"))
-             (io/spit (str dir "/src/needle.py") "def find_me():\n    return 42\n")
-             (io/spit (str dir "/src/other.py") "x = 1\n"))
-    :prompt "Find which file defines find_me using grep, and list all .py files using glob. Report the file names."
-    :check (fn [dir events answer _] (and (used? events "grep") (used? events "glob")
-                                        (str/includes? (str answer) "needle.py")))}
-   {:row :multi-step
-    :setup (fn [dir] (io/spit (str dir "/config.ini") "port = 8080\nhost = localhost\n"))
-    :prompt "Read config.ini, work out the port value, then edit the file so the port is one higher than it is now."
-    :check (fn [dir events _ _] (and (used? events "read_file")
-                                   (str/includes? (str (file dir "config.ini")) "8081")))}
-   {:row :truncation
-    :setup (fn [dir] (io/spit (str dir "/big.txt") (apply str (repeat 1500 (str (apply str (repeat 6 "0123456789")) "\n")))))
-    :prompt "Read big.txt with the read_file tool and tell me how many characters the tool output warned it removed, if any."
-    :check (fn [dir events _ history]
-             (let [reads (filter #(= "read_file" (:tool_name %)) (tool-starts events))
-                   full (some #(when (> (count (str (:output %))) 60000) %) (tool-ends events))
-                   model-view (some #(when (str/includes? (str (:content %)) "Tool output was truncated") %)
-                                    (mapcat :results (filter #(= :tool_results (:type %)) history)))]
-               (and (seq reads) (some? full) (some? model-view))))}
-   {:row :error-recovery
-    :setup (fn [dir] (io/spit (str dir "/recovery-source.txt") "recovered-token\n"))
-    :prompt "First call read_file on absent-source.txt. After receiving its error, read recovery-source.txt instead. Write the recovered text into recovered.txt."
-    :check (fn [dir events _ history]
-             (when (= "recovered-token\n" (file dir "recovered.txt"))
-               (checks/recovery-evidence history "recovered-token")))}
-   {:row :provider-edit-format
-    :setup (fn [dir] (io/spit (str dir "/edit-target.txt") "before\nkeep this line\n"))
-    :prompt "Read edit-target.txt and use your profile's dedicated editing tool (apply_patch if available, otherwise edit_file) to change only before to after. Preserve the remaining text exactly. Do not use shell or write_file."
-    :check (fn [dir events _ history]
-             (and (= "after\nkeep this line\n" (file dir "edit-target.txt"))
-                  (used? events "read_file")
-                  (not (used? events "shell")) (not (used? events "write_file"))))}])
-
-(defn- run-row [spec {:keys [row prompt setup check]}]
-  (let [dir (fresh-dir) events (atom []) started (System/currentTimeMillis)]
-    (when setup (setup dir))
-    (let [s (session spec dir events)
-          outcome (try (let [answer (agent/process-input! s prompt)]
-                         {:answer answer})
-                       (catch Object e {:error {:category (:category (ex-data e)) :message (ex-message e)}}))
-          history (:history @s)
-          _ (agent/close-session! s)
-          proof (when (nil? (:error outcome))
-                  (try (check dir @events (:answer outcome) history) (catch Object _ false)))
-          profile (:provider_profile @s)
-          expected-edit (if (some #(= "apply_patch" (:name %))
-                                 (profiles/profile-tools profile)) "apply_patch" "edit_file")
-          edit-result (some #(when (and (= expected-edit (:tool_name %)) (false? (:is_error %))) %)
-                            (mapcat :results (filter #(= :tool_results (:type %)) history)))
-          passed (and proof (or (not= row :provider-edit-format) (some? edit-result)))]
-      {:row row :status (if passed :pass :fail) :model spec
-       :protocol (providers/protocol-of (:id profile))
-       :proof (cond (map? proof) proof
-                    (and passed (= row :provider-edit-format)) {:editing_tool expected-edit :file_verified true}
-                    :else nil)
-       :duration_ms (- (System/currentTimeMillis) started)
-       :tools (mapv :tool_name (tool-starts @events))
-       :failure_details (when-not passed
-                          {:answer (:answer outcome)
-                           :tool_calls (vec (mapcat :tool_calls (filter #(= :assistant (:type %)) history)))
-                           :tool_results (mapv #(update % :content (fn [s] (subs (str s) 0 (min 4000 (count (str s))))))
-                                               (mapcat :results (filter #(= :tool_results (:type %)) history)))
-                           :recovered_file (when (= row :error-recovery) (file dir "recovered.txt"))
-                           :edited_file (when (= row :provider-edit-format) (file dir "edit-target.txt"))})
-       :error (:error outcome)})))
 
 (defn -main [& args]
   (deadline/arm-from-args! args 1800000 "the parity matrix")
@@ -139,11 +26,11 @@
           (prn {:status :error :reason (str "unknown provider " provider)}) (os/exit 2))
         (let [selected (some-> (env "ATTRACTOR_PARITY_ROWS") (str/split #",")
                               (#(set (map (comp keyword str/trim) %))))
-              selected-rows (mapv second (selection/select-journeys (mapv (juxt :row identity) rows) selected))
-              results (mapv (fn [row] (let [r (run-row spec row)] (prn (providers/redact r)) r)) selected-rows)
+              selected-rows (mapv second (selection/select-journeys (mapv (juxt :row identity) journeys/rows) selected))
+              results (mapv (fn [row] (let [r (journeys/run-row spec row)] (prn (providers/redact r)) r)) selected-rows)
               failed (filter #(= :fail (:status %)) results)
               evidence {:scenario "SCN-CAL-PARITY-LIVE" :recorded_at (str (System/currentTimeMillis))
-                        :model spec :available_rows (mapv :row rows) :rows results}]
+                        :model spec :available_rows (mapv :row journeys/rows) :rows results}]
           (io/mkdir "evidence/parity-matrix-evidence")
           (io/spit (str "evidence/parity-matrix-evidence/" (str/replace spec #"[^A-Za-z0-9._-]+" "-")
                         "-" (:recorded_at evidence) ".edn")

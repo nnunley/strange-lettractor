@@ -1,5 +1,7 @@
 (ns attractor.profiles
-  (:require [clojure.string :as str] [attractor.tool-images :as tool-images]))
+  (:require [clojure.string :as str] [attractor.tool-images :as tool-images]
+            [attractor.patch :as patch]
+            [attractor.execution :as execution]))
 
 (defn- validate-registered-tool! [tool]
   (let [definition (:definition tool)
@@ -115,6 +117,86 @@
 (defn- registered [definition executor]
   {:definition definition :executor executor})
 
+(defn- read-file-for-tool [environment path offset limit]
+  (if-let [read-tool (or (:read_file_tool environment)
+                        (when (= :tool (:read_file_format environment))
+                          (:read_file environment)))]
+    (read-tool path offset limit)
+    (let [raw ((:read_file environment) path nil nil)]
+      (if (string? raw)
+        (execution/format-file-text raw offset limit)
+        raw))))
+
+(defn- read-edit-text [environment path]
+  ;; The optional raw reader supports environments whose tool-facing
+  ;; read_file adds line numbers or pagination (including the local adapter).
+  ;; Spec-only environments provide full text through read_file(path,nil,nil).
+  (let [content (if-let [read-text (:read_text environment)]
+                  (read-text path)
+                  (do
+                    (when (= :tool (:read_file_format environment))
+                      (throw (ex-info "Formatted file reader requires read_text for editing"
+                                      {:category :unsupported-operation
+                                       :operation :read_text :path path})))
+                    ((:read_file environment) path nil nil)))]
+    (when-not (string? content)
+      (throw (ex-info "Editing requires a text file"
+                      {:category :unsupported-binary-file :path path})))
+    content))
+
+(defn- edit-file-through-environment [environment path old-string new-string replace-all]
+  (when (empty? old-string)
+    (throw (ex-info "old_string must not be empty" {:category :invalid-edit})))
+  (let [content (read-edit-text environment path)
+        matches (loop [start 0 total 0]
+                  (if-let [index (str/index-of content old-string start)]
+                    (recur (+ index (count old-string)) (inc total))
+                    total))]
+    (when (zero? matches)
+      (throw (ex-info "old_string was not found"
+                      {:category :edit-not-found :path path})))
+    (when (and (> matches 1) (not replace-all))
+      (throw (ex-info "old_string is not unique; provide more context or set replace_all"
+                      {:category :edit-not-unique :matches matches :path path})))
+    ((:write_file environment) path
+      (if replace-all
+        (str/replace content old-string new-string)
+        (str/replace-first content old-string new-string)))
+    (if replace-all matches 1)))
+
+(defn- patch-delete-operation [environment]
+  (or (:delete_file environment)
+      ;; The specified file interface omits deletion. POSIX environments can
+      ;; perform it through their own command interface; other environments
+      ;; can provide delete_file without emulating a shell. Never use os/sh.
+      (when (and (:exec_command environment)
+                 (:platform environment)
+                 (contains? #{"linux" "darwin"} ((:platform environment))))
+        (fn [path]
+          (let [quoted (str "'" (str/replace path "'" "'\"'\"'") "'")
+                result ((:exec_command environment) (str "rm -f -- " quoted)
+                        (or (:default_command_timeout_ms environment) 10000) nil nil)]
+            (when (or (not= 0 (:exit_code result))
+                      (:timed_out result) (:cancelled result)
+                      ((:file_exists environment) path))
+              (throw (ex-info (str "Unable to delete file through execution environment: " path)
+                              {:category :patch-delete-failed :path path
+                               :exit_code (:exit_code result)
+                               :stderr (:stderr result)}))))))))
+
+(defn- apply-patch-through-environment [environment patch-text]
+  (patch/apply-patch-with-files
+    {:file_exists (:file_exists environment)
+     ;; Missing raw access is a capability failure, so the patch engine must
+     ;; detect it before an earlier add/delete operation changes anything.
+     :read_file (when (or (:read_text environment)
+                          (and (:read_file environment)
+                               (not= :tool (:read_file_format environment))))
+                  (fn [path] (read-edit-text environment path)))
+     :write_file (:write_file environment)
+     :delete_file (patch-delete-operation environment)}
+    patch-text))
+
 (defn- base-tools [edit-kind default-shell-timeout grep-output-modes]
   (let [read-def (definition "read_file" "Read a line-numbered file"
                              {:file_path {:type "string"}
@@ -162,8 +244,8 @@
         nil?
         [(registered read-def
                  (fn [args env]
-                   ((:read_file env) (arg args "file_path")
-                    (arg args "offset") (arg args "limit"))))
+                   (read-file-for-tool env (arg args "file_path")
+                                       (arg args "offset") (arg args "limit"))))
          (registered write-def
                  (fn [args env]
                    (let [content (arg args "content")
@@ -175,22 +257,34 @@
                    (fn [args env]
                      (if-let [apply-patch (:apply_patch env)]
                        (apply-patch (arg args "patch"))
-                       (throw (ex-info "Execution environment does not support apply_patch"
-                                       {:category :unsupported-operation}))))
+                       (apply-patch-through-environment env (arg args "patch"))))
                    (fn [args env]
-                     ((:edit_file env)
-                      (arg args "file_path")
-                      (arg args "old_string")
-                      (arg args "new_string")
-                      (boolean (arg args "replace_all"))))))
-     (registered shell-def
+                     (let [edit (or (:edit_file env)
+                                    (fn [path old-string new-string replace-all]
+                                      (edit-file-through-environment
+                                        env path old-string new-string replace-all)))]
+                       (edit (arg args "file_path")
+                             (arg args "old_string")
+                             (arg args "new_string")
+                             (boolean (arg args "replace_all")))))))
+     (assoc (registered shell-def
                  (fn [args env]
                    ((:exec_command env) (arg args "command")
-                    (or (arg args "timeout_ms")
-                        default-shell-timeout
-                        (:default_command_timeout_ms env)
-                        10000)
+                    (min (or (:max_command_timeout_ms env) 600000)
+                         (max 1 (or (arg args "timeout_ms")
+                                    default-shell-timeout
+                                    (:default_command_timeout_ms env)
+                                    10000)))
                     nil nil)))
+            ;; This classifier belongs to this registry entry. A custom shell
+            ;; replacement does not inherit native command-result semantics.
+            :result_is_error
+            (fn [result]
+              (and (map? result)
+                   (or (true? (:timed_out result))
+                       (true? (:cancelled result))
+                       (and (number? (:exit_code result))
+                            (not= 0 (:exit_code result)))))))
      (registered grep-def
                  (fn [args env]
                    ((:grep env) (arg args "pattern") (arg args "path") args)))
@@ -256,11 +350,12 @@
   (let [read-many
         (registered
           (definition "read_many_files" "Read several files"
-                      {:paths {:type "array"}} ["paths"])
+                      {:paths {:type "array" :items {:type "string"}}} ["paths"])
           (fn [args env]
             (let [paths (arg args "paths")
                   results (mapv (fn [path]
-                                  (tool-images/normalize-output ((:read_file env) path nil nil))) paths)]
+                                  (tool-images/normalize-output
+                                    (read-file-for-tool env path nil nil))) paths)]
               (if-not (some tool-images/attachment-output? results) results
                 {:content (str/join "\n\n"
                             (map (fn [path result]

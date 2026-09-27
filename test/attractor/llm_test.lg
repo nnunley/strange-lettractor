@@ -1951,9 +1951,9 @@
           (first
             (llm/validate-json-schema
               3
-              {:$ref "#/$defs/choices/1"
-               :$defs {:choices [{:type "string"}
-                                  {:type "integer" :minimum 2}]}}))))
+              {:$ref "#/$defs/choices/anyOf/1"
+               :$defs {:choices {:anyOf [{:type "string"}
+                                          {:type "integer" :minimum 2}]}}}))))
     (doseq [invalid
             [(assoc valid "enabled" "false")
              (assoc valid "name" nil)

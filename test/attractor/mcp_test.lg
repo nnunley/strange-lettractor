@@ -8,6 +8,7 @@
             [os :as os]
             [json :as json]
             [attractor.mcp :as mcp]
+            [attractor.mcp-client :as mcp-client]
             [attractor.cli :as cli]
             [attractor.agent :as agent]
             [attractor.execution :as execution]
@@ -90,7 +91,7 @@
 ;; Manifest validation.
 ;; ---------------------------------------------------------------------------
 
-(deftest manifest-rejects-non-read-only-classes-and-bad-shape
+(deftest manifest-rejects-unknown-classes-and-bad-shape
   (let [roots (make-roots)]
     (doseq [[label manifest]
             [["write-class"
@@ -1105,3 +1106,140 @@
           (is (= :ok (:status entry)))
           (is (not (str/includes? (pr-str entry) "tok-"))))
         (finally ((:close! server)))))))
+
+;; Host write approvals are separate from declarations and root selection.
+(defn- write-tool []
+  (assoc (query-tool) :name "update" :class :write-tool :side-effects :write))
+
+(defn- bare-mcp-session []
+  (atom {:id "write-admission-test"
+         :provider_profile {:tool_registry (profiles/make-tool-registry)}
+         :mcp_evidence (atom [])}))
+
+(defn- write-grant [roots id names]
+  {id {:manifest-digest (hash/sha256 (io/slurp (str (:project roots) "/" id "/mcp.edn")))
+       :tools names}})
+
+(deftest write-tools-require-an-exact-host-grant-before-opening
+  (let [roots (make-roots)
+        manifest (manifest-for "demo" "https://m.example/mcp" [(write-tool)])
+        _ (write-manifest! (:project roots) "demo" manifest)
+        calls (atom [])
+        credentials (atom [])
+        opts (base-opts roots (json-transport calls "{}")
+                        (fn [name] (swap! credentials conj name) "tok"))
+        exact (write-grant roots "demo" #{"update"})]
+    (doseq [grant [nil {}
+                   {"other" (get exact "demo")}
+                   {"demo" (assoc (get exact "demo") :manifest-digest "stale")}
+                   {"demo" (assoc (get exact "demo") :tools #{"quote"})}
+                   {"demo" (assoc (get exact "demo") :tools ["update"])}]]
+      (let [error (try (mcp/admit-servers! (bare-mcp-session) ["demo"]
+                                         (assoc opts :write-approvals grant))
+                       (catch Object error error))]
+        (is (= :mcp-write-approval-required (:category (ex-data error))))))
+    (is (= [] @calls))
+    (is (= [] @credentials))
+    ;; The manifest's own approval-shaped field cannot grant authority.
+    (write-manifest! (:project roots) "demo" (assoc manifest :write-approvals exact))
+    (is (= :mcp-write-approval-required
+           (:category (ex-data (try (mcp/admit-servers! (bare-mcp-session) ["demo"] opts)
+                                    (catch Object error error))))))))
+
+(deftest exact-write-approval-registers-and-executes-declared-tools
+  (doseq [tool-class [:write-tool :idempotent-tool]]
+    (let [roots (make-roots)
+          _ (write-manifest! (:project roots) "demo"
+                            (manifest-for "demo" "https://m.example/mcp"
+                                          [(assoc (write-tool) :class tool-class)]))
+          calls (atom []) session (bare-mcp-session)
+          transport (fn [request]
+                      (swap! calls conj request)
+                      {:status 200 :headers {"content-type" "application/json"}
+                       :body (call-echo request "updated")})
+          result (mcp/admit-servers! session ["demo"]
+                                    (assoc (base-opts roots transport (fn [_] "tok"))
+                                           :write-approvals (write-grant roots "demo" #{"update"})))
+          tool (profiles/registry-get (get-in @session [:provider_profile :tool_registry])
+                                      "demo__update")]
+      (try
+        (is (= ["demo__update"] (:write-tools (first (:servers result)))))
+        (is (str/includes? ((:executor tool) {:symbol "AAA"} nil) "updated"))
+        (let [body (json/read-json (:body (last @calls)))]
+          (is (= "tools/call" (get body "method")))
+          (is (= "update" (get-in body ["params" "name"]))))
+        (finally (doseq [close (:mcp_close_fns @session)] (close)))))))
+
+(deftest programmatic-write-access-uses-the-same-host-gate
+  (let [roots (make-roots)
+        _ (write-manifest! (:project roots) "demo"
+                          (manifest-for "demo" "https://m.example/mcp" [(write-tool)]))
+        calls (atom [])
+        opts (base-opts roots
+                        (fn [request] (swap! calls conj request)
+                          {:status 200 :headers {"content-type" "application/json"}
+                           :body (call-echo request "updated")})
+                        (fn [_] "tok"))]
+    (is (= :mcp-write-approval-required
+           (:category (ex-data (try (mcp/open-server! "demo" opts)
+                                    (catch Object error error))))))
+    (is (= [] @calls))
+    (let [server (mcp/open-server! "demo" (assoc opts :write-approvals (write-grant roots "demo" #{"update"})))]
+      (try
+        (is (= "updated" ((:call! server) "update" {:symbol "AAA"})))
+        (is (= "update" (:tool (last ((:evidence server))))))
+        (finally ((:close! server)))))))
+
+(deftest all-selected-write-grants-are-preflighted-before-any-server-opens
+  (let [roots (make-roots)
+        _ (write-manifest! (:project roots) "read"
+                          (-> (manifest-for "read" "https://r.example/mcp" [(query-tool)])
+                              (dissoc :endpoint)
+                              (assoc :transport :stdio :command ["must-not-launch"])))
+        _ (write-manifest! (:project roots) "write" (manifest-for "write" "https://w.example/mcp" [(write-tool)]))
+        credentials (atom []) opened (atom []) session (bare-mcp-session)
+        opts (base-opts roots (fn [_] (throw (ex-info "Transport must not open" {})))
+                        (fn [name] (swap! credentials conj name) "tok"))
+        error (with-redefs [mcp-client/open-session
+                            (fn [options]
+                              (swap! opened conj options)
+                              (throw (ex-info "Server must not open" {})))]
+                (try (mcp/admit-servers! session ["read" "write"] opts)
+                     (catch Object error error)))]
+    (is (= :mcp-write-approval-required (:category (ex-data error))))
+    (is (= [] @opened))
+    (is (= [] @credentials))
+    (is (nil? (profiles/registry-get (get-in @session [:provider_profile :tool_registry]) "read__quote")))))
+
+(deftest contradictory-tool-effects-fail-manifest-validation
+  (let [roots (make-roots)]
+    (doseq [[tool-class effects] [[:write-tool :none] [:write-tool :read]
+                                 [:pure-tool :write] [:read-only-resource :write]]]
+      (write-manifest! (:project roots) "demo"
+                       (manifest-for "demo" "https://m.example/mcp"
+                                     [(assoc (write-tool) :class tool-class :side-effects effects)]))
+      (is (= :mcp-manifest-invalid
+             (:category (ex-data (try (mcp/open-server! "demo"
+                                       (base-opts roots (fn [_] nil) (fn [_] "tok")))
+                                      (catch Object error error)))))))))
+
+(deftest make-session-forwards-explicit-mcp-write-approvals
+  (let [roots (make-roots)
+        _ (write-manifest! (:project roots) "demo"
+                          (manifest-for "demo" "https://m.example/mcp" [(write-tool)]))
+        previous (os/getenv "MCP_TEST_TOKEN")
+        options {:provider_profile (profiles/make-profile {:id "custom" :model "test" :supports_streaming false})
+                 :execution_env (journey-env) :max_subagent_depth 0 :project_docs []
+                 :mcp ["demo"] :project_mcp_root (:project roots) :user_mcp_root (:user roots)}]
+    (os/setenv "MCP_TEST_TOKEN" "write-admission-test-token")
+    (try
+      (is (= :mcp-write-approval-required
+             (:category (ex-data (try (agent/make-session options) (catch Object error error))))))
+      (let [session (agent/make-session
+                      (assoc options :mcp_write_approvals (write-grant roots "demo" #{"update"})))]
+        (try
+          (is (= ["demo__update"] (:write-tools (first (:mcp_servers @session)))))
+          (is (some? (profiles/registry-get
+                       (get-in @session [:provider_profile :tool_registry]) "demo__update")))
+          (finally (agent/close-session! session))))
+      (finally (os/setenv "MCP_TEST_TOKEN" (or previous ""))))))

@@ -1,0 +1,311 @@
+(ns attractor.schema-dialect-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(def draft "https://json-schema.org/draft/2020-12/schema")
+(defn- check [value schema & [options]]
+  (llm/validate-json-schema value schema options))
+(defn- valid? [value schema & [options]] (first (check value schema options)))
+
+(deftest declared-and-default-dialects
+  (is (false? (valid? 1 {:$schema draft :type "strng"})))
+  (is (false? (valid? 1 {:type "strng"})))
+  (is (false? (valid? [1] {:$schema draft :items [{:type "integer"}]})))
+  (is (true? (valid? [1] {:items [{:type "integer"}]})))
+  (is (false? (valid? [1] {:items [{:type "integer"}]}
+                      {:schema_default_dialect draft})))
+  (is (true? (valid? 1 {:$schema (str draft "#") :type "integer"}
+                     {:schema_default_dialect "https://example.org/unsupported-default"})))
+  (is (true? (valid? {"a" 1} {:$schema draft :dependencies {"a" ["b"]}})))
+  (is (false? (valid? {"a" 1} {:dependencies {"a" ["b"]}})))
+  (is (true? (valid? [1 2] {:$schema draft :prefixItems [{:const 1}]
+                              :additionalItems false})))
+  (is (false? (valid? [1 2] {:items [{:const 1}] :additionalItems false})))
+  (is (true? (valid? {"x" 1}
+                     {:type :object :properties {:x {:type :integer}}})))
+  (doseq [uri ["http://json-schema.org/draft-04/schema#"
+               "https://example.org/unavailable-meta"]]
+    (let [[ok reason] (check 1 {:$schema uri :minimum 2})]
+      (is (false? ok))
+      (is (string? reason)))))
+
+(deftest invalid-unused-schema-branches-fail-preflight
+  (doseq [schema [{:$schema draft :anyOf [true {:type "strng"}]}
+                  {:$schema draft :if false :then {:required "x"}}
+                  {:$schema draft :$defs {:bad {:minLength -1}}}
+                  {:$schema draft :properties {:unused {:type "strng"}}}
+                  {:$schema draft :anyOf [true {:pattern "["}]}
+                  {:$schema draft :patternProperties {"[" true}}
+                  {:$schema draft :anyOf [true {:$ref "bad uri"}]}
+                  {:$schema draft :if false :then {:$ref "bad uri"}}
+                  {:$schema draft :if false :else {:$dynamicRef "bad uri"}}]]
+    (is (false? (valid? 1 schema)) (pr-str schema)))
+  (is (false? (valid? 1 {:$schema draft :$ref "other"}
+                      {:schema_registry {"https://attractor.invalid/other"
+                                         {:type "strng"}}}))))
+
+(deftest malformed-unused-legacy-schemas-fail
+  (is (false? (valid? [] {:items [{:type "strng"}]})))
+  (is (false? (valid? [] {:items [true {:minimum "one"}]})))
+  (is (false? (valid? [] {:items [true] :additionalItems {:required "x"}}))))
+
+(deftest compatibility-additional-items-distinguishes-null-from-absence
+  (is (false? (valid? 1 {:additionalItems nil})))
+  (is (false? (valid? [] {:items [true] :additionalItems nil})))
+  (is (false? (valid? 1 {"additionalItems" nil})))
+  (is (true? (valid? 1 {:items [true]})))
+  (is (true? (valid? 1 {:additionalItems false})))
+  (is (true? (valid? 1 {:$schema draft :additionalItems nil}))))
+
+(deftest deprecated-dependency-children-still-have-schema-shapes
+  (is (false? (valid? 1 {:$schema draft
+                         :dependencies {"x" {:$id "https://example.org/bad"
+                                              :type "strng"}}}))))
+
+(deftest resource-local-dialect-and-inert-annotations
+  (let [schema {:$schema draft :$id "https://example.org/root"
+                :$defs {:inherited {:$id "inherit" :items [{:const 1}]}}
+                :$ref "inherit"}]
+    (is (false? (valid? [1] schema))))
+  (let [schema {:$schema draft :$id "https://example.org/root"
+                :$defs {:override {:$id "legacy" :$schema draft :type "integer"}}
+                :$ref "legacy"}]
+    (is (true? (valid? 1 schema))))
+  (is (false? (valid? 1 {:$schema draft :allOf [{:$schema draft :type "integer"}]})))
+  (is (true? (valid? 1 {:$schema draft :default {:$schema "bad" :$id "fake"}
+                         :type "integer"}))))
+
+(deftest custom-vocabularies
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        applicator "https://json-schema.org/draft/2020-12/vocab/applicator"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://example.org/meta"
+        meta {:$id meta-uri :$schema draft
+              :$vocabulary {core true applicator true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/applicator"}]}
+        schema {:$schema meta-uri :properties {"bad" false "n" {:minimum 10}}}]
+    (is (true? (valid? {"n" 1} schema {:schema_registry {meta-uri meta}})))
+    (is (false? (valid? {"bad" 1} schema {:schema_registry {meta-uri meta}})))
+    (is (false? (valid? {"n" 1} schema
+                        {:schema_registry {meta-uri (assoc-in meta [:$vocabulary validation] false)}})))
+    (is (false? (valid? 1 {:$schema meta-uri :minimum 2}
+                        {:schema_registry {meta-uri (assoc-in meta [:$vocabulary "https://example.org/unknown"] true)}})))
+    (is (true? (valid? 1 {:$schema meta-uri :minimum 2}
+                       {:schema_registry {meta-uri (assoc-in meta [:$vocabulary "https://example.org/unknown"] false)}})))))
+
+(deftest inactive-applicator-locations-are-annotation-data
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://example.org/core-validation"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        options {:schema_registry {meta-uri meta}}
+        schema {:$schema meta-uri :properties {"x" {:$id "x" :$schema "bad"
+                                                  :type "strng"}}}]
+    (is (true? (valid? {"x" 1} schema options)))
+    (is (false? (valid? 1 {:$schema meta-uri :$defs {:bad {:type "strng"}}}
+                        options)))))
+
+(deftest malformed-vocabulary-declarations-fail
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        meta-uri "https://example.org/vocabulary-contract"
+        base {:$id meta-uri :$schema draft :$dynamicAnchor "meta"}]
+    (doseq [declarations [{core false}
+                          {"https://example.org/optional" false}
+                          {core true "/relative-vocabulary" false}
+                          {core true "https://example.org/../not-normalized" false}]]
+      (is (false? (valid? 1 {:$schema meta-uri}
+                          {:schema_registry {meta-uri
+                                             (assoc base :$vocabulary declarations)}}))
+          (pr-str declarations)))))
+
+(deftest relative-meta-identifiers-select-vocabulary-and-resolve-meta-refs
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        retrieval "https://review.example/meta-root"
+        meta-uri "https://review.example/nested/custom"
+        meta {:$id "nested/custom" :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "../rules"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        schema {:$schema meta-uri :type "integer"
+                :properties {"ignored" {:$schema "bad"}}}
+        opts {:schema_registry {retrieval meta
+                                "https://review.example/rules" {:type "object"}}}]
+    (is (true? (valid? 1 schema opts)))))
+
+(deftest relative-registry-key-respects-schema-base-uri
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://review.example/meta"
+        meta {:$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        schema {:$schema meta-uri :type "integer"
+                :properties {:x {:$schema "not-a-dialect"}}}
+        opts {:schema_base_uri "https://review.example/root"
+              :schema_registry {"meta" meta}}]
+    (is (true? (valid? 1 schema opts)))))
+
+(deftest registered-compound-document-can-supply-embedded-meta
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://review.example/compound/meta"
+        meta {:$id "meta" :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        compound {:$id "https://review.example/compound/root"
+                  :$defs {:meta meta}}
+        schema {:$schema meta-uri :type "integer"
+                :properties {:x {:$schema "not-a-dialect"}}}
+        opts {:schema_registry {"https://review.example/compound/root" compound}}]
+    (is (true? (valid? 1 schema opts)))))
+
+(deftest registered-inactive-locations-cannot-create-meta-resources
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        applicator "https://json-schema.org/draft/2020-12/vocab/applicator"
+        meta-uri "https://review.example/active-meta"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}}
+        root {:$schema draft :type "integer"}]
+    (doseq [inert-child [{:$id "bad uri"}
+                         {:$id 7}
+                         {:$id meta-uri :$schema draft
+                          :$vocabulary {core true applicator true}}]]
+      (let [inert {:$schema meta-uri
+                   :properties {"x" inert-child}}
+            options {:schema_registry {meta-uri meta
+                                       "https://review.example/inert" inert}}]
+        (is (true? (valid? 1 root options)) (pr-str inert-child))
+        (is (true? (valid? 1 {:$schema meta-uri :type "integer"
+                             :properties {"x" {:$schema "bad"}}} options))
+            (pr-str inert-child))))))
+
+(deftest self-hosted-registered-dialect-uses-core-defs-bootstrap
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://review.example/self-hosted"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}}
+        schema {:$schema meta-uri :type "integer"
+                :properties {:x {:$schema "unavailable"}}}
+        container {:$schema meta-uri :$defs {:meta meta}}
+        inert-container {:$schema meta-uri :properties {:meta meta}}]
+    (is (true? (valid? 1 schema
+                      {:schema_registry {"https://review.example/container"
+                                         container}})))
+    (is (false? (valid? 1 schema
+                       {:schema_registry {"https://review.example/container"
+                                          inert-container}})))))
+
+(deftest custom-dialect-does-not-index-deprecated-definitions
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        meta-uri "https://review.example/core-only"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true}}
+        options {:schema_registry {meta-uri meta}}]
+    (is (true? (valid? 1 {:$schema meta-uri
+                          :definitions {:x {:$id "bad uri"}}} options)))
+    (is (true? (valid? 1 {:$schema meta-uri
+                          :definitions {:x {:$schema "unavailable"}}} options)))
+    (is (false? (valid? 1 {:$schema meta-uri :$ref "fake"
+                           :definitions {:x {:$id "fake" :const 1}}} options)))
+    (is (true? (valid? 1 {:definitions {:x {:$id "fake" :const 1}}
+                         :$ref "fake"})))
+    (is (true? (valid? 1 {:$schema draft
+                          :definitions {:x {:$id "fake" :const 1}}
+                          :$ref "fake"})))))
+
+(deftest bundled-trusted-metas-cannot-be-shadowed-by-registry
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://review.example/trusted-meta-boundary"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        fake {:$id "https://json-schema.org/draft/2020-12/meta/validation"
+              :$schema draft :type ["object" "boolean"]}
+        schema {:$schema meta-uri :minimum "bad"}]
+    (is (false? (valid? 1 schema {:schema_registry {meta-uri meta}})))
+    (is (false? (valid? 1 schema
+                        {:schema_registry {meta-uri meta
+                                           "https://json-schema.org/draft/2020-12/meta/validation"
+                                           fake}})))
+    (is (false? (valid? 1 schema
+                        {:schema_registry {meta-uri meta
+                                           "https://review.example/validation-alias"
+                                           fake}})))))
+
+(deftest custom-meta-requires-explicit-registry-registration
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://review.example/main-only-meta"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}}
+        schema {:$schema meta-uri :$defs {:meta meta} :type "integer"}]
+    (is (false? (valid? 1 schema)))
+    (is (true? (valid? 1 schema {:schema_registry {meta-uri meta}})))))
+
+(deftest compound-resources-have-own-meta-contracts
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        applicator "https://json-schema.org/draft/2020-12/vocab/applicator"
+        custom-uri "https://example.org/core-applicator"
+        meta {:$id custom-uri :$schema draft
+              :$vocabulary {core true applicator true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/applicator"}]}
+        options {:schema_registry {custom-uri meta}}]
+    (is (true? (valid? 1 {:$schema draft :$defs
+                          {:child {:$id "child" :$schema custom-uri :type "strng"}}
+                          :$ref "child"} options)))
+    (is (false? (valid? 1 {:$schema custom-uri :$defs
+                           {:child {:$id "child" :$schema draft :type "strng"}}}
+                        options)))))
+
+(deftest compatibility-parent-respects-child-vocabulary
+  (let [core "https://json-schema.org/draft/2020-12/vocab/core"
+        validation "https://json-schema.org/draft/2020-12/vocab/validation"
+        meta-uri "https://example.org/core-validation-legacy-boundary"
+        meta {:$id meta-uri :$schema draft :$dynamicAnchor "meta"
+              :$vocabulary {core true validation true}
+              :allOf [{:$ref "https://json-schema.org/draft/2020-12/meta/core"}
+                      {:$ref "https://json-schema.org/draft/2020-12/meta/validation"}]}
+        schema {:$defs {:child {:$id "https://example.org/child"
+                                :$schema meta-uri :items [123]}}
+                :$ref "https://example.org/child"}]
+    (is (true? (valid? 1 schema {:schema_registry {meta-uri meta}})))))
+
+(deftest structured-apis-keep-provider-schema-and-localize-dialect-option
+  (doseq [[schema text expected]
+          [[{:type :integer :minimum 2} "3" {:output 3}]
+           [{:type "strng"} "3" {:category :no-object-generated}]]]
+    (let [requests (atom [])
+          response {:message {:role :assistant :content text}
+                    :tool_calls [] :usage {} :finish_reason :stop}
+          adapter (llm/make-adapter "fixture"
+                    (fn [request] (swap! requests conj request) response)
+                    (fn [request]
+                      (swap! requests conj request)
+                      [{:type :stream_start} {:type :text_delta :delta text}
+                       {:type :finish :finish_reason :stop :response response}]))
+          opts {:client (llm/make-client {:providers {"fixture" adapter}})
+                :schema_default_dialect draft}
+          outcome (fn [f]
+                    (try {:output (f)}
+                         (catch Object e {:category (:category (ex-data e))})))
+          generated (outcome #(:output (llm/generate-object "fixture/model" "json" schema opts)))
+          streamed (outcome #((:object (llm/stream-object "fixture/model" "json" schema opts))))]
+      (is (= expected generated))
+      (is (= expected streamed))
+      (is (= 2 (count @requests)))
+      (doseq [request @requests]
+        (is (= schema (get-in request [:response_format :json_schema])))
+        (is (not (contains? request :schema_default_dialect)))))))

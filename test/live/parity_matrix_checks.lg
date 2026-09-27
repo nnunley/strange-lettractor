@@ -1,6 +1,9 @@
 (ns live.parity-matrix-checks
-  (:require [clojure.string :as str]
-            [attractor.profiles :as profiles]))
+  (:require [clojure.string :as str] [clojure.edn :as edn]
+            [os :as os] [io :as io]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]
+            [attractor.providers :as providers]))
 
 (defn profile-for [protocol provider model]
   ;; Transport aliases must not silently substitute the generic tool profile.
@@ -25,3 +28,237 @@
           {:failed_call (:tool_call_id failed) :recovered_call (:tool_call_id recovered)
            :recovered_text expected}
           (recur (rest rounds) (or failed (some #(when (true? (:is_error %)) %) reads))))))))
+
+(defn- file-content [dir name]
+  (let [path (str dir "/" name)]
+    (when (os/stat path) (io/slurp path))))
+
+(defn file-target [working-dir path]
+  "Resolve a model file argument as the local execution environment does.
+   Canonicalize the existing parent, not the possibly uncreated leaf: this
+   preserves filesystem symlink/.. behavior without reducing identity to a
+   basename or lexically rewriting paths."
+  (when (and (string? working-dir) (string? path))
+    (let [absolute? (or (str/starts-with? path "/")
+                        (and (> (count path) 2) (= ":" (subs path 1 2))))
+          resolved (if absolute? path (str working-dir "/" path))
+          slash (str/last-index-of resolved "/")
+          parent (when (and slash (> slash 0)) (subs resolved 0 slash))
+          leaf (when slash (subs resolved (inc slash)))]
+      (when (and (seq parent) (seq leaf) (not (contains? #{"." ".."} leaf)))
+        (try (str (os/canonical-path parent) "/" leaf)
+             (catch Object _ nil))))))
+
+(defn- tool-results [history]
+  (mapcat :results (filter #(= :tool_results (:type %)) history)))
+
+(defn- assistant-calls [history]
+  (mapcat :tool_calls (filter #(= :assistant (:type %)) history)))
+
+(defn parallel-evidence [{:keys [dir history barrier]}]
+  (let [batch (some #(when (= #{"write_file"}
+                              (set (map :name (:tool_calls %))))
+                       (when (= 2 (count (:tool_calls %))) %) )
+                    (filter #(= :assistant (:type %)) history))
+        ids (set (map :id (:tool_calls batch)))
+        results (some #(when (= ids (set (map :tool_call_id (:results %))))
+                         (:results %))
+                      (filter #(= :tool_results (:type %)) history))]
+    (when (and batch (= 2 (count ids)) (= 2 (count results))
+               (every? #(false? (:is_error %)) results)
+               (some #(and (= ids %)
+                           (every? (:successful @barrier) %))
+                     (:overlap-pairs @barrier))
+               (= "alpha" (file-content dir "parallel-a.txt"))
+               (= "beta" (file-content dir "parallel-b.txt")))
+      {:call_ids (vec ids) :overlap true :files_verified true})))
+
+(defn- indexed-write-call [history dir path content]
+  (let [target (file-target dir path)]
+    (some (fn [[index turn]]
+            (when (= :assistant (:type turn))
+              (some (fn [call]
+                      (when (and (= "write_file" (:name call))
+                                 target
+                                 (= target (file-target dir
+                                             (or (get-in call [:arguments "file_path"])
+                                                 (get-in call [:arguments :file_path]))))
+                                 (= content (or (get-in call [:arguments "content"])
+                                                (get-in call [:arguments :content]))))
+                        {:index index :call call}))
+                    (:tool_calls turn))))
+          (map-indexed vector history))))
+
+(defn- indexed-result [history call-id]
+  (some (fn [[index turn]]
+          (when (= :tool_results (:type turn))
+            (some (fn [result]
+                    (when (= call-id (:tool_call_id result))
+                      {:index index :result result}))
+                  (:results turn))))
+        (map-indexed vector history)))
+
+(defn- matching-event-index [events type call-id]
+  (some (fn [[index event]]
+          (when (and (= type (:type event))
+                     (= call-id (:call_id event))
+                     (= "write_file" (:tool_name event))
+                     (or (not= :tool_call_end type)
+                         (string? (:output event))))
+            index))
+        (map-indexed vector events)))
+
+(defn steering-evidence [{:keys [dir events history requests boundaries]}]
+  (let [boundary (:steering boundaries)
+        request-index (:request_count boundary)
+        native-next (when (integer? request-index) (nth requests request-index nil))
+        injected (some (fn [[index turn]]
+                         (when (and (= :steering (:type turn))
+                                    (= (:content boundary) (:content turn))) index))
+                       (map-indexed vector history))
+        first-write (indexed-write-call history dir "steering-first.txt" "before")
+        changed-write (indexed-write-call history dir "steering-correct.txt" "after")
+        first-id (get-in first-write [:call :id])
+        changed-id (get-in changed-write [:call :id])
+        first-result (indexed-result history first-id)
+        changed-result (indexed-result history changed-id)
+        first-start (matching-event-index events :tool_call_start first-id)
+        first-end (matching-event-index events :tool_call_end first-id)
+        changed-start (matching-event-index events :tool_call_start changed-id)
+        changed-end (matching-event-index events :tool_call_end changed-id)
+        injected-event (:event_index boundary)]
+    (when (and (string? (:content boundary))
+               (str/includes? (:content boundary) "STEER_TO_CORRECT")
+               (str/includes? (pr-str native-next) (:content boundary))
+               (integer? injected)
+               first-write changed-write first-result changed-result
+               (not= first-id changed-id)
+               (false? (get-in first-result [:result :is_error]))
+               (false? (get-in changed-result [:result :is_error]))
+               (< (:index first-write) (:index first-result) injected
+                  (:index changed-write) (:index changed-result))
+               (every? integer? [first-start first-end injected-event
+                                 changed-start changed-end])
+               (< first-start first-end injected-event changed-start changed-end)
+               (= "before" (file-content dir "steering-first.txt"))
+               (= "after" (file-content dir "steering-correct.txt"))
+               (nil? (file-content dir "steering-wrong.txt")))
+      {:first_call first-id :changed_call changed-id
+       :injected true :native_continuation true :files_verified true})))
+
+(defn- native-effort [protocol body]
+  (case protocol
+    :openai-responses (get-in body ["reasoning" "effort"])
+    :anthropic-messages (or (get-in body ["output_config" "effort"])
+                            (get-in body ["thinking" "budget_tokens"]))
+    :gemini-generate-content (or (get-in body ["generationConfig" "thinkingConfig" "thinkingLevel"])
+                                 (get-in body ["generationConfig" "thinkingConfig" "thinkingBudget"]))
+    nil))
+
+(defn- expected-native-efforts [protocol model]
+  (case protocol
+    :openai-responses ["low" "high"]
+    :anthropic-messages
+    (if (= :adaptive (:reasoning_mode (llm/get-model-info model)))
+      ["low" "high"] [1024 3072])
+    :gemini-generate-content
+    (if (re-matches #"(?:models/)?gemini-2\.5-(?:pro|flash(?:-lite)?)(?:[-.].*)?"
+                    (str/lower-case (str model)))
+      [1024 24576] ["low" "high"])
+    nil))
+
+(defn reasoning-evidence [{:keys [history requests session dir]}]
+  (let [profile (:provider_profile @session)
+        protocol (providers/protocol-of (:id profile))
+        efforts (mapv #(native-effort protocol %) requests)
+        expected (expected-native-efforts protocol (:model profile))]
+    (when (and (>= (count efforts) 2)
+               (= expected (subvec efforts 0 2))
+               (= "changed" (file-content dir "reasoning.txt"))
+               (some #(and (= :assistant (:type %)) (empty? (:tool_calls %))) history))
+      {:native_efforts (subvec efforts 0 2) :continued true})))
+
+(defn- subagent-attempt-evidence [{:keys [dir history events session]} spawn wait-call]
+  (let [results (tool-results history)
+        spawn-result (some #(when (= (:id spawn) (:tool_call_id %)) %) results)
+        spawn-value (try (edn/read-string (str (:content spawn-result)))
+                         (catch Object _ nil))
+        agent-id (:agent_id spawn-value)
+        wait-result (some #(when (= (:id wait-call) (:tool_call_id %)) %) results)
+        wait-value (try (edn/read-string (str (:content wait-result)))
+                        (catch Object _ nil))
+        forwarded (filter #(= :subagent_event (:type %)) events)
+        handle (get-in @session [:subagents agent-id])
+        child-history (when-let [child (:session handle)] (:history @child))
+        child-dir (when-let [child (:session handle)]
+                    ((:working_directory (:execution_env @child))))
+        expected-file (file-target dir "child-proof.txt")
+        child-write (some (fn [call]
+                            (when (and (= "write_file" (:name call))
+                                       expected-file
+                                       (= expected-file
+                                          (file-target child-dir
+                                            (or (get-in call [:arguments "file_path"])
+                                                (get-in call [:arguments :file_path]))))
+                                       (= "child-done"
+                                          (or (get-in call [:arguments "content"])
+                                              (get-in call [:arguments :content]))))
+                              call))
+                          (assistant-calls child-history))
+        child-result (some #(when (= (:id child-write) (:tool_call_id %)) %)
+                           (tool-results child-history))
+        child-start (some #(when (and (= agent-id (:agent_id %))
+                                     (= :tool_call_start (get-in % [:event :type]))
+                                     (= "write_file" (get-in % [:event :tool_name]))
+                                     (= (:id child-write) (get-in % [:event :call_id]))) %)
+                          forwarded)
+        child-end (some #(when (and (= agent-id (:agent_id %))
+                                   (= :tool_call_end (get-in % [:event :type]))
+                                   (= "write_file" (get-in % [:event :tool_name]))
+                                   (= (:id child-write) (get-in % [:event :call_id]))
+                                   (string? (get-in % [:event :output]))) %)
+                        forwarded)]
+    (when (and spawn wait-call spawn-result wait-result agent-id
+               (false? (:is_error spawn-result)) (false? (:is_error wait-result))
+               (true? (:success wait-value))
+               (= agent-id (or (get-in wait-call [:arguments "agent_id"])
+                               (get-in wait-call [:arguments :agent_id])))
+               (seq forwarded) (every? #(= agent-id (:agent_id %)) forwarded)
+               child-write child-result child-start child-end
+               (false? (:is_error child-result))
+               (= "child-done" (file-content dir "child-proof.txt"))
+               (= :closed (:status handle))
+               (realized? (:future handle))
+               (= :closed (:state @(:session handle))))
+      {:agent_id agent-id :child_file_verified true :joined_and_closed true})))
+
+(defn subagent-evidence [{:keys [history] :as context}]
+  ;; A rejected spawn (for example, an unknown skill) does not invalidate a
+  ;; later completed child. Match whole attempts; never mix result call IDs,
+  ;; child identity, forwarded events, filesystem proof, or lifecycle handles.
+  (let [calls (assistant-calls history)
+        spawns (filter #(= "spawn_agent" (:name %)) calls)
+        waits (filter #(= "wait" (:name %)) calls)]
+    (some (fn [spawn]
+            (some #(subagent-attempt-evidence context spawn %) waits))
+          spawns)))
+
+(defn loop-evidence [{:keys [events history requests boundaries]}]
+  (let [calls (assistant-calls history)
+        repeats (filter #(= "read_file" (:name %)) calls)
+        boundary (:loop-warning boundaries)
+        warning (:message boundary)
+        request-index (:request_count boundary)
+        native-next (when (integer? request-index) (nth requests request-index nil))
+        steering (some #(when (and (= :steering (:type %))
+                                   (= warning (:content %))) %) history)
+        warning-event (when (integer? (:event_index boundary))
+                        (nth events (:event_index boundary) nil))]
+    (when (and (>= (count repeats) 2)
+               (= (map :arguments (take 2 repeats))
+                  (repeat 2 (:arguments (first repeats))))
+               (string? warning)
+               (= :loop_detection (:type warning-event))
+               (= warning (:message warning-event))
+               steering (str/includes? (pr-str native-next) warning))
+      {:repeated_calls 2 :warning_in_history true :native_continuation true})))

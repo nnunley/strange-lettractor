@@ -153,7 +153,13 @@
             ;; Word / Identifier / Number / Duration / BareValue
             :else
             (let [rest-s (subs src i)
-                  m (re-find #"^-?[A-Za-z0-9_.:]+" rest-s)]
+                  m (re-find #"^(?:-?[0-9]+(?:ms|s|m|h|d)|-?(?:[0-9]*\.[0-9]+|[0-9]+)|[A-Za-z_][A-Za-z0-9_.:-]*)" rest-s)
+                  m (if (and m
+                             (str/ends-with? m "-")
+                             (< (+ i (count m)) n)
+                             (= ">" (subs src (+ i (count m)) (inc (+ i (count m))))))
+                        (subs m 0 (dec (count m)))
+                        m)]
               (if m
                 (let [val-len (count m)]
                   (recur (+ i val-len) (conj tokens {:type :word :val m})))
@@ -179,6 +185,10 @@
 (defn- typed-boolean [v]
   (cond (= v "true") true (= v "false") false :else v))
 
+(defn- valid-attribute-key? [value]
+  (and (string? value)
+       (some? (re-matches #"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*" value))))
+
 ;; Parse an attribute block starting at token idx: [ key=val, key2=val2 ... ]
 ;; Returns [attrs next-idx]
 (defn- parse-attr-block-tokens [tokens start-idx]
@@ -203,10 +213,14 @@
             ;; Custom CSS properties need quoted DOT names: unquoted -- is
             ;; reserved for unsupported undirected edges.
             (or (= (:type t) :word)
-                (and (= (:type t) :string)
+            (and (= (:type t) :string)
                      (re-matches #"--[a-z][a-z0-9-]*" (:val t))))
             (let [k-name (:val t)
                   next-t (get tokens (inc i))]
+              (when (and (= (:type t) :word)
+                         (not (valid-attribute-key? k-name)))
+                (throw (ex-info (str "Invalid attribute key: " k-name)
+                                {:attribute k-name :token-index i})))
               (when-not (and next-t (= (:val next-t) "="))
                 (throw (ex-info "Attribute requires '=' and a value"
                                 {:attribute k-name :token-index i})))
@@ -348,6 +362,7 @@
       (and (< (+ idx 2) n)
            (= (get-in tokens [(inc idx) :val]) "="))
       (let [k-name val
+            _ (require-identifier! k-name "graph attribute")
             v-tok (nth tokens (+ idx 2))
             v (convert-val v-tok)
             next-i (+ idx 3)]

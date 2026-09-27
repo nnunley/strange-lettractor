@@ -3,8 +3,9 @@
 
    Servers are declared data-only in mcp.edn files under project and user
    roots. Admission is explicit per session (:mcp [ids], same shape as
-   :skills): manifests are digest-verified, restricted to read-only
-   classes, and registered as namespaced tools after collision checks.
+   :skills): manifests are digest-verified and registered as namespaced
+   tools after collision checks. Writes additionally require host approvals
+   pinned to the resolved manifest digest and each declared write tool.
    Credentials travel by reference (env names) and live in memory only;
    evidence carries digests and redaction flags, never secret values.
    Every failure is fail-closed with an :mcp-* category."
@@ -25,8 +26,8 @@
 
 (def manifest-file "mcp.edn")
 (def approvals-file-name "mcp-approvals.edn")
-(def allowed-tool-classes #{:pure-tool :idempotent-tool :read-only-resource})
-(def allowed-side-effects #{:none :read})
+(def allowed-tool-classes #{:pure-tool :idempotent-tool :read-only-resource :write-tool})
+(def allowed-side-effects #{:none :read :write})
 (def resource-tool-suffix "read_resource")
 (def result-truncation-marker "[MCP result truncated at byte budget]")
 
@@ -108,6 +109,12 @@
                  (contains? allowed-tool-classes (:class entry))
                  (contains? allowed-side-effects (:side-effects entry)))
     (fail! :mcp-manifest-invalid {:server_id id :reason :invalid-tool-entry
+                                 :tool (:name entry)}))
+  (when (or (and (= :write-tool (:class entry))
+                 (not= :write (:side-effects entry)))
+            (and (= :write (:side-effects entry))
+                 (not (contains? #{:write-tool :idempotent-tool} (:class entry)))))
+    (fail! :mcp-manifest-invalid {:server_id id :reason :contradictory-tool-effects
                                  :tool (:name entry)}))
   (when (some? (:schema entry))
     (when-not (map? (:schema entry))
@@ -1037,10 +1044,28 @@
                     :transport (if stdio? :stdio :streamable-http)
                     :server-pid (:server-pid server-ctx)
                     :tools (mapv :name tool-entries)
+                    :write-tools (mapv #(str server-id "__" %) (:admitted-write-tools resolved))
                     :resources (mapv :uri (:resources manifest))
                     :token-source (:token-env manifest)
                     :redacted true
                     :approvals-used (:approval resolved)}}))))
+
+(defn- require-write-approval! [resolved approvals]
+  (let [manifest (:manifest resolved)
+        server-id (:id manifest)
+        writes (mapv :name (filter #(= :write (:side-effects %)) (:tools manifest)))
+        grant (get approvals server-id)]
+    (when (seq writes)
+      (when-not (and (map? grant)
+                     (= (:manifest-digest resolved) (:manifest-digest grant))
+                     (set? (:tools grant))
+                     (every? #(contains? (:tools grant) %) writes))
+        (fail! :mcp-write-approval-required
+               {:server_id server-id
+                :manifest-digest (:manifest-digest resolved)
+                :tools writes
+                :hint "Host write-approvals must pin this manifest digest and explicitly name every write tool."})))
+    (assoc resolved :admitted-write-tools writes)))
 
 (defn mcp-config-digest [admitted]
   (hash/sha256
@@ -1052,11 +1077,14 @@
   "Admit explicitly selected MCP servers into a live session. Resolves
    manifests across project/user roots with sticky approvals, verifies
    digests, requires handoff tokens, registers namespaced tools after
-   collision checks, and records per-server evidence. Returns
+   collision checks, and records per-server evidence. Write tools additionally
+   require :write-approvals {server-id {:manifest-digest digest :tools #{names}}}
+   from the host; manifest fields and cross-root approvals grant no write access.
+   Every selected server is checked before any is opened. Returns
    {:servers [...] :config-digest ...}. Every failure is fail-closed."
   [session selected-ids opts]
   (let [{:keys [project-root user-root read-text file-exists approvals
-                transport token-reader oauth-authorizer credential-store]} (or opts {})]
+                transport token-reader oauth-authorizer credential-store write-approvals]} (or opts {})]
     (when-not (and (vector? selected-ids) (seq selected-ids)
                    (every? non-blank-string? selected-ids))
       (fail! :mcp-selection-invalid {:reason :ids-must-be-non-empty-strings}))
@@ -1074,7 +1102,10 @@
     (let [resolved (mapv #(resolve-one % {:project-root project-root :user-root user-root}
                                        read-text file-exists (or approvals {}))
                          selected-ids)
-          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer credential-store) resolved)
+          ;; Preflight the whole selection before credentials, transports, or
+          ;; registry mutation: an unapproved later server opens none of them.
+          authorized (mapv #(require-write-approval! % write-approvals) resolved)
+          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer credential-store) authorized)
           config-digest (mcp-config-digest (map :evidence admitted))]
       (swap! session assoc :mcp_servers (mapv :evidence admitted))
       (swap! session assoc :mcp_config_digest config-digest)
@@ -1117,7 +1148,8 @@
                        :mcp_evidence (atom [])})
         resolved (resolve-one server-id options (:read-text options)
                               (:file-exists options) approvals)
-        admitted (admit-one-server session resolved (:token-reader options)
+        authorized (require-write-approval! resolved (:write-approvals options))
+        admitted (admit-one-server session authorized (:token-reader options)
                                    (:transport options) (:oauth-authorizer options)
                                    (:credential-store options))
         server-ctx (:server-ctx admitted)

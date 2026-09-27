@@ -300,6 +300,29 @@
                (sort-by first (:nodes graph)))))
 
 ;; Full validation runner
+(defn- lint-callable? [value]
+  (and (ifn? value)
+       (not (or (map? value)
+                (vector? value)
+                (set? value)
+                (keyword? value)))))
+
+(defn- apply-lint-rule [rule graph]
+  (cond
+    (lint-callable? rule) (rule graph)
+    (map? rule)
+    (let [rule-name (:name rule)
+          apply-rule (:apply rule)]
+      (when-not (and (string? rule-name)
+                     (not (str/blank? rule-name))
+                     (lint-callable? apply-rule))
+        (throw (ex-info "Custom lint rule maps require a non-blank string :name and callable :apply"
+                        {:category :invalid_lint_rule :rule rule})))
+      (apply-rule graph))
+    :else
+    (throw (ex-info "Custom lint rules must be functions or rule maps"
+                    {:category :invalid_lint_rule :rule rule}))))
+
 (defn validate
   ([graph] (validate graph []))
   ([graph custom-rules]
@@ -322,7 +345,7 @@
                          rule-parameter-reference-coerced
                          rule-parameter-delegable-open]
          all-rules (concat built-in-rules custom-rules)]
-     (vec (mapcat (fn [r] (r graph)) all-rules)))))
+     (vec (mapcat (fn [r] (apply-lint-rule r graph)) all-rules)))))
 
 (defn raise-on-errors
   "Return diagnostics unchanged, or raise with the complete vector when any are errors."

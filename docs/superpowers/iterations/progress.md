@@ -1,5 +1,236 @@
 # Progress
 
+OpenRouter follow-up: user-requested `or-responses/openai/gpt-5.2` checks use
+the OpenAI Responses adapter/profile with gateway provenance. Combined parity
+coverage is 15/15 across initial, targeted and final runs; the final strengthened
+same-session smoke passes 7/7. Report `1790550366776` completes its selected
+reasoning-change plus smoke scope (exit 0). This supplements accepted first-party OpenAI wire evidence without
+claiming direct OpenAI live access. See the current provider evidence.
+
+2026-09-27 live follow-up: `lgx live-coding-conformance` now combines all
+fifteen parity rows and the implemented seven-step same-session smoke, with
+explicit provider/check/row scope and native-origin validation. Anthropic has
+15/15 parity coverage across an initial 13-row pass and a targeted two-row rerun
+after clarifying exact-output prompts (assertions unchanged). Gemini also covers
+15/15 across its repaired full run and targeted loop-warning rerun. Strengthened
+Anthropic smoke passes five steps before quota-exceeded in the subagent step;
+timeout remains unrun. Gemini strengthened smoke passes all seven steps. Initial
+weaker smoke evidence is excluded. First-party OpenAI is wire verified, direct live not run, and
+explicitly accepted by the user for publication without a push blocker. See
+[current provider
+evidence](../../provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+The current named audit includes these follow-ups. The earlier full-suite count
+below remains dated repair evidence, not final publication verification.
+
+## Coding-loop audit — 2026-09-27
+
+The [current audit](../../coding-loop-audit-2026-09-27.md) records repairs to
+CAL-AUDIT-01–04. Regular coding-loop and execution-scope regressions now cover
+local child/descendant cancellation with parent/sibling survival, steering
+retention, shell error results and supplied-environment timeout caps.
+`lgx audit-coding-loop` passes 261 tests / 2529 assertions, zero failures/errors.
+Earlier repair full suite passed 1566 tests / 14159 assertions with zero failures. Custom environments need optional
+`:fork_scope` for independent child cancellation. The full live matrix and
+same-session smoke remain open separately; this is not specification completion.
+
+## User priority update — 2026-09-24
+
+Finish ITER-0020 review/integration and the provider-journey batch first. The
+approved offline model-catalog extraction is promoted ahead of shared-session
+smoke implementation. Luna remains assigned to bounded extraction work; Sol
+handles integration. The user also requested investigation of Gemini funding
+and postpay availability; no payment or billing-plan change is authorized.
+
+The user independently added $5 to AI Studio. Root's one retry-disabled native
+Gemini 3.1 Flash Lite request returned HTTP 200 and READY (5 input / 2 output
+tokens), resolving the prior depleted-credit blocker. Evidence:
+`evidence/native-gemini-trace-20260924-funded.edn`. Norman's Projects showed
+ordinary Cloud postpay and separate AI Studio prepay. Gemini tool parity still
+requires the signature repair and bounded native journeys; basic access is now
+available. The user also funded/configured Anthropic; a retry-disabled native
+Haiku 4.5 request returned HTTP 200 and READY (12 input / 6 output tokens),
+retained in `evidence/native-anthropic-trace-20260924-funded.edn`. Only native
+OpenAI credentials remain unavailable. The user asked about OIDC for the local
+desktop/CLI and reminded us that structured EDN credentials already exist;
+provider token exchange/refresh remains a separate, unimplemented auth extension.
+
+The user selected **both** Gemini OAuth and Anthropic Google-issued OIDC for
+the local desktop/CLI. A concrete design is proposed in
+[`2026-09-24-local-provider-credentials-design.md`](../specs/2026-09-24-local-provider-credentials-design.md):
+EDN profiles, reusable credential modules, **Attractor-native browser login** and
+direct token refresh/exchange. The user selected native login over the proposed
+gcloud/ADC bootstrap; implementation planning is in progress. No auth code or
+cloud grants have changed. Read-only checks confirm the selected project is billing-enabled
+under Norman's Projects, but existing ADC names a different quota project.
+Neither required Google API is enabled in the selected project; the funded
+AI Studio project's identity and Anthropic federation resources still need
+verification. This auth extension does not change the remaining original-spec
+catalog/smoke obligations below.
+
+ITER-0020 is complete as a bounded runner/serializer repair. Final shared-runner
+proof passes 11 tests / 156 assertions, including equivalent-path acceptance
+and preseeded wrong-directory rejection. Existing parity predicates pass 2/17,
+native adapters 7/131 and Gemini serializer 2/23, all with zero failures.
+Paired specification, quality and progress audits approve. Final root `lgx test`
+passes **1498 tests / 13585 assertions / zero failures**, exit 0, retained in
+`/tmp/attractor-parity-integrated-20260924.log`. Fresh compiled parity CLI exits
+3 without a model and 1 for an unknown row before dispatch, listing all fifteen
+rows. Fresh main CLI validates the example with 5 nodes, 4 edges and zero
+diagnostics. These results prove deterministic native orchestration; full live
+native parity remains open. No commit or publication was made.
+
+ITER-0021 is implemented by gpt-6-sol and frozen after paired specification
+and quality approval. It shares provider CLI/test journeys, strengthens native
+input/result evidence, preserves Gemini original signed parts and Anthropic
+signed/redacted thinking in agent history, and explicitly reports unobserved
+rate limiting as incomplete. Review repairs added real success/failure cleanup,
+auto-choice omitted-tool rejection, bounded failure output and strict signed
+agent fixtures. Root focused/impacted verification passes 62 tests / 673
+assertions / zero failures. Compiled provider CLI passes five selection/exit/
+404/429/incomplete checks; compiled main validates the example. Final `lgx test`
+passes **1526 tests / 13863 assertions / zero failures**, exit0, retained in
+`/tmp/attractor-provider-integrated-20260924.log`. Both progress auditors found
+the bounded/impacted evidence clean; this full-suite pass satisfies their sole
+remaining integration condition. ITER-0021 is complete as the bounded runner
+and signed-history repair. Final review artifacts:
+`/tmp/iter0021-spec-r3-{a,b}.txt` and `/tmp/iter0021-quality-{a,b}.txt`.
+The collaboration thread limit required fresh read-only Codex CLI reviewers.
+
+Native subsets now pass eight rows each on Gemini 3.1 Flash Lite and Haiku 4.5;
+each single rate-limit probe returned200 and remains explicitly unproved.
+Catalog defaults Gemini 3.8 Flash and Fable 5.1 each pass text, parallel tools
+and agent loop. A separate Fable high-reasoning agent session also passed while
+replaying a signed thinking block. Gemini native continuations retain returned
+signatures. See `docs/provider-model-audits.md` for evidence paths and limits.
+Full first-party matrices, OpenAI credentials, the remaining smoke and offline
+catalog packaging remain separate obligations. Historical updates below refer
+to earlier snapshots.
+
+Two nonblocking quality followups remain recorded: retain richer bounded
+failed-probe diagnostics, and add a controlled signed Gemini stream split
+across multiple SSE frames. Reviewers found no unmet acceptance condition from
+either; the current accumulation appends frames correctly. No commit or
+publication was made. The next implementation priority is the approved offline
+catalog extraction; provider OIDC acquisition/refresh is not implemented.
+
+## Active original-spec closure — 2026-09-23
+
+User adjusted implementation staffing: cheaper subagents own implementation
+(`gpt-6-luna` for bounded repairs; `gpt-6-sol` for complex integration). Primary
+agent coordinates, integrates and verifies. Original specification goal retained.
+
+ITER-0020 is assigned to gpt-6-sol for batch 1 of `parity-evidence-plan.md`:
+the shared agent runner and five missing parity journeys. Paired scope review
+approved after explicitly requiring multi-call native fixture responses,
+request-aware parent/child routing, causal steering, identity correlations and
+failure controls. ITER-0019's final full-suite pass (1485/13406/0), with no
+intervening source/test edits, supplies the sentinel baseline. Requirement IDs were independently reconciled
+(58 defined, 49 referenced by the roadmap, no unknown IDs); the skill's citation
+script reported zero recognized citations and was not used as substantive proof.
+Native-provider access remains unchanged; no repeat billing probes are planned.
+The initial shared-runner positive check passes 3 tests / 23 assertions across
+the three native scripted protocols, including an existing creation row:
+`/tmp/iter0020-b1-green-journeys.log`. This is preliminary evidence only;
+negative controls, overlap/child identity checks, alias reasoning coverage and
+independent reviews remain in progress before integrated verification.
+The subsequent expanded run passes 5 tests / 51 assertions in
+`/tmp/iter0020-b1-controls-red.log` (the filename is historical; the run is GREEN).
+This adds native failure controls and alias coverage. Model-specific reasoning
+budget coverage and the remaining proof controls are still under review.
+The next run passes 6 tests / 56 assertions in the green-journeys log. Inspection
+then confirmed a production dependency: Gemini 2.5 receives `thinkingLevel`
+instead of its required `thinkingBudget`. The same Sol implementer is authorized
+to repair portable mapping and prove completion/streaming serialization plus
+the shared budget-model journey. This dependency is recorded in the plan and
+ULLM-QUIRKS-01 is marked partial until verified; no full-suite claim is updated.
+The Gemini correction is now implemented: serializer RED had 13 failures;
+the focused serializer check passes 2 tests / 23 assertions, and the shared
+journey run passes 7 / 59 with native 2.5 budgets 1024 then 24576. Root independently
+ran `lg -source-paths src:test test/runner.lg attractor.gemini-reasoning-budget-test
+attractor.llm-test`: 86 tests / 523 assertions / zero failures/errors, exit 0.
+Final identity/cleanup controls and paired reviews still precede integration.
+Root also built the pre-review parity CLI snapshot as
+`/tmp/attractor-parity-pre-review-20260923-0254`. With an empty live-model setting
+it exits 3 with the expected skipped result; an unknown row exits 1 with the
+available fifteen row names before journey execution. These entry-point checks
+do not replace a final settled-snapshot build or provider evidence.
+
+ITER-0019 is implemented and integrated through gpt-6-luna. The advisory catalog
+adds Opus 5.5, GPT-6 Sol and Luna, corrects Opus 4.6's context and records Sonnet
+4.5's sourced cutoff. Existing aliases and Fable/Astra defaults remain unchanged.
+Real completion/stream serializer checks prove Opus 5.5 adaptive behavior and
+unsupported-option rejection before transport; session checks prove cutoff
+propagation. Root focused verification passes 137 tests / 822 assertions;
+paired spec and quality reviews approve. Final `lgx test` on 0.3.2 passes
+**1485 tests / 13406 assertions / zero failures**, exit 0. Log:
+`/tmp/attractor-catalog-integrated-20260923.log`. A fresh compiled CLI validates
+the example. See `catalog-refresh-plan.md` and `docs/provider-model-audits.md`.
+The spec's separate offline catalog-data packaging preference remains a
+pre-existing final-audit obligation, distinct from this factual refresh.
+
+ITER-0018 is implemented and integrated through gpt-6-sol under `schema-dialect-plan.md`.
+Paired spec review approves the documented contract after repairs to relative
+registry bases, embedded meta discovery, inactive annotation isolation, unused
+schema preflight, explicit nulls and trusted meta precedence. Focused evidence
+passes 20 tests / 88 assertions. A fresh standalone compiled probe passes six
+public validation cases from `/tmp`, including rejection of a trusted-meta
+override. Paired quality review approves without blocking findings. The first
+integrated run reaches 1481 tests / 13375 assertions with 12 failures in older
+reference fixtures: invalid arrays stored directly under `$defs`, and malformed
+percent escapes expecting the old resolution diagnostic. The mandatory official
+corpus and new dialect contracts pass in that run. A bounded gpt-6-luna task
+aligned the old fixtures while preserving their pointer/error proof, without
+relaxing production validation. Root focused verification passes 108 tests /
+616 assertions, and paired spec and quality reviews approve the fixture repair.
+Final `lgx test` on 0.3.2 passes **1481 tests / 13376 assertions / zero failures**,
+exit 0. Logs: `/tmp/attractor-schema-dialect-integrated-20260923.log` and
+`/tmp/attractor-schema-dialect-initial-failures-20260923.log`.
+All 1301 mandatory official draft2020-12 cases pass; a fresh standalone CLI
+validates the example. Historical drafts and optional format/content assertions
+are outside the documented schema support contract.
+The provider-documentation audit's catalog/capability findings are closed by
+the bounded gpt-6-luna refresh in ITER-0019 above.
+
+ITER-0017 is implemented through gpt-6-luna: DOT BareValue tokenization,
+stylesheet reasoning values and named lint-rule objects. Root and independent
+reviews found and repaired duration/trailing-hyphen, callable-Var and attribute-key
+regressions. Fresh public parser/style/validation/lifecycle checks pass **40
+tests / 327 assertions / zero failures**; paired spec and quality reviews approve.
+A fresh standalone CLI validates the example. The final integrated `lgx suite`
+passes **1460 tests / 11894 assertions / zero failures**, exit 0, on lgx 0.3.2.
+Log: `/tmp/attractor-preparation-integrated-20260923.log`.
+The schema task's original baseline ran all 1301 mandatory draft2020-12 cases,
+with one vocabulary-selection failure, now closed by ITER-0018. See
+`schema-dialect-plan.md` for the chosen contract and test-corpus details.
+
+The preceding ITER-0015/0016 integrated snapshot passed on lgx 0.3.2: **1453 tests /
+11844 assertions / zero failures**, exit 0. Resource/reference focused evidence
+is 61 tests / 716 assertions, including all 323 official reference/unevaluated
+cases. Runtime SKIPPED focused evidence is 19/138/0; fresh root impacted checks
+pass 208/1506/0. Paired spec and quality reviews are clean. The gpt-6-luna repair
+to the interrupted-verifier fixture passes in this full suite. Fresh standalone
+and project CLI binaries validate the example. Logs and limitations are in
+[spec-closure.md](spec-closure.md). See also
+[schema-reference-plan.md](schema-reference-plan.md) and
+[schema-validation.md](../../schema-validation.md). Release/parity evidence
+remains open. Native Gemini
+model discovery works, but generation returns depleted-prepaid-credit HTTP 402;
+native OpenAI/Anthropic credentials are absent. These cells remain unproved.
+
+Goal remains active: finish all three `specs/` specifications. Current work and
+remaining obligations are in [spec-closure.md](spec-closure.md), with independent
+runtime/agent and LLM audit files beside it. Completed repairs include schema
+unevaluated annotations, false/null structured-stream completion, and standard
+environment editing with raw/tool-reader separation. Final review's raw-read
+capability preflight repair is implemented and verified before patch writes.
+
+Installed lgx 0.3.2 at the user's request; `lgx suite` delegates to the built-in
+runner. ITER-0014/0015/0016/0017/0018/0019 repairs are integrated; the overall goal remains
+active. Next: missing parity rows, complete smoke journeys and native provider
+evidence, followed by the
+full original-requirement audit. Historical entries below retain their original
+evidence and do not supersede this current state.
+
 ## Original-spec execution audit — 2026-09-12
 
 Found and fixed manager child lifecycle bypass: raw child graphs went directly

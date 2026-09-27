@@ -1,5 +1,102 @@
 # Provider & Model Audits — Consolidated
 
+## Live coding conformance follow-up — 2026-09-27
+
+`lgx live-coding-conformance` (also `make live-coding-conformance`) runs all
+fifteen parity rows plus the seven-step same-session smoke for the three native
+providers by default. Explicit configured gateway aliases require an explicit
+model and supported native-style protocol; their evidence is labeled gateway. `ATTRACTOR_CODING_PROVIDERS` and `ATTRACTOR_CODING_CHECKS` select scope;
+`ATTRACTOR_PARITY_ROWS` narrows parity rows. Reports retain selected checks/rows,
+available rows, model, protocol, endpoint and first-party/gateway origin. In-progress
+snapshots and missing credentials cannot become completed evidence.
+
+Current live evidence is partial:
+
+- **Anthropic / `claude-fable-5-1`: 15/15 parity rows across two runs.** Initial
+  report `evidence/coding-conformance-1790548362398.edn` passed 13 rows. Parallel
+  and steering failed because the model added trailing newlines that their
+  prompts had not forbidden. Prompts now request exact contents without a
+  newline; strict assertions were unchanged. Targeted report
+  `evidence/coding-conformance-1790549204403.edn` passes both rows. This is
+  combined coverage, not a claim that the initial full run passed.
+- **Gemini / `gemini-3.8-flash`: 15/15 parity rows across two repaired runs.**
+  Initial requests were rejected with HTTP 400 because `read_many_files.paths`
+  lacked its array item schema. The profile now declares string items, with
+  regression coverage. Report `evidence/coding-conformance-1790549303410.edn`
+  passes fourteen rows. Loop detection initially failed because the model
+  alternated `read_file` and `read_many_files`. Its prompt now explicitly
+  requires the identical `read_file` call twice; assertions were unchanged.
+  Targeted report `evidence/coding-conformance-1790549464590.edn` passes that
+  remaining row. This is combined coverage, not a clean initial full run.
+- **First-party OpenAI: wire verified; direct live not run.** The user explicitly accepts the
+  existing OpenAI wire-protocol evidence for publication. This is not a push
+  blocker and does not become a real-key live result. Earlier generated reports
+  retain their historical missing-credential status unchanged.
+
+At the user's request, OpenAI-family live checks also run through OpenRouter:
+
+```sh
+ATTRACTOR_CONFIG=test/live/openrouter_protocols.edn \
+ATTRACTOR_CODING_PROVIDERS=or-responses \
+ATTRACTOR_OR_RESPONSES_MODEL=openai/gpt-5.2 \
+lgx live-coding-conformance
+```
+
+The existing overlay uses the OpenAI Responses adapter and OpenAI profile,
+with OpenRouter credentials and endpoint. This is gateway evidence, not direct
+first-party OpenAI access. Initial report
+`evidence/coding-conformance-1790549994021.edn` passed 11/15 parity rows and
+6/7 smoke steps. Three parity prompts were ambiguous about read limits or exact
+newlines; those instructions were clarified without loosening assertions.
+The subagent proof checker incorrectly chose the first failed spawn despite a
+later successful spawn/wait/write. It now accepts a correlated successful retry
+while preserving child identity, owned-write and mutation-test requirements.
+Targeted report `evidence/coding-conformance-1790550248198.edn` passes truncation,
+error recovery and subagent parity. Reasoning-change still failed because the
+model wrote extra literal words; the prompt then gave explicit write-file
+arguments. Final report `evidence/coding-conformance-1790550366776.edn` passes
+reasoning-change and all **seven strengthened same-session smoke steps**, with
+`:aggregate_status :complete`, exit 0, for that selected scope.
+
+Combined OpenRouter coverage is **15/15 parity rows**: eleven initial passes,
+three targeted passes and the final reasoning pass. This is not a single clean
+full run. The final smoke is one retained-session 7/7 pass. Evidence records
+`:protocol :openai-responses`, endpoint `https://openrouter.ai/api/v1` and
+`:origin :gateway`; direct first-party OpenAI live access is not claimed.
+
+The same-session smoke is now implemented in
+`test/live/coding_smoke_journey.lg`, with deterministic proof controls in
+`test/attractor/coding_smoke_journey_test.lg`. It checks one retained session,
+actual file/tool effects, full-event versus truncated-request content, steering
+order, child-owned tests, parent continuation and timeout recovery. Child tests
+must pass a unittest baseline and reject both output-removal mutants. The Flask
+check validates a constrained AST; this is not a deployed Flask server test.
+Anthropic's 120-second profile default is explicitly capped to ten seconds for
+the smoke, so the result does not claim its stock default is ten seconds.
+
+The initial weaker Anthropic smoke pass is excluded from closure evidence.
+The strengthened shell checker now permits equivalent actual Python invocations
+without accepting echo/comment substitutes. Final strengthened smoke report
+`evidence/coding-conformance-1790549433394.edn` records Anthropic passing creation,
+editing, shell execution, truncation and steering. The subagent step then hit
+`quota-exceeded`; the timeout step could not run because the session was closed.
+This is five of seven steps, not a smoke pass. Anthropic is not being retried
+against that quota limit. The same final report records **Gemini passing all
+seven strengthened smoke steps**. Its observed Python command also satisfies
+the final shell-invocation checker.
+
+Final deterministic named audit: **261 tests / 2529 assertions, zero failures
+or errors**, exit 0 (`/tmp/attractor-prepush-coding-audit-20260927.log`). It includes
+the new live-conformance and smoke proof namespaces. The earlier full-suite
+1566/14159/0 result predates this follow-up; publication verification is separate.
+
+All three model families now have fifteen-row live coverage across the recorded
+runs: first-party Anthropic and Gemini, and OpenAI through OpenRouter Responses.
+This is not 45 first-party live cells or three passing live smokes: Anthropic
+smoke stopped at quota exhaustion. First-party OpenAI wire evidence remains
+accepted, and the user-requested gateway run supplies additional live proof. Generated
+reports are local evidence; reproducible test/runner source belongs in Git.
+
 ## Default Model Selection Audit
 
 # Omitted model selection
@@ -796,3 +893,78 @@ Reproduce the retained successful image rows using the credential-free
 separate `reasoning` selection. Keep separate evidence paths so later runs do
 not overwrite earlier failures. Native Gemini, first-party completion, live
 rate limiting, and the other open release requirements remain unproved.
+
+## Bounded model-catalog refresh — 2026-09-23
+
+Rechecked the catalog entries below against their official provider pages.
+`src/attractor/models.lg` now corrects Opus 4.6's context window, adds the
+current Opus and GPT-6 Sol/Luna entries, and records Sonnet 4.5's published
+reliable cutoff. Cutoff values retain a source URL in the catalog.
+
+| Model | Reliable cutoff | Context | Maximum output | Official source |
+| --- | --- | ---: | ---: | --- |
+| claude-opus-4-6 | 2025-05 | 1,000,000 | 128,000 | [Anthropic Opus 4.6](https://platform.claude.com/docs/en/models/opus-4-6/overview) |
+| claude-opus-5-5 | 2026-06 | 1,000,000 | 128,000 | [Anthropic Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview) |
+| claude-sonnet-4-5 | 2025-01 | 200,000 | 64,000 | [Anthropic Sonnet 4.5](https://platform.claude.com/docs/en/models/sonnet-4-5/overview) |
+| gpt-6-sol | 2026-04-20 | 1,050,000 | 128,000 | [OpenAI GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) |
+| gpt-6-luna | 2026-05-18 | 1,050,000 | 128,000 | [OpenAI GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) |
+
+Opus 5.5 is listed after Fable 5.1 and before Opus 5, leaving Fable first for
+the quality-oriented default. GPT-6 Sol and Luna follow Astra and precede the
+retained older OpenAI entries. Existing aliases still resolve to their prior
+model IDs. Opus 5.5 uses the existing Anthropic capability metadata to require
+adaptive thinking and reject forced tool choice before transport.
+
+The linked pages also document tool calls, image input and reasoning for all
+three newly added current models. These deterministic catalog and request
+capture checks establish metadata and serialization behavior only; they do not
+establish live account access or model availability for any credential.
+
+Implemented by gpt-6-luna. Root verification across Anthropic model contracts,
+LLM contracts, client defaults, prompt metadata and context capacity passes
+137 tests / 822 assertions / zero failures/errors. Paired spec and quality
+reviewers approve; each quality reviewer independently ran the three changed
+namespaces (16/169/0). Final `lgx test` on 0.3.2 passes **1485 tests / 13406
+assertions / zero failures**, exit 0. Logs:
+`/tmp/attractor-catalog-focused-20260923.log` and
+`/tmp/attractor-catalog-integrated-20260923.log`. A fresh standalone CLI
+validates `examples/hello.dot` with no diagnostics.
+
+The current source-namespace catalog packaging predates this bounded repair.
+The §2.9 preference for a separately updateable offline data artifact remains
+tracked in the final specification audit; this does not authorize a downloaded
+catalog layered into provider/auth configuration.
+
+## Funded native provider journeys — 2026-09-24
+
+After the user funded AI Studio and Anthropic, root invoked the shared
+`live.provider-matrix-journeys` functions with each native adapter and a
+transport observer that records status and signed-history counts, never keys
+or headers. The local wrapper loads `.env` before using the existing provider
+credential resolver; structured EDN credentials remain supported independently.
+
+| Native model | Selection | Verified subset | Remaining condition |
+| --- | --- | --- | --- |
+| Gemini 3.1 Flash Lite | explicit override | Eight rows: text, stream, exact Alice/30 extraction, streaming tools, parallel tools, multi-round tools, agent loop, nonexistent-model404 | The one rate-limit request returned200;429 is unproved and aggregate is incomplete |
+| Claude Haiku 4.5 | explicit override | Same eight rows | The one rate-limit request returned200;429 is unproved and aggregate is incomplete |
+| Gemini 3.8 Flash | actual catalog default | Text, parallel tools and agent loop | Other default-model rows were not selected |
+| Claude Fable 5.1 | actual catalog default | Text, parallel tools and agent loop | Other default-model rows were not selected |
+
+Gemini continuation requests carried the returned opaque signatures; sequential
+tool steps retained one, then two, then three signed parts. The Anthropic
+ordinary runs did not return thinking blocks, so they do not establish that
+specific behavior. A separate real Fable 5.1 agent session with high reasoning
+effort executed one lookup and replayed a returned thinking block; both native
+requests returned200 and the final answer contained the tool's opaque value.
+No thought text or signatures are retained in this trace, only block counts.
+
+Local evidence files are under ignored `evidence/`:
+`native-provider-journeys-20260924-{gemini,anthropic}-{low-cost,catalog}.edn`
+and `native-provider-journeys-20260924-anthropic-thinking.edn`.
+The local reproduction driver is
+`/tmp/attractor-native-provider-journeys-20260924.lg`; the normal reusable live
+entry point remains `make live-matrix` with provider/model/journey selectors.
+These are bounded native subsets, not full provider or coding-agent parity.
+Native OpenAI credentials, native429 evidence, the remaining matrix rows and
+the full shared-session smoke remain open. No auth or billing configuration
+was changed by these checks.

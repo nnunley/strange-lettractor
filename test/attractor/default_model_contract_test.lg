@@ -23,6 +23,14 @@
       (doseq [result (results client request)]
         (is (= {:provider provider :model expected} result))))))
 
+(deftest legacy-aliases-and-openai-selection-order-remain-stable
+  (doseq [[id alias] [["claude-opus-4-6" "opus"]
+                      ["claude-opus-4-6" "claude-opus"]
+                      ["claude-sonnet-4-5" "sonnet"]
+                      ["claude-sonnet-4-5" "claude-sonnet"]]]
+    (is (= id (:id (llm/get-model-info alias)))))
+  (is (= "gpt-6-astra" (:id (llm/get-latest-model "openai" "tools")))))
+
 (deftest model-default-follows-final-middleware-destination
   (let [client (llm/make-client
                  {:providers {"openai" (echo-adapter "openai" {})

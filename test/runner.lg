@@ -5,9 +5,9 @@
      lg -source-paths src:test test/runner.lg --all
    Exits 0 on success, 1 on failure.
 
-   `lgx test` cannot be used instead: lgx 0.3.0 ships a harness written
-   against let-go's pre-1.13.0 test namespace, so it fails to compile on
-   1.13.0. lgx PR #52 ports it; revisit this file once that ships.
+   The full suite uses lgx 0.3.2+'s built-in `lgx test` harness. This
+   entry point provides namespace selection, optional diagnostic deadlines,
+   and the machine-readable summary consumed by test/runners.sh.
 
    There is no default deadline: a test that can hang bounds itself.
    `--deadline-ms N` is for chasing a hang: past N the run exits 124 and

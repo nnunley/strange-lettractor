@@ -1,0 +1,177 @@
+(ns attractor.schema.resources
+  "Explicit JSON Schema resources and immutable reference evaluation scope."
+  (:require [clojure.string :as str]
+            [io :as io]
+            [attractor.schema.uri :as uri]))
+
+(defn- field [schema key]
+  (when (map? schema)
+    (if (contains? schema key) (get schema key) (get schema (name key)))))
+
+(defn- invalid! [reason]
+  (throw (ex-info reason {:category :invalid-schema-reference :reason reason})))
+
+(defn- children [schema dialect active-keyword?]
+  ;; Annotation data (default/examples/enum) cannot define schema resources.
+  (let [active? (fn [key] (or (nil? active-keyword?)
+                              (active-keyword? dialect key)))]
+   (filter map?
+    (concat
+      (mapcat (fn [key] (let [v (field schema key)] (when (map? v) (vals v))))
+              (filter active? [:$defs :definitions :properties :patternProperties
+                               :dependentSchemas :dependencies]))
+      (map (fn [key] (field schema key))
+           (filter active? [:items :additionalItems :contains :additionalProperties
+                            :propertyNames :unevaluatedItems :unevaluatedProperties
+                            :not :if :then :else :contentSchema]))
+      (mapcat (fn [key] (let [v (field schema key)] (when (vector? v) v)))
+              (filter active? [:items :prefixItems :allOf :anyOf :oneOf]))))))
+
+(defn- identifier [base reference]
+  (let [resolved (uri/resolve-uri base reference)
+        components (uri/parts resolved)]
+    (when-not (and (:scheme components) (str/blank? (:fragment components)))
+      (invalid! (str "Invalid schema resource identifier: " reference)))
+    (uri/compose (assoc components :fragment nil))))
+
+(defn- register [resources id location]
+  (when (and (contains? resources id)
+             (not= (:document (get resources id)) (:document location)))
+    (invalid! (str "Conflicting schema resource identifier: " id)))
+  (assoc resources id location))
+
+(defn- index-schema [resources schema base dialect root? active-keyword?]
+  (let [id (when (map? schema) (field schema :$id))
+        base (if (some? id) (identifier base id) base)
+        resource? (or root? (some? id))
+        _ (when (and (map? schema) (some? (field schema :$schema)) (not resource?))
+            (invalid! "$schema is only valid at a schema resource root"))
+        dialect (if (and resource? (map? schema) (some? (field schema :$schema)))
+                  (field schema :$schema) dialect)
+        location {:base_uri base :document schema :dialect dialect}
+        resources (if (some? id) (register resources base location) resources)]
+    (reduce (fn [index child] (index-schema index child base dialect false active-keyword?)) resources
+            (when (map? schema) (children schema dialect active-keyword?)))))
+
+(defn- index-document [resources schema retrieval-uri default-dialect active-keyword?]
+  (let [base (if (and (map? schema) (some? (field schema :$id)))
+               (identifier retrieval-uri (field schema :$id)) retrieval-uri)
+        dialect (or (field schema :$schema) default-dialect)
+        location {:base_uri base :document schema :dialect dialect}
+        resources (register (register resources retrieval-uri location) base location)]
+    {:resources (index-schema resources schema retrieval-uri dialect true active-keyword?)
+     :location location}))
+
+(defn initial-state [schema options]
+  (let [base (identifier "https://attractor.invalid/schema"
+                         (or (:schema_base_uri options) "https://attractor.invalid/schema"))
+        registry-base (identifier base (or (:schema_registry_base_uri options) base))
+        resources (reduce (fn [index [id document]]
+                            (:resources (index-document index document (identifier registry-base id)
+                                                        (:schema_default_dialect options)
+                                                        (:schema_active_keyword? options))))
+                          {} (or (:schema_registry options) {}))
+        indexed (index-document resources schema base (:schema_default_dialect options)
+                                (:schema_active_keyword? options))
+        location (:location indexed)]
+    (assoc location :resources (:resources indexed)
+                    :schema_active_keyword? (:schema_active_keyword? options)
+                    :dynamic_scope [location] :active_refs #{})))
+
+(defn- enter-location [state location]
+  ;; Re-entering a resource cannot alter its outermost dynamic binding.
+  (let [seen? (some #(= (:base_uri %) (:base_uri location)) (:dynamic_scope state))]
+    (cond-> (merge state location)
+      (not seen?) (update :dynamic_scope conj location))))
+
+(defn enter [state schema]
+  (if (and (map? schema) (some? (field schema :$id))
+           (not= schema (:document state)))
+    (let [id (identifier (:base_uri state) (field schema :$id))]
+      (enter-location state (or (get (:resources state) id)
+                                {:base_uri id :document schema
+                                 :dialect (or (field schema :$schema) (:dialect state))})))
+    state))
+
+(defn- anchor [state location name dynamic-only?]
+  (let [document (:document location)
+        dialect (:dialect location)]
+  (when (re-matches #"[A-Za-z_][A-Za-z0-9_.-]*" name)
+    (loop [pending [document] matches []]
+      (if (empty? pending)
+        (first matches)
+        (let [schema (peek pending)
+              matches (if (and (map? schema)
+                               (or (= name (field schema :$dynamicAnchor))
+                                   (and (not dynamic-only?) (= name (field schema :$anchor)))))
+                        (conj matches schema) matches)]
+          (when (< (count matches) 2)
+            (recur (into (pop pending)
+                         (when (map? schema)
+                           (remove (fn [child] (some? (field child :$id)))
+                                   (children schema dialect (:schema_active_keyword? state)))))
+                   matches))))))))
+
+(defn- pointer-child [current segment]
+  (when (re-matches #"(?:[^~]|~[01])*" segment)
+    (let [key (-> segment (str/replace "~1" "/") (str/replace "~0" "~"))]
+      (cond
+        (map? current) (if (contains? current key) (get current key) (get current (keyword key)))
+        (and (vector? current) (re-matches #"0|[1-9][0-9]*" key))
+        (let [i (try (parse-long key) (catch Object _ nil))]
+          (when (and (some? i) (< i (count current))) (get current i)))
+        :else nil))))
+
+(defn- pointer-mode [mode current segment]
+  (case mode
+    :schema-map :schema
+    :schema-array :schema
+    :schema
+    (let [key (keyword (-> segment (str/replace "~1" "/") (str/replace "~0" "~")))]
+      (cond
+        (contains? #{:$defs :definitions :properties :patternProperties
+                     :dependentSchemas :dependencies} key) :schema-map
+        (or (contains? #{:prefixItems :allOf :anyOf :oneOf} key)
+            (and (= :items key) (vector? (field current key)))) :schema-array
+        (contains? #{:items :additionalItems :contains :additionalProperties :propertyNames
+                     :unevaluatedItems :unevaluatedProperties :not :if :then :else :contentSchema}
+                   key) :schema
+        :else :data))
+    :data))
+
+(defn- target [state location fragment]
+  (cond
+    (= "" fragment) (assoc location :schema (:document location))
+    (str/starts-with? fragment "/")
+    (reduce (fn [loc segment]
+              (when loc
+                (let [child (pointer-child (:schema loc) segment)
+                      mode (pointer-mode (:pointer_mode loc) (:schema loc) segment)]
+                  (when (some? child)
+                    (assoc (if (= :schema mode) (enter loc child) loc)
+                           :schema child :pointer_mode mode)))))
+            (assoc location :schema (:document location) :pointer_mode :schema)
+            (str/split (subs fragment 1) #"/" -1))
+    :else (when-let [schema (anchor state location fragment false)]
+            (assoc location :schema schema))))
+
+(defn resolve-reference [state reference dynamic?]
+  (when-let [resolved-uri (uri/resolve-uri (:base_uri state) reference)]
+    (let [components (uri/parts resolved-uri)
+          resource-id (uri/compose (assoc components :fragment nil))
+          location (get (:resources state) resource-id)
+          fragment (try (io/decode :url (str/replace (or (:fragment components) "") "+" "%2B"))
+                        (catch Object _ nil))
+          resolved (when (and location (some? fragment)) (target state location fragment))
+          dynamic-anchor? (and dynamic? resolved
+                               (not (str/blank? fragment))
+                               (= fragment (field (:schema resolved) :$dynamicAnchor)))
+          override (when dynamic-anchor?
+                     (some (fn [scope]
+                             (when-let [schema (anchor state scope fragment true)]
+                               (assoc scope :schema schema)))
+                           (:dynamic_scope state)))
+          selected (or override resolved)]
+      (when selected
+        {:schema (:schema selected)
+         :state (enter-location state (select-keys selected [:base_uri :document :dialect]))}))))

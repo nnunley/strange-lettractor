@@ -1,0 +1,357 @@
+(ns attractor.schema.dialects
+  "Dialect selection, trusted schema-document preflight, and vocabulary gates."
+  (:require [clojure.string :as str]
+            [attractor.schema.resources :as resources]
+            [attractor.schema.uri :as uri]
+            [attractor.schema.trusted-metas :as trusted]))
+
+(def standard-uri "https://json-schema.org/draft/2020-12/schema")
+(def ^:private trusted-meta-state
+  (assoc (resources/initial-state (get trusted/documents standard-uri)
+           {:schema_registry trusted/documents :schema_base_uri standard-uri})
+         :trusted_meta true))
+(def vocab-prefix "https://json-schema.org/draft/2020-12/vocab/")
+(def known-vocabularies
+  (set (map #(str vocab-prefix %)
+            ["core" "applicator" "unevaluated" "validation" "meta-data"
+             "format-annotation" "content"])))
+(def validation-keywords
+  #{"type" "enum" "const" "multipleOf" "maximum" "exclusiveMaximum"
+    "minimum" "exclusiveMinimum" "maxLength" "minLength" "pattern"
+    "maxItems" "minItems" "uniqueItems" "maxContains" "minContains"
+    "maxProperties" "minProperties" "required" "dependentRequired"})
+(def applicator-keywords
+  #{"prefixItems" "items" "contains" "additionalProperties" "properties"
+    "patternProperties" "dependentSchemas" "propertyNames" "if" "then"
+    "else" "allOf" "anyOf" "oneOf" "not"})
+(def unevaluated-keywords #{"unevaluatedItems" "unevaluatedProperties"})
+(def legacy-keywords #{"dependencies" "additionalItems"})
+(declare schema-map-keys schema-array-keys schema-single-keys)
+
+(defn- field [schema key]
+  (when (map? schema)
+    (if (contains? schema key) (get schema key) (get schema (name key)))))
+(defn- key-name [key] (if (keyword? key) (name key) (str key)))
+(defn- canonical [uri]
+  (if (and (string? uri) (str/ends-with? uri "#")) (subs uri 0 (dec (count uri))) uri))
+(defn- invalid! [reason]
+  (throw (ex-info reason {:category :invalid-schema-dialect :reason reason})))
+
+(defn- declared-vocabularies [meta]
+  (let [declarations (field meta :$vocabulary)]
+    (when (and (some? declarations) (not (map? declarations)))
+      (invalid! "Invalid $vocabulary declaration"))
+    (when (and (map? declarations)
+               (some (fn [[uri required?]]
+                       (let [parsed (uri/parts uri)]
+                         (or (not (string? uri)) (not (boolean? required?))
+                             (nil? (:scheme parsed))
+                             (not= uri (uri/resolve-uri uri uri)))))
+                     declarations))
+      (invalid! "Invalid $vocabulary declaration"))
+    (when (and (map? declarations)
+               (not= true (get declarations (str vocab-prefix "core"))))
+      (invalid! "A declared dialect requires the 2020-12 core vocabulary"))
+    (when-let [unknown (first (filter (fn [[uri required?]]
+                                       (and required? (not (contains? known-vocabularies uri))))
+                                     declarations))]
+      (invalid! (str "Unsupported required vocabulary: " (first unknown))))
+    ;; A declared known vocabulary is active whether its support flag is true
+    ;; or false. The flag says whether an implementation must understand it.
+    (if (map? declarations)
+      (set (filter known-vocabularies (keys declarations)))
+      known-vocabularies)))
+
+(defn- meta-document [state dialect]
+  (let [uri (canonical dialect)]
+    (or (get trusted/documents uri)
+        (:document (get (:resources state) uri)))))
+
+(defn- dialect-entry [state dialect]
+  (let [uri (canonical dialect)]
+    (cond
+      (nil? uri) {:mode :compat :meta (get trusted/documents standard-uri)
+                  :vocabularies known-vocabularies}
+      (not (string? uri)) (invalid! "$schema must be a URI string")
+      :else
+      (let [meta (meta-document state uri)]
+        (when-not meta (invalid! (str "Unsupported or unavailable schema dialect: " uri)))
+        (when-not (= standard-uri (canonical (field meta :$schema)))
+          (invalid! (str "Unsupported schema dialect ancestry: " uri)))
+        {:mode :2020 :meta meta :vocabularies (declared-vocabularies meta)}))))
+
+(defn- meta-for [indexed dialect]
+  (when dialect
+    (or (get trusted/documents (canonical dialect))
+        (get indexed (canonical dialect)))))
+
+(defn- resource-vocabularies [indexed dialect]
+  (if (nil? dialect)
+    known-vocabularies
+    (when-let [meta (meta-for indexed dialect)]
+      (declared-vocabularies meta))))
+
+(defn- active-resource-keyword? [dialect keyword vocabs]
+  (let [name (key-name keyword)
+        active? (fn [suffix] (contains? vocabs (str vocab-prefix suffix)))]
+    (cond
+      (= name "$defs") (active? "core")
+      (= name "definitions")
+      (or (nil? dialect) (= (canonical dialect) standard-uri))
+      (contains? legacy-keywords name) (nil? dialect)
+      (contains? applicator-keywords name) (active? "applicator")
+      (contains? unevaluated-keywords name) (active? "unevaluated")
+      (= name "contentSchema") (active? "content")
+      :else true)))
+
+(defn- schema-children [schema dialect vocabs]
+  (mapcat (fn [[key value]]
+            (let [name (key-name key)]
+              (if-not (active-resource-keyword? dialect key vocabs)
+                []
+                (cond
+                  (and (contains? schema-map-keys name) (map? value))
+                  (vals value)
+                  (and (contains? schema-array-keys name) (vector? value)) value
+                  (and (= name "items") (vector? value)) value
+                  (contains? schema-single-keys name) [value]
+                  :else []))))
+          schema))
+
+(declare discover-resources)
+(defn- discover-resources [indexed [schema source-base inherited root?]]
+  (if-not (map? schema)
+    [indexed []]
+    (let [id (field schema :$id)
+          identified (when id (uri/resolve-uri source-base id))
+          base (or identified source-base)
+          dialect (if (or root? id) (or (field schema :$schema) inherited) inherited)
+          indexed (if (and identified (not (contains? indexed (canonical identified))))
+                    (assoc indexed (canonical identified) schema) indexed)
+          vocabs (resource-vocabularies indexed dialect)]
+      (if (nil? vocabs)
+        ;; Every supported custom 2020-12 dialect requires Core. Its $defs
+        ;; storage can contain the meta-schema that defines this very dialect.
+        ;; Defer all other locations until the vocabulary is known.
+        (let [[next-index deferred]
+              (reduce (fn [[index waiting] child]
+                        (let [[new-index new-waiting]
+                              (discover-resources index [child base dialect false])]
+                          [new-index (into waiting new-waiting)]))
+                      [indexed []] (vals (or (field schema :$defs) {})))]
+          [next-index (conj deferred [schema source-base inherited root?])])
+        (reduce (fn [[index deferred] child]
+                  (let [[next-index next-deferred]
+                        (discover-resources index [child base dialect false])]
+                    [next-index (into deferred next-deferred)]))
+                [indexed []] (schema-children schema dialect vocabs))))))
+
+(defn- registry-candidates [registry base default-dialect]
+  (let [nodes (mapv (fn [[retrieval document]]
+                      [document (uri/resolve-uri base retrieval)
+                       default-dialect true]) registry)
+        roots (reduce (fn [acc [document retrieval _ _]]
+                        (let [identified (when-let [id (field document :$id)]
+                                           (uri/resolve-uri retrieval id))]
+                          (cond-> (assoc acc (canonical retrieval) document)
+                            (and identified
+                                 (not (contains? acc (canonical identified))))
+                            (assoc (canonical identified) document))))
+                      {} nodes)]
+    (loop [indexed roots pending nodes]
+      (let [[next-index deferred]
+            (reduce (fn [[index waiting] node]
+                      (let [[new-index new-waiting] (discover-resources index node)]
+                        [new-index (into waiting new-waiting)]))
+                    [indexed []] pending)]
+        (if (and (seq deferred) (> (count next-index) (count indexed)))
+          (recur next-index deferred)
+          next-index)))))
+
+(defn resource-keyword-selector [options]
+  "Select schema-bearing locations while indexing. Unknown data stays inert."
+  (let [registry (or (:schema_registry options) {})
+        base (or (:schema_base_uri options) "https://attractor.invalid/schema")
+        indexed (registry-candidates registry base (:schema_default_dialect options))]
+    (fn [dialect keyword]
+      (let [vocabs (resource-vocabularies indexed dialect)]
+        (when (nil? vocabs)
+          (invalid! (str "Unsupported or unavailable schema dialect: " dialect)))
+        (active-resource-keyword? dialect keyword vocabs)))))
+
+(def schema-map-keys
+  #{"$defs" "definitions" "properties" "patternProperties" "dependentSchemas" "dependencies"})
+(def schema-array-keys #{"prefixItems" "allOf" "anyOf" "oneOf"})
+(def schema-single-keys
+  #{"items" "additionalItems" "contains" "additionalProperties" "propertyNames"
+    "unevaluatedItems" "unevaluatedProperties" "not" "if" "then" "else"
+    "contentSchema"})
+
+(declare sanitized)
+(defn- child [value mode preserve-id?]
+  (if (and (not preserve-id?) (map? value) (some? (field value :$id)))
+    true
+    (sanitized value mode preserve-id?)))
+(defn- sanitized [schema mode & [preserve-id?]]
+  (if-not (map? schema)
+    schema
+    (into (empty schema)
+          (map (fn [[key value]]
+                 (let [name (key-name key)]
+                   [key (cond
+                          (= name "type")
+                          (cond
+                            (keyword? value) (clojure.core/name value)
+                            (vector? value) (mapv #(if (keyword? %) (clojure.core/name %) %) value)
+                            :else value)
+                          (and (= mode :compat) (= name "items") (vector? value))
+                          true
+                          (and (contains? schema-map-keys name) (map? value))
+                          (into (empty value)
+                                (map (fn [[k v]] [k (if (and (= name "dependencies")
+                                                       (vector? v)) v
+                                                        (if (and (= mode :2020)
+                                                                 (= name "dependencies"))
+                                                          (sanitized v mode true)
+                                                          (child v mode preserve-id?)))]) value))
+                          (and (contains? schema-array-keys name) (vector? value))
+                          (mapv #(child % mode preserve-id?) value)
+                          (contains? schema-single-keys name)
+                          (child value mode preserve-id?)
+                          :else value)])) schema))))
+
+(defn- compatibility-shapes! [schema validate-legacy! & [nested?]]
+  (when (and (map? schema) (or (not nested?) (nil? (field schema :$id))))
+    (let [items (field schema :items)
+          additional (field schema :additionalItems)
+          additional-present? (or (contains? schema :additionalItems)
+                                  (contains? schema "additionalItems"))]
+      (when (and (vector? items)
+                 (some #(not (or (map? %) (boolean? %))) items))
+        (invalid! "Legacy tuple items must contain schemas"))
+      (when (and additional-present?
+                 (not (or (map? additional) (boolean? additional))))
+        (invalid! "Legacy additionalItems must be a schema"))
+      (when (vector? items)
+        (doseq [item items]
+          (when-not (and (map? item) (some? (field item :$id)))
+            (validate-legacy! item))))
+      (when (and additional-present?
+                 (not (and (map? additional) (some? (field additional :$id)))))
+        (validate-legacy! additional))
+      (doseq [[key value] schema]
+        (let [name (key-name key)]
+          (cond
+            (and (contains? schema-map-keys name) (map? value))
+            (doseq [[_ child-schema] value]
+              (when (or (not= name "dependencies") (not (vector? child-schema)))
+                (compatibility-shapes! child-schema validate-legacy! true)))
+            (and (contains? schema-array-keys name) (vector? value))
+            (doseq [child-schema value]
+              (compatibility-shapes! child-schema validate-legacy! true))
+            (and (= name "items") (vector? value))
+            (doseq [child-schema value]
+              (compatibility-shapes! child-schema validate-legacy! true))
+            (contains? schema-single-keys name)
+            (compatibility-shapes! value validate-legacy! true)))))))
+
+(defn- check-pattern! [pattern]
+  (when (string? pattern)
+    (try (re-pattern pattern)
+         (catch Object _ (invalid! (str "Invalid schema regular expression: " pattern))))))
+
+(defn- semantic-patterns! [schema dialect vocabularies active-keyword? & [nested?]]
+  (when (and (map? schema) (or (not nested?) (nil? (field schema :$id))))
+    (doseq [key [:$ref :$dynamicRef]]
+      (when-let [reference (field schema key)]
+        (when-not (uri/parts reference)
+          (invalid! (str "Invalid schema reference URI: " reference)))))
+    (when (contains? vocabularies (str vocab-prefix "validation"))
+      (check-pattern! (field schema :pattern)))
+    (when (active-keyword? dialect :patternProperties)
+      (doseq [[pattern _] (or (field schema :patternProperties) {})]
+        (check-pattern! (key-name pattern))))
+    (doseq [[key value] schema]
+      (let [name (key-name key)
+            walk (fn [child]
+                   (semantic-patterns! child dialect vocabularies
+                                       active-keyword? true))]
+        (when (active-keyword? dialect key)
+          (cond
+            (and (contains? schema-map-keys name) (map? value))
+            (doseq [[_ child] value]
+              (when (or (not= name "dependencies") (not (vector? child)))
+                (walk child)))
+            (and (contains? schema-array-keys name) (vector? value))
+            (doseq [child value] (walk child))
+            (and (= name "items") (vector? value))
+            (doseq [child value] (walk child))
+            (contains? schema-single-keys name) (walk value)))))))
+
+(defn preflight
+  "Validate each independent/embedded resource under its own dialect.
+   evaluate is the trusted internal evaluator; it must not call public preflight."
+  [state options evaluate]
+  (let [locations (distinct (vals (:resources state)))
+        dialects (set (map :dialect locations))
+        registry (merge (or (:schema_registry options) {}) trusted/documents)
+        entries (into {}
+                  (map (fn [dialect]
+                         (let [entry (dialect-entry state dialect)
+                               meta (:meta entry)
+                               custom-state
+                               (when (and dialect
+                                          (not= (canonical dialect) standard-uri))
+                                 (let [registry-state
+                                       (resources/initial-state true
+                                         {:schema_registry registry
+                                          :schema_active_keyword?
+                                          (:schema_active_keyword? options)
+                                          :schema_registry_base_uri
+                                          (or (:schema_base_uri options)
+                                              "https://attractor.invalid/schema")
+                                          :schema_base_uri
+                                          "https://attractor.invalid/meta-evaluation"})
+                                       resolved (resources/resolve-reference
+                                                  registry-state (canonical dialect) false)]
+                                   (when-not resolved
+                                     (invalid! (str "Unavailable schema dialect: " dialect)))
+                                   (assoc (:state resolved) :trusted_meta true)))]
+                           [dialect (assoc entry :meta-state
+                                      (if (or (nil? dialect)
+                                              (= (canonical dialect) standard-uri))
+                                        trusted-meta-state
+                                        custom-state))])) dialects))]
+    (doseq [location locations]
+      (when-not (= (get trusted/documents (:base_uri location)) (:document location))
+       (let [{:keys [mode meta meta-state vocabularies]} (get entries (:dialect location))
+            schema (:document location)
+            validate-legacy! (fn [child]
+                               (let [[valid? reason]
+                                     (evaluate (sanitized child :compat) meta meta-state)]
+                                 (when-not valid?
+                                   (invalid! (str "Invalid legacy schema at "
+                                                  (:base_uri location) ": " reason)))))
+            _ (when (= mode :compat)
+                (compatibility-shapes! schema validate-legacy!))
+            document (sanitized schema mode)
+            [valid? reason] (evaluate document meta meta-state)]
+        (when-not valid?
+          (invalid! (str "Invalid schema at " (:base_uri location) ": " reason)))
+        (semantic-patterns! schema (:dialect location) vocabularies
+                            (:schema_active_keyword? options)))))
+    (assoc state :dialect_entries entries)))
+
+(defn active-schema [schema state]
+  (if (or (:trusted_meta state) (not (map? schema)))
+    schema
+    (let [{:keys [mode vocabularies]} (get (:dialect_entries state) (:dialect state))
+          active? (fn [suffix] (contains? vocabularies (str vocab-prefix suffix)))]
+      (into (empty schema)
+            (remove (fn [[key _]]
+                      (let [name (key-name key)]
+                        (or (and (= mode :2020) (contains? legacy-keywords name))
+                            (and (contains? validation-keywords name) (not (active? "validation")))
+                            (and (contains? applicator-keywords name) (not (active? "applicator")))
+                            (and (contains? unevaluated-keywords name) (not (active? "unevaluated"))))))
+                    schema)))))

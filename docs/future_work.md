@@ -8,13 +8,13 @@ raised; the roadmap decides scheduling.
 
 ## User configuration (requested 2026-09-08)
 
-Today the only user configuration is the process environment plus `.env`
-(`dotenv`): provider credentials and base URLs, as the unified LLM spec §2.2
-prescribes for `Client.from_env()`. The specs describe a library whose host
+At the time of this request, user configuration was limited to the process
+environment plus `.env` (`dotenv`). Provider configuration now also loads
+data-only `attractor.edn` files from user and project roots. The specs describe a library whose host
 application owns all other settings in code, and never contemplated a
 standalone product with a console, agent defaults, local model endpoints or
-per-user preferences. Everything else is currently repeated as CLI flags on
-every invocation: `--model provider/name`, `--alias`, `--agent-cwd`,
+per-user preferences. Other application defaults still use CLI options such as
+`--model provider/name`, `--alias`, `--agent-cwd`,
 `--agent-model`, `--agent-sandbox`, `--agent-permission-mode`, the hub's
 per-agent commands, and the llama.cpp endpoint.
 
@@ -31,8 +31,11 @@ The design session should settle:
   reader superset (the project's reader decision), at a user location
   (`~/.config/attractor/` or `$XDG_CONFIG_HOME`) and at the project root,
   layered as built-in defaults, user file, project file, environment, then
-  flags. Keep credentials in the environment or `.env`; the file may name an
-  environment variable, never contain a secret.
+  flags. The original environment-only credential proposal is superseded:
+  provider entries can name an environment variable, borrow another entry's
+  credential, or contain `:api_key` in a mode-0600 file. See the README's
+  provider configuration contract; this remaining design concerns application
+  defaults beyond the provider layer.
 - **Contents.** Model aliases and the default model (`provider/name`), provider
   base URLs for local services, default agent options per agent name (cwd,
   model, tools, permission mode, sandbox, approval policy, timeout), agent
@@ -115,19 +118,19 @@ processes.
 
 ## Shared hub transport (requested 2026-09-09)
 
-Since 2026-09-09 every CLI command (`run`, `resume`, `agent`, `console`)
-submits its work to an in-process hub and renders the hub's event log, so all
-commands share one event, question and cancellation contract. The hub has no
-network face yet: a CLI cannot attach to a hub owned by another process, and
-`serve` is still a separate HTTP server rather than the hub's HTTP view.
+Implemented: `hub` owns a loopback nREPL listener, `console --connect PORT`
+attaches to it, and `serve --connect PORT` gives the same hub an HTTP view.
+Unattached `serve` owns a hub and listener. The transport uses bencode envelopes
+with EDN request/reply payloads, not the originally suggested Unix JSON-RPC
+socket. `run`, `resume`, and `agent` still embed their own hubs. See
+[current hub usage](hub.md).
 
-Next step: give the hub a socket transport (unix socket, JSON-RPC framing of
-the existing request/reply and event-cursor contract, the same shape as the
-Codex app-server the codex agent already speaks) and a `--hub <path>` flag so
-a CLI attaches instead of embedding. Open decisions: who starts the daemon
-and when it exits, how a hub is discovered (`.attractor/hub.sock` under the
-repository root is the obvious default), whether `serve` becomes the hub's
-HTTP face, and how to authorise clients on a shared machine.
+Remaining work includes automatic discovery/reconnect, durable event history,
+retry-safe mutations after a lost reply, historical session-turn results,
+stronger slow-client bounds, and established signal-triggered cleanup. The
+loopback nREPL endpoint is trusted local access with evaluation capability;
+authenticated multi-user/remote access is a separate design. These limits do
+not mean shared transport is absent.
 
 ## Evaluation harness extension (requested 2026-09-13)
 

@@ -19,12 +19,14 @@ does both, in let-go:
 |---|---|---|
 | Attractor Specification | `src/attractor/{parser,engine,handlers,server,...}.lg` | [Runtime requirements and evidence](docs/superpowers/iterations/requirements/attractor.md) |
 | Coding Agent Loop Specification | `src/attractor/{agent,profiles,execution,subagent}.lg` (own loop, no external agent SDK) | [Component, native-wire, and live evidence](docs/superpowers/iterations/requirements/coding-agent-loop.md) |
-| Unified LLM Client Specification | `src/attractor/llm.lg` (own SDK: native OpenAI, Anthropic, Gemini adapters plus `openai-compat`) | [Component checks and remaining schema/provider gaps](docs/superpowers/iterations/requirements/unified-llm.md) |
+| Unified LLM Client Specification | `src/attractor/llm.lg` (own SDK: native OpenAI, Anthropic, Gemini adapters plus `openai-compat`) | [Component checks and remaining provider gaps](docs/superpowers/iterations/requirements/unified-llm.md) |
 | "Build your own software factory" | `bin/attractor run`, `console`, `agent`, `serve` | [tutorial](docs/tutorial.md), [behavior corpus](docs/superpowers/iterations/behavior-corpus.md) |
 
 The ledgers and audits distinguish tested behavior from remaining requirements;
-the full suite is `lgx suite` (`make test`). Native-provider live coverage and full schema
-conformance remain incomplete. See the [current specification audit](docs/original-spec-status.md)
+the full suite is `lgx suite` (`make test`). Schema validation passes the mandatory
+2020-12 corpus under its [documented support contract](docs/schema-validation.md).
+Native-provider live coverage and complete parity/smoke evidence remain incomplete.
+See the [current specification audit](docs/superpowers/iterations/spec-closure.md)
 for verified results and remaining gaps. Historical story counts alone do not
 establish full specification conformance.
 
@@ -43,7 +45,7 @@ Prerequisites:
   release carries everything Attractor needs, including the native TCP listener
   and correct JSON object keys that this project previously had to patch in
   locally. `lgx.edn` pins the version; lgx refuses to run on a mismatch.
-- [lgx](https://github.com/abogoyavlensky/lgx) 0.3.0 or newer.
+- [lgx](https://github.com/abogoyavlensky/lgx) 0.3.2 or newer.
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
   OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for
@@ -59,20 +61,26 @@ thin passthrough over the same tasks.
 ```sh
 # Layout: src/ code; test/attractor/ suites; test/fixtures/ loopback servers;
 # test/live/ credential-gated gates; test/probes/ manual checks and let-go
-# issue reproducers; test/runner.lg is the suite entry point.
+# issue reproducers; lgx test discovers the full suite.
 lgx install            # fetches tiny-tui (pinned in lgx.edn)
 lgx rebuild            # bin/attractor      (make build)
-lgx suite              # full suite, ~2.5 min  (make test)
+lgx test               # full suite (lgx suite / make test are aliases)
+lgx audit-coding-loop  # original coding-loop contracts and repair regressions
+lgx live-coding-conformance  # native-provider parity + same-session smoke; uses credentials
 lgx test-ns attractor.validation-test   # one namespace   (make run-validation)
 lgx runners            # each namespace in its own process (make runners)
 bin/attractor help
 ```
 
-`lgx test`, lgx's own bundled harness, does not work on let-go 1.13.0: it is
-written against the `test` namespace that 1.13.0 replaced with a `clojure.test`
-port. [lgx#52](https://github.com/abogoyavlensky/lgx/pull/52) fixes it. Until
-that ships, `lgx suite` runs `test/runner.lg`, which hands the namespaces to
-`clojure.test/run-tests`.
+The [coding-loop audit](docs/coding-loop-audit-2026-09-27.md) maps original
+requirements to evidence and records four repaired implementation defects. Its
+named suite passes 233 tests / 2380 assertions; the repairs are also covered by
+regular tests. Full live-provider parity and shared-session smoke remain open.
+
+lgx 0.3.2 includes the `clojure.test` runner fix for let-go 1.13.0.
+`lgx suite` and `make test` delegate to its built-in `lgx test` command.
+The local `test/runner.lg` remains available for namespace selection, deadline
+diagnostics, and the per-namespace summary format used by `lgx runners`.
 
 Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
 
@@ -97,7 +105,7 @@ OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 OPENAI_COMPAT_API_KEY=local \
 For a persistent hub, run `bin/attractor hub --mock --port 4555` in one terminal
 and attach with `console --connect 4555` in another. Quitting a client preserves
 hub work; `bin/attractor hub --stop 4555` shuts down the host. See
-[nREPL hub usage](docs/_archive/nrepl-hub.md) for model configuration and embedding.
+[hub usage](docs/hub.md) for ownership, attachment and HTTP access.
 
 Inside the console:
 
@@ -111,9 +119,11 @@ Inside the console:
 | `/agent claude\|codex <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p] [--sandbox s] [--approval-policy p]` | start an external agent job |
 | `/alias codex agent codex` | define an explicit shortcut (`/codex …`); none exist by default. `--alias name=expansion` at startup does the same |
 | `/list`, `/focus <id>`, `/new`, `/cancel`, `/quit` | list sessions/runs/jobs, select, open a session, cancel, leave |
+| `/answer <key or text>` | answer a pending human gate, preferring the focused workflow |
 
 In the TUI, Ctrl-C discards a multiline draft, cancels busy focused work, or
-quits when idle. Human-gated workflows need `--auto-approve` for now. See
+quits when idle. Human-gated workflows can be answered with `/answer`;
+`--auto-approve` selects an answer automatically. See
 [console requirements and evidence](docs/_archive/console-requirements.md).
 
 ### Pipelines
@@ -166,9 +176,12 @@ to a hub (`src/attractor/hub.lg`) and renders the hub's event log. Human
 gates are hub questions: the console answers them with `/answer`, while `run`
 and `resume` answer them on the process's stdin and hand the answer back to
 the hub. Tools still execute locally inside the session that owns them; the
-hub only owns submission, events, questions and cancellation. Today each CLI
-process embeds its own hub. Attaching to a running hub over a socket is
-recorded in [future work](docs/future_work.md).
+hub owns submission, events, questions and cancellation. `run`, `resume`,
+`agent`, and an unattached `console` embed a hub. `hub` runs a persistent
+loopback nREPL host; `console --connect PORT` attaches without creating another
+hub. `serve --connect PORT` exposes that same hub through HTTP, while `serve`
+without `--connect` owns a hub and an nREPL listener. Client detach preserves
+host-owned work. See [hub usage and current limits](docs/hub.md).
 
 ## External agents
 

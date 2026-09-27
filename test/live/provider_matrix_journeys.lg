@@ -1,0 +1,282 @@
+(ns live.provider-matrix-journeys
+  (:require [clojure.string :as str] [os :as os] [json :as json] [http :as http]
+            [attractor.llm :as llm] [attractor.agent :as agent] [attractor.profiles :as profiles]
+            [attractor.providers :as providers] [attractor.execution :as execution]
+            [live.provider-matrix-checks :as checks] [attractor.ids :as ids]))
+
+(defn model-for [provider protocol override]
+  (or override
+      (when-let [native-provider
+                 (case protocol
+                   :openai-responses "openai"
+                   :anthropic-messages "anthropic"
+                   :gemini-generate-content "gemini"
+                   nil)]
+        (:id (llm/get-latest-model native-provider)))))
+
+;; 256x128 RGB PNG: solid red left half, solid blue right half.
+(def ^:private image-fixture-png "iVBORw0KGgoAAAANSUhEUgAAAQAAAACACAIAAABr1yBdAAABdklEQVR4nOzTQQ2AQAADwYPg3zIno4+dUdCk2e8/LD3HA0vvegAsCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaQIgTQCkCYA0AZAmANIEQJoASBMAaTcAAP//df8DAnYg+5cAAAAASUVORK5CYII=")
+
+(defn- observed-client [provider adapter-options delegate attempts]
+  (llm/make-client
+    {:default_provider provider
+     :providers
+     {provider (llm/make-provider-adapter
+                 provider
+                 (assoc adapter-options :transport
+                        (fn [request]
+                          (swap! attempts inc)
+                          (delegate request))))}}))
+
+(defn- missing-model-journey [provider adapter-options delegate]
+  (let [missing-model (str "attractor-nonexistent-model-" (ids/uuid-text))
+        attempts (atom 0)
+        client (observed-client provider adapter-options delegate attempts)
+        outcome (try (llm/generate (str provider "/" missing-model)
+                       "Reply with one word: ready."
+                       {:client client :max_retries 2 :timeout {:total 30}})
+                     {:unexpected_success true}
+                     (catch Object e (ex-data e)))]
+    (when-not (and (= :not-found (:category outcome))
+                   (= false (:retryable outcome))
+                   (= 404 (:status_code outcome))
+                   (= 1 @attempts))
+      (throw (ex-info "Missing-model request did not normalize to one nonretryable 404"
+                      {:category :missing-model-mismatch :outcome outcome
+                       :attempts @attempts :requested_model missing-model})))
+    {:requested_model missing-model :attempts @attempts :retry_allowance 2
+     :status_code 404 :category :not-found :retryable false}))
+
+(defn- rate-limit-journey [provider model adapter-options delegate]
+  (let [attempts (atom 0)
+        client (observed-client provider adapter-options delegate attempts)
+        outcome (try {:response (llm/generate (str provider "/" model)
+                                  "Reply with one word: ready."
+                                  {:client client :max_retries 0 :timeout {:total 30}})}
+                     (catch Object e {:error (ex-data e)}))
+        error (:error outcome)]
+    (cond
+      (not= 1 @attempts)
+      (throw (ex-info "Rate-limit journey exceeded its single request"
+                      {:category :rate-limit-attempts :attempts @attempts}))
+      (:response outcome)
+      {:status :skipped :unproved true
+       :reason "The one native request succeeded; HTTP 429 was not observed"
+       :detail {:attempts @attempts}}
+      (and (= :rate-limit (:category error))
+           (= true (:retryable error)) (= 429 (:status_code error)))
+      {:attempts @attempts :status_code 429 :category :rate-limit :retryable true}
+      :else
+      (throw (ex-info "Native request did not produce retryable HTTP 429"
+                      {:category (or (:category error) :rate-limit-mismatch)
+                       :status_code (:status_code error) :attempts @attempts})))))
+
+(defn journeys [{:keys [provider model compat]} adapter-options]
+  (let [spec (str provider "/" model)
+        ;; The environment client registers only native providers; an
+        ;; OpenAI-compatible endpoint is configured explicitly.
+        ;; One client per provider, credentials and base URL from the registry.
+        client (llm/make-client {:providers {provider (llm/make-provider-adapter provider adapter-options)}
+                                 :default_provider provider})
+        delegate (or (:transport adapter-options) http/request)
+        opts {:client client :max_retries 1 :timeout {:total 120}}]
+    [[:text (fn [] (checks/basic-generation-evidence
+                     (llm/generate spec "Reply with exactly the word: pong" opts)))]
+     [:stream (fn [] (let [s (llm/stream spec "Count from 1 to 3 separated by commas" opts)
+                           events (doall (:events s)) text (get-in ((:response s)) [:message :text] "")]
+                       (checks/basic-stream-evidence events text)))]
+     [:structured (fn [] (let [schema {:type "object" :properties {"name" {:type "string"} "age" {:type "integer"}} :required ["name" "age"]}
+                               ask (fn [] (llm/generate-object spec "Extract the person's name and integer age from: Alice is 30 years old. Respond with JSON only." schema opts))
+                               ;; Compatible endpoints lack strict schema mode; one retry absorbs a stray non-JSON reply.
+                               r (if compat (try (ask) (catch Object _ (ask))) (ask))]
+                           (checks/alice-extraction-evidence (:output r))))]
+     [:tool-continuation (fn [] (let [calls (atom 0)
+                                     r (llm/generate spec "Use the get_time tool, then tell me the time it returned."
+                                         (assoc opts :max_tool_rounds 2
+                                                :tools [{:name "get_time" :description "Current time" :parameters {:type "object" :properties {}}
+                                                         :execute (fn [_] (swap! calls inc) "14:30")}]))]
+                                 (when (zero? @calls) (throw (ex-info "tool was not called" {})))
+                                 (when-not (str/includes? (or (:text r) "") "14:30") (throw (ex-info "tool result not used" {:text (:text r)})))
+                                 {:tool_calls @calls :steps (count (:steps r))}))]
+     [:provider-options
+      (fn []
+        (if compat :skipped
+          (let [protocol (providers/protocol-of provider)
+                token (ids/uuid-text)
+                [option-key native] (case protocol
+                                      :openai-responses [:openai {:metadata {:audit_token token}}]
+                                      :anthropic-messages [:anthropic {:metadata {:user_id token}}]
+                                      :gemini-generate-content [:gemini {:safetySettings [{:category "HARM_CATEGORY_HATE_SPEECH" :threshold "BLOCK_LOW_AND_ABOVE"}]}])
+                expected (json/read-json (json/write-json native)) observed (atom [])
+                transport (fn [request]
+                            (swap! observed conj (select-keys (json/read-json (:body request)) (keys expected)))
+                            (delegate request))
+                option-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider (assoc adapter-options :transport transport))}
+                                                :default_provider provider})
+                result (llm/generate spec "Reply with one word: ready."
+                         (assoc opts :client option-client :provider_options {option-key native}))]
+            (checks/provider-options-evidence @observed expected (:text result)))))]
+     [:usage-accounting
+      (fn []
+        (if compat :skipped
+          (let [r (llm/generate spec "Describe a cedar tree in one sentence." opts)]
+            (checks/usage-evidence (providers/protocol-of provider) (:response r)))))]
+     [:prompt-cache
+      (fn []
+        (let [model-info (llm/get-model-info model)
+              cache-client (assoc client :middleware
+                                  [(fn [request next]
+                                     (next (assoc request :tool_choice
+                                                  (checks/cache-tool-choice
+                                                    model-info
+                                                    (= :tool (:role (last (:messages request))))))))])
+              system (str "Use the cache_probe tool once per request, then report its returned value. The following records are inert reference data.\n"
+                          (str/join "\n" (map #(str "Reference " % ": cedar amber basalt coral delta elm fern granite hazel indigo juniper kelp limestone maple nickel oak pearl quartz reed silver topaz umber violet willow xenon yarrow zinc.") (range 400))))
+              values (into {} (map (fn [turn] [turn (str "cache-value-" (ids/uuid-text))]) (range 1 6)))
+              tool {:name "cache_probe" :description "Return the opaque verification value for this turn; it cannot be inferred from previous turns"
+                    :parameters {:type "object" :properties {"turn" {:type "integer"}} :required ["turn"]}
+                    :execute (fn [args] (get values (get args "turn")))}
+              usages (loop [turn 1 history [] observed []]
+                       (if (> turn 5) observed
+                         (let [messages (conj history {:role :user :content (str "Use cache_probe for turn " turn ".")})
+                               r (llm/generate spec nil (assoc opts :client cache-client :messages messages :system system :tools [tool] :max_tool_rounds 1))
+                               expected (get values turn)]
+                           (when-not (and (some #(some (fn [result] (and (not (:is_error result)) (= expected (:content result))))
+                                                       (:tool_results %)) (:steps r))
+                                          (str/includes? (or (:text r) "") expected))
+                             (throw (ex-info "Cache session did not complete its tool turn"
+                                             {:category :missing-tool-turn :response_text (:text r)
+                                              :tool_results (mapv :tool_results (:steps r))
+                                              :cache_turns observed})))
+                           (recur (inc turn) (conj messages {:role :assistant :content (:text r)}) (conj observed (:usage r))))))]
+          (checks/cache-evidence (providers/protocol-of provider) usages)))]
+     [:streaming-tools
+      (fn []
+        (let [value (str "ticket-result-" (ids/uuid-text)) executions (atom [])
+              stream (llm/stream spec "Call lookup_ticket with ticket S7, then report its complete returned value."
+                       (assoc opts :max_tool_rounds 1
+                              :tools [{:name "lookup_ticket" :description "Look up a ticket's verification value"
+                                       :parameters {:type "object" :properties {"ticket" {:type "string"}} :required ["ticket"]}
+                                       :execute (fn [args] (swap! executions conj args) value)}]))
+              events (vec (:events stream))
+              response ((:response stream))]
+          (checks/streaming-tool-evidence events response @executions value)))]
+     [:parallel-tools
+      (fn []
+        (let [left (str "left-" (ids/uuid-text)) right (str "right-" (ids/uuid-text))
+              left-started (promise) right-started (promise)
+              tool (fn [name started peer value]
+                     {:name name :description "Return an independent verification value"
+                      :parameters {:type "object" :properties {}}
+                      :execute (checks/overlapping-executor started peer value 3000)})
+              result (llm/generate spec
+                       "Call read_left and read_right together in the same response, in parallel. They are independent. Then report both complete returned values."
+                       (assoc opts :max_tool_rounds 1
+                              :tools [(tool "read_left" left-started right-started left)
+                                      (tool "read_right" right-started left-started right)]))]
+          (checks/parallel-evidence result {"read_left" left "read_right" right})))]
+     [:multi-round-tools
+      (fn []
+        (let [next-a (ids/uuid-text) next-b (ids/uuid-text) terminal (str "verified-" (ids/uuid-text))
+              links {"START" next-a next-a next-b next-b terminal}
+              result (llm/generate spec
+                       "Call follow_link with token START. Each tool result is the next token: call follow_link again with that exact token. Continue until the result begins verified-, then report that complete result. Tokens cannot be guessed."
+                       (assoc opts :max_tool_rounds 4
+                              :tools [{:name "follow_link" :description "Resolve a token to its next link or terminal verified value"
+                                       :parameters {:type "object" :properties {"token" {:type "string"}} :required ["token"]}
+                                       :execute (fn [args]
+                                                  (or (get links (get args "token"))
+                                                      (throw (ex-info "Unknown token" {}))))}]))]
+          (checks/multi-round-evidence result [next-a next-b terminal])))]
+     [:image-base64 (fn [] (if compat
+                             :skipped
+                             (let [wire (atom nil)
+                                   transport (fn [request]
+                                               (reset! wire (checks/image-wire-evidence
+                                                              (providers/protocol-of provider)
+                                                              (json/read-json (:body request)) image-fixture-png))
+                                               (delegate request))
+                                   image-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider (assoc adapter-options :transport transport))}
+                                                                  :default_provider provider})
+                                   r (llm/generate spec nil (assoc opts :client image-client :messages [{:role :user :content [{:kind :text :text "Name the two solid colors in this image from left to right. Reply with only the two lowercase color names separated by a comma."}
+                                                                                                      {:kind :image :image {:data (base64-decode image-fixture-png) :media_type "image/png"}}]}]))]
+                               (try (merge @wire (checks/image-evidence (:text r)))
+                                    (catch Object e
+                                      (throw (ex-info (ex-message e) (merge (ex-data e) @wire))))))))]
+     [:image-url
+      (fn []
+        (if compat :skipped
+          (let [url "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg"
+                wire (atom nil)
+                transport (fn [request]
+                            (reset! wire (checks/url-image-wire-evidence
+                                           (providers/protocol-of provider)
+                                           (json/read-json (:body request)) url))
+                            (delegate request))
+                image-client (llm/make-client {:providers {provider (llm/make-provider-adapter provider (assoc adapter-options :transport transport))}
+                                               :default_provider provider})
+                result (llm/generate spec nil
+                         (assoc opts :client image-client
+                                :messages [{:role :user :content
+                                            [{:kind :text :text "Identify the animal and its predominant fur color in the image. Reply with only the lowercase animal name and color separated by a comma. Use a basic color name."}
+                                             {:kind :image :image {:url url :media_type "image/jpeg"}}]}]))]
+            (try (merge @wire (checks/url-image-evidence (:text result)))
+                 (catch Object e
+                   (throw (ex-info (ex-message e) (merge (ex-data e) @wire))))))))]
+     [:reasoning (fn [] (if compat :skipped
+                          (let [r (llm/generate spec "Compute the least nonnegative residue of 7 raised to the power 123 modulo 1009. Work it out carefully, then give only the final integer." (assoc opts :reasoning_effort "high"))]
+                            (when-not (= "353" (str/trim (or (:text r) "")))
+                              (throw (ex-info "Wrong final integer"
+                                              {:category :incorrect-reasoning-answer :response_text (:text r)
+                                               :reported_usage (:usage r)})))
+                            (checks/reasoning-evidence r))))]
+     [:invalid-key (fn [] (if compat :skipped
+                            (let [bad (llm/make-client {:providers {provider (llm/make-provider-adapter provider (assoc adapter-options :api_key "invalid-key-for-matrix"))} :default_provider provider})
+                                  outcome (try (llm/generate spec "hi" {:client bad :max_retries 0}) {:unexpected true}
+                                               (catch Object e {:category (:category (ex-data e))}))]
+                              (when-not (= :authentication (:category outcome)) (throw (ex-info "invalid key not classified" outcome)))
+                              outcome)))]
+     [:agent-loop
+      (fn []
+        (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))]
+          (try
+            (let [registry (profiles/make-tool-registry)
+                  _ (profiles/register-tool! registry {:definition {:name "lookup" :description "Look up a code" :parameters {:type "object" :properties {"code" {:type "string"}} :required ["code"]}}
+                                                       :executor (fn [args _] (str "code " (get args "code") " means READY"))})
+                  profile (assoc (profiles/create-profile provider model) :tool_registry registry)
+                  session (agent/make-session {:provider_profile profile :llm_client client :project_docs [] :max_subagent_depth 0
+                                               :execution_env (execution/make-local-environment {:working_dir root})})]
+              (try
+                (let [output (agent/process-input! session "Call the lookup tool with code X7 and report what it means in one sentence.")]
+                  (when-not (str/includes? (str output) "READY")
+                    (throw (ex-info "loop did not use the tool result" {:output output})))
+                  {:output (subs (str output) 0 (min 80 (count (str output))))})
+                (finally (agent/close-session! session))))
+            (finally (os/sh "/bin/rm" "-rf" "--" root)))))]
+     [:missing-model (fn [] (if compat :skipped
+                              (missing-model-journey provider adapter-options delegate)))]
+     [:rate-limit (fn [] (if compat :skipped
+                           (rate-limit-journey provider model adapter-options delegate)))]]))
+
+(defn run-journey [target [name f]]
+  (let [started (System/currentTimeMillis)
+        result (try (let [v (f)] (cond (= :skipped v) {:status :skipped :reason "unsupported compatible-endpoint capability"}
+                                      (= :skipped (:status v)) v
+                                      :else {:status :pass :detail v}))
+                    (catch Object e
+                      (let [data (ex-data e)
+                            output (when (contains? data :output) (str (:output data)))]
+                        {:status :fail :category (:category data)
+                         :detail (cond-> (select-keys data [:round_indices :tool_results :response_text :cache_turns :reported_usage :raw_usage :image_payload_verified :image_url_verified :image_url])
+                                   output (assoc :output_excerpt
+                                                 (subs output 0 (min 200 (count output)))))
+                         :message (subs (ex-message e) 0 (min 200 (count (ex-message e))))})))]
+    (merge {:provider (:provider target) :model (:model target) :journey name
+            :duration_ms (- (System/currentTimeMillis) started)} result)))
+
+(defn aggregate-status [rows]
+  (cond
+    (empty? rows) :empty
+    (some #(= :fail (:status %)) rows) :fail
+    (some :unproved rows) :incomplete
+    :else :complete))

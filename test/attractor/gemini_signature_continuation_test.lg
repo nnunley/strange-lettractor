@@ -1,0 +1,226 @@
+(ns attractor.gemini-signature-continuation-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [json :as json]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]))
+
+(defn- gemini-client [reply transport]
+  (let [requests (atom [])
+        client (llm/make-client
+                 {:default_provider "gemini"
+                  :providers
+                  {"gemini"
+                   (llm/make-provider-adapter
+                     "gemini"
+                     {:api_key "fixture"
+                      :base_url "https://fixture.invalid/v1beta"
+                      :transport
+                      (fn [request]
+                        (let [body (json/read-json (:body request))]
+                          (swap! requests conj body)
+                          (transport reply request (count @requests))))})}})]
+    [client requests]))
+
+(defn- answer [text]
+  {:responseId "done"
+   :candidates [{:content {:role "model" :parts [{:text text}]}
+                 :finishReason "STOP"}]
+   :usageMetadata {:promptTokenCount 10 :candidatesTokenCount 3 :totalTokenCount 13}})
+
+(defn- sse [body]
+  (str "data: " (json/write-json body) "\n\n"))
+
+(deftest generate-preserves-first-only-signed-parallel-call-part
+  (let [first-response
+        {:responseId "first"
+         :candidates
+         [{:content {:role "model"
+                     :parts [{:text "" :thought true :thoughtSignature "thought-opaque"}
+                             {:functionCall {:name "left" :args {}} :thoughtSignature "call-opaque"}
+                             {:functionCall {:name "right" :args {}}}]}
+           :finishReason "STOP"}]
+         :usageMetadata {:promptTokenCount 8 :candidatesTokenCount 3 :totalTokenCount 11}}
+        [client requests]
+        (gemini-client first-response
+          (fn [reply _ count]
+            {:status 200 :body (json/write-json (if (= count 1) reply (answer "left-value right-value")))}))
+        calls (atom [])
+        tool (fn [name value]
+               {:name name :description name :parameters {:type "object" :properties {}}
+                :execute (fn [_] (swap! calls conj name) value)})
+        result (llm/generate "gemini/gemini-3-flash-preview" "Call both tools"
+                 {:client client :max_retries 0
+                  :tools [(tool "left" "left-value") (tool "right" "right-value")]})
+        parts (get-in (second @requests) ["contents" 1 "parts"])]
+    (is (= 2 (count @requests)))
+    (is (= #{"left" "right"} (set @calls)))
+    (is (= "left-value right-value" (:text result)))
+    (is (= "thought-opaque" (get-in parts [0 "thoughtSignature"])))
+    (is (= true (get-in parts [0 "thought"])))
+    (is (= "" (get-in parts [0 "text"])))
+    (is (= "call-opaque" (get-in parts [1 "thoughtSignature"])))
+    (is (= "left" (get-in parts [1 "functionCall" "name"])))
+    (is (= "right" (get-in parts [2 "functionCall" "name"])))
+    (is (nil? (get-in parts [2 "thoughtSignature"])))))
+
+(deftest stream-preserves-signed-parts-in-native-order
+  (let [signed
+        {:responseId "stream-first"
+         :candidates
+         [{:content {:role "model"
+                     :parts [{:text "pre" :thoughtSignature "text-opaque"}
+                             {:functionCall {:name "lookup" :args {}} :thoughtSignature "tool-opaque"}
+                             {:text "" :thoughtSignature "empty-opaque"}]}
+           :finishReason "STOP"}]
+         :usageMetadata {:promptTokenCount 8 :candidatesTokenCount 3 :totalTokenCount 11}}
+        [client requests]
+        (gemini-client signed
+          (fn [reply _ count]
+            {:status 200
+             :body (sse (if (= count 1) reply (answer "opaque-result")))}))
+        stream (llm/stream "gemini/gemini-3-flash-preview" "Use lookup"
+                 {:client client :max_retries 0
+                  :tools [{:name "lookup" :description "lookup"
+                           :parameters {:type "object" :properties {}}
+                           :execute (fn [_] "opaque-result")}]
+                  :max_tool_rounds 1})
+        events (vec (:events stream))
+        response ((:response stream))
+        parts (get-in (second @requests) ["contents" 1 "parts"])]
+    (is (= 2 (count @requests)))
+    (is (= "opaque-result" (get-in response [:message :text])))
+    (is (some #(= :step_finish (:type %)) events))
+    (is (= ["text-opaque" "tool-opaque" "empty-opaque"]
+           (mapv #(get % "thoughtSignature") parts)))
+    (is (= "pre" (get-in parts [0 "text"])))
+    (is (= "lookup" (get-in parts [1 "functionCall" "name"])))
+    (is (= "" (get-in parts [2 "text"])))))
+
+(deftest agent-history-replays-original-signed-assistant-parts
+  (let [requests (atom [])
+        first-response
+        {:responseId "agent-first"
+         :candidates [{:content {:role "model"
+                                 :parts [{:text "" :thought true :thoughtSignature "agent-thought"}
+                                         {:functionCall {:name "lookup" :args {}}
+                                          :thoughtSignature "agent-call"}]}
+                       :finishReason "STOP"}]
+         :usageMetadata {:promptTokenCount 8 :candidatesTokenCount 3 :totalTokenCount 11}}
+        adapter (llm/make-provider-adapter
+                  "gemini"
+                  {:api_key "fixture" :base_url "https://fixture.invalid/v1beta"
+                   :transport
+                   (fn [request]
+                     (if (nil? (:body request))
+                       {:status 404 :body "unavailable"}
+                       (let [body (json/read-json (:body request))
+                             n (count (swap! requests conj body))]
+                         {:status 200
+                          :body (sse (if (= n 1) first-response (answer "lookup-ready")))})))})
+        client (llm/make-client {:default_provider "gemini" :providers {"gemini" adapter}})
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool!
+            registry
+            {:definition {:name "lookup" :description "Lookup a code"
+                          :parameters {:type "object" :properties {}}}
+             :executor (fn [_ _] "lookup-ready")})
+        profile (assoc (profiles/create-profile "gemini" "gemini-3-flash-preview")
+                       :tool_registry registry)
+        session (agent/make-session
+                  {:provider_profile profile :llm_client client :project_docs []
+                   :max_subagent_depth 0
+                   :execution_env (execution/make-local-environment {:working_dir (os/cwd)})})]
+    (try
+      (is (= "lookup-ready" (agent/process-input! session "Call lookup")))
+      (is (= 2 (count @requests)))
+      (let [parts (get-in (second @requests) ["contents" 1 "parts"])]
+        (is (= "agent-thought" (get-in parts [0 "thoughtSignature"])))
+        (is (= "agent-call" (get-in parts [1 "thoughtSignature"])))
+        (is (= "lookup" (get-in parts [1 "functionCall" "name"]))))
+      (finally (agent/close-session! session)))))
+
+(deftest later-tool-round-replays-each-distinct-signature
+  (let [requests (atom [])
+        signed-call (fn [name signature]
+                      {:responseId name
+                       :candidates [{:content {:role "model"
+                                               :parts [{:functionCall {:name name :args {}}
+                                                        :thoughtSignature signature}]}
+                                     :finishReason "STOP"}]
+                       :usageMetadata {:promptTokenCount 8 :candidatesTokenCount 3 :totalTokenCount 11}})
+        replies [(signed-call "first" "signature-one")
+                 (signed-call "second" "signature-two")
+                 (answer "first-result second-result")]
+        client (llm/make-client
+                 {:default_provider "gemini"
+                  :providers
+                  {"gemini" (llm/make-provider-adapter
+                              "gemini"
+                              {:api_key "fixture" :base_url "https://fixture.invalid/v1beta"
+                               :transport (fn [request]
+                                            (let [n (count (swap! requests conj (json/read-json (:body request))))]
+                                              {:status 200 :body (json/write-json (nth replies (dec n)))}))})}})
+        tool (fn [name]
+               {:name name :description name :parameters {:type "object" :properties {}}
+                :execute (fn [_] (str name "-result"))})
+        result (llm/generate "gemini/gemini-3-flash-preview" "Use both in order"
+                 {:client client :max_retries 0 :max_tool_rounds 2
+                  :tools [(tool "first") (tool "second")]})
+        second-parts (get-in (second @requests) ["contents" 1 "parts"])
+        third-contents (get (nth @requests 2) "contents")]
+    (is (= 3 (count @requests)))
+    (is (= "first-result second-result" (:text result)))
+    (is (= "signature-one" (get-in second-parts [0 "thoughtSignature"])))
+    (is (= "signature-one" (get-in third-contents [1 "parts" 0 "thoughtSignature"])))
+    (is (= "signature-two" (get-in third-contents [3 "parts" 0 "thoughtSignature"])))))
+
+(deftest signed-gemini-parts-do-not-leak-native-fields-to-other-providers
+  (let [signed {:responseId "source"
+                :candidates [{:content {:role "model"
+                                        :parts [{:text "portable text"
+                                                 :thoughtSignature "gemini-only-opaque"}]}
+                              :finishReason "STOP"}]
+                :usageMetadata {}}
+        [source-client _]
+        (gemini-client signed
+          (fn [reply _ _] {:status 200 :body (json/write-json reply)}))
+        source (llm/client-complete source-client
+                 {:model "gemini-3-flash-preview"
+                  :messages [{:role :user :content "Say portable text"}]})]
+    (doseq [provider ["openai" "anthropic" "openai-compat"]]
+      (let [wire (atom nil)
+            target-response
+            (case provider
+              "openai" {:id "r1" :status "completed"
+                        :output [{:type "message" :role "assistant"
+                                  :content [{:type "output_text" :text "done"}]}]
+                        :usage {:input_tokens 5 :output_tokens 2}}
+              "openai-compat" {:id "chatcmpl-1"
+                               :choices [{:index 0 :message {:role "assistant" :content "done"}
+                                          :finish_reason "stop"}]
+                               :usage {:prompt_tokens 5 :completion_tokens 2}}
+              {:id "m1" :type "message" :role "assistant"
+               :content [{:type "text" :text "done"}]
+               :stop_reason "end_turn" :usage {:input_tokens 5 :output_tokens 2}})
+            client (llm/make-client
+                     {:default_provider provider
+                      :providers
+                      {provider (llm/make-provider-adapter
+                                  provider
+                                  {:api_key "fixture" :base_url "https://fixture.invalid"
+                                   :transport (fn [request]
+                                                (reset! wire (json/read-json (:body request)))
+                                                {:status 200 :body (json/write-json target-response)})})}})]
+        (llm/client-complete client
+          {:model "fixture-model"
+           :messages [{:role :user :content "Earlier answer"}
+                      (:message source)
+                      {:role :user :content "Continue"}]})
+        (let [body (pr-str @wire)]
+          (is (not (clojure.string/includes? body "thoughtSignature")) provider)
+          (is (not (clojure.string/includes? body "gemini-only-opaque")) provider)
+          (is (clojure.string/includes? body "portable text") provider))))))

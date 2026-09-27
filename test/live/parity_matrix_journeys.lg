@@ -1,0 +1,272 @@
+(ns live.parity-matrix-journeys
+  (:require [clojure.string :as str] [clojure.core :as core]
+            [os :as os] [io :as io]
+            [http :as http] [json :as json]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.llm :as llm] [attractor.providers :as providers]
+            [attractor.profiles :as profiles]
+            [live.parity-matrix-checks :as checks]))
+
+(defn- fresh-dir []
+  (let [root (str (str/replace (os/temp-dir) #"/+$" "") "/lettractor-live-matrix-"
+                  (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    root))
+
+(defn- session [spec dir events requests holder options]
+  (let [[provider model] (let [i (str/index-of spec "/")] [(subs spec 0 i) (subs spec (inc i))])
+        delegate (or (get-in options [:adapter_options :transport]) http/request)
+        transport (fn [request]
+                    (when (and (= :post (:method request)) (string? (:body request)))
+                      (try (swap! requests conj
+                                  (select-keys (json/read-json (:body request))
+                                               ["input" "messages" "contents" "reasoning"
+                                                "thinking" "output_config" "generationConfig"]))
+                           (catch Object _ nil)))
+                    (delegate request))
+        client (or (:llm_client options)
+                   (llm/make-client {:default_provider provider
+                                     :providers {provider (llm/make-provider-adapter
+                                                            provider (assoc (or (:adapter_options options) {})
+                                                                            :transport transport))}}))
+        base-env (execution/make-local-environment {:working_dir dir :default_command_timeout_ms 10000})
+        delegated-env (if-let [wrap (:environment_wrapper options)] (wrap base-env) base-env)
+        barrier (:barrier options)
+        working-dir ((:working_directory delegated-env))
+        parallel-targets (set (map #(checks/file-target working-dir %)
+                                   ["parallel-a.txt" "parallel-b.txt"]))
+        parallel-env
+        (if (= :parallel-tools (:row options))
+          (assoc delegated-env :write_file
+                 (fn [path content]
+                   (let [target (checks/file-target working-dir path)]
+                     (if-not (and target (contains? parallel-targets target))
+                       ((:write_file delegated-env) path content)
+                       (let [calls (:tool_calls (last (filter #(= :assistant (:type %))
+                                                             (:history @@holder))))
+                             call-id (some (fn [call]
+                                             (when (and (= "write_file" (:name call))
+                                                        (= target
+                                                           (checks/file-target working-dir
+                                                             (or (get-in call [:arguments "file_path"])
+                                                                 (get-in call [:arguments :file_path])))))
+                                               (:id call))) calls)
+                             deadline (+ (System/currentTimeMillis) 1000)]
+                         (swap! barrier assoc-in [:active call-id] target)
+                         (try
+                           (loop []
+                             (let [active (:active @barrier)]
+                               (if (some #(contains? % call-id) (:overlap-pairs @barrier))
+                                 nil
+                                 (if (and (= 2 (count active))
+                                          (= parallel-targets (set (vals active))))
+                                   (swap! barrier update :overlap-pairs conj (set (keys active)))
+                                   (if (< (System/currentTimeMillis) deadline)
+                                     (do (core/sleep 5) (recur))
+                                     (throw (ex-info "Parallel tool barrier timed out"
+                                                     {:category :barrier-timeout})))))))
+                           (let [result ((:write_file delegated-env) path content)]
+                             (swap! barrier update :successful conj call-id)
+                             result)
+                           (finally (swap! barrier update :active dissoc call-id))))))))
+          delegated-env)
+        environment parallel-env]
+    (agent/make-session
+      (merge {:model spec :llm_client client
+       :provider_profile (checks/profile-for (providers/protocol-of provider) provider model)
+       :execution_env environment
+       :project_docs [] :max_subagent_depth (if (= (:row options) :subagent) 1 0) :max_tool_rounds_per_input 12
+       :retry_policy {:max_retries 1}
+       :on_event (fn [event]
+                   (swap! events conj event)
+                   (when (and (= :steering (:row options))
+                              (= :steering_injected (:type event)))
+                     (swap! (:boundaries options)
+                            (fn [value]
+                              (if (:steering value) value
+                                  (assoc value :steering
+                                         {:request_count (count @requests)
+                                          :event_index (dec (count @events))
+                                          :content (:content event)})))))
+                   (when (and (= :loop-warning (:row options))
+                              (= :loop_detection (:type event)))
+                     (swap! (:boundaries options)
+                            (fn [value]
+                              (if (:loop-warning value) value
+                                  (assoc value :loop-warning
+                                         {:request_count (count @requests)
+                                          :event_index (dec (count @events))
+                                          :message (:message event)})))))
+                   (when (and (= :tool_call_end (:type event)) @holder
+                              (compare-and-set! (:boundary-fired options) false true))
+                     (when-not (= :none (:boundary_action options))
+                       (case (:row options)
+                         :steering (agent/steer-session! @holder
+                                     (or (:steering_text options)
+                                         "STEER_TO_CORRECT: create steering-correct.txt containing exactly after, with no trailing newline"))
+                         :reasoning-change (agent/set-reasoning-effort! @holder "high")
+                         nil)))
+                   (when-let [observe (:on_event options)]
+                     (when-let [s @holder] (observe s event))))}
+             (merge (case (:row options)
+                      :reasoning-change {:reasoning_effort "low"}
+                      :loop-warning {:loop_detection_window 2}
+                      {})
+                    (:session_options options))))))
+
+(defn- tool-ends [events] (filter #(= :tool_call_end (:type %)) events))
+(defn- tool-starts [events] (filter #(= :tool_call_start (:type %)) events))
+(defn- used? [events tool] (some #(= tool (:tool_name %)) (tool-starts events)))
+(defn- file [dir name] (let [p (str dir "/" name)] (when (os/stat p) (io/slurp p))))
+
+(def rows
+  [{:row :file-creation
+    :prompt "Create a file named hello.txt in the current directory containing exactly the text hello (no newline). Use the write_file tool."
+    :check (fn [dir events _ _] (= "hello" (some-> (file dir "hello.txt") str/trim)))}
+   {:row :read-then-edit
+    :setup (fn [dir] (io/spit (str dir "/greet.txt") "hello\n"))
+    :prompt "Read greet.txt, then change the word hello in it to HELLO using the edit tool. Do not rewrite the whole file."
+    :check (fn [dir events _ _] (and (used? events "read_file")
+                                   (= "HELLO" (some-> (file dir "greet.txt") str/trim))))}
+   {:row :multi-file-edit
+    :setup (fn [dir] (io/spit (str dir "/a.txt") "alpha\n") (io/spit (str dir "/b.txt") "beta\n"))
+    :prompt "In a.txt replace alpha with ALPHA, and in b.txt replace beta with BETA. Edit both files."
+    :check (fn [dir events _ _] (and (= "ALPHA" (some-> (file dir "a.txt") str/trim))
+                                   (= "BETA" (some-> (file dir "b.txt") str/trim))))}
+   {:row :shell-execution
+    :prompt "Run the shell command `printf matrix-ok` and tell me its exact output."
+    :check (fn [dir events answer _] (and (used? events "shell")
+                                        (some #(str/includes? (str (:output %)) "matrix-ok") (tool-ends events))
+                                        (str/includes? (str answer) "matrix-ok")))}
+   {:row :shell-timeout
+    :prompt "Run the shell command `sleep 5` with timeout_ms set to 200. Report whether it timed out."
+    :check (fn [dir events _ _] (some #(str/includes? (str (:output %) (:error %)) "timed out") (tool-ends events)))}
+   {:row :grep-and-glob
+    :setup (fn [dir] (io/mkdir (str dir "/src"))
+             (io/spit (str dir "/src/needle.py") "def find_me():\n    return 42\n")
+             (io/spit (str dir "/src/other.py") "x = 1\n"))
+    :prompt "Find which file defines find_me using grep, and list all .py files using glob. Report the file names."
+    :check (fn [dir events answer _] (and (used? events "grep") (used? events "glob")
+                                        (str/includes? (str answer) "needle.py")))}
+   {:row :multi-step
+    :setup (fn [dir] (io/spit (str dir "/config.ini") "port = 8080\nhost = localhost\n"))
+    :prompt "Read config.ini, work out the port value, then edit the file so the port is one higher than it is now."
+    :check (fn [dir events _ _] (and (used? events "read_file")
+                                   (str/includes? (str (file dir "config.ini")) "8081")))}
+   {:row :truncation
+    :setup (fn [dir] (io/spit (str dir "/big.txt") (apply str (repeat 1500 (str (apply str (repeat 6 "0123456789")) "\n")))))
+    :prompt "Read all of big.txt in one read_file call with offset 1 and limit 2000, so the tool output exceeds its truncation budget. Tell me how many characters the tool output warned it removed, if any."
+    :check (fn [dir events _ history]
+             (let [reads (filter #(= "read_file" (:tool_name %)) (tool-starts events))
+                   full (some #(when (> (count (str (:output %))) 60000) %) (tool-ends events))
+                   model-view (some #(when (str/includes? (str (:content %)) "Tool output was truncated") %)
+                                    (mapcat :results (filter #(= :tool_results (:type %)) history)))]
+               (and (seq reads) (some? full) (some? model-view))))}
+   {:row :error-recovery
+    :setup (fn [dir] (io/spit (str dir "/recovery-source.txt") "recovered-token\n"))
+    :prompt "First call read_file on absent-source.txt. After receiving its error, read recovery-source.txt instead. Write the recovered text into recovered.txt, preserving its trailing newline exactly."
+    :check (fn [dir events _ history]
+             (when (= "recovered-token\n" (file dir "recovered.txt"))
+               (checks/recovery-evidence history "recovered-token")))}
+   {:row :provider-edit-format
+    :setup (fn [dir] (io/spit (str dir "/edit-target.txt") "before\nkeep this line\n"))
+    :prompt "Read edit-target.txt and use your profile's dedicated editing tool (apply_patch if available, otherwise edit_file) to change only before to after. Preserve the remaining text exactly. Do not use shell or write_file."
+    :check (fn [dir events _ history]
+             (and (= "after\nkeep this line\n" (file dir "edit-target.txt"))
+                  (used? events "read_file")
+                  (not (used? events "shell")) (not (used? events "write_file"))))}
+   {:row :parallel-tools
+    :prompt "In one assistant turn, call write_file twice in parallel: create parallel-a.txt with exactly alpha and parallel-b.txt with exactly beta, both with no trailing newline. Wait for both successful results."
+    :proof-check checks/parallel-evidence}
+   {:row :steering
+    :prompt "Create steering-first.txt with exactly before and no trailing newline, then create a second file as instructed at the next tool boundary."
+    :proof-check checks/steering-evidence}
+   {:row :reasoning-change
+    :prompt "Call write_file with file_path=\"reasoning.txt\" and content=\"changed\" (seven ASCII characters, no trailing newline). Continue after the tool result."
+    :proof-check checks/reasoning-evidence}
+   {:row :subagent
+    :prompt "PARENT_DELEGATE: spawn a child and ask it to write exactly child-done to child-proof.txt. Wait for that child to finish, then report completion."
+    :proof-check checks/subagent-evidence}
+   {:row :loop-warning
+    :setup (fn [dir] (io/spit (str dir "/loop-source.txt") "repeat"))
+    :prompt "Call read_file on loop-source.txt twice using identical arguments, in two successive tool rounds, before finishing. Use read_file for both calls, not read_many_files, and continue after the second result."
+    :proof-check checks/loop-evidence}])
+
+(defn run-row
+  "Run one live parity journey. `options` supplies only harness-owned transport,
+   environment and observation hooks; the CLI and native wire tests call this
+   same entry point. The fresh work root is always removed after evidence is
+   captured, and the session is closed even when setup or a check fails."
+  [spec {:keys [row prompt setup check proof-check]} & [options]]
+  (let [dir (fresh-dir) events (atom []) requests (atom []) holder (atom nil)
+        boundaries (atom {})
+        barrier (atom {:active {} :overlap-pairs [] :successful #{}})
+        close-error (atom nil)
+        started (System/currentTimeMillis)
+        opts (assoc (or options {}) :row row :barrier barrier :boundaries boundaries
+                                  :boundary-fired (atom false))]
+    (try
+      (let [outcome (try
+                      (when setup (setup dir))
+                      (reset! holder (session spec dir events requests holder opts))
+                      {:answer (agent/process-input! @holder prompt)}
+                      (catch Object e
+                        {:error {:category (:category (ex-data e))
+                                 :message (ex-message e)}})
+                      (finally
+                        (when-let [s @holder]
+                          (try (agent/close-session! s)
+                               (catch Object e
+                                 (reset! close-error
+                                         {:category (:category (ex-data e))
+                                          :message (ex-message e)}))))))
+            outcome (if @close-error (assoc outcome :error @close-error) outcome)
+            s @holder
+            history (vec (when s (:history @s)))
+            profile (when s (:provider_profile @s))
+            tracked (case row
+                      :parallel-tools ["parallel-a.txt" "parallel-b.txt"]
+                      :steering ["steering-first.txt" "steering-correct.txt" "steering-wrong.txt"]
+                      :reasoning-change ["reasoning.txt"]
+                      :subagent ["child-proof.txt"]
+                      :loop-warning ["loop-source.txt"]
+                      [])
+            files (into {} (map (fn [name] [name (file dir name)]) tracked))
+            context {:dir dir :events @events :history history :barrier barrier
+                     :boundaries @boundaries
+                     :requests @requests :session s :answer (:answer outcome)
+                     :files files}
+            _ (when-let [capture (:capture opts)] (reset! capture context))
+            proof (when (nil? (:error outcome))
+                    (try (if proof-check
+                           (proof-check context)
+                           (check dir @events (:answer outcome) history))
+                         (catch Object _ false)))
+            expected-edit (when profile
+                            (if (some #(= "apply_patch" (:name %))
+                                      (profiles/profile-tools profile)) "apply_patch" "edit_file"))
+            edit-result (some #(when (and (= expected-edit (:tool_name %))
+                                          (false? (:is_error %))) %)
+                              (mapcat :results (filter #(= :tool_results (:type %)) history)))
+            passed (and proof (or (not= row :provider-edit-format) (some? edit-result)))]
+        {:row row :status (if passed :pass :fail) :model spec
+         :protocol (when profile (providers/protocol-of (:id profile)))
+         :proof (cond (map? proof) proof
+                      (and passed (= row :provider-edit-format))
+                      {:editing_tool expected-edit :file_verified true}
+                      :else nil)
+         :duration_ms (- (System/currentTimeMillis) started)
+         :tools (mapv :tool_name (tool-starts @events))
+         :failure_details (when-not passed
+                            {:answer (:answer outcome)
+                             :tool_calls (vec (mapcat :tool_calls (filter #(= :assistant (:type %)) history)))
+                             :tool_results (mapv #(update % :content
+                                                (fn [v] (subs (str v) 0 (min 4000 (count (str v))))))
+                                                 (mapcat :results (filter #(= :tool_results (:type %)) history)))
+                             :recovered_file (when (= row :error-recovery) (file dir "recovered.txt"))
+                             :edited_file (when (= row :provider-edit-format) (file dir "edit-target.txt"))
+                             :files files})
+         :error (:error outcome)})
+      (finally
+        ;; `dir` is generated above under the dedicated lettractor prefix.
+        (os/sh "rm" "-rf" dir)))))

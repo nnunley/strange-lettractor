@@ -1,0 +1,141 @@
+(ns attractor.preparation-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [os :as os]
+            [attractor.handlers :as handlers]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [attractor.stylesheet :as stylesheet]
+            [attractor.validation :as validation]))
+
+(defn preparation-var-rule [_]
+  [{:rule "var_rule" :severity :info :message "var rule"}])
+
+(defn preparation-var-apply [_]
+  [{:rule "var_apply" :severity :info :message "var apply"}])
+
+(deftest dot-bare-values-allow-internal-hyphens-with-strict-identifiers
+  (let [graph (try
+                (parser/parse-dot
+                  "digraph G { start[shape=Mdiamond]; task[llm_model=claude-sonnet-4-5, weight=-2, height=1.5]; exit[shape=Msquare]; start->task->exit; }")
+                (catch Object _ nil))]
+    (is (= "claude-sonnet-4-5" (get-in graph [:nodes "task" :llm_model])))
+    (is (= -2 (get-in graph [:nodes "task" :attrs :weight])))
+    (is (= 1.5 (get-in graph [:nodes "task" :attrs :height])))
+    (is (= [{:from "start" :to "task"} {:from "task" :to "exit"}]
+           (mapv #(select-keys % [:from :to]) (:edges graph))))
+    (is (thrown? Object
+                 (parser/parse-dot "digraph G { bad-id[shape=box] }")))
+    (is (thrown? Object
+                 (parser/parse-dot "digraph G { task[llm_model=-claude] }")))
+    (is (thrown? Object
+                 (parser/parse-dot "digraph G { start -- exit }")))))
+
+(deftest stylesheet-reasoning-effort-is-limited-to-recognized-values
+  (doseq [value ["low" "medium" "high"]
+          declaration [(str "reasoning_effort: " value)
+                       (str "reasoning_effort: \"" value "\"")]]
+    (let [css (str "box { " declaration "; }")
+          rules (stylesheet/parse-stylesheet css)]
+      (is (nil? (stylesheet/validate-stylesheet-syntax css)) css)
+      (is (= value (get-in (first rules) [:properties :reasoning_effort])) css)))
+  (let [css "* { llm_model: partial-model; --context-window: 8000; reasoning_effort: extreme; }"
+        prepared (pipeline/prepare
+                   (str "digraph G { graph [model_stylesheet=\"" css "\"]; "
+                        "start[shape=Mdiamond]; task[shape=box]; exit[shape=Msquare]; start->task->exit; }"))]
+    (is (some #(and (= "stylesheet_syntax" (:rule %))
+                    (= :error (:severity %)))
+              (:diagnostics prepared)))
+    (is (empty? (stylesheet/parse-stylesheet css)))
+    (is (nil? (get-in prepared [:graph :nodes "task" :llm_model])))
+    (is (nil? (get-in prepared [:graph :nodes "task" :--context-window])))))
+
+(deftest dot-bare-values-retain-trailing-hyphens-and-duration-tokens
+  (let [graph (try
+                (parser/parse-dot
+                  "digraph G { task[model=word-, class=word--, timeout=900s, wait=250ms] }")
+                (catch Object _ nil))]
+    (is (= "word-" (get-in graph [:nodes "task" :attrs :model])))
+    (is (= "word--" (get-in graph [:nodes "task" :attrs :class])))
+    (is (= "900s" (get-in graph [:nodes "task" :attrs :timeout])))
+    (is (= "250ms" (get-in graph [:nodes "task" :attrs :wait])))))
+
+(deftest dot-attribute-keys-follow-identifier-grammar
+  (doseq [source ["digraph G { graph[bad-key=value] }"
+                  "digraph G { node[bad-key=value] }"
+                  "digraph G { edge[bad-key=value] }"
+                  "digraph G { task[bad-key=value] }"
+                  "digraph G { start -> exit[bad-key=value] }"
+                  "digraph G { bad-key=value }"]]
+    (is (thrown? Object (parser/parse-dot source)) source))
+  (let [graph (parser/parse-dot
+                "digraph G { graph[meta.owner=team]; node[meta.source=generated]; edge[meta.route=fast]; start[shape=Mdiamond, meta.node=entry]; task; exit[shape=Msquare]; start->task->exit[meta.edge=review]; task[\"--context-window\"=8000] }")]
+    (is (= "team" (get-in graph [:attrs :meta.owner])))
+    (is (= "generated" (get-in graph [:nodes "task" :attrs :meta.source])))
+    (is (= "entry" (get-in graph [:nodes "start" :attrs :meta.node])))
+    (is (= "review" (get-in graph [:edges 0 :attrs :meta.edge])))
+    (is (= 8000 (get-in graph [:nodes "task" :attrs :--context-window])))))
+
+(deftest custom-lint-map-rules-preserve-order-and-aggregate-diagnostics
+  (let [graph (parser/parse-dot "digraph G { start[shape=Mdiamond]; exit[shape=Msquare]; start->exit; }")
+        calls (atom [])
+        diagnostics [{:rule "map_first" :severity :warning :message "first"}
+                     {:rule "map_second" :severity :info :message "second"}]
+        first-rule {:name "first" :apply (fn [_]
+                                            (swap! calls conj :first)
+                                            [(first diagnostics)])}
+        function-rule (fn [_]
+                        (swap! calls conj :function)
+                        [(second diagnostics)])
+        second-rule {:name "second" :apply (fn [_]
+                                              (swap! calls conj :second)
+                                              [])}]
+    (is (= ["map_first" "map_second"]
+           (mapv :rule (validation/validate graph [first-rule function-rule second-rule]))))
+    (is (= [:first :function :second] @calls)))
+  (let [graph (parser/parse-dot "digraph G { start[shape=Mdiamond]; exit[shape=Msquare]; start->exit; }")
+        error (try (validation/validate graph [{:name "missing-apply"}])
+                   nil
+                   (catch Object caught caught))]
+    (is (= :invalid_lint_rule (:category (ex-data error)))
+        "invalid rule maps must fail explicitly")))
+
+(deftest custom-lint-rules-accept-vars-and-reject-data-callables
+  (let [graph (parser/parse-dot "digraph G { start[shape=Mdiamond]; exit[shape=Msquare]; start->exit; }")]
+    (is (= ["var_rule"]
+           (mapv :rule (validation/validate graph [(var preparation-var-rule)]))))
+    (is (= ["var_apply"]
+           (mapv :rule
+                 (validation/validate graph [{:name "var-apply"
+                                              :apply (var preparation-var-apply)}]))))
+    (doseq [invalid [[[:data]] [{:name "keyword-apply" :apply :missing}]]]
+      (let [error (try (validation/validate graph invalid)
+                       nil
+                       (catch Object caught caught))]
+        (is (= :invalid_lint_rule (:category (ex-data error))))))))
+
+(deftest public-run-rejects-custom-rule-errors-before-handlers-or-events
+  (let [dot "digraph G { start[shape=Mdiamond]; work[shape=box]; exit[shape=Msquare]; start->work->exit; }"
+        handler-calls (atom 0)
+        events (atom [])
+        registry (handlers/make-handler-registry)
+        logs (str (os/temp-dir) "/attractor-preparation-contract-" (System/nanoTime))
+        error-rule {:name "stop-run"
+                    :apply (fn [_]
+                             [{:rule "stop_run" :severity :error :message "blocked"}])}]
+    (handlers/register-handler! registry "codergen"
+      (fn [_ _ _ _] (swap! handler-calls inc) {:status :success}))
+    (let [prepared (pipeline/prepare dot {:custom-rules [error-rule]})
+          failure (try
+                    (pipeline/run dot {:custom-rules [error-rule]
+                                      :registry registry
+                                      :logs-root logs
+                                      :on-event #(swap! events conj %)
+                                      :on-prepared #(swap! events conj :prepared)
+                                      :on-published #(swap! events conj :published)})
+                    nil
+                    (catch Object error error))]
+      (is (some #(= "stop_run" (:rule %)) (:diagnostics prepared)))
+      (is (= :validation_error (:category (ex-data failure))))
+      (is (= 0 @handler-calls))
+      (is (= [] @events))
+      (is (nil? (os/stat logs))))))

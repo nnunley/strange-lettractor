@@ -113,6 +113,36 @@ Signature recognition is not image decoding or a promise that every provider/mod
 accepts that format. Other formats are not implemented by this reader. The
 separate `read_text` environment operation continues returning unmodified bytes.
 
+## Custom execution environments: raw data and tool display
+
+`execution/make-environment` treats `read_file(path, nil, nil)` as a complete,
+unformatted read. Built-in profile tools add the line numbers and apply the
+requested 1-based offset and line limit (default 2,000). The Gemini batch reader
+uses the same formatting. Generic edit tools consume the complete raw text,
+so a model's paginated read does not truncate the file when it edits a later
+line. Literal file text such as `1 | example` remains literal text: the tool
+displays it as `1 | 1 | example`, and editing does not strip either prefix.
+
+Two explicit compatibility options are available:
+
+- `:read_file_tool` can provide a custom tool-facing `(path offset limit)`
+  reader, including image attachments. `:read_file` remains the raw reader.
+- Existing environments whose `:read_file` already formats its output declare
+  `:read_file_format :tool`. Their current reader then remains authoritative for
+  tool output, including overrides added with `assoc`. They must also supply
+  a raw `:read_text` callback or their own `:edit_file`/`:apply_patch` callbacks.
+  Generic editing refuses a marked formatted reader without raw access before
+  any write; it never guesses how to remove line numbers.
+
+The local environment declares `:read_file_format :tool` and supplies
+`:read_text` plus dedicated editing callbacks. Its established direct
+`:read_file` API and image behavior remain unchanged.
+
+This boundary is exercised by `environment_edit_portability_test.lg`: native
+agent sessions on a standard in-memory environment, default and explicit
+pagination, literal numbered-looking text, edits beyond line 2,000, Gemini
+batch reads, local compatibility, and refusal of formatted edit input.
+
 Agent attachments require string `:content`. An ordered nonempty `:images` vector
 can contain multiple attachment maps. Gemini's mixed `read_many_files` output
 uses this form, preserving path-labeled text, image occurrence order, and per-image

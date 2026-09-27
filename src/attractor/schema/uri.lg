@@ -1,0 +1,75 @@
+(ns attractor.schema.uri
+  "URI reference resolution for schema identifiers (RFC 3986 section 5.2).
+   Pure string operations; identifiers are never fetched from the network."
+  (:require [clojure.string :as str]))
+
+(defn parts [uri]
+  (when (and (string? uri)
+             (not (re-find #"[\x00-\x20\\]" uri))
+             (re-matches #"(?:[^%]|%[0-9A-Fa-f]{2})*" uri))
+    (when-let [m (re-matches #"^(?:([A-Za-z][A-Za-z0-9+.-]*):)?(?://([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#([^#]*))?$" uri)]
+      ;; Delimiter presence matters: an empty query replaces an inherited query.
+      ;; Captures cannot distinguish absent/empty groups on every runtime.
+      (let [hash (str/index-of uri "#")
+            before-fragment (if hash (subs uri 0 hash) uri)
+            query (str/index-of before-fragment "?")
+            scheme (when-not (str/blank? (nth m 1)) (nth m 1))
+            after-scheme (if scheme (subs uri (inc (count scheme))) uri)
+            path (nth m 3)]
+        (when-not (and (nil? scheme) (not (str/starts-with? path "/"))
+                       (str/includes? (first (str/split path #"/")) ":"))
+         {:scheme scheme
+         :authority (when (str/starts-with? after-scheme "//") (nth m 2))
+         :path (nth m 3)
+         :query (when query (subs before-fragment (inc query)))
+         :fragment (when hash (subs uri (inc hash)))})))))
+
+(defn compose [{:keys [scheme authority path query fragment]}]
+  (str (when scheme (str scheme ":"))
+       (when (some? authority) (str "//" authority))
+       path
+       (when (some? query) (str "?" query))
+       (when (some? fragment) (str "#" fragment))))
+
+(defn- remove-last-segment [output]
+  (if-let [index (str/last-index-of output "/")]
+    (subs output 0 index) ""))
+
+(defn- remove-dot-segments [path]
+  (loop [input path output ""]
+    (cond
+      (empty? input) output
+      (str/starts-with? input "../") (recur (subs input 3) output)
+      (str/starts-with? input "./") (recur (subs input 2) output)
+      (str/starts-with? input "/./") (recur (subs input 2) output)
+      (= input "/.") (recur "/" output)
+      (str/starts-with? input "/../") (recur (subs input 3) (remove-last-segment output))
+      (= input "/..") (recur "/" (remove-last-segment output))
+      (or (= input ".") (= input "..")) output
+      :else
+      (let [end (or (str/index-of input "/" (if (str/starts-with? input "/") 1 0))
+                    (count input))]
+        (recur (subs input end) (str output (subs input 0 end)))))))
+
+(defn- merge-path [base relative]
+  (if (and (some? (:authority base)) (empty? (:path base)))
+    (str "/" relative)
+    (str (when-let [index (str/last-index-of (:path base) "/")]
+           (subs (:path base) 0 (inc index))) relative)))
+
+(defn resolve-uri [base reference]
+  (when-let [r (parts reference)]
+    (when-let [b (parts base)]
+      (let [target
+            (cond
+              (:scheme r) (update r :path remove-dot-segments)
+              (some? (:authority r))
+              (assoc (update r :path remove-dot-segments) :scheme (:scheme b))
+              (empty? (:path r))
+              (assoc b :query (if (some? (:query r)) (:query r) (:query b)))
+              :else
+              (assoc r :scheme (:scheme b) :authority (:authority b)
+                       :path (remove-dot-segments
+                               (if (str/starts-with? (:path r) "/")
+                                 (:path r) (merge-path b (:path r))))))]
+        (compose (assoc target :fragment (:fragment r)))))))

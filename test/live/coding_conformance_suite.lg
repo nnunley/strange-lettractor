@@ -1,0 +1,107 @@
+(ns live.coding-conformance-suite
+  (:require [clojure.string :as str] [os :as os] [io :as io]
+            [attractor.dotenv :as dotenv] [attractor.providers :as providers]
+            [live.provider-matrix-journeys :as models]
+            [live.provider-matrix-checks :as selection]
+            [live.parity-matrix-journeys :as parity]
+            [live.coding-smoke-journey :as smoke]))
+
+(def native-providers ["openai" "anthropic" "gemini"])
+
+(defn native-origin? [row]
+  (let [expected (get providers/built-in (:id row))]
+    (boolean (and (some #{(:id row)} native-providers)
+                   (= (:protocol expected) (:protocol row))
+                   (= (:base_url expected) (str/replace (str (:base_url row)) #"/+$" ""))))))
+
+(defn select-providers [selection & [configured-ids]]
+  (let [ids (if (nil? selection) native-providers (str/split selection #"," -1))
+        allowed (into (set native-providers) configured-ids)]
+    (when-not (and (seq ids) (= (count ids) (count (distinct ids)))
+                   (every? allowed ids))
+      (throw (ex-info "Select distinct native providers or explicitly configured aliases"
+                      {:category :invalid-selection})))
+    (vec ids)))
+
+(defn aggregate [results]
+  (cond (some #(= :fail (:status %)) results) :fail
+        (and (seq results) (every? #(= :pass (:status %)) results)) :complete
+        :else :incomplete))
+
+(defn select-checks [selection]
+  (let [checks (if (nil? selection) [:parity :smoke] (mapv keyword (str/split selection #"," -1)))]
+    (when-not (and (seq checks) (= (count checks) (count (distinct checks)))
+                   (every? #{:parity :smoke} checks))
+      (throw (ex-info "Select parity,smoke or either check" {:category :invalid-selection})))
+    checks))
+
+(defn select-parity-rows [value]
+  (let [selected (when (some? value)
+                   (set (map (comp keyword str/trim) (str/split value #"," -1))))]
+    (mapv second (selection/select-journeys (mapv (juxt :row identity) parity/rows) selected))))
+
+(defn report [selected checks results finished? & [rows]]
+  {:scenario "SCN-CAL-CONFORMANCE-LIVE" :selected_providers selected
+   :selected_checks checks
+   :selected_parity_rows (if (some #{:parity} checks) (mapv :row (or rows parity/rows)) [])
+   :available_parity_rows (mapv :row parity/rows)
+   :aggregate_status (if finished? (aggregate results) :in-progress)
+   :results results})
+
+(defn- env [key]
+  (let [value (os/getenv key)] (when-not (str/blank? value) value)))
+
+(defn run-suite!
+  "Run selected parity rows (all 15 by default) and the seven-step shared-session
+   smoke for each selected provider (native three by default). Explicit configured
+   aliases require ATTRACTOR_<ALIAS>_MODEL and a supported native protocol; their
+   evidence is labeled :gateway. Native IDs retain their first-party origin gate.
+   ATTRACTOR_PARITY_ROWS narrows parity; reports retain selected and available
+   rows. Missing credentials or models are blocked."
+  []
+  (dotenv/load-dotenv!)
+  (let [checks (select-checks (env "ATTRACTOR_CODING_CHECKS"))
+        rows (select-parity-rows (env "ATTRACTOR_PARITY_ROWS"))
+        configured (into {} (map (juxt :id identity) (providers/effective)))
+        selected (select-providers (env "ATTRACTOR_CODING_PROVIDERS") (keys configured))
+        results (atom [])
+        timestamp (str (System/currentTimeMillis))
+        report-path (str "evidence/coding-conformance-" timestamp ".edn")
+        save! (fn [finished?]
+                (io/spit report-path
+                  (pr-str (providers/redact
+                    (assoc (report selected checks @results finished? rows) :recorded_at timestamp)))))]
+    (io/mkdir "evidence")
+    (doseq [provider selected]
+      (let [row (get configured provider)
+            native-id? (boolean (some #{provider} native-providers))
+            override (env (str "ATTRACTOR_" (providers/env-name provider "_MODEL")))
+            supported? (contains? #{:openai-responses :anthropic-messages :gemini-generate-content}
+                                   (:protocol row))
+            model (if native-id?
+                    (models/model-for provider (:protocol row) override)
+                    override)
+            spec (str provider "/" model)
+            evidence {:provider provider :endpoint (:base_url row) :protocol (:protocol row)
+                      :origin (when row (if (native-origin? row) :first-party :gateway))}
+            blocked-reason
+            (cond
+              (and row native-id? (not (native-origin? row))) :non-native-provider-configuration
+              (and row (not supported?)) :unsupported-coding-protocol
+              (and (not native-id?) (nil? override)) :missing-explicit-alias-model
+              (not (and (:key_present row) model)) :missing-native-credentials-or-model)]
+        (if blocked-reason
+          (let [result (assoc evidence :status :blocked :reason blocked-reason)]
+            (swap! results conj result) (prn (providers/redact result)) (save! false))
+          (do
+            (when (some #{:parity} checks)
+            (doseq [journey rows]
+              (let [result (merge (parity/run-row spec journey) evidence {:kind :parity})]
+                (swap! results conj result) (prn (providers/redact result)) (save! false))))
+            (when (some #{:smoke} checks)
+            (let [result (merge (smoke/run-journey spec) evidence {:kind :same-session-smoke})]
+              (swap! results conj result) (prn (providers/redact result)) (save! false)))))))
+    (save! true)
+    (let [status (aggregate @results)]
+      (prn {:aggregate_status status :evidence report-path :checks (count @results)})
+      (case status :complete 0 :fail 1 3))))

@@ -1,6 +1,7 @@
 (ns attractor.pipeline
   (:require [attractor.ids :as ids] [attractor.engine :as engine]
             [attractor.capture :as capture]
+            [attractor.conditions :as conditions]
             [attractor.context :as context]
             [attractor.parameters :as parameters]
             [attractor.parser :as parser]
@@ -227,6 +228,103 @@
       (declared-retry-transition?
         graph outcomes prior-node-ids from-id to-id)))
 
+(defn- valid-saved-transition?
+  [graph outcomes context-values prior-node-ids historical? transition]
+  (let [{:keys [kind from to edge_index]} transition
+        edge (when (and (integer? edge_index)
+                        (<= 0 edge_index)
+                        (< edge_index (count (:edges graph))))
+               (nth (:edges graph) edge_index))]
+    (and (map? transition)
+         (string? from)
+         (case kind
+           :edge (and (string? to)
+                      edge
+                      (= from (:from edge))
+                      (= to (:to edge))
+                      (= #{:kind :from :to :edge_index}
+                         (set (keys transition))))
+           :override (and (string? to)
+                          (parser/find-node graph to)
+                          (= #{:kind :from :to} (set (keys transition))))
+           :retry (and (string? to)
+                       (or historical?
+                           (failed-checkpoint-outcome? (get outcomes from)))
+                       (= to (node-retry-target (parser/find-node graph from)))
+                       (= #{:kind :from :to} (set (keys transition))))
+           :goal_gate (and (string? to)
+                           (some
+                             (fn [node-id]
+                               (let [node (parser/find-node graph node-id)]
+                                 (and (:goal_gate node)
+                                      (or historical?
+                                          (failed-checkpoint-outcome?
+                                            (get outcomes node-id)))
+                                      (= to (goal-gate-retry-target node graph)))))
+                             prior-node-ids)
+                           (= #{:kind :from :to} (set (keys transition))))
+           :none (and (nil? to)
+                      (= #{:kind :from :to} (set (keys transition)))
+                      (let [node (parser/find-node graph from)]
+                        (or (engine/terminal-node? node)
+                            (let [status (or (get context-values "outcome")
+                                             (get context-values :outcome))
+                                  route-outcome {:status status}]
+                              (not-any?
+                                (fn [edge]
+                                  (let [condition (:condition edge)]
+                                    (or (str/blank? condition)
+                                        ;; A skipped visit does not retain its
+                                        ;; optional preferred label. This case
+                                        ;; remains undecidable from a checkpoint.
+                                        (and (not (conditions/condition-references-key?
+                                                    condition "preferred_label"))
+                                             (conditions/evaluate-condition
+                                               condition route-outcome context-values)))))
+                                (parser/outgoing-edges graph from))))))
+           :failed_none (and (nil? to)
+                             (failed-checkpoint-outcome? (get outcomes from))
+                             (= #{:kind :from :to} (set (keys transition))))
+           false))))
+
+(defn- validate-saved-transitions! [checkpoint graph completed]
+  (let [any? (some #(contains? checkpoint %)
+                   [:selected_transition :transition_history :transition_history_start])]
+    (when any?
+      (let [selected (:selected_transition checkpoint)
+            history (:transition_history checkpoint)
+            start (:transition_history_start checkpoint)
+            n (count completed)
+            valid-shape?
+            (and (contains? checkpoint :selected_transition)
+                 (contains? checkpoint :transition_history)
+                 (contains? checkpoint :transition_history_start)
+                 (integer? start) (<= 0 start) (< start n)
+                 (vector? history)
+                 (= (- n start) (count history))
+                 (= selected (last history))
+                 (every?
+                   (fn [[offset transition]]
+                     (let [index (+ start offset)
+                           from (nth completed index)
+                           next-id (when (< (inc index) n)
+                                     (nth completed (inc index)))]
+                       (and (= from (:from transition))
+                            (valid-saved-transition?
+                              graph (:node_outcomes checkpoint)
+                              (:context_values checkpoint)
+                              (subvec completed 0 (inc index))
+                              (< (inc index) n)
+                              transition)
+                            (if next-id
+                              (= next-id (:to transition))
+                              true))))
+                   (map-indexed vector history)))]
+        (when-not valid-shape?
+          (snapshot-corrupt! "Workflow checkpoint transition is invalid"
+                             {:kind :checkpoint :field :selected_transition})))))
+  checkpoint)
+
 (defn- validate-checkpoint-map! [checkpoint graph completed-set field]
   (let [records (get checkpoint field)]
     (when-not (and (map? records)
@@ -313,14 +411,18 @@
     (validate-checkpoint-map! checkpoint graph completed-set :node_outcomes)
     (validate-checkpoint-map! checkpoint graph completed-set :node_retries)
     (validate-checkpoint-values! checkpoint graph)
+    (validate-saved-transitions! checkpoint graph completed)
     (when-not
       (every?
         (fn [[index transition]]
-          (valid-checkpoint-transition?
-            graph
-            (:node_outcomes checkpoint)
-            (subvec completed 0 (inc index))
-            transition))
+          (if (and (contains? checkpoint :transition_history)
+                   (>= index (:transition_history_start checkpoint)))
+            true
+            (valid-checkpoint-transition?
+              graph
+              (:node_outcomes checkpoint)
+              (subvec completed 0 (inc index))
+              transition)))
         (map-indexed vector (partition 2 1 completed)))
       (snapshot-corrupt! "Workflow checkpoint history does not match the captured plan"
                          {:kind :checkpoint

@@ -1,0 +1,326 @@
+(ns live.coding-smoke-journey
+  "Original coding-agent §9.13: seven inputs, one session and one local directory.
+   Requests are observed before provider translation; evidence never exports bodies."
+  (:require [clojure.string :as str] [clojure.edn :as edn] [clojure.core :as core]
+            [os :as os] [io :as io]
+            [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.llm :as llm] [attractor.providers :as providers] [attractor.ids :as ids]
+            [live.parity-matrix-checks :as parity]))
+
+(def steering-text "Actually, just create a single /health endpoint for now. Write app.py with `from flask import Flask`, `app = Flask(__name__)`, and exactly one @app.route('/health') function returning a literal dict or string. No factories, blueprints, dynamic registration, or other routes.")
+(def steps
+  [{:step :create :prompt "SMOKE_CREATE: Create hello.py that prints 'Hello World'."}
+   {:step :edit :prompt "SMOKE_EDIT: Read hello.py and add a second print statement that says 'Goodbye'. Preserve the existing Hello World statement."}
+   {:step :shell :prompt "SMOKE_SHELL: Run exactly `python3 hello.py` in the shell and report its output."}
+   {:step :truncation :prompt "SMOKE_TRUNCATION: Read big.txt using read_file. Report the truncation warning, without echoing its contents."}
+   {:step :steering :prompt "SMOKE_STEERING: Create a Flask web application with multiple routes in app.py. First read hello.py to inspect the project before writing app.py; continue after that tool result."}
+   {:step :subagent :prompt "SMOKE_SUBAGENT: Spawn one subagent with max_turns 12, no skills selection and no working_dir override. Ask it to write test_hello.py in the shared working directory with runnable unittest.TestCase tests asserting the actual output of hello.py contains both Hello World and Goodbye (run hello.py via subprocess); then wait for that child and review its output. The child must write the tests itself; do not replace its work with a parent write."}
+   {:step :timeout :prompt "SMOKE_TIMEOUT: Run exactly `sleep 30` using shell with the default timeout. Omit timeout_ms entirely. Explain the timeout result; do not retry."}])
+
+(defn- args [call key] (or (get (:arguments call) key) (get (:arguments call) (name key))))
+(defn- calls [history] (vec (mapcat :tool_calls (filter #(= :assistant (:type %)) history))))
+(defn- results [history] (vec (mapcat :results (filter #(= :tool_results (:type %)) history))))
+(defn- parse-result [result] (try (edn/read-string (str (:content result))) (catch Object _ nil)))
+(defn- result-for [history call] (some #(when (= (:id call) (:tool_call_id %)) %) (results history)))
+(defn- target? [dir path expected]
+  (if dir (= (parity/file-target dir path) (parity/file-target dir expected)) (= path expected)))
+(defn- read-call [context path]
+  (some #(when (and (= "read_file" (:name %)) (target? (:dir context) (args % :file_path) path)
+                   (false? (:is_error (result-for (:history context) %)))) %) (calls (:history context))))
+(defn- writes? [context call path]
+  (or (and (contains? #{"write_file" "edit_file"} (:name call))
+           (target? (:dir context) (args call :file_path) path))
+      (and (= "apply_patch" (:name call))
+           (some (fn [[_ target]] (target? (:dir context) target path))
+                 (re-seq #"(?m)^\*\*\* (?:Add|Update) File: ([^\r\n]+)"
+                         (str (args call :patch)))))))
+(defn- successful-write [context path]
+  (some #(when (and (writes? context % path) (false? (:is_error (result-for (:history context) %)))) %)
+        (calls (:history context))))
+(defn- observed-result? [requests result]
+  (some (fn [request]
+          (some (fn [message]
+                  (and (= :tool (:role message)) (sequential? (:content message))
+                       (some #(and (= (:tool_call_id result) (:tool_call_id %))
+                                   (= (:content result) (:content %))) (:content message))))
+                (:messages request))) requests))
+(defn- shell-proof [context predicate]
+  (some (fn [call]
+          (when (= "shell" (:name call))
+            (let [result (result-for (:history context) call) value (parse-result result)]
+              (when (predicate call result value) {:call_id (:id call) :duration_ms (:duration_ms value)}))))
+        (calls (:history context))))
+(defn- event-index [events predicate]
+  (first (keep-indexed #(when (predicate %2) %1) events)))
+
+(defn- natural-completion? [history events]
+  (let [last-turn (last history)]
+    (and (= :assistant (:type last-turn)) (empty? (:tool_calls last-turn))
+         (not-any? #(contains? #{:turn_limit :token_limit :error} (:type %)) events))))
+
+(def flask-ast-check
+  (str/join "\n"
+    ["import ast, sys"
+     "try:"
+     " t = ast.parse(sys.argv[1]); assigned = 0; routes = 0; imported = 0"
+     " for n in t.body:"
+     "  if isinstance(n, ast.ImportFrom):"
+     "   assert n.module == 'flask' and all(a.name == 'Flask' and a.asname is None for a in n.names)"
+     "   imported += 1"
+     "  elif isinstance(n, ast.Assign):"
+     "   assert imported == 1 and len(n.targets)==1 and isinstance(n.targets[0],ast.Name) and n.targets[0].id=='app'"
+     "   v=n.value; assert isinstance(v,ast.Call) and isinstance(v.func,ast.Name) and v.func.id=='Flask'"
+     "   assert len(v.args)==1 and isinstance(v.args[0],ast.Name) and v.args[0].id=='__name__' and not v.keywords"
+     "   assigned += 1"
+     "  elif isinstance(n, ast.FunctionDef):"
+     "   assert assigned == 1 and len(n.decorator_list)==1"
+     "   a=n.args; assert not (a.posonlyargs or a.args or a.vararg or a.kwonlyargs or a.kw_defaults or a.kwarg or a.defaults)"
+     "   assert n.returns is None and n.type_comment is None and not getattr(n,'type_params',[])"
+     "   d=n.decorator_list[0]; assert isinstance(d,ast.Call) and isinstance(d.func,ast.Attribute)"
+     "   assert isinstance(d.func.value,ast.Name) and d.func.value.id=='app' and d.func.attr in ('route','get')"
+     "   assert len(d.args)==1 and ast.literal_eval(d.args[0])=='/health'"
+     "   assert all(k.arg=='methods' and ast.literal_eval(k.value)==['GET'] for k in d.keywords)"
+     "   body=[x for x in n.body if not (isinstance(x,ast.Expr) and isinstance(x.value,ast.Constant) and isinstance(x.value.value,str))]"
+     "   assert len(body)==1 and isinstance(body[0],ast.Return); assert isinstance(ast.literal_eval(body[0].value),(str,dict))"
+     "   routes += 1"
+     "  elif isinstance(n, ast.Expr):"
+     "   assert isinstance(n.value,ast.Constant) and isinstance(n.value.value,str)"
+     "  elif isinstance(n, ast.If):"
+     "   assert ast.dump(n.test)==ast.dump(ast.parse(\"__name__ == '__main__'\",mode='eval').body) and not n.orelse and len(n.body)==1"
+     "   v=n.body[0]; assert isinstance(v,ast.Expr) and isinstance(v.value,ast.Call)"
+     "   c=v.value; assert isinstance(c.func,ast.Attribute) and isinstance(c.func.value,ast.Name) and c.func.value.id=='app' and c.func.attr=='run'"
+     "   assert not c.args; [ast.literal_eval(k.value) for k in c.keywords]"
+     "  else: raise AssertionError()"
+     " assert imported==1 and assigned==1 and routes==1"
+     "except Exception: sys.exit(1)"
+     "print('verified')"]))
+
+(defn- static-health-app? [source]
+  (and (string? source) (<= (count source) 100000)
+       (try (= 0 (:exit (os/sh "python3" "-c" flask-ast-check source)))
+            (catch Object _ false))))
+
+(defn verify-child-tests!
+  "Execute unittest baseline and two valid output mutations; restore hello.py.
+   Passing zero tests, comments, and tests independent of hello.py cannot pass."
+  [environment]
+  (if-not (and ((:file_exists environment) "hello.py")
+               ((:file_exists environment) "test_hello.py"))
+    {:baseline_passed false}
+    (let [original ((:read_text environment) "hello.py")
+          run (fn [] ((:exec_command environment) "python3 -m unittest -v test_hello.py" 10000 nil nil))]
+      (try
+        (let [baseline (run) report (str (:stdout baseline) (:stderr baseline))
+              count-match (re-find #"Ran ([1-9][0-9]*) tests?" report)
+              baseline? (and (= 0 (:exit_code baseline)) (some? count-match))]
+          (if-not baseline? {:baseline_passed false}
+            (do
+              ((:write_file environment) "hello.py" "print('Goodbye')\n")
+              (let [no-hello (run)]
+                ((:write_file environment) "hello.py" "print('Hello World')\n")
+                (let [no-goodbye (run)]
+                  {:baseline_passed true :test_count (parse-long (second count-match))
+                   :hello_mutant_rejected (and (= 1 (:exit_code no-hello)) (str/includes? (str (:stderr no-hello)) "FAILED"))
+                   :goodbye_mutant_rejected (and (= 1 (:exit_code no-goodbye)) (str/includes? (str (:stderr no-goodbye)) "FAILED"))})))))
+        (catch Object _ {:baseline_passed false})
+        (finally ((:write_file environment) "hello.py" original))))))
+
+(def python-invocation-check
+  (str/join "\n"
+    ["import os, shlex, sys"
+     "try:"
+     " root=os.path.realpath(sys.argv[2]); command=sys.argv[1].strip(); assert chr(10) not in command and chr(13) not in command; lexer=shlex.shlex(command,posix=True,punctuation_chars=True)"
+     " lexer.whitespace_split=True; lexer.commenters=''; parts=list(lexer)"
+     " if len(parts)==5:"
+     "  assert parts[0]=='cd' and parts[2]=='&&'"
+     "  assert os.path.realpath(os.path.join(root,parts[1]))==root"
+     "  parts=parts[3:]"
+     " assert len(parts)==2 and parts[0]=='python3'"
+     " assert os.path.realpath(os.path.join(root,parts[1]))==os.path.join(root,'hello.py')"
+     "except Exception: sys.exit(1)"]))
+
+(defn- invokes-hello? [command directory]
+  (and (string? command) (<= (count command) 10000)
+       (try (= 0 (:exit (os/sh "python3" "-c" python-invocation-check command (or directory (os/cwd)))))
+            (catch Object _ false))))
+
+(defn check-step
+  "Return bounded proof details. A positive result requires correlated actual
+   calls/results/files, never the model's completion claim. Public for controls."
+  [step context]
+  (let [{:keys [history events requests files session]} context
+        hello (str (get files "hello.py"))
+        proof
+        (case step
+          :create (when (and (str/includes? hello "Hello") (successful-write context "hello.py"))
+                    {:file_verified true})
+          :edit (let [read (read-call context "hello.py") write (successful-write context "hello.py")
+                      order (calls history)]
+                  (when (and read write (str/includes? hello "Hello") (str/includes? hello "Goodbye")
+                             (< (event-index order #(= (:id read) (:id %))) (event-index order #(= (:id write) (:id %)))))
+                    {:read_call (:id read) :write_call (:id write) :preserved_hello true}))
+          :shell (shell-proof context #(and (invokes-hello? (args %1 :command) (:dir context))
+                                             (false? (:is_error %2)) (= 0 (:exit_code %3))
+                                             (str/includes? (str (:stdout %3)) "Hello")
+                                             (str/includes? (str (:stdout %3)) "Goodbye")))
+          :truncation
+          (let [read (read-call context "big.txt") result (result-for history read)
+                event (some #(when (and (= :tool_call_end (:type %)) (= (:id read) (:call_id %))
+                                        (= "read_file" (:tool_name %))) %) events)
+                full (str (:output event)) payload (apply str (repeat 100000 "x"))]
+            (when (and read (str/includes? full payload)
+                       (str/includes? (str (:content result)) "Tool output was truncated")
+                       (< (count (:content result)) (count full)) (observed-result? requests result))
+              {:call_id (:id read) :source_chars 100000 :event_chars (count full)
+               :model_chars (count (:content result)) :request_verified true}))
+          :steering
+          (let [read (read-call context "hello.py") write (successful-write context "app.py")
+                ended (event-index events #(and (= :tool_call_end (:type %)) (= (:id read) (:call_id %))))
+                injected (event-index events #(and (= :steering_injected (:type %)) (= steering-text (:content %))))
+                started (event-index events #(and (= :tool_call_start (:type %)) (= (:id write) (:call_id %))))
+                app (str (get files "app.py"))
+                requested (some #(some (fn [m] (and (= :user (:role m)) (= steering-text (:content m)))) (:messages %)) requests)]
+            (when (and read write (every? integer? [ended injected started]) (< ended injected started)
+                       requested (static-health-app? app))
+              {:read_call (:id read) :write_call (:id write) :steering_observed true :only_health true}))
+          :subagent
+          (some
+            (fn [[spawn wait-call]]
+              (let [spawn-result (result-for history spawn) id (:agent_id (parse-result spawn-result))
+                    wait-result (result-for history wait-call) handle (when session (get-in @session [:subagents id]))
+                    child (:session handle) child-history (when child (:history @child))
+                    child-write (successful-write (assoc context :history child-history) "test_hello.py")
+                    test-source (str (get files "test_hello.py"))]
+                (when (and id (= id (args wait-call :agent_id))
+                           (false? (:is_error spawn-result)) (false? (:is_error wait-result))
+                           (true? (:success (parse-result wait-result))) child-write
+                           (observed-result? requests wait-result) (natural-completion? history events)
+                           (every? true? (map #(get (:test_verification context) %) [:baseline_passed :hello_mutant_rejected :goodbye_mutant_rejected]))
+                           (str/includes? test-source "assert") (str/includes? test-source "Hello")
+                           (str/includes? test-source "Goodbye")
+                           (some #(and (= :subagent_event (:type %)) (= id (:agent_id %))
+                                       (= :tool_call_end (get-in % [:event :type]))
+                                       (= (:id child-write) (get-in % [:event :call_id]))) events))
+                  {:agent_id id :spawn_call (:id spawn) :wait_call (:id wait-call)
+                   :child_write_call (:id child-write) :child_tests_verified true :test_verification (:test_verification context)})))
+            (for [spawn (filter #(= "spawn_agent" (:name %)) (calls history))
+                  wait-call (filter #(= "wait" (:name %)) (calls history))]
+              [spawn wait-call]))
+          :timeout
+          (shell-proof context #(and (= "sleep 30" (str/trim (str (args %1 :command))))
+                                      (not (or (contains? (:arguments %1) :timeout_ms)
+                                               (contains? (:arguments %1) "timeout_ms")))
+                                      (true? (:is_error %2)) (= 124 (:exit_code %3))
+                                      (observed-result? requests %2) (natural-completion? history events)
+                                      (true? (:timed_out %3)) (number? (:duration_ms %3))
+                                      (<= 9000 (:duration_ms %3) 18000)
+                                      (str/includes? (str (:stderr %3)) "10000ms")))
+          nil)]
+    {:passed (boolean proof) :proof proof}))
+
+(defn- snapshot-files [root]
+  (into {} (map (fn [name] [name (let [path (str root "/" name)]
+                                  (when (os/stat path) (io/slurp path)))])
+                ["hello.py" "app.py" "test_hello.py"])))
+
+(defn- subagent-diagnostics [context]
+  {:test_verification (:test_verification context)
+   :children (vec (take 20
+                   (map (fn [[id handle]]
+                          (let [child (:session handle)]
+                            {:agent_id id :status (:status handle)
+                             :session_state (when child (:state @child))
+                             :tools (vec (take 40 (map :name (calls (when child (:history @child))))))}))
+                        (when-let [session (:session context)] (:subagents @session)))))
+   :spawn_wait_results
+   (vec (take 40
+          (map (fn [call]
+                 (let [result (result-for (:history context) call) value (parse-result result)]
+                   {:call_id (:id call) :tool (:name call)
+                    :agent_id (or (:agent_id value) (args call :agent_id))
+                    :is_error (:is_error result) :child_success (:success value)
+                    :error_kind (cond (true? (:is_error result)) :tool-error
+                                      (false? (:success value)) :child-failed
+                                      (nil? result) :missing-result :else nil)}))
+               (filter #(contains? #{"spawn_agent" "wait"} (:name %)) (calls (:history context))))))})
+
+(defn run-journey
+  "Run all seven smoke inputs in one real local session. options supports
+   :llm_client, :adapter_options (including injected transport), :complete_fn,
+   :step_timeout_ms (default 120000), and :on_event observer. No live credentials
+   or response bodies are exported. Anthropic's 120s profile default is capped
+   at 10s explicitly; this is an effective default test, not a stock-default claim."
+  [spec & [options]]
+  (let [options (or options {}) parsed (llm/parse-model-spec spec)
+        provider (:provider parsed) model (:model parsed)
+        root (str (str/replace (os/temp-dir) #"/+$" "") "/attractor-coding-smoke-" (ids/uuid-text))
+        events (atom []) requests (atom []) holder (atom nil)
+        current-step (atom nil) steered (atom false) close-error (atom nil)
+        client-base (or (:llm_client options)
+                        (when-not (:complete_fn options)
+                          (llm/make-client {:default_provider provider
+                            :providers {provider (llm/make-provider-adapter provider (:adapter_options options))}})))
+        client (when client-base
+                 (update client-base :middleware conj
+                         (fn [request next] (swap! requests conj request) (next request))))
+        evidence (atom []) _ (io/mkdir root)]
+    (try
+      (reset! holder
+        (agent/make-session
+          (cond-> {:model spec :provider_profile (parity/profile-for (providers/protocol-of provider) provider model)
+                   :llm_client client :execution_env (execution/make-local-environment {:working_dir root})
+                   :project_docs [] :max_subagent_depth 1 :max_tool_rounds_per_input 12
+                   :default_command_timeout_ms 10000 :max_command_timeout_ms 10000
+                   :retry_policy {:max_retries 1}
+                   :on_event (fn [event]
+                               (swap! events conj event)
+                               (when (and (= :steering @current-step) (= :tool_call_end (:type event))
+                                          (= "read_file" (:tool_name event))
+                                          (compare-and-set! steered false true))
+                                 (agent/steer-session! @holder steering-text))
+                               (when-let [observe (:on_event options)] (observe event)))}
+            (:complete_fn options)
+            (assoc :complete_fn (fn [request] (swap! requests conj request) ((:complete_fn options) request))))))
+      (doseq [{:keys [step prompt]} steps]
+        (reset! current-step step)
+        (when (= step :truncation) (io/spit (str root "/big.txt") (apply str (repeat 100000 "x"))))
+        (let [history-start (count (:history @@holder)) event-start (count @events) request-start (count @requests)
+              started (System/currentTimeMillis)
+              outcome (if (= :closed (:state @@holder)) {:error :session-closed}
+                        (let [task (core/future
+                                     (try (agent/process-input! @holder prompt) {:finished true}
+                                          (catch Object e {:error (or (:category (ex-data e)) :session-error)})))
+                              value (deref task (or (:step_timeout_ms options) 120000) ::timeout)]
+                          (if (= ::timeout value)
+                            (do (agent/abort-session! @holder) (deref task 1000 nil) {:error :step-timeout}) value)))
+              context {:dir root :history (subvec (vec (:history @@holder)) history-start)
+                       :events (subvec @events event-start) :requests (subvec @requests request-start)
+                       :files (snapshot-files root) :session @holder
+                       :test_verification (when (and (= step :subagent) (nil? (:error outcome))
+                                                     (every? #(contains? #{:completed :failed :closed} (:status %))
+                                                             (vals (:subagents @@holder))))
+                                            (verify-child-tests! (:execution_env @@holder)))}
+              checked (check-step step context)]
+          (swap! evidence conj {:step step :status (if (and (:passed checked) (nil? (:error outcome))) :pass :fail)
+                                :proof (:proof checked) :error (:error outcome)
+                                :subagent_diagnostics (when (= step :subagent) (subagent-diagnostics context))
+                                :tools (mapv :name (calls (:history context)))
+                                :shell_commands (mapv (fn [call] (let [command (str (args call :command))]
+                                                                  (subs command 0 (min 1000 (count command)))))
+                                                      (filter #(= "shell" (:name %)) (calls (:history context))))
+                                :files_present (into {} (map (fn [[name content]] [name (some? content)]) (:files context)))
+                                :duration_ms (- (System/currentTimeMillis) started)})))
+      (catch Object error
+        (swap! evidence conj {:step :runner :status :fail :error (or (:category (ex-data error)) :runner-error)}))
+      (finally
+        (when @holder
+          (try (agent/close-session! @holder)
+               (catch Object error (reset! close-error (or (:category (ex-data error)) :cleanup-error)))))))
+    (let [result {:status (if (and (= 7 (count @evidence)) (every? #(= :pass (:status %)) @evidence)
+                                  (nil? @close-error)) :pass :fail)
+                  :model spec :session_id (when @holder (:id @@holder))
+                  :same_session (boolean @holder) :steps @evidence :cleanup_error @close-error
+                  :timeout_policy {:default_command_timeout_ms 10000 :max_command_timeout_ms 10000
+                                   :anthropic_profile_default_capped true}}]
+      (os/sh "rm" "-rf" root)
+      result)))

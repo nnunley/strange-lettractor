@@ -1,6 +1,145 @@
 # Behavior Scenarios
 
+OpenRouter follow-up: user-requested `or-responses/openai/gpt-5.2` checks use
+the OpenAI Responses adapter/profile with gateway provenance. Combined parity
+coverage is 15/15 across initial, targeted and final runs; the final strengthened
+same-session smoke passes 7/7. Report `1790550366776` completes its selected
+reasoning-change plus smoke scope (exit 0). This supplements accepted first-party OpenAI wire evidence without
+claiming direct OpenAI live access. See the current provider evidence.
+
 Each scenario has a stable ID, an observable contract, and the strongest appropriate seam.
+
+### SCN-CAL-CONFORMANCE-LIVE — Native coding parity and same-session smoke
+
+- **Seams:** native provider adapters with real local tools; fifteen parity rows
+  and one retained-session seven-step smoke. Scope and effective native origin
+  are recorded; missing credentials never count as a live pass.
+- **Command:** `lgx live-coding-conformance`; narrow with
+  `ATTRACTOR_CODING_PROVIDERS`, `ATTRACTOR_CODING_CHECKS` and
+  `ATTRACTOR_PARITY_ROWS`. Reports distinguish selected and available rows.
+- **Proof controls:** one session across all smoke steps, correlated raw and
+  truncated read output, steering before the resulting write, child-owned
+  tests that pass baseline and reject output mutants, and model continuation
+  after the default-timeout error. Native-origin and row-selection controls
+  reject gateways, wrong protocols and unknown rows before live work.
+- **Current evidence:** Anthropic 15/15 parity across initial and targeted runs;
+  Gemini also 15/15 across repaired full and targeted runs. Strengthened
+  Anthropic smoke passes five steps then hits quota-exceeded; timeout is unrun.
+  Gemini smoke passes all seven steps; the initial weaker smoke pass is excluded.
+- **Accepted publication scope:** OpenAI wire verified; live not run. The user
+  explicitly accepts that evidence without a push blocker. Do not describe
+  this acceptance as 45 live cells or three live smoke passes.
+- **Details:** [provider evidence](../../provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+
+### SCN-CAL-SPEC-EDGE — Coding-loop original-spec regressions
+
+- **Stories:** CAL-AUDIT-01–04.
+- **Seams:** real native sessions with scripted model completion; a reentrant
+  event listener; real local shell exit/timeout and child execution; a custom
+  environment observing the timeout passed to `exec_command`.
+- **Command:** `lgx audit-coding-loop`; focused regular tests:
+  `lg -source-paths src:test test/runner.lg attractor.coding-loop-audit-test attractor.execution-scope-test`.
+- **Required observations:** child close prevents subsequent shell writes while
+  preserving parent/sibling operation; accepted steering survives a drain and
+  is delivered once; shell failures/timeouts return `is_error=true`; session
+  timeout caps reach supplied custom and local environments.
+- **Current evidence:** repaired. Named audit: 261 tests / 2529 assertions,
+  zero failures/errors. Coding-loop regressions: 12 tests / 70 assertions;
+  five execution-scope tests also cover descendants, parent/sibling survival,
+  SIGTERM-resistant commands, retained options and admission races. Historical
+  red suite: 220/2248, six failures reproducing four defects. Child execution
+  uses a start/release handshake, bounded waits and an expiration control.
+- **Limit:** custom environments need optional `:fork_scope` for independently
+  owned child cancellation. Earlier repair full suite passed 1566 tests / 14159 assertions
+  with zero failures; no live models, full provider matrix or shared-session
+  smoke is established.
+
+### SCN-PROVIDER-JOURNEYS — Shared native provider journeys
+
+- Status: reviewed and integrated in ITER-0021, 2026-09-24; full suite
+  1526 tests / 13863 assertions / zero failures. Native coverage is a bounded subset.
+- The live CLI and deterministic tests call the same ordinary journey functions
+  through actual native adapters. Preserve the fifteen existing named rows,
+  relative order, selection, compatible-endpoint behavior and nested routing.
+- Generation proves text, positive input/output usage and stop on one response;
+  streaming proves nonempty deltas concatenate to final text. Parallel tools
+  prove matched successful opaque results, distinct IDs, concurrent executors,
+  at least two steps and use of both results in the final continuation.
+- Structured extraction returns exactly Alice and integer age 30. Missing-model
+  smoke observes one HTTP 404 with a positive retry allowance and nonretryable
+  normalized error. One bounded rate-limit probe proves only an actual HTTP 429;
+  a successful request leaves that condition unproved and the aggregate incomplete.
+- Native fixture responses depend on submitted prompts, mode, schema/model and
+  real opaque tool results. Wrong inputs and corrupted results must fail.
+- Catalog defaults preserve aliases and explicit overrides. Cache proof respects
+  model capabilities and still completes five actual tool turns with counters.
+  Agent-loop cleanup closes sessions and removes temporary roots on all exits.
+- Verified seam: `live.provider-matrix-journeys` invoked by CLI and all three
+  native-protocol loopback tests, supplemented by independent negative controls.
+  Scripted results do not establish native account/model availability.
+- Evidence: `lgx test test/attractor/provider_matrix_journeys_test.lg`
+  (18 tests / 210 assertions) and `provider_matrix_evidence_test.lg`
+  (18 / 111). Root combined focused/impacted verification passes 62 / 673.
+  Compiled CLI proves empty/unknown selections, 404, actual scripted 429 and
+  HTTP-200 incomplete reporting. Native subset results are in
+  [provider-model-audits.md](../../provider-model-audits.md).
+
+### SCN-GEMINI-SIGNATURES — Original-part Gemini continuation
+
+- Status: bounded repair reviewed and integrated in ITER-0021;
+  focused and native continuation evidence verified, full suite1526/13863/0.
+- Public complete/stream responses preserve each returned opaque signature on
+  its original normalized part. High-level tool loops and agent history replay
+  return those parts unchanged in the next Gemini native request.
+- Cover signed function calls, ordinary/empty/thought text, first-only signed
+  parallel calls and distinct signatures across sequential tool steps. Retain
+  text/history compatibility, tool-call identity and unsigned behavior.
+- A strict native fixture rejects omitted, moved or altered signatures.
+  Non-Gemini regressions reject provider-specific metadata leakage.
+  The same agent-history seam must retain Anthropic signed/redacted thinking
+  blocks when returning their associated tool results; strict native regression
+  verifies this adjacent continuation dependency.
+- Verified seam: public native adapters, high-level generate/stream and real
+  agent sessions with recorded native continuations. Run
+  `lg -source-paths src:test test/runner.lg attractor.gemini-signature-continuation-test
+  attractor.anthropic-thinking-history-test` (6 tests / 42 assertions).
+  Strict shared fixture controls are also in `provider_matrix_journeys_test.lg`.
+  Native Gemini tool/agent continuations and one Fable 5.1 agent session with
+  high reasoning effort returned HTTP 200 while replaying signed history.
+
+### SCN-CAL-PARITY-JOURNEYS — Shared native agent journeys
+
+- Status: verified deterministic runner in ITER-0020, 2026-09-24; native live-provider completion remains unproved.
+- Given a fresh temporary directory, the protocol-native profile and a supplied
+  native adapter, execute the same journey function used by the live parity CLI.
+- Parallel calls must share an assistant round, overlap while delegating real
+  environment operations, return successful matching call IDs and produce both
+  expected files. Serial execution, unmatched results and missing effects fail.
+- Steering at a tool boundary must reach the next native request and cause the
+  changed file result. A missing steering message or wrong result fails.
+- Low-to-high reasoning changes must reach each protocol's native option fields
+  and complete a continuation; unchanged settings fail. Gemini 2.5 uses numeric
+  thinking budgets and Gemini 3 uses thinking levels. Completion and streaming
+  serializers must preserve explicit native overrides and omit portable thinking
+  settings when effort is absent; fixture acceptance of an invalid native field
+  cannot count as model-specific proof.
+- A model-issued spawn/wait pair must use the generated child identity, correlate
+  child events and real child file effects, and leave parent/child work joined
+  and closed. Direct helper calls cannot prove this row.
+- Repeated calls must cause a loop warning that enters steering history and the
+  next native request; disabled detection must not pass.
+- Preserve the ten earlier rows, native profiles for aliases and CLI selection.
+  Accept bare, `./` and absolute arguments for the same target; reject writes
+  to another directory even if expected files were already present.
+  Close sessions in `finally`, retaining proof/diagnostics before temporary-root
+  cleanup, including failure paths.
+- Seam: the public test-support journey entry used by the CLI, through all
+  three real native adapters and a loopback recording server with scripted
+  responses. This proves orchestration, not native account/model availability.
+- Evidence command: `lg -source-paths src:test test/runner.lg
+  attractor.parity-matrix-journeys-test attractor.gemini-reasoning-budget-test`
+  (journeys 11/156/0, budget 2/23/0; final full suite 1498/13585/0, paired
+  spec/quality/progress audits approve; compiled CLI gates verified).
 
 ### SCN-TASK-REVIEW-BINDINGS — Stylesheet-selected native reviews
 

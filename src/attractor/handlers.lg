@@ -199,10 +199,13 @@
              ;; Backend returned an Outcome directly
              (if (= :cancelled (:status backend-result))
                backend-result
-               (do
+               (let [skipped? (#{:skipped "skipped"} (:status backend-result))]
                  (when-not (os/stat (str stage-dir "/response.md"))
                    (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
-                 (when-not engine-managed-status?
+                 (when (and skipped? (not engine-managed-status?)
+                            (io/file-exists? (str stage-dir "/status.json")))
+                   (io/delete-file (str stage-dir "/status.json")))
+                 (when-not (or engine-managed-status? skipped?)
                    (io/spit (str stage-dir "/status.json")
                             (status/outcome->status-json backend-result)))
                  backend-result))

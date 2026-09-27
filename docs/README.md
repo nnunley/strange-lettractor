@@ -1,6 +1,6 @@
 # Attractor Documentation
 
-**Project:** [Attractor](https://github.com/strongdm/attractor) / Strange Lettractor — an agentic workflow orchestration framework implemented in [let-go](https://github.com/nooga/let-go) (Go-based Clojure).
+**Project:** [Attractor](https://github.com/strongdm/attractor) / Strange Lettractor — a unified LLM client, coding-agent runtime and workflow framework implemented in [let-go](https://github.com/nooga/let-go) (Go-based Clojure).
 
 This directory consolidates the project documentation. Files marked *consolidated* were merged from multiple related source files; the original files are preserved in [`_archive/`](_archive/).
 
@@ -12,9 +12,10 @@ The upstream Attractor spec repository uses **NLSpecs** — human-readable
 specifications intended to be directly usable by coding agents to implement
 and validate behavior.
 
-The project maintains snapshotted copies of the three NLSpec documents in
-[`docs/specs/`](specs/), with implementation evidence tracked against each
-checklist item:
+The original audit baseline is [`specs/`](../specs/). Copies under
+[`docs/specs/`](specs/) retain historical checklist annotations; checked boxes
+are not current conformance evidence. Current status comes from the
+[closure ledger](superpowers/iterations/spec-closure.md) and dated audits:
 
 | NLSpec | Source |
 |---|---|
@@ -27,6 +28,8 @@ checklist item:
 ## Navigation
 
 - **New to Attractor?** Start with the [Tutorial](tutorial.md).
+- **Shared console and HTTP host:** [Hub usage](hub.md).
+- **Current coding-loop findings:** [2026-09-27 original-spec audit](coding-loop-audit-2026-09-27.md).
 - **Project overview & future work:** [future_work.md](future_work.md).
 - **Iteration tracking:** See [`superpowers/iterations/`](superpowers/iterations/).
 - **ASDLC methodology reference:** See [`asdlc-skill/`](asdlc-skill/).
@@ -35,14 +38,15 @@ checklist item:
 
 ## Specifications
 
-The three NLSpec documents from [`strongdm/attractor`](https://github.com/strongdm/attractor)
-are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done checklists:
+The original specifications remain the requirements. Component tests, scripted
+provider tests and live-model journeys prove different things; no aggregate
+checkbox count establishes complete conformance.
 
-| Document | Checklist Items |
+| Document | Current evidence |
 |---|---|
-| [Attractor Specification](specs/attractor-spec.md) | 76/76 [x] |
-| [Coding Agent Loop Specification](specs/coding-agent-loop-spec.md) | 59/59 [x] |
-| [Unified LLM Client Specification](specs/unified-llm-spec.md) | 71/71 [x] |
+| [Attractor Specification](../specs/attractor-spec.md) | [Closure ledger](superpowers/iterations/spec-closure.md); remaining smoke and final-audit obligations |
+| [Coding Agent Loop Specification](../specs/coding-agent-loop-spec.md) | [Current audit](coding-loop-audit-2026-09-27.md): four repaired defects; deterministic audit passes; native conformance and same-session smoke implemented, live evidence partial |
+| [Unified LLM Client Specification](../specs/unified-llm-spec.md) | [Provider evidence](provider-model-audits.md) and [schema support contract](schema-validation.md) |
 | [Evaluation Harness Extension](evaluation-harness-extension.md) | Proposed extension: run scoring, independent evaluation, skills, MCP, and constrained generated let-go modules |
 
 ## Consolidated Audits & Implementation Docs
@@ -54,6 +58,7 @@ are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done chec
 | [`runtime-audits.md`](runtime-audits.md) | *Consolidated* — Build, condition, execution, human interaction, integration, parsing/validation, and state audits (7 original files) | 26 KB |
 | [`original-spec-status.md`](original-spec-status.md) | Original Attractor spec reconciliation and status | 6 KB |
 | [`coding-agent-definition-of-done.md`](coding-agent-definition-of-done.md) | Coding agent loop evidence mapping | 4 KB |
+| [`coding-loop-audit-2026-09-27.md`](coding-loop-audit-2026-09-27.md) | Original-spec findings, repairs, coverage and regular regressions | — |
 
 ### Providers & Models
 
@@ -73,6 +78,7 @@ are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done chec
 | Document | Contents | Size |
 |---|---|---|
 | [`agent-workers.md`](agent-workers.md) | *Consolidated* — Codex app-server, Claude agent/worker, Qwen development trials (5 original files) | 23 KB |
+| [`mcp.md`](mcp.md) | MCP admission, explicit host write grants and manifest binding | — |
 
 ### Console
 
@@ -85,6 +91,7 @@ are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done chec
 | Document | Contents | Size |
 |---|---|---|
 | [`hub-features.md`](hub-features.md) | *Consolidated* — Listener, session plan, worker findings, nREPL investigation, shared hub transport (7 original files) | 52 KB |
+| [`hub.md`](hub.md) | Current host, console attachment and shared HTTP usage and limits | — |
 | [`http-question-audit.md`](http-question-audit.md) | HTTP human-question audit | 2 KB |
 
 ### Tool Features
@@ -113,7 +120,7 @@ are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done chec
 
 | Document | Contents | Size |
 |---|---|---|
-| [`interviewer-queues.md`](interviewer-queues.md) | *Consolidated* — Queue implementation plan and contract (2 original files) | 5 KB |
+| [`interviewer-queues.md`](_archive/interviewer-queues.md) | Archived interviewer queue contract | — |
 
 ### Let-go Runtime Issues
 
@@ -143,7 +150,7 @@ are maintained in [`docs/specs/`](specs/) with completed Definition-of-Done chec
 
 | Document | Description |
 |---|---|
-| [`superpowers/iterations/roadmap.md`](superpowers/iterations/roadmap.md) | Iterative delivery roadmap (ITER-0000 through ITER-0007) |
+| [`superpowers/iterations/roadmap.md`](superpowers/iterations/roadmap.md) | Iterative delivery roadmap and current closure follow-ups |
 | [`superpowers/iterations/iteration-log.md`](superpowers/iterations/iteration-log.md) | Detailed component-completion log |
 | [`superpowers/iterations/progress.md`](superpowers/iterations/progress.md) | Goal progress and original-spec reconciliation |
 | [`superpowers/iterations/requirements/`](superpowers/iterations/requirements/) | Story-level requirements per spec area |

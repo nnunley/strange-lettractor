@@ -445,6 +445,7 @@
                                  :file-exists (:file-exists skill-access)
                                  :list-dir (:list-dir skill-access)
                                  :approvals mcp-approvals
+                                 :write-approvals (:mcp_write_approvals options)
                                  :token-reader (fn [name] (os/getenv name))
                                  :oauth-authorizer (:mcp_oauth_authorizer options)
                                  :credential-store (:mcp_credential_store options)))]
@@ -596,14 +597,19 @@
         true))))
 
 (defn- drain-steering! [session event-fn]
-  (let [queued (:steering-queue @session)]
+  ;; Detach this batch before invoking callbacks. A listener may enqueue more
+  ;; steering; that new batch belongs to the next safe drain, not this clear.
+  (let [queued (with-session-lock session
+                 (fn []
+                   (let [queued (:steering-queue @session)]
+                     (swap! session assoc :steering-queue [])
+                     queued)))]
     (doseq [msg queued]
       (when (append-history-if-open!
               session
               {:type :steering :role :user :content msg
                :timestamp (System/currentTimeMillis)})
-        (event-fn {:type :steering_injected :content msg})))
-    (swap! session assoc :steering-queue [])))
+        (event-fn {:type :steering_injected :content msg})))))
 
 (defn- history-to-messages [history]
   (mapv
@@ -611,6 +617,7 @@
       (case (:type turn)
         :tool_results {:role :tool :content (:results turn)}
         :assistant (cond-> {:role :assistant :content (:content turn)}
+                     (seq (:parts turn)) (assoc :parts (:parts turn))
                      (seq (:tool_calls turn)) (assoc :tool_calls (:tool_calls turn)))
         {:role :user :content (:content turn)}))
     history))
@@ -787,7 +794,10 @@
                   (throw (ex-info reason {:category :invalid-tool-arguments})))
                     raw-output (tool-images/normalize-output
                                  ((:executor registered) args (:execution_env @session)))]
-                {:result raw-output :is_error false :skipped false})
+                {:result raw-output
+                 :is_error (boolean (when-let [error? (:result_is_error registered)]
+                                      (error? raw-output)))
+                 :skipped false})
               (catch Object error {:result (str "Tool error (" tool-name "): " error)
                                    :is_error true :skipped (= :invalid-tool-arguments (:category (ex-data error)))})))
           raw-output (:result outcome)
@@ -1069,6 +1079,13 @@
                                           :role :assistant
                                           :content text
                                           :tool_calls tool-calls
+                                          :parts (let [parts (get-in response [:message :parts])]
+                                                   (when (or (and (= "gemini" (:provider response))
+                                                                  (some #(contains? (:provider_data %) "thoughtSignature") parts))
+                                                             (and (= "anthropic" (:provider response))
+                                                                  (some #(contains? #{:thinking :redacted_thinking}
+                                                                                    (:kind %)) parts)))
+                                                     parts))
                                           :reasoning (:reasoning response)
                                           :usage (:usage response)
                                           :response_id (:id response)
@@ -1279,13 +1296,23 @@
           parent-environment (:execution_env @parent)
           scoped-environment
           (if (and (not (str/blank? requested-dir))
-                   (:with_working_directory parent-environment))
-            ((:with_working_directory parent-environment) requested-dir)
+                   (or (:with_working_directory_from parent-environment)
+                       (:with_working_directory parent-environment)))
+            (if-let [view-from (:with_working_directory_from parent-environment)]
+              (view-from parent-environment requested-dir)
+              ((:with_working_directory parent-environment) requested-dir))
             parent-environment)
-          ;; The parent owns shared-environment lifecycle cleanup.
-          child-environment (assoc scoped-environment
-                              :initialize (fn [] nil)
-                              :cleanup (fn [] nil))
+          ;; Share files, not command cancellation. Local environments fork an
+          ;; owned command scope; custom backends may provide the same hook.
+          ;; Without it, preserve borrowed callbacks and leave lifecycle cleanup
+          ;; to the parent (that backend cannot promise per-child cancellation).
+          child-environment (assoc (cond
+                                    (:fork_scope_from scoped-environment)
+                                    ((:fork_scope_from scoped-environment) scoped-environment)
+                                    (:fork_scope scoped-environment)
+                                    ((:fork_scope scoped-environment))
+                                    :else (assoc scoped-environment :cleanup (fn [] nil)))
+                                   :initialize (fn [] nil))
           parent-profile (:provider_profile @parent)
           requested-model (subagent-arg arguments "model")
           child-profile (if (str/blank? requested-model)
@@ -1306,6 +1333,10 @@
              :max_total_tokens (or (subagent-arg arguments "max_total_tokens") 0)
              :max_tool_rounds_per_input
              (get-in @parent [:config :max_tool_rounds_per_input])
+             :default_command_timeout_ms
+             (get-in @parent [:config :default_command_timeout_ms])
+             :max_command_timeout_ms
+             (get-in @parent [:config :max_command_timeout_ms])
              :max_subagent_depth max-depth
              :subagent_depth (inc depth)
              :on_event

@@ -5,7 +5,32 @@
             [os :as os]
             [attractor.patch :as patch]))
 
-(defn make-environment [operations]
+(defn make-environment
+  "Construct an execution environment from caller-owned operations.
+
+   Standard read_file(path,nil,nil) returns the complete, unformatted file
+   contents. Profile tools own their 1-based offset, default 2000-line limit,
+   and line-number presentation; edits always read the full raw contents.
+
+   Optional read_file_tool(path,offset,limit) overrides the model-facing reader
+   (including image attachments). Optional read_text(path) overrides raw reads.
+   A legacy environment whose read_file is already formatted must declare
+   read_file_format :tool and provide read_text or dedicated editing callbacks.
+   The local adapter uses that explicit marker, preserving its direct read_file
+   API and consumers' overrides of that function.
+   Never return numbered or truncated text from a standard raw reader.
+
+   Optional fork_scope() returns an independently cancellable child environment
+   over the same filesystem. Child cleanup joins its commands and descendants;
+   parent cleanup closes every child scope. Working-directory views retain their
+   owning scope. Custom backends must implement fork_scope to support scoped
+   cancellation; copying callbacks alone cannot provide that guarantee.
+   Source-aware fork_scope_from(environment) preserves composed file callbacks;
+   local command/cleanup wrappers require an explicitly supplied scope hook.
+   with_working_directory_from(environment,directory) similarly protects composed
+   views. Override these hooks (or the legacy zero-argument fork_scope / one-
+   argument with_working_directory hooks) when the host can rebind its wrappers."
+  [operations]
   (merge {:initialize (fn [] nil)
           :cleanup (fn [] nil)
           :working_directory (fn [] (os/cwd))
@@ -28,7 +53,9 @@
     (when (and (some? index) (> index 0))
       (subs path 0 index))))
 
-(defn- numbered-lines [content offset limit]
+(defn format-file-text
+  "Format raw text for the read_file tool without changing the underlying file."
+  [content offset limit]
   ;; A trailing newline terminates the last line; it does not start an
   ;; empty line after it.
   (let [lines (let [all (vec (str/split content #"\n"))]
@@ -76,7 +103,7 @@
                   (re-find #"[\x00-\x08\x0e-\x1f\x7f]" raw))
           (throw (ex-info "Cannot read unsupported binary file as text"
                           {:category :unsupported-binary-file :path path})))
-        (numbered-lines raw offset limit)))))
+        (format-file-text raw offset limit)))))
 
 (defn- occurrence-count [content needle]
   ;; Whitespace is valid exact-match text; only an empty needle cannot advance.
@@ -409,6 +436,40 @@
     "wait \"$canceller\" 2>/dev/null\n"
     "exit \"$status\"\n"))
 
+(defn- new-command-scope [parent]
+  {:active_commands (atom {})
+   :command_counter (atom 0)
+   :environment_id (str (random-uuid))
+   :control_lock (or (:control_lock parent) (atom false))
+   :closed (atom false)
+   :children (atom {})
+   :parent parent})
+
+(defn- command-scopes [scope]
+  (cons scope (mapcat command-scopes (vals @(:children scope)))))
+
+(defn- changed-environment-keys [baseline source]
+  (filter #(or (not= (contains? baseline %) (contains? source %))
+               (not= (get baseline %) (get source %)))
+          (distinct (concat (keys baseline) (keys source)))))
+
+(defn- preserve-environment-overrides [baseline source target]
+  (reduce (fn [result key]
+            (if (contains? source key) (assoc result key (get source key))
+                (dissoc result key)))
+          target (changed-environment-keys baseline source)))
+
+(defn- reject-composed-environment! [operation changed]
+  (when (seq changed)
+    (throw (ex-info
+             (str "Cannot " (name operation) " with wrapped environment operations "
+                  (pr-str (vec changed)) ". Supply a composition-aware "
+                  (if (= operation :fork_scope) "fork_scope_from (or fork_scope)"
+                      "with_working_directory_from (or with_working_directory)")
+                  " hook that preserves wrappers and command ownership.")
+             {:category :unsupported-environment-composition
+              :operation operation :operations (vec changed)}))))
+
 (defn make-local-environment [& [opts]]
   (let [options (or opts {})
         working-dir (or (:working_dir options) (os/cwd))
@@ -427,11 +488,7 @@
         rg-command (or (:rg_command options) "rg")
         lifecycle
         (or (:_lifecycle options)
-            {:active_commands (atom {})
-             :command_counter (atom 0)
-             :environment_id (System/nanoTime)
-             :control_lock (atom false)
-             :closed (atom false)})
+            (new-command-scope nil))
         active-commands (:active_commands lifecycle)
         command-counter (:command_counter lifecycle)
         environment-id (:environment_id lifecycle)
@@ -565,33 +622,86 @@
                                              {:stdin_cleanup {:file @payload :directory directory :failures failures}}))))))))))
         cleanup
         (fn []
-          (let [signal-errors (atom [])]
-            (with-control-lock
-              (fn []
-                (reset! closed true)
-                (doseq [[command-id marker] @active-commands]
-                  (try
-                    (io/spit marker "")
-                    (catch Object error
-                      (swap! signal-errors conj
-                             {:command_id command-id
-                              :error (str error)}))))))
-            (let [deadline (+ (System/currentTimeMillis) 3000)]
-              (loop []
-                (when (and (seq @active-commands)
-                           (< (System/currentTimeMillis) deadline))
-                  (core/sleep 10)
-                  (recur))))
-            (let [remaining (vec (keys @active-commands))]
+          (let [signal-errors (atom [])
+                ;; All scopes share one admission lock. Closing the entire
+                ;; subtree before releasing it fences both commands and forks.
+                scopes
+                (with-control-lock
+                  (fn []
+                    (let [scopes (vec (command-scopes lifecycle))]
+                      (doseq [scope scopes]
+                        (reset! (:closed scope) true)
+                        (doseq [[command-id marker] @(:active_commands scope)]
+                          (try
+                            (io/spit marker "")
+                            (catch Object error
+                              (swap! signal-errors conj
+                                     {:command_id command-id :error (str error)})))))
+                      scopes)))
+                remaining-commands
+                (fn [] (vec (mapcat #(keys @(:active_commands %)) scopes)))
+                deadline (+ (System/currentTimeMillis) 3000)]
+            (loop []
+              (when (and (seq (remaining-commands))
+                         (< (System/currentTimeMillis) deadline))
+                (core/sleep 10)
+                (recur)))
+            (let [remaining (remaining-commands)]
               (when (or (seq @signal-errors) (seq remaining))
                 (throw
                   (ex-info
                     "Execution environment cleanup did not terminate every command"
                     {:category :execution-cleanup-failed
                      :signal_errors @signal-errors
-                     :active_command_ids remaining}))))))]
-    (make-environment
+                     :active_command_ids remaining}))))
+            ;; Retain failed scopes for retry, but completed children must not
+            ;; accumulate for the lifetime of a long-running parent session.
+            (with-control-lock
+              (fn []
+                (doseq [scope scopes]
+                  (reset! (:children scope) {})
+                  (when-let [parent (:parent scope)]
+                    (swap! (:children parent) dissoc (:environment_id scope))))))))]
+    (let [baseline (atom nil)
+          environment (make-environment
       {:cleanup cleanup
+       :fork_scope_from
+       (fn [source]
+         (if (not= (:fork_scope source) (:fork_scope @baseline))
+           ((:fork_scope source))
+           (do
+             (reject-composed-environment!
+               :fork_scope
+               (filter #{:exec_command :exec_command_stdin :cleanup}
+                       (changed-environment-keys @baseline source)))
+             (preserve-environment-overrides @baseline source
+                                             ((:fork_scope @baseline))))))
+       :with_working_directory_from
+       (fn [source directory]
+         (if (not= (:with_working_directory source) (:with_working_directory @baseline))
+           ((:with_working_directory source) directory)
+           (do
+             ;; A callback may close over the old directory; rebasing it would
+             ;; silently discard its wrapper or route operations inconsistently.
+             (reject-composed-environment!
+               :with_working_directory
+               (filter #(or (fn? (get source %)) (fn? (get @baseline %)))
+                       (remove #{:initialize} (changed-environment-keys @baseline source))))
+             (preserve-environment-overrides
+               @baseline source ((:with_working_directory @baseline) directory)))))
+       :fork_scope
+       (fn []
+         (with-control-lock
+           (fn []
+             (when @closed
+               (throw (ex-info "Cannot fork a closed execution environment"
+                               {:category :execution-environment-closed})))
+             (let [child (new-command-scope lifecycle)
+                   environment (make-local-environment
+                                 (assoc options :working_dir working-dir
+                                                :_lifecycle child))]
+               (swap! (:children lifecycle) assoc (:environment_id child) child)
+               environment))))
        :working_directory (fn [] working-dir)
        :with_working_directory
        (fn [directory]
@@ -612,6 +722,9 @@
        :read_file
        (fn [path offset limit]
          (read-local-file (path-for path) offset limit))
+       ;; Preserve direct local read_file and consumers' overrides while
+       ;; keeping profile tools from formatting this reader's results again.
+       :read_file_format :tool
        :read_text (fn [path] (io/slurp (path-for path)))
        :write_file
        (fn [path content]
@@ -711,4 +824,6 @@
                (ex-info
                  (str "glob failed: " error)
                  {:category :glob-failed
-                  :cause_category (:category (ex-data error))})))))})))
+                  :cause_category (:category (ex-data error))})))))})]
+      (reset! baseline environment)
+      environment)))

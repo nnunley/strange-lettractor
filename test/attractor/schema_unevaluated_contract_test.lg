@@ -1,0 +1,116 @@
+(ns attractor.schema-unevaluated-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(defn- check-cases [schema cases]
+  (doseq [[value expected] cases]
+    (is (= expected (first (llm/validate-json-schema value schema)))
+        (str "schema=" (pr-str schema) " instance=" (pr-str value)))))
+
+(deftest unevaluated-properties-apply-to-only-uncovered-members
+  (check-cases {:unevaluatedProperties false} [[{} true] [{"extra" 1} false] [1 true]])
+  (check-cases {"properties" {"named" {"type" "integer"}}
+                "patternProperties" {"^x" {"type" "string"}}
+                "unevaluatedProperties" {"type" "boolean"}}
+               [[{"named" 1 "xyz" "ok" "other" true} true]
+                [{"named" 1 "xyz" "ok" "other" 1} false]
+                [{"named" "bad"} false]])
+  (check-cases {:additionalProperties true :unevaluatedProperties false}
+               [[{"anything" 1} true]])
+  (check-cases {:additionalProperties {:type "integer"} :unevaluatedProperties false}
+               [[{"anything" 1} true] [{"anything" "bad"} false]]))
+
+(deftest in-place-applicators-propagate-only-successful-annotations
+  (check-cases {:allOf [{:properties {"a" true}} {:properties {"b" true}}]
+                :unevaluatedProperties false}
+               [[{"a" 1 "b" 2} true] [{"a" 1 "extra" 2} false]])
+  (check-cases {:anyOf [{:properties {"a" {:type "integer"}} :required ["a"]}
+                        {:properties {"b" {:type "integer"}} :required ["b"]}]
+                :unevaluatedProperties false}
+               [[{"a" 1 "b" 2} true] [{"a" 1 "b" "bad"} false]
+                [{"a" 1 "extra" 2} false] [{"b" 2} true]])
+  (check-cases {:oneOf [{:properties {"a" true} :required ["a"]}
+                        {:properties {"b" true} :required ["b"]}]
+                :unevaluatedProperties false}
+               [[{"a" 1} true] [{"a" 1 "b" 2} false] [{"a" 1 "extra" 2} false]])
+  (check-cases {:not {:properties {"a" false}} :unevaluatedProperties false}
+               [[{"a" 1} false]]))
+
+(deftest conditions-and-dependencies-propagate-at-the-same-instance
+  (check-cases {:if {:properties {"kind" {:const "a"}} :required ["kind"]}
+                :then {:properties {"a" true}}
+                :else {:properties {"b" true}}
+                :unevaluatedProperties false}
+               [[{"kind" "a" "a" 1} true] [{"kind" "a" "b" 1} false]
+                [{"b" 1} true] [{"kind" "b" "b" 1} false]])
+  (check-cases {:if {:properties {"a" true}} :unevaluatedProperties false}
+               [[{"a" 1} true] [{"extra" 1} false]])
+  (doseq [keyword [:dependentSchemas :dependencies]]
+    (check-cases {:properties {"trigger" true}
+                  keyword {"trigger" {:properties {"dependent" true}}}
+                  :unevaluatedProperties false}
+                 [[{"trigger" false "dependent" 1} true]
+                  [{"dependent" 1} false] [{"trigger" true "extra" 1} false]])))
+
+(deftest references-and-nested-evaluations-retain-their-boundaries
+  (check-cases {:$defs {:base {:properties {"a" true}}}
+                :$ref "#/$defs/base" :unevaluatedProperties false}
+               [[{"a" 1} true] [{"a" 1 "extra" 2} false]])
+  (check-cases {:properties {"child" {:properties {"a" true}
+                                     :unevaluatedProperties false}}
+                :unevaluatedProperties false}
+               [[{"child" {"a" 1}} true] [{"child" {"extra" 1}} false]
+                [{"child" {"a" 1} "a" 2} false]])
+  ;; A sibling cannot donate annotations inward to another allOf branch.
+  (check-cases {:allOf [{:properties {"a" true}} {:unevaluatedProperties false}]}
+               [[{"a" 1} false]])
+  (check-cases {:allOf [{:unevaluatedProperties {:type "integer"}}]
+                :unevaluatedProperties false}
+               [[{"a" 1} true] [{"a" "bad"} false]]))
+
+(deftest unevaluated-items-observe-prefix-tail-and-contains
+  (check-cases {:unevaluatedItems false} [[[] true] [[1] false] [1 true]])
+  (check-cases {:prefixItems [{:type "integer"}] :unevaluatedItems {:type "string"}}
+               [[[1 "tail"] true] [[1 2] false] [["bad"] false]])
+  (check-cases {:prefixItems [true] :items true :unevaluatedItems false}
+               [[[1 2 3] true]])
+  (check-cases {:contains {:type "integer"} :unevaluatedItems false}
+               [[[1 2] true] [[1 "bad"] false] [[] false]])
+  (check-cases {:contains {:type "integer"} :minContains 0 :unevaluatedItems false}
+               [[[] true] [["bad"] false]])
+  (check-cases {:prefixItems [true] :contains {:type "integer"} :unevaluatedItems false}
+               [[["prefix" 1 2] true] [["prefix" 1 "extra"] false]]))
+
+(deftest array-annotations-cross-applicators-without-leaking-from-failures
+  (check-cases {:anyOf [{:prefixItems [{:type "string"}]}
+                        {:contains {:type "integer"}}]
+                :unevaluatedItems false}
+               [[["prefix" 1] true] [["prefix" true] false] [[true 1] false]])
+  (check-cases {:$defs {:prefix {:prefixItems [true]}}
+                :$ref "#/$defs/prefix" :unevaluatedItems false}
+               [[[1] true] [[1 2] false]])
+  (check-cases {:allOf [{:unevaluatedItems {:type "integer"}}]
+                :unevaluatedItems false}
+               [[[1 2] true] [[1 "bad"] false]])
+  (check-cases {:prefixItems [{:prefixItems [true] :unevaluatedItems false}]
+                :unevaluatedItems false}
+               [[[[1]] true] [[[1 2]] false] [[[1] 2] false]]))
+
+(deftest structured-output-accessors-enforce-unevaluated-constraints
+  (doseq [[schema text] [[{:properties {"known" true} :unevaluatedProperties false}
+                          "{\"known\":1,\"extra\":2}"]
+                         [{:prefixItems [true] :unevaluatedItems false} "[1,2]"]]]
+    (let [adapter (llm/make-adapter "fixture"
+                    (fn [_] {:message {:role :assistant :text text} :finish_reason :stop})
+                    (fn [_] [{:type :stream_start} {:type :text_delta :delta text}
+                             {:type :finish :finish_reason :stop}]))
+          opts {:client (llm/make-client {:providers {"fixture" adapter}})}]
+      (is (= :no-object-generated
+             (try (llm/generate-object "fixture/model" "data" schema opts)
+                  :unexpected-success (catch Object e (:category (ex-data e))))))
+      (is (= :no-object-generated
+             (try ((:object (llm/stream-object "fixture/model" "data" schema opts)))
+                  :unexpected-success (catch Object e (:category (ex-data e)))))))))
+
+(deftest public-validator-preserves-its-result-shape
+  (is (= [true ""] (llm/validate-json-schema {"a" 1} {:properties {"a" true}}))))

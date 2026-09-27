@@ -18,9 +18,13 @@
                       :$ref "#%2F$defs%2Fnested%2Fvalue"})))))
 
 (deftest malformed-reference-escapes-do-not-resolve-literal-keys
-  (doseq [key ["bad~2" "bad~" "bad%" "bad%2" "bad%GG"]]
+  (doseq [key ["bad~2" "bad~"]]
     (let [reference (str "#/$defs/" key)]
       (is (= [false (str "Unresolved schema reference: " reference)]
+             (llm/validate-json-schema 3 {:$defs {key true} :$ref reference})))))
+  (doseq [key ["bad%" "bad%2" "bad%GG"]]
+    (let [reference (str "#/$defs/" key)]
+      (is (= [false (str "Invalid schema reference URI: " reference)]
              (llm/validate-json-schema 3 {:$defs {key true} :$ref reference}))))))
 
 (deftest reference-and-sibling-constraints-both-apply
@@ -31,15 +35,21 @@
     (is (false? (first (llm/validate-json-schema 6 schema))))))
 
 (deftest array-reference-indices-must-be-canonical-and-in-range
-  (doseq [index ["00" "01" "99999999999999999999999999999999999999" "2" "-" "-1"]]
-    (let [reference (str "#/$defs/choices/" index)
-          result (try (llm/validate-json-schema 3
-                        {:$defs {:choices [true true]} :$ref reference})
-                      (catch Object _ :unexpected-exception))]
-      (is (= [false (str "Unresolved schema reference: " reference)] result))))
-  (doseq [index ["0" "1"]]
+  (let [valid-schema {:$defs {:choices {:anyOf [true true]}}}
+        array-path "#/$defs/choices/anyOf/"]
+    ;; The old direct array is invalid as a schema and stops at preflight.
+    (is (= [false (str "Invalid schema at https://attractor.invalid/schema: "
+                       "Property $defs: Property choices: Expected [\"object\" \"boolean\"]")]
+           (llm/validate-json-schema
+             3 {:$defs {:choices [true true]} :$ref "#/$defs/choices/0"})))
+    (doseq [index ["00" "01" "99999999999999999999999999999999999999" "2" "-" "-1"]]
+      (let [reference (str array-path index)
+            result (try (llm/validate-json-schema 3
+                          (assoc valid-schema :$ref reference))
+                        (catch Object _ :unexpected-exception))]
+        (is (= [false (str "Unresolved schema reference: " reference)] result))))
+    (doseq [index ["0" "1"]]
+      (is (true? (first (llm/validate-json-schema 3
+                         (assoc valid-schema :$ref (str array-path index)))))))
     (is (true? (first (llm/validate-json-schema 3
-                       {:$defs {:choices [true true]}
-                        :$ref (str "#/$defs/choices/" index)})))))
-  (is (true? (first (llm/validate-json-schema 3
-                     {:$defs {"01" true} :$ref "#/$defs/01"})))))
+                       {:$defs {"01" true} :$ref "#/$defs/01"}))))))

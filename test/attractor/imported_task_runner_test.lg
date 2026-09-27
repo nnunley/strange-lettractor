@@ -1,5 +1,6 @@
 (ns attractor.imported-task-runner-test
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [clojure.core :as core]
             [io :as io] [os :as os]
             [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]))
@@ -80,10 +81,24 @@
   (let [{:keys [state dir registry]} (run-case "exit 0" "VERDICT: SHIP\n" [])
         p (prepared)
         node (-> (get-in p [:graph :nodes "verify"])
-                 (assoc :timeout "100ms") (assoc-in [:attrs :timeout] "100ms"))]
+                 (assoc :timeout "30s") (assoc-in [:attrs :timeout] "30s"))]
     (io/spit (str state "/iter") "0")
     (io/spit (str state "/convergence.jsonl") "")
-    (io/spit (str dir "/attractor_runs/task-runner/task.verify.sh") "sleep 2")
-    (dotimes [_ 2]
-      (is (= :fail (:status ((get @registry "tool") node nil (:graph p) (str dir "/timeout-log"))))))
+    (dotimes [attempt 2]
+      (let [started (str state "/verify-started-" attempt)
+            cancelled? (atom false)]
+        (io/spit (str dir "/attractor_runs/task-runner/task.verify.sh")
+                 (str "touch '" started "'\nsleep 30\n"))
+        (let [task (core/future
+                     ((get @registry "tool")
+                      (assoc node :cancelled? #(deref cancelled?)) nil (:graph p)
+                      (str dir "/timeout-log")))
+              ready? (loop [deadline (+ (System/currentTimeMillis) 5000)]
+                       (cond
+                         (io/file-exists? started) true
+                         (>= (System/currentTimeMillis) deadline) false
+                         :else (do (core/sleep 5) (recur deadline))))]
+          (is ready? "verifier must start before cancellation")
+          (reset! cancelled? true)
+          (is (= :cancelled (:status (core/deref task 10000 ::timed-out)))))))
     (is (= "2\n" (io/slurp (str state "/iter"))))))

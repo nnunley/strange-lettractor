@@ -12,8 +12,8 @@ export
 
 LGX := lgx
 
-.PHONY: help install hooks build test suite runners live-matrix live-parity \
-        live-smoke live-mcp-pilot live-mcp-pilot-live providers models clean distclean
+.PHONY: help install hooks build test suite audit-coding-loop runners live-matrix live-parity \
+        live-smoke live-coding-conformance live-mcp-pilot live-mcp-pilot-live providers models clean distclean
 
 help: ## Show the lgx entry points
 	@$(LGX) help
@@ -32,6 +32,9 @@ test: ## Full suite (about two and a half minutes)
 
 suite: test ## Alias for test
 
+audit-coding-loop: ## Original coding-loop contracts and repair regressions
+	$(LGX) audit-coding-loop
+
 runners: ## Every test namespace in its own process, one summary line each
 	$(LGX) runners
 
@@ -46,6 +49,9 @@ live-parity: ## Live coding-agent parity matrix against ATTRACTOR_LIVE_MODEL
 
 live-smoke: ## Live Attractor pipeline smoke against ATTRACTOR_LIVE_MODEL
 	$(LGX) live-smoke
+
+live-coding-conformance: ## Coding-agent parity and same-session smoke
+	$(LGX) live-coding-conformance
 
 live-mcp-pilot: ## MCP pilot dry run (no network): prints plan, exits 2
 	$(LGX) live-mcp-pilot

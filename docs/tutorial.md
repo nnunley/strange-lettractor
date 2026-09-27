@@ -8,7 +8,9 @@ Strange Lettractor is a unified agentic framework implementing [StrongDM's Attra
 
 ### Environment Configuration
 
-Configure `lgx` to point to your `let-go` runtime:
+Install stock let-go 1.13.0 as `lg` on `PATH` and lgx 0.3.2 or newer.
+`lgx.edn` pins the runtime version. No patched runtime or `LGX_LG` override
+is required. To deliberately use a local runtime build instead:
 
 ```bash
 export LGX_LG="$HOME/development/let-go/lg"
@@ -21,7 +23,7 @@ export LGX_LG="$HOME/development/let-go/lg"
 lgx test
 
 # 2. Compile the standalone binary
-lgx build
+lgx rebuild
 # Output: built ./bin/attractor
 
 # 3. View CLI options

@@ -440,6 +440,11 @@ collision checked.
 
 ### 8.2 MCP trust boundaries
 
+Implemented admission policy: [MCP tool admission](mcp.md). The initial
+read-only slice now also admits write tools through explicit host grants tied
+to exact tool names and manifest digests. Human approval, where required by the
+host, precedes supplying that grant.
+
 Each MCP invocation MUST have:
 
 - an explicit request ID and run/session identity;

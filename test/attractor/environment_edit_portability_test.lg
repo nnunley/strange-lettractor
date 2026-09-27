@@ -1,0 +1,339 @@
+(ns attractor.environment-edit-portability-test
+  "Built-in edit tools work through the specified ExecutionEnvironment methods.
+   The fixture has an in-memory filesystem and no local-only edit helpers."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]))
+
+(defn- memory-environment [initial]
+  (let [files (atom initial)
+        writes (atom [])
+        environment
+        {:read_file (fn [path _ _]
+                      (if (contains? @files path)
+                        (get @files path)
+                        (throw (ex-info "File not found" {:category :path-not-found}))))
+         :write_file (fn [path content]
+                       (swap! writes conj [path content])
+                       (swap! files assoc path content)
+                       nil)
+         :file_exists (fn [path] (contains? @files path))
+         :list_directory (fn [_ _] [])
+         :exec_command (fn [_ _ _ _]
+                         {:stdout "" :stderr "Commands unavailable"
+                          :exit_code 127 :timed_out false :duration_ms 0})
+         :grep (fn [_ _ _] "")
+         :glob (fn [_ _] [])
+         :initialize (fn [] nil)
+         :cleanup (fn [] nil)
+         :working_directory (fn [] "/virtual")
+         :platform (fn [] "wasm")
+         :os_version (fn [] "in-memory")}]
+    {:files files :writes writes :environment environment}))
+
+(defn- invoke [profile name args environment]
+  (try
+    {:result ((:executor (profiles/registry-get (:tool_registry profile) name))
+              args environment)}
+    (catch Object error {:error (ex-message error) :category (:category (ex-data error))})))
+
+(deftest unmodified-native-profiles-complete-editing-in-a-spec-only-environment
+  (doseq [profile [(profiles/create-openai-profile)
+                   (profiles/create-anthropic-profile)
+                   (profiles/create-gemini-profile)]]
+    (let [{:keys [files environment]} (memory-environment {})
+          openai? (= "openai" (:id profile))
+          requests (atom [])
+          script [{:id "write" :name "write_file"
+                   :arguments {"file_path" "hello.txt" "content" "before\n"}}
+                  {:id "read" :name "read_file" :arguments {"file_path" "hello.txt"}}
+                  (if openai?
+                    {:id "edit" :name "apply_patch"
+                     :arguments {"patch" "*** Begin Patch\n*** Update File: hello.txt\n@@\n-before\n+after\n*** End Patch"}}
+                    {:id "edit" :name "edit_file"
+                     :arguments {"file_path" "hello.txt" "old_string" "before" "new_string" "after"}})
+                  {:id "verify" :name "read_file" :arguments {"file_path" "hello.txt"}}]
+          session (agent/make-session
+                    {:provider_profile profile :execution_env environment
+                     :project_docs [] :max_subagent_depth 0
+                     :complete_fn
+                     (fn [request]
+                       (swap! requests conj request)
+                       (let [call (get script (dec (count @requests)))]
+                         {:text (if call "working" "done")
+                          :tool_calls (if call [call] [])}))})]
+      (try
+        (is (= "done" (agent/process-input! session "Write, read, edit, and verify hello.txt")))
+        (is (= "after\n" (get @files "hello.txt")) (:id profile))
+        (let [results (vec (mapcat :results (filter #(= :tool_results (:type %)) (:history @session))))]
+          (is (= 4 (count results)))
+          (is (every? #(false? (:is_error %)) results) (pr-str results))
+          (is (= "1 | before" (:content (get results 1))))
+          (is (= "1 | after" (:content (last results)))))
+        (is (= :idle (:state @session)))
+        (finally (agent/close-session! session))))))
+
+(deftest generic-search-and-replace-retains-local-edit-safety
+  (doseq [profile [(profiles/create-anthropic-profile) (profiles/create-gemini-profile)]]
+    (doseq [[old-string expected-category]
+            [["absent" :edit-not-found] ["same" :edit-not-unique] ["" :invalid-edit]]]
+      (let [{:keys [files writes environment]} (memory-environment {"sample.txt" "same same\n"})
+            result (invoke profile "edit_file"
+                           {"file_path" "sample.txt" "old_string" old-string "new_string" "changed"}
+                           environment)]
+        (is (= expected-category (:category result)) (pr-str result))
+        (is (empty? @writes))
+        (is (= "same same\n" (get @files "sample.txt")))))
+    (let [{:keys [files environment]} (memory-environment {"sample.txt" "same same\n"})]
+      (is (= 2 (:result (invoke profile "edit_file"
+                               {"file_path" "sample.txt" "old_string" "same"
+                                "new_string" "changed" "replace_all" true}
+                               environment))))
+      (is (= "changed changed\n" (get @files "sample.txt")))))
+  (let [{:keys [files environment]} (memory-environment {"spaces.txt" "a b\n"})]
+    (is (= 1 (:result (invoke (profiles/create-anthropic-profile) "edit_file"
+                             {"file_path" "spaces.txt" "old_string" " " "new_string" "_"}
+                             environment))))
+    (is (= "a_b\n" (get @files "spaces.txt")))))
+
+(deftest generic-openai-patch-adds-and-updates-with-native-hunk-matching
+  (let [{:keys [files environment]}
+        (memory-environment {"sample.txt" "section one\nvalue = 1\nsection two\nvalue = 1\nflag   =   false\n"})
+        result (invoke (profiles/create-openai-profile) "apply_patch"
+                       {"patch" (str "*** Begin Patch\n"
+                                     "*** Add File: nested/new.txt\n+created\n"
+                                     "*** Update File: sample.txt\n"
+                                     "@@ section two\n-value = 1\n+value = 2\n"
+                                     "@@ flag = false\n-flag = false\n+flag = true\n"
+                                     "*** End Patch")}
+                       environment)]
+    (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+    (is (= "created\n" (get @files "nested/new.txt")))
+    (is (= "section one\nvalue = 1\nsection two\nvalue = 2\nflag = true\n"
+           (get @files "sample.txt")))))
+
+(deftest patch-delete-and-move-use-only-the-environments-delete-capability
+  (let [{:keys [files environment]}
+        (memory-environment {"old.txt" "before\n" "obsolete.txt" "remove me\n"})
+        deletions (atom [])
+        environment (assoc environment :delete_file
+                           (fn [path]
+                             (swap! deletions conj path)
+                             (swap! files dissoc path)))
+        result (invoke (profiles/create-openai-profile) "apply_patch"
+                       {"patch" (str "*** Begin Patch\n"
+                                     "*** Update File: old.txt\n*** Move to: nested/moved.txt\n"
+                                     "@@\n-before\n+after\n"
+                                     "*** Delete File: obsolete.txt\n*** End Patch")}
+                       environment)]
+    (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+    (is (= {"nested/moved.txt" "after\n"} @files))
+    (is (= ["old.txt" "obsolete.txt"] @deletions))))
+
+(deftest patch-refuses-unavailable-delete-before-mutating-any-file
+  (doseq [operation ["*** Delete File: original.txt\n"
+                     "*** Update File: original.txt\n*** Move to: moved.txt\n@@\n-before\n+after\n"]]
+    (let [{:keys [files writes environment]} (memory-environment {"original.txt" "before\n"})
+          result (invoke (profiles/create-openai-profile) "apply_patch"
+                         {"patch" (str "*** Begin Patch\n*** Add File: new.txt\n+new\n"
+                                       operation "*** End Patch")}
+                         environment)]
+      (is (= :unsupported-operation (:category result)) (pr-str result))
+      (is (str/includes? (:error result) "deletion"))
+      (is (empty? @writes))
+      (is (= {"original.txt" "before\n"} @files)))))
+
+(deftest raw-reader-and-specialized-edit-overrides-remain-authoritative
+  (doseq [tool ["edit_file" "apply_patch"]]
+    (let [{:keys [files environment]} (memory-environment {"sample.txt" "before\n"})
+          profile (if (= tool "apply_patch")
+                    (profiles/create-openai-profile) (profiles/create-anthropic-profile))
+          arguments (if (= tool "apply_patch")
+                      {"patch" "*** Begin Patch\n*** Update File: sample.txt\n@@\n-before\n+after\n*** End Patch"}
+                      {"file_path" "sample.txt" "old_string" "before" "new_string" "after"})
+          environment (assoc environment
+                             :read_file_format :tool
+                             :read_file (fn [_ _ _] "1 | before")
+                             :read_text (fn [path] (get @files path)))
+          result (invoke profile tool arguments environment)]
+      (is (nil? (:error result)) (pr-str result))
+      (is (= "after\n" (get @files "sample.txt"))))
+    (let [called (atom [])
+          profile (if (= tool "apply_patch")
+                    (profiles/create-openai-profile) (profiles/create-anthropic-profile))
+          environment {(keyword tool) (fn [& args] (swap! called conj args) "owned edit")}
+          result (invoke profile tool
+                         {"file_path" "sample.txt" "old_string" "before" "new_string" "after" "patch" "custom"}
+                         environment)]
+      (is (= "owned edit" (:result result)))
+      (is (= 1 (count @called))))))
+
+(deftest generic-patch-errors-preserve-environment-files
+  (doseq [[patch-text category]
+          [["*** Begin Patch\n*** Add File: sample.txt\n+overwrite\n*** End Patch" :invalid-patch]
+           ["*** Begin Patch\n*** Add File: ../escape.txt\n+escape\n*** End Patch" :invalid-patch]
+           ["*** Begin Patch\n*** Update File: sample.txt\n@@\n-not found\n+changed\n*** End Patch" :invalid-patch]
+           ["*** Begin Patch\n*** Update File: absent.txt\n@@\n-not found\n+changed\n*** End Patch" :invalid-patch]]]
+    (let [{:keys [files writes environment]} (memory-environment {"sample.txt" "before\n"})
+          result (invoke (profiles/create-openai-profile) "apply_patch" {"patch" patch-text} environment)]
+      (is (= category (:category result)) (pr-str result))
+      (is (empty? @writes))
+      (is (= {"sample.txt" "before\n"} @files)))))
+
+(deftest spec-only-posix-environment-deletes-and-moves-via-its-command-interface
+  (let [root (str (os/temp-dir) "/lettractor-portable-patch-" (random-uuid))
+        _ (io/mkdir root)
+        local (execution/make-local-environment {:working_dir root})
+        source "old'$(touch injected).txt"
+        obsolete "-obsolete ' $(touch injected).txt"
+        environment (assoc (select-keys local [:write_file :file_exists :list_directory
+                                               :exec_command :grep :glob :initialize :cleanup
+                                               :working_directory :platform :os_version])
+                           :read_file (fn [path _ _] ((:read_text local) path)))
+        profile (profiles/create-openai-profile)]
+    (try
+      ((:write_file environment) source "before\n")
+      ((:write_file environment) obsolete "obsolete\n")
+      (let [result (invoke profile "apply_patch"
+                           {"patch" (str "*** Begin Patch\n*** Update File: " source "\n"
+                                         "*** Move to: nested/moved.txt\n@@\n-before\n+after\n"
+                                         "*** Delete File: " obsolete "\n*** End Patch")}
+                           environment)]
+        (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+        (is (false? ((:file_exists environment) source)))
+        (is (false? ((:file_exists environment) obsolete)))
+        (is (true? ((:file_exists environment) "nested/moved.txt")))
+        (is (false? ((:file_exists environment) "injected")))
+        (when ((:file_exists environment) "nested/moved.txt")
+          (is (= "after\n" ((:read_file environment) "nested/moved.txt" nil nil)))))
+      (finally ((:cleanup local))))))
+
+(deftest delegated-deletion-must-succeed-and-remove-the-file
+  (doseq [result [{:exit_code 1 :stderr "denied"}
+                  {:exit_code 0 :stderr ""}]]
+    (let [{:keys [files environment]} (memory-environment {"original.txt" "before\n"})
+          commands (atom [])
+          environment (assoc environment :platform (fn [] "linux")
+                             :exec_command (fn [command timeout dir variables]
+                                             (swap! commands conj [command timeout dir variables])
+                                             result))
+          response (invoke (profiles/create-openai-profile) "apply_patch"
+                           {"patch" "*** Begin Patch\n*** Delete File: original.txt\n*** End Patch"}
+                           environment)]
+      (is (= :patch-delete-failed (:category response)) (pr-str response))
+      (is (= 1 (count @commands)))
+      (is (= {"original.txt" "before\n"} @files)))))
+
+(deftest generic-read-tools-format-and-page-without-truncating-edit-input
+  (doseq [profile [(profiles/create-openai-profile)
+                   (profiles/create-anthropic-profile)
+                   (profiles/create-gemini-profile)]]
+    (let [prefix (str "1 | literal file content\n" (apply str (repeat 2000 "keep\n")))
+          original (str prefix "tail-target\nlast\n")
+          {:keys [files environment]} (memory-environment {"large.txt" original})
+          read-result (invoke profile "read_file" {"file_path" "large.txt"} environment)
+          lines (str/split (:result read-result) #"\n")]
+      (is (= 2000 (count lines)))
+      (is (= "1 | 1 | literal file content" (first lines)))
+      (is (= "2000 | keep" (last lines)))
+      (is (= "2002 | tail-target\n2003 | last"
+             (:result (invoke profile "read_file"
+                              {"file_path" "large.txt" "offset" 2002 "limit" 2}
+                              environment))))
+      (is (= "" (:result (invoke profile "read_file"
+                                 {"file_path" "large.txt" "offset" 4000}
+                                 environment))))
+      (let [openai? (= "openai" (:id profile))
+            result (invoke profile (if openai? "apply_patch" "edit_file")
+                           (if openai?
+                             {"patch" "*** Begin Patch\n*** Update File: large.txt\n@@\n-tail-target\n+changed\n*** End Patch"}
+                             {"file_path" "large.txt" "old_string" "tail-target" "new_string" "changed"})
+                           environment)]
+        (is (nil? (:error result)) (pr-str result))
+        (is (= (str prefix "changed\nlast\n") (get @files "large.txt")))))))
+
+(deftest gemini-read-many-uses-the-same-generic-tool-format
+  (let [{:keys [environment]} (memory-environment {"one.txt" "1 | literal\nsecond\n"
+                                                 "two.txt" "other"})]
+    (is (= ["1 | 1 | literal\n2 | second" "1 | other"]
+           (:result (invoke (profiles/create-gemini-profile) "read_many_files"
+                            {"paths" ["one.txt" "two.txt"]} environment))))))
+
+(deftest explicit-tool-reader-retains-its-format-and-receives-requested-range
+  (let [{:keys [files environment]} (memory-environment {"sample.txt" "raw before\n"})
+        calls (atom [])
+        environment (assoc environment :read_file_tool
+                           (fn [path offset limit]
+                             (swap! calls conj [path offset limit])
+                             "owned tool read"))
+        profile (profiles/create-anthropic-profile)]
+    (is (= "owned tool read"
+           (:result (invoke profile "read_file"
+                            {"file_path" "sample.txt" "offset" 2 "limit" 3} environment))))
+    (is (= [["sample.txt" 2 3]] @calls))
+    (is (= 1 (:result (invoke profile "edit_file"
+                             {"file_path" "sample.txt" "old_string" "before" "new_string" "after"}
+                             environment))))
+    (is (= "raw after\n" (get @files "sample.txt")))))
+
+(deftest local-reader-keeps-legacy-direct-output-without-double-numbering
+  (let [root (str (os/temp-dir) "/lettractor-read-compatibility-" (random-uuid))
+        local (execution/make-local-environment {:working_dir root})]
+    (try
+      ((:write_file local) "numbered.txt" "1 | literal\nsecond\n")
+      (is (= :tool (:read_file_format local)))
+      (is (= "1 | 1 | literal\n2 | second" ((:read_file local) "numbered.txt" nil nil)))
+      (is (= "2 | second"
+             (:result (invoke (profiles/create-anthropic-profile) "read_file"
+                              {"file_path" "numbered.txt" "offset" 2 "limit" 1} local))))
+      (finally ((:cleanup local))))))
+
+(deftest explicitly-formatted-reader-cannot-be-used-as-raw-edit-input
+  (doseq [tool ["edit_file" "apply_patch"]]
+    (let [{:keys [files writes environment]} (memory-environment {"sample.txt" "before\n"})
+          environment (assoc environment :read_file_format :tool
+                             :read_file (fn [_ _ _] "1 | before"))
+          profile (if (= tool "apply_patch")
+                    (profiles/create-openai-profile) (profiles/create-anthropic-profile))
+          args (if (= tool "apply_patch")
+                 {"patch" "*** Begin Patch\n*** Update File: sample.txt\n@@\n-1 | before\n+after\n*** End Patch"}
+                 {"file_path" "sample.txt" "old_string" "before" "new_string" "after"})
+          result (invoke profile tool args environment)]
+      (is (= :unsupported-operation (:category result)) (pr-str result))
+      (is (empty? @writes))
+      (is (= "before\n" (get @files "sample.txt")))
+      (is (= "1 | before" (:result (invoke profile "read_file" {"file_path" "sample.txt"}
+                                           environment)))))))
+
+(deftest patch-preflights-raw-read-capability-before-any-writes
+  (doseq [formatted? [false true]]
+    (let [{:keys [files writes environment]} (memory-environment {"original.txt" "before\n"})
+          environment (if formatted?
+                        (assoc environment :read_file_format :tool
+                                           :read_file (fn [_ _ _] "1 | before"))
+                        (dissoc environment :read_file))
+          result (invoke (profiles/create-openai-profile) "apply_patch"
+                         {"patch" (str "*** Begin Patch\n*** Add File: new.txt\n+created\n"
+                                       "*** Update File: original.txt\n@@\n-before\n+after\n*** End Patch")}
+                         environment)]
+      (is (= :unsupported-operation (:category result)) (pr-str result))
+      (is (empty? @writes))
+      (is (= {"original.txt" "before\n"} @files)))))
+
+(deftest patches-that-only-add-or-delete-do-not-require-a-raw-reader
+  (doseq [formatted? [false true]]
+    (let [{:keys [files environment]} (memory-environment {"obsolete.txt" "old\n"})
+          environment (assoc (if formatted?
+                               (assoc environment :read_file_format :tool)
+                               (dissoc environment :read_file))
+                             :delete_file (fn [path] (swap! files dissoc path)))
+          result (invoke (profiles/create-openai-profile) "apply_patch"
+                         {"patch" (str "*** Begin Patch\n*** Add File: new.txt\n+created\n"
+                                       "*** Delete File: obsolete.txt\n*** End Patch")}
+                         environment)]
+      (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+      (is (= {"new.txt" "created\n"} @files)))))

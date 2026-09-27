@@ -499,6 +499,15 @@
           (some? (:current_fidelity checkpoint))
           (assoc :current_fidelity (:current_fidelity checkpoint))
 
+          (contains? checkpoint :selected_transition)
+          (assoc :selected_transition (:selected_transition checkpoint))
+
+          (contains? checkpoint :transition_history)
+          (assoc :transition_history (:transition_history checkpoint))
+
+          (contains? checkpoint :transition_history_start)
+          (assoc :transition_history_start (:transition_history_start checkpoint))
+
           (some? (:workflow_fingerprint checkpoint))
           (assoc :workflow_fingerprint (:workflow_fingerprint checkpoint))
 
@@ -537,6 +546,18 @@
        :logs (or (checkpoint-field data :logs) [])}
       (some? (checkpoint-field data :current_fidelity))
       (assoc :current_fidelity (checkpoint-field data :current_fidelity))
+
+      (or (contains? data :selected_transition)
+          (contains? data "selected_transition"))
+      (assoc :selected_transition (checkpoint-field data :selected_transition))
+
+      (or (contains? data :transition_history)
+          (contains? data "transition_history"))
+      (assoc :transition_history (checkpoint-field data :transition_history))
+
+      (or (contains? data :transition_history_start)
+          (contains? data "transition_history_start"))
+      (assoc :transition_history_start (checkpoint-field data :transition_history_start))
 
       (some? (checkpoint-field data :workflow_fingerprint))
       (assoc :workflow_fingerprint

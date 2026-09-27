@@ -103,3 +103,15 @@
           (str (:id entry) " records a cutoff without its source"))
       (is (nil? (:knowledge_cutoff_source entry))
           (str (:id entry) " cites a source for a cutoff it does not record")))))
+
+(deftest current-vendor-cutoffs-reach-the-generated-model-context
+  (doseq [[provider model expected-cutoff profile-fn]
+          [["anthropic" "claude-opus-5-5" "2026-06" profiles/create-anthropic-profile]
+           ["anthropic" "claude-opus-4-6" "2025-05" profiles/create-anthropic-profile]
+           ["anthropic" "claude-sonnet-4-5" "2025-01" profiles/create-anthropic-profile]
+           ["openai" "gpt-6-sol" "2026-04-20" profiles/create-openai-profile]
+           ["openai" "gpt-6-luna" "2026-05-18" profiles/create-openai-profile]]]
+    (let [{:keys [prompts requests]} (capture (profile-fn model))]
+      (is (= [model model] (mapv :model requests)))
+      (is (every? #(str/includes? % (str "Knowledge cutoff: " expected-cutoff "\n")) prompts)
+          (str model " cutoff must reach each generated prompt")))))

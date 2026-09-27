@@ -1,0 +1,159 @@
+(ns attractor.coding-conformance-suite-test
+  (:require [clojure.test :refer [deftest is]]
+            [live.coding-conformance-suite :as suite]
+            [attractor.dotenv :as dotenv] [attractor.providers :as providers]
+            [live.parity-matrix-journeys :as parity]
+            [live.coding-smoke-journey :as smoke]
+            [clojure.edn :as edn] [io :as io] [os :as os]))
+
+(deftest explicit-native-selection
+  (is (= ["openai" "anthropic" "gemini"] (suite/select-providers nil)))
+  (is (= ["gemini"] (suite/select-providers "gemini")))
+  (doseq [selection ["" "gemini,gemini" "openrouter" "gemini,"]]
+    (is (= :invalid-selection
+           (try (suite/select-providers selection) nil
+                (catch Object e (:category (ex-data e))))))))
+
+(deftest incomplete-evidence-cannot-pass
+  (is (= :incomplete (suite/aggregate [])))
+  (is (= :incomplete (suite/aggregate [{:status :blocked}])))
+  (is (= :incomplete (suite/aggregate [{:status :pass} {:status :blocked}])))
+  (is (= :fail (suite/aggregate [{:status :pass} {:status :fail}])))
+  (is (= :complete (suite/aggregate [{:status :pass} {:status :pass}]))))
+
+(deftest snapshots-stay-in-progress-until-finished
+  (is (= :in-progress (:aggregate_status (suite/report ["gemini"] [:parity] [{:status :pass}] false)))))
+
+(deftest check-selection-is-explicit
+  (is (= [:parity :smoke] (suite/select-checks nil)))
+  (is (= [:smoke] (suite/select-checks "smoke")))
+  (is (= :invalid-selection (try (suite/select-checks "other") nil
+                               (catch Object e (:category (ex-data e)))))))
+
+(deftest suite-runs-every-row-and-smoke-and-retains-blocked-provider
+  (let [calls (atom []) reports (atom [])]
+    (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                  os/getenv (fn [_] "")
+                  providers/effective (fn [] [{:id "anthropic" :protocol :anthropic-messages
+                                              :base_url "https://api.anthropic.com/v1" :key_present true}])
+                  parity/run-row (fn [model row] (swap! calls conj (:row row)) {:status :pass :row (:row row)})
+                  smoke/run-journey (fn [model] (swap! calls conj :smoke) {:status :pass})
+                  io/mkdir (fn [_] nil)
+                  io/spit (fn [_ content] (swap! reports conj (edn/read-string content)))]
+      (is (= 3 (suite/run-suite!)))
+      (is (= (conj (mapv :row parity/rows) :smoke) @calls))
+      (is (= :incomplete (:aggregate_status (last @reports))))
+      (is (every? #(= :first-party (:origin %))
+                   (filter #(= :pass (:status %)) (:results (last @reports)))))
+      (is (= 2 (count (filter #(= :blocked (:status %)) (:results (last @reports))))))
+      (is (every? #(= :in-progress (:aggregate_status %)) (butlast @reports))))))
+
+(deftest native-origin-cannot-be-a-gateway-or-another-protocol
+  (let [native {:id "openai" :protocol :openai-responses :base_url "https://api.openai.com/v1"}]
+    (is (true? (suite/native-origin? native)))
+    (is (false? (suite/native-origin? (assoc native :protocol :gemini-generate-content))))
+    (is (false? (suite/native-origin? (assoc native :base_url "https://gateway.example/v1"))))
+    (is (false? (suite/native-origin? (assoc native :base_url "https://api.openai.com.evil.example/v1"))))))
+
+(deftest parity-row-selection-limits-work-and-records-its-scope
+  (let [calls (atom []) reports (atom [])]
+    (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                  os/getenv (fn [key] (get {"ATTRACTOR_CODING_PROVIDERS" "anthropic"
+                                            "ATTRACTOR_CODING_CHECKS" "parity"
+                                            "ATTRACTOR_PARITY_ROWS" "steering, parallel-tools"} key ""))
+                  providers/effective (fn [] [(assoc (get providers/built-in "anthropic")
+                                                      :id "anthropic" :key_present true)])
+                  parity/run-row (fn [_ row] (swap! calls conj (:row row)) {:status :pass :row (:row row)})
+                  smoke/run-journey (fn [_] (swap! calls conj :smoke) {:status :pass})
+                  io/mkdir (fn [_] nil)
+                  io/spit (fn [_ content] (swap! reports conj (edn/read-string content)))]
+      (is (= 0 (suite/run-suite!)))
+      (is (= [:parallel-tools :steering] @calls))
+      (is (= [:parallel-tools :steering] (:selected_parity_rows (last @reports))))
+      (is (= (mapv :row parity/rows) (:available_parity_rows (last @reports))))
+      (is (every? #(= [:parallel-tools :steering] (:selected_parity_rows %)) @reports)))))
+
+(deftest unknown-or-missing-parity-row-name-is-rejected-before-work
+  (doseq [selection ["unknown-row" "steering," ","]]
+    (let [calls (atom [])]
+      (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                    os/getenv (fn [key] (if (= key "ATTRACTOR_PARITY_ROWS") selection ""))
+                    providers/effective (fn [] (swap! calls conj :configuration) [])
+                    parity/run-row (fn [& _] (swap! calls conj :parity))
+                    smoke/run-journey (fn [& _] (swap! calls conj :smoke))
+                    io/mkdir (fn [& _] (swap! calls conj :mkdir))
+                    io/spit (fn [& _] (swap! calls conj :write))]
+        (is (= :invalid-journey-selection
+               (try (suite/run-suite!) nil (catch Object e (:category (ex-data e))))))
+        (is (empty? @calls))))))
+
+(deftest non-native-selection-blocks-before-any-journey
+  (doseq [override [{:protocol :gemini-generate-content}
+                   {:base_url "https://gateway.example/v1"}]]
+    (let [calls (atom []) reports (atom [])]
+      (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                    os/getenv (fn [key] (if (= key "ATTRACTOR_CODING_PROVIDERS") "openai" ""))
+                    providers/effective (fn [] [(merge (get providers/built-in "openai")
+                                                        {:id "openai" :key_present true} override)])
+                    parity/run-row (fn [& _] (swap! calls conj :parity))
+                    smoke/run-journey (fn [& _] (swap! calls conj :smoke))
+                    io/mkdir (fn [_] nil)
+                    io/spit (fn [_ content] (swap! reports conj (edn/read-string content)))]
+        (is (= 3 (suite/run-suite!)))
+        (is (empty? @calls))
+        (is (= :non-native-provider-configuration
+               (:reason (first (:results (last @reports))))))))))
+
+(deftest reports-distinguish-default-parity-from-smoke-only
+  (is (= (mapv :row parity/rows)
+         (:selected_parity_rows (suite/report ["gemini"] [:parity :smoke] [] false))))
+  (is (= [] (:selected_parity_rows (suite/report ["gemini"] [:smoke] [] false))))
+  (is (= (mapv :row parity/rows)
+         (:available_parity_rows (suite/report ["gemini"] [:smoke] [] false)))))
+
+(deftest configured-alias-selection-must-be-explicit
+  (is (= ["or-responses"] (suite/select-providers "or-responses" #{"or-responses"})))
+  (is (= suite/native-providers (suite/select-providers nil #{"or-responses"})))
+  (is (= :invalid-selection
+         (try (suite/select-providers "unknown" #{"or-responses"}) nil
+              (catch Object error (:category (ex-data error)))))))
+
+(deftest configured-native-protocol-alias-requires-model-and-records-gateway-origin
+  (doseq [model [nil "openai/gpt-5.2"]]
+    (let [calls (atom []) reports (atom [])]
+      (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                    os/getenv (fn [key] (get {"ATTRACTOR_CODING_PROVIDERS" "or-responses"
+                                             "ATTRACTOR_OR_RESPONSES_MODEL" model} key ""))
+                    providers/effective (fn [] [{:id "or-responses" :protocol :openai-responses
+                                                :base_url "https://openrouter.ai/api/v1" :key_present true}])
+                    parity/run-row (fn [spec row] (swap! calls conj spec) {:status :pass :row (:row row)})
+                    smoke/run-journey (fn [spec] (swap! calls conj spec) {:status :pass})
+                    io/mkdir (fn [_] nil)
+                    io/spit (fn [_ content] (swap! reports conj (edn/read-string content)))]
+        (is (= (if model 0 3) (suite/run-suite!)))
+        (let [results (:results (last @reports))]
+          (is (every? #(= :gateway (:origin %)) results))
+          (is (every? #(= :openai-responses (:protocol %)) results))
+          (is (every? #(= "https://openrouter.ai/api/v1" (:endpoint %)) results))
+          (if model
+            (do
+              (is (= (inc (count parity/rows)) (count @calls)))
+              (is (every? #(= "or-responses/openai/gpt-5.2" %) @calls)))
+            (do
+              (is (empty? @calls))
+              (is (= :missing-explicit-alias-model (:reason (first results)))))))))))
+
+(deftest configured-chat-completions-alias-is-not-native-coding-conformance
+  (let [calls (atom []) reports (atom [])]
+    (with-redefs [dotenv/load-dotenv! (fn [] nil)
+                  os/getenv (fn [key] (get {"ATTRACTOR_CODING_PROVIDERS" "gateway"
+                                           "ATTRACTOR_GATEWAY_MODEL" "openai/gpt-5.2"} key ""))
+                  providers/effective (fn [] [{:id "gateway" :protocol :openai-chat-completions
+                                              :base_url "https://gateway.example/v1" :key_present true}])
+                  parity/run-row (fn [& _] (swap! calls conj :parity))
+                  smoke/run-journey (fn [& _] (swap! calls conj :smoke))
+                  io/mkdir (fn [_] nil)
+                  io/spit (fn [_ content] (swap! reports conj (edn/read-string content)))]
+      (is (= 3 (suite/run-suite!)))
+      (is (empty? @calls))
+      (is (= :unsupported-coding-protocol (:reason (first (:results (last @reports)))))))))

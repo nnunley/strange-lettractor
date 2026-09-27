@@ -94,6 +94,12 @@
     (let [clauses (mapv parse-clause (split-clauses condition))]
       (every? #(evaluate-parsed-clause % outcome context) clauses))))
 
+(defn condition-references-key? [condition key]
+  (boolean
+    (and (not (str/blank? condition))
+         (some #(= key (:key %))
+               (map parse-clause (split-clauses condition))))))
+
 (defn validate-condition-syntax [condition]
   (try
     (when-not (str/blank? condition)

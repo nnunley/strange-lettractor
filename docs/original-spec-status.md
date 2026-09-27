@@ -1,6 +1,35 @@
-# Original-spec status — 2026-09-11 (runtime entry updated 2026-09-20)
+# Original-spec status — historical reconciliation and current pointers
 
-This is a reconciliation of existing records, not a fresh completion audit.
+OpenRouter follow-up: user-requested `or-responses/openai/gpt-5.2` checks use
+the OpenAI Responses adapter/profile with gateway provenance. Combined parity
+coverage is 15/15 across initial, targeted and final runs; the final strengthened
+same-session smoke passes 7/7. Report `1790550366776` completes its selected
+reasoning-change plus smoke scope (exit 0). This supplements accepted first-party OpenAI wire evidence without
+claiming direct OpenAI live access. See the current provider evidence.
+
+Live follow-up, 2026-09-27: same-session smoke is now implemented and native
+conformance has partial live results. Anthropic covers 15/15 parity rows across
+two runs; Gemini also has 15/15 across repaired full and targeted runs. Strengthened
+Anthropic smoke passes five steps then hits quota-exceeded; Gemini strengthened smoke passes all seven steps. First-party OpenAI is wire verified, direct live not run,
+and explicitly accepted by the user for publication without a push blocker. See [provider evidence](provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+The current named audit includes this live-harness/profile work; the older
+full-suite result below is dated repair evidence.
+
+2026-09-27: the [coding-loop audit](coding-loop-audit-2026-09-27.md) records
+four repaired implementation defects. The named audit passes 261 tests / 2529
+assertions with zero failures/errors; earlier repair full suite passed 1566 tests / 14159 assertions with zero failures.
+Custom environments require `:fork_scope` for independent child cancellation.
+The coding parity runner now implements all fifteen rows; full native-provider
+results and the seven-step shared-session smoke remain unproved. The older
+eight/ten-row counts and credential statements below are dated history, not
+the current state. See the audit and closure ledger for current obligations.
+
+The remaining text reconciles 2026-09-11 records (runtime entry updated
+2026-09-20), not a fresh completion audit.
+
+For current repair status and remaining obligations, see the
+[2026-09-23 specification closure](superpowers/iterations/spec-closure.md).
+The historical evidence and gap statements below retain their original dates.
 
 Generated reports are local/CI output under ignored `evidence/`, not repository
 deliverables. See [verification output](verification.md). Coding-agent parity

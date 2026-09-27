@@ -129,17 +129,22 @@
 
 (defn authorization-url
   "Build the authorization redirect target. Values are URL-encoded."
-  [{:keys [authorization-endpoint client-id redirect-uri scope state code-challenge]}]
-  (str authorization-endpoint
-       (if (str/includes? (str authorization-endpoint) "?") "&" "?")
-       (str/join "&"
-                 [(str "response_type=code")
+  [{:keys [authorization-endpoint client-id redirect-uri scope state code-challenge
+           access-type prompt]}]
+  (let [required [(str "response_type=code")
                   (str "client_id=" (url-encode client-id))
                   (str "redirect_uri=" (url-encode redirect-uri))
                   (str "scope=" (url-encode scope))
                   (str "state=" (url-encode state))
                   (str "code_challenge=" (url-encode code-challenge))
-                  "code_challenge_method=S256"])))
+                  "code_challenge_method=S256"]
+        optional (concat (when (some? access-type)
+                           [(str "access_type=" (url-encode access-type))])
+                         (when (some? prompt)
+                           [(str "prompt=" (url-encode prompt))]))]
+    (str authorization-endpoint
+         (if (str/includes? (str authorization-endpoint) "?") "&" "?")
+         (str/join "&" (concat required optional)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Credential store: OS keychain through git credential-osxkeychain.
@@ -359,13 +364,16 @@
 
 (defn exchange-code
   "Single authorization-code exchange. Returns {:access-token
-   :refresh-token :expires-in}. Callers enforce single-use per code."
+   :refresh-token :expires-in}, plus optional :scope and :token-type.
+   Callers enforce single-use per code."
   [transport token-endpoint code redirect-uri client-id code-verifier & [opts]]
   (let [form (str "grant_type=authorization_code"
                   "&code=" (url-encode code)
                   "&redirect_uri=" (url-encode redirect-uri)
                   "&client_id=" (url-encode client-id)
-                  "&code_verifier=" (url-encode code-verifier))
+                  "&code_verifier=" (url-encode code-verifier)
+                  (when (non-blank-string? (:client-secret opts))
+                    (str "&client_secret=" (url-encode (:client-secret opts)))))
         response (bounded-call
                    transport
                    {:method :post :url token-endpoint
@@ -383,11 +391,17 @@
         (fail! :auth-exchange-failed {:reason :exchange-rejected
                                      :error-code (when (map? server-error)
                                                    (get server-error "code"))})))
+    (when-not (= 200 (:status response))
+      (fail! :auth-exchange-failed {:reason :exchange-http-status
+                                    :status (when (integer? (:status response))
+                                              (:status response))}))
     (when-not (non-blank-string? (get body "access_token"))
       (fail! :auth-exchange-failed {:reason :exchange-without-token}))
-    {:access-token (get body "access_token")
-     :refresh-token (get body "refresh_token")
-     :expires-in (get body "expires_in")}))
+    (cond-> {:access-token (get body "access_token")
+             :refresh-token (get body "refresh_token")
+             :expires-in (get body "expires_in")}
+      (contains? body "scope") (assoc :scope (get body "scope"))
+      (contains? body "token_type") (assoc :token-type (get body "token_type")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Loopback listener: echo-back capture, single-shot, off-chat.
@@ -555,15 +569,19 @@
 (defn authorize
   "Full OAuth authorization-code + PKCE handoff for one service.
    descriptor: {:authorization-endpoint :token-endpoint
-   :registration-endpoint? :scope :client-id?}. When endpoints are blank,
+   :registration-endpoint? :scope :client-id? :access-type? :prompt?
+   :client-secret?}. When endpoints are blank,
    resource-url enables RFC 9728 discovery. opts: :store (credential store
    map for refresh persistence; absent means memory-only), :service-id
    (required with :store), :on-url (fn [url], default prints), :timeout-ms,
-   :port, :pkce-run (openssl injection for tests), :client-name.
+   :port, :pkce-run (openssl injection for tests), :client-name,
+   :validate-tokens (callback before persistence), :persist-client-id?
+   (default true).
 
    The code is exchanged exactly once; refresh tokens persist only via
    :store, access tokens stay memory-only. Returns {:service-id
-   :access-token :expires-in :expires-at-ms :refresh-stored :flow-evidence}
+   :access-token :expires-in :expires-at-ms :refresh-stored :flow-evidence,
+   with optional :scope and :token-type when returned by the server}
    with no secret values anywhere in the evidence."
   [transport resource-url descriptor & [opts]]
   (let [options (or opts {})
@@ -577,6 +595,8 @@
                   :registration-endpoint (or (:registration-endpoint descriptor)
                                              (:registration-url descriptor))
                   :scope (or (:scope descriptor) "internal")
+                  :access-type (:access-type descriptor)
+                  :prompt (:prompt descriptor)
                   :client-id (:client-id descriptor)}
         ;; Explicit endpoints skip the public-client check: there is no
         ;; metadata to check against, so explicit configuration asserts a
@@ -616,7 +636,9 @@
                           :redirect-uri redirect-uri
                           :scope (:scope endpoints)
                           :state state
-                          :code-challenge challenge})]
+                          :code-challenge challenge
+                          :access-type (:access-type resolved)
+                          :prompt (:prompt resolved)})]
           ((or (:on-url options)
                (fn [url]
                  (println "Open this URL to authorize:")
@@ -630,7 +652,17 @@
                            (reset! exchanged? true)
                            (exchange-code transport (:token-endpoint endpoints)
                                           (:code captured) redirect-uri client-id verifier
-                                          opts))
+                                          (assoc options :client-secret
+                                                 (or (:client-secret options)
+                                                     (:client-secret descriptor)))))
+                _ (when-let [validate (:validate-tokens options)]
+                    (let [accepted? (try (validate tokens)
+                                         (catch Object _
+                                           (fail! :auth-validation-failed
+                                                  {:reason :token-validation-rejected})))]
+                      (when (= false accepted?)
+                        (fail! :auth-validation-failed
+                               {:reason :token-validation-rejected}))))
                 expires-at (when (integer? (:expires-in tokens))
                              (+ (System/currentTimeMillis)
                                 (* 1000 (max 0 (:expires-in tokens)))))
@@ -645,26 +677,29 @@
                                    ;; A refresh token only redeems with the client it
                                    ;; was issued to, and a registered id is new each
                                    ;; handoff, so a later process needs both.
-                                   ((:store store) {:host (token-host (:token-endpoint endpoints))
-                                                    :username (client-id-username service-id)
-                                                    :secret client-id})
+                                   (when (not= false (:persist-client-id? options))
+                                     ((:store store) {:host (token-host (:token-endpoint endpoints))
+                                                      :username (client-id-username service-id)
+                                                      :secret client-id}))
                                    true))
                 completed-at (System/currentTimeMillis)
                 stats @(:state-atom server)]
-            {:service-id service-id
-           :client-id client-id
-             :access-token (:access-token tokens)
-             :expires-in (:expires-in tokens)
-             :expires-at-ms expires-at
-             :refresh-stored refresh-stored
-             :flow-evidence {:service-id service-id
-                             :token-host (token-host (:token-endpoint endpoints))
-                             :redirect-port (:port server)
-                             :requests-seen (:requests stats)
-                             :mismatches (:mismatches stats)
-                             :exchanges 1
-                             :refresh-stored refresh-stored
-                             :expires-in (:expires-in tokens)
-                             :started-at started-at
-                             :completed-at completed-at}}))
+            (cond-> {:service-id service-id
+                     :client-id client-id
+                     :access-token (:access-token tokens)
+                     :expires-in (:expires-in tokens)
+                     :expires-at-ms expires-at
+                     :refresh-stored refresh-stored
+                     :flow-evidence {:service-id service-id
+                                     :token-host (token-host (:token-endpoint endpoints))
+                                     :redirect-port (:port server)
+                                     :requests-seen (:requests stats)
+                                     :mismatches (:mismatches stats)
+                                     :exchanges 1
+                                     :refresh-stored refresh-stored
+                                     :expires-in (:expires-in tokens)
+                                     :started-at started-at
+                                     :completed-at completed-at}}
+              (contains? tokens :scope) (assoc :scope (:scope tokens))
+              (contains? tokens :token-type) (assoc :token-type (:token-type tokens)))))
         (finally (close-code-listener! server))))))
