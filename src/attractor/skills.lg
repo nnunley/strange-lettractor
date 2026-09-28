@@ -16,7 +16,8 @@
    error. Approvals live in user-level config (see default-approvals-path)
    so repeat runs do not re-prompt; `attractor skills approvals` reviews
    them and `attractor skills revoke <id>` revokes them."
-  (:require [clojure.edn :as edn]
+  (:require [attractor.manifests :as manifests]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [hash :as hash]
             [io :as io]
@@ -262,43 +263,23 @@
       (when (present? file-exists manifest-path)
         (read-loaded-root root root-name id manifest-path read-text file-exists)))))
 
-(defn- approval-matches? [approval project-loaded user-loaded]
-  (and (map? approval)
-       (contains? #{"project" "user"} (:winning-root approval))
-       (= (:project-digest approval) (:manifest-digest project-loaded))
-       (= (:user-digest approval) (:manifest-digest user-loaded))))
-
 (defn- resolve-one [id roots read-text file-exists approvals]
   (let [{:keys [project-root user-root]} roots
         project-loaded (load-from-root project-root "project" id read-text file-exists)
-        user-loaded (load-from-root user-root "user" id read-text file-exists)]
-    (cond
-      (and (nil? project-loaded) (nil? user-loaded))
-      (fail! :skill-not-found {:skill_id id})
-
-      (nil? user-loaded)
-      {:loaded (assoc project-loaded :cross-root :sole-project) :agreed false :approval nil}
-
-      (nil? project-loaded)
-      {:loaded (assoc user-loaded :cross-root :sole-user) :agreed false :approval nil}
-
-      (= (:manifest-digest project-loaded) (:manifest-digest user-loaded))
-      {:loaded (assoc project-loaded :cross-root :agree) :agreed true :approval nil}
-
-      :else
-      (let [approval (get approvals id)]
-        (if (approval-matches? approval project-loaded user-loaded)
-          {:loaded (assoc (if (= "user" (:winning-root approval)) user-loaded project-loaded)
-                          :cross-root :approved
-                          :loser-digest (:manifest-digest
-                                         (if (= "user" (:winning-root approval))
-                                           project-loaded user-loaded)))
-           :agreed false :approval {id approval}}
-          (fail! :skill-cross-root-conflict
-                 {:skill_id id
-                  :project-digest (:manifest-digest project-loaded)
-                  :user-digest (:manifest-digest user-loaded)
-                  :hint "Record a sticky approval for this id naming winning-root plus both digests."}))))))
+        user-loaded (load-from-root user-root "user" id read-text file-exists)
+        {:keys [status winner cross-root loser-digest approval]}
+        (manifests/select-root project-loaded user-loaded (get approvals id))]
+    (case status
+      :missing (fail! :skill-not-found {:skill_id id})
+      :conflict (fail! :skill-cross-root-conflict
+                      {:skill_id id
+                       :project-digest (:manifest-digest project-loaded)
+                       :user-digest (:manifest-digest user-loaded)
+                       :hint "Record a sticky approval for this id naming winning-root plus both digests."})
+      {:loaded (cond-> (assoc winner :cross-root cross-root)
+                 approval (assoc :loser-digest loser-digest))
+       :agreed (= :agree cross-root)
+       :approval (when approval {id approval})})))
 
 (defn skills-config-digest
   "Stable digest over the sorted [id revision manifest-digest] triples of
@@ -390,47 +371,10 @@
    digest-pinned selection. Entries that fail to parse are skipped here;
    explicit selection still fails loudly on them."
   [opts]
-  (let [{:keys [project-root user-root read-text list-dir]} opts]
-    (if (nil? list-dir)
-      []
-      (let [entries-for
-            (fn [root root-name]
-              (if (or (nil? root) (str/blank? root))
-                []
-                (mapv (fn [id] {:id id :root root :root-name root-name})
-                      (sort (filter valid-id? (or (list-dir root) []))))))
-            describe
-            (fn [{:keys [id root root-name]}]
-              (try
-                (let [text (read-or-nil read-text (str root "/" id "/" manifest-file))]
-                  (when (some? text)
-                    (let [manifest (edn/read-string text)]
-                      (when (and (map? manifest)
-                                 (= id (:id manifest))
-                                 (non-blank-string? (:description manifest)))
-                        (let [[capped truncated?] (cap-description (:description manifest))]
-                          {:id id
-                           :revision (str (:revision manifest))
-                           :description capped
-                           :description-truncated truncated?
-                           :manifest-digest (hash/sha256 text)
-                           :root root-name})))))
-                (catch Object _ nil)))
-            project-described (vec (keep describe (entries-for project-root "project")))
-            project-by-id (into {} (map (fn [entry] [(:id entry) entry]) project-described))
-            user-described (vec (keep describe (entries-for user-root "user")))]
-        (vec (concat (mapv (fn [entry]
-                             (let [user-entry (some #(when (= (:id entry) (:id %)) %) user-described)]
-                               (assoc entry :cross-root
-                                      (if (nil? user-entry)
-                                        :sole-project
-                                        (if (= (:manifest-digest entry)
-                                               (:manifest-digest user-entry))
-                                          :agree
-                                          :divergent)))))
-                           project-described)
-                     (mapv #(assoc % :cross-root :sole-user)
-                           (remove #(contains? project-by-id (:id %)) user-described))))))))
+  (manifests/discover opts manifest-file valid-id?
+    (fn [manifest]
+      (let [[capped truncated?] (cap-description (:description manifest))]
+        {:description capped :description-truncated truncated?}))))
 
 (defn- roster-lines [roster]
   (mapv (fn [{:keys [id description]}] (str id ": " description)) roster))
@@ -557,7 +501,7 @@
       (fail! :skill-not-found {:skill_id id})
 
       (or (nil? project-info) (nil? user-info)
-          (= (:manifest-digest project-info) (:manifest-digest user-info)))
+          (manifests/same-digest? project-info user-info))
       (fail! :skill-approval-unneeded {:skill_id id})
 
       :else

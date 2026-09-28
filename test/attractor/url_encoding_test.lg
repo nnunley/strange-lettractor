@@ -1,0 +1,36 @@
+(ns attractor.url-encoding-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [attractor.auth :as auth] [attractor.mcp :as mcp]
+            [attractor.credentials.google :as google]))
+
+(defn captured-value [field invoke]
+  (let [body (atom nil)
+        transport (fn [request]
+                    (reset! body (:body request))
+                    {:status 200 :body "{\"access_token\":\"fixture\",\"expires_in\":3600,\"token_type\":\"Bearer\"}"})]
+    (invoke transport)
+    (some (fn [pair]
+            (when (str/starts-with? pair (str field "="))
+              (subs pair (inc (count field)))))
+          (str/split @body #"&"))))
+
+(deftest oauth-query-and-form-values-encode-utf8-bytes
+  (doseq [[value expected] [["AZaz09-._~" "AZaz09-._~"]
+                          ["é中😀" "%C3%A9%E4%B8%AD%F0%9F%98%80"]
+                          ["a&b=c+d /%" "a%26b%3Dc%2Bd%20%2F%25"]
+                          ["\t\r\n" "%09%0D%0A"]
+                          ["" ""]]]
+    (testing (pr-str value)
+      (let [url (auth/authorization-url
+                  {:authorization-endpoint "https://fixture.invalid/authorize"
+                   :client-id value :redirect-uri "http://127.0.0.1/callback"
+                   :scope "test" :state "state" :code-challenge "challenge"})]
+        (is (= expected (second (re-find #"client_id=([^&]*)" url)))))
+      (is (= expected (captured-value "code"
+                        #(auth/exchange-code % "https://fixture.invalid/token" value
+                           "http://127.0.0.1/callback" "client" "verifier"))))
+      (is (= expected (captured-value "refresh_token"
+                        #(mcp/refresh-access-token % "https://fixture.invalid/token" "client" value))))
+      (is (= expected (captured-value "refresh_token"
+                        #(google/refresh! % {:client-id "client" :client-secret "secret"} value [])))))))

@@ -9,6 +9,7 @@
    in the OS keychain (never files, logs, evidence, shell history, or
    argv). Every failure is fail-closed with an :auth-* category."
   (:require [clojure.string :as str]
+            [attractor.url :as url]
             [clojure.core :as core]
             [json :as json]
             [hash :as hash]
@@ -25,18 +26,6 @@
 
 (defn- non-blank-string? [value]
   (and (string? value) (not (str/blank? value))))
-
-(defn- url-encode [text]
-  (let [safe? (fn [character]
-                (or (and (<= (int \a) (int character)) (<= (int character) (int \z)))
-                    (and (<= (int \A) (int character)) (<= (int character) (int \Z)))
-                    (and (<= (int \0) (int character)) (<= (int character) (int \9)))
-                    (contains? #{\- \_ \. \~} character)))]
-    (apply str (map (fn [character]
-                      (if (safe? character)
-                        (str character)
-                        (format "%%%02x" (int character))))
-                    (str text)))))
 
 (defn- percent-decode [text]
   (let [hex-value (fn [character]
@@ -132,16 +121,16 @@
   [{:keys [authorization-endpoint client-id redirect-uri scope state code-challenge
            access-type prompt]}]
   (let [required [(str "response_type=code")
-                  (str "client_id=" (url-encode client-id))
-                  (str "redirect_uri=" (url-encode redirect-uri))
-                  (str "scope=" (url-encode scope))
-                  (str "state=" (url-encode state))
-                  (str "code_challenge=" (url-encode code-challenge))
+                  (str "client_id=" (url/encode-component client-id))
+                  (str "redirect_uri=" (url/encode-component redirect-uri))
+                  (str "scope=" (url/encode-component scope))
+                  (str "state=" (url/encode-component state))
+                  (str "code_challenge=" (url/encode-component code-challenge))
                   "code_challenge_method=S256"]
         optional (concat (when (some? access-type)
-                           [(str "access_type=" (url-encode access-type))])
+                           [(str "access_type=" (url/encode-component access-type))])
                          (when (some? prompt)
-                           [(str "prompt=" (url-encode prompt))]))]
+                           [(str "prompt=" (url/encode-component prompt))]))]
     (str authorization-endpoint
          (if (str/includes? (str authorization-endpoint) "?") "&" "?")
          (str/join "&" (concat required optional)))))
@@ -378,12 +367,12 @@
    Callers enforce single-use per code."
   [transport token-endpoint code redirect-uri client-id code-verifier & [opts]]
   (let [form (str "grant_type=authorization_code"
-                  "&code=" (url-encode code)
-                  "&redirect_uri=" (url-encode redirect-uri)
-                  "&client_id=" (url-encode client-id)
-                  "&code_verifier=" (url-encode code-verifier)
+                  "&code=" (url/encode-component code)
+                  "&redirect_uri=" (url/encode-component redirect-uri)
+                  "&client_id=" (url/encode-component client-id)
+                  "&code_verifier=" (url/encode-component code-verifier)
                   (when (non-blank-string? (:client-secret opts))
-                    (str "&client_secret=" (url-encode (:client-secret opts)))))
+                    (str "&client_secret=" (url/encode-component (:client-secret opts)))))
         response (bounded-call
                    transport
                    {:method :post :url token-endpoint

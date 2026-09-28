@@ -10,6 +10,8 @@
    evidence carries digests and redaction flags, never secret values.
    Every failure is fail-closed with an :mcp-* category."
   (:require [attractor.auth :as auth]
+            [attractor.url :as url]
+            [attractor.manifests :as manifests]
             [attractor.text :as text]
              [attractor.context-discovery :as capacity]
             [attractor.ids :as ids]
@@ -301,49 +303,21 @@
 ;; Resolution with sticky approvals.
 ;; ---------------------------------------------------------------------------
 
-(defn- approval-matches? [approval project-info user-info]
-  (and (map? approval)
-       (contains? #{"project" "user"} (:winning-root approval))
-       (= (:project-digest approval) (:manifest-digest project-info))
-       (= (:user-digest approval) (:manifest-digest user-info))))
-
 (defn- resolve-one [id roots read-text file-exists approvals]
   (let [project-info (manifest-info (:project-root roots) id read-text file-exists)
-        user-info (manifest-info (:user-root roots) id read-text file-exists)]
-    (cond (and (nil? project-info) (nil? user-info))
-          (fail! :mcp-not-found {:server_id id})
-
-          (nil? user-info)
-          {:manifest (:manifest project-info)
-           :manifest-digest (:manifest-digest project-info)
-           :root "project" :cross-root :sole-project :approval nil}
-
-          (nil? project-info)
-          {:manifest (:manifest user-info)
-           :manifest-digest (:manifest-digest user-info)
-           :root "user" :cross-root :sole-user :approval nil}
-
-          (= (:manifest-digest project-info) (:manifest-digest user-info))
-          {:manifest (:manifest project-info)
-           :manifest-digest (:manifest-digest project-info)
-           :root "project" :cross-root :agree :approval nil}
-
-          :else
-          (let [approval (get approvals id)]
-            (if (approval-matches? approval project-info user-info)
-              (let [winner (if (= "user" (:winning-root approval)) user-info project-info)
-                    loser (if (= "user" (:winning-root approval)) project-info user-info)]
-                {:manifest (:manifest winner)
-                 :manifest-digest (:manifest-digest winner)
-                 :root (:winning-root approval)
-                 :cross-root :approved
-                 :loser-digest (:manifest-digest loser)
-                 :approval {id approval}})
-              (fail! :mcp-cross-root-conflict
-                     {:server_id id
-                      :project-digest (:manifest-digest project-info)
-                      :user-digest (:manifest-digest user-info)
-                      :hint "Record a sticky approval naming winning-root plus both digests."}))))))
+        user-info (manifest-info (:user-root roots) id read-text file-exists)
+        {:keys [status winner root cross-root loser-digest approval]}
+        (manifests/select-root project-info user-info (get approvals id))]
+    (case status
+      :missing (fail! :mcp-not-found {:server_id id})
+      :conflict (fail! :mcp-cross-root-conflict
+                      {:server_id id
+                       :project-digest (:manifest-digest project-info)
+                       :user-digest (:manifest-digest user-info)
+                       :hint "Record a sticky approval naming winning-root plus both digests."})
+      (cond-> (assoc winner :root root :cross-root cross-root
+                     :approval (when approval {id approval}))
+        approval (assoc :loser-digest loser-digest)))))
 
 (defn propose-approval
   "Build the sticky approval entry for a cross-root-divergent server id
@@ -365,7 +339,7 @@
             (fail! :mcp-not-found {:server_id id})
 
             (or (nil? project-info) (nil? user-info)
-                (= (:manifest-digest project-info) (:manifest-digest user-info)))
+                (manifests/same-digest? project-info user-info))
             (fail! :mcp-approval-unneeded {:server_id id})
 
             :else
@@ -376,38 +350,12 @@
 (defn discover
   "Best-effort roster of declared servers across both roots for operators."
   [opts]
-  (let [{:keys [project-root user-root read-text list-dir]} opts]
-    (if (nil? list-dir)
-      []
-      (let [entries-for
-            (fn [root root-name]
-              (if (or (nil? root) (str/blank? root))
-                []
-                (mapv (fn [id] {:id id :root root :root-name root-name})
-                      (sort (filter valid-id? (or (list-dir root) []))))))
-            describe
-            (fn [{:keys [id root root-name]}]
-              (try
-                (let [text (read-or-nil read-text (str root "/" id "/" manifest-file))]
-                  (when (some? text)
-                    (let [manifest (edn/read-string text)]
-                      (when (and (map? manifest)
-                                 (= id (:id manifest))
-                                 (non-blank-string? (:description manifest)))
-                        {:id id
-                         :revision (str (:revision manifest))
-                         :description (:description manifest)
-                         :endpoint (when (:endpoint manifest) (str (:endpoint manifest)))
-                         :command (:command manifest)
-                         :stdio (contains? #{:stdio "stdio"} (:transport manifest))
-                         :manifest-digest (hash/sha256 text)
-                         :root root-name}))))
-                (catch Object _ nil)))
-            project-described (vec (keep describe (entries-for project-root "project")))
-            project-ids (into #{} (map :id project-described))
-            user-described (vec (keep describe (entries-for user-root "user")))]
-        (vec (concat project-described
-                     (remove #(contains? project-ids (:id %)) user-described)))))))
+  (mapv #(dissoc % :cross-root)
+        (manifests/discover opts manifest-file valid-id?
+          (fn [manifest]
+            {:endpoint (when (:endpoint manifest) (str (:endpoint manifest)))
+             :command (:command manifest)
+             :stdio (contains? #{:stdio "stdio"} (:transport manifest))}))))
 
 (defn find-manifest
   "Locate and validate one server manifest across both roots. Returns
@@ -420,7 +368,7 @@
     (cond (and (nil? project-info) (nil? user-info)) nil
           (nil? user-info) (assoc project-info :root "project")
           (nil? project-info) (assoc user-info :root "user")
-          (= (:manifest-digest project-info) (:manifest-digest user-info))
+          (manifests/same-digest? project-info user-info)
           (assoc project-info :root "project" :cross-root :agree)
           :else (assoc project-info :root "project" :cross-root :divergent))))
 
@@ -469,24 +417,8 @@
 ;; Token refresh and dynamic registration (memory only, never persisted).
 ;; ---------------------------------------------------------------------------
 
-(defn- url-encode [text]
-  (-> (str text)
-      (str/replace "%" "%25")
-      (str/replace "&" "%26")
-      (str/replace "=" "%3D")
-      (str/replace "+" "%2B")
-      (str/replace " " "%20")
-      (str/replace "/" "%2F")
-      (str/replace ":" "%3A")
-      (str/replace "?" "%3F")
-      (str/replace "#" "%23")
-      (str/replace "@" "%40")
-      (str/replace "[" "%5B")
-      (str/replace "]" "%5D")
-      (str/replace "\"" "%22")))
-
 (defn- form-body [pairs]
-  (str/join "&" (map (fn [[key value]] (str (url-encode key) "=" (url-encode value)))
+  (str/join "&" (map (fn [[key value]] (str (url/encode-component key) "=" (url/encode-component value)))
                      pairs)))
 
 (defn refresh-access-token

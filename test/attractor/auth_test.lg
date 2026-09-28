@@ -249,7 +249,7 @@
                 :timeout-ms 8000
                 :pkce-run (fn [_] "fake-challenge")
                 :on-url (fn [url]
-                          (let [port (parse-long (second (re-find #"127\.0\.0\.1%3a(\d+)" url)))
+                          (let [port (parse-long (second (re-find #"(?i)127\.0\.0\.1%3a(\d+)" url)))
                                 state (second (re-find #"state=([^&\s]+)" url))
                                 connection (net/dial "127.0.0.1" port)]
                             (net/write! connection
@@ -305,7 +305,7 @@
                                    true)
                 :on-url (fn [url]
                           (reset! auth-url url)
-                          (let [port (parse-long (second (re-find #"127\.0\.0\.1%3a(\d+)" url)))
+                          (let [port (parse-long (second (re-find #"(?i)127\.0\.0\.1%3a(\d+)" url)))
                                 state (second (re-find #"state=([^&\s]+)" url))
                                 connection (net/dial "127.0.0.1" port)]
                             (net/write! connection
@@ -358,7 +358,7 @@
                  :pkce-run (fn [_] "fake-challenge")
                  :validate-tokens (fn [_] (throw (ex-info "reject tok-refresh" {})))
                  :on-url (fn [url]
-                           (let [p (parse-long (second (re-find #"127\.0\.0\.1%3a(\d+)" url)))
+                           (let [p (parse-long (second (re-find #"(?i)127\.0\.0\.1%3a(\d+)" url)))
                                  state (second (re-find #"state=([^&\s]+)" url))
                                  connection (net/dial "127.0.0.1" p)]
                              (reset! port p)

@@ -120,3 +120,26 @@ zero failures**, exit 0. The shared registration matrix first reproduced eight
 failures before the fix; its final four tests / 49 assertions pass. Source and
 coverage reviews passed, as did `lgx run main.lg help`. Full output is retained
 locally at `/tmp/attractor-consolidation-full.log`.
+
+## Shared protocol and manifest helpers
+
+The follow-up consolidation routes auth query values, authorization-code forms,
+MCP refresh forms, and Google credential values through `attractor.url`.
+`url_encoding_test.lg` checks their actual outgoing values against the same
+UTF-8 byte-encoding cases, including multibyte text, reserved separators, and
+control characters. Escapes use uppercase hexadecimal; callback fixtures
+accept either case. Google retains its public `encode` entry point as a delegate.
+
+`attractor.manifests` owns root selection, digest-bound approval matching, and
+best-effort discovery. Skills and MCP still own validation, admission, error
+categories, and evidence shapes; both roots are loaded before selection. Their
+integration tests remain, including the MCP discovery shape/precedence case.
+`attractor.reasoning` owns effort normalization, while session and native-adapter
+entry points still validate independently. Repeated live-result introductions
+now link to [canonical provider evidence](provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+
+Follow-up verification on 2026-09-28: `lgx suite` passed **1,596 tests /
+14,332 assertions, zero failures**, exit 0. The encoding regression first failed
+nine assertions against the old implementations and now passes all 20 outgoing
+value checks. Both independent reviews passed. Full output is retained locally
+at `/tmp/attractor-consolidation-followup-full.log`.

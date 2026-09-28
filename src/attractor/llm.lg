@@ -8,6 +8,7 @@
             [http :as http]
             [attractor.context-discovery :as capacity]
             [attractor.models :as models]
+            [attractor.reasoning :as reasoning]
             [attractor.providers :as providers]
             [attractor.schema.dialects :as schema-dialects]
             [attractor.schema.resources :as schema-resources]
@@ -863,19 +864,6 @@
     (and (map? m) (contains? m (name k))) (get m (name k))
     :else nil))
 
-(defn- portable-reasoning-effort [request]
-  (when (some? (:reasoning_effort request))
-    (let [value (:reasoning_effort request)
-          normalized (str/lower-case
-                       (if (keyword? value) (name value) (str value)))]
-      (when-not (contains? #{"low" "medium" "high"} normalized)
-        (throw
-          (ex-info (str "Invalid reasoning_effort: " value)
-                   {:category :invalid-reasoning-effort
-                    :reasoning_effort value
-                    :valid_values ["low" "medium" "high"]})))
-      normalized)))
-
 (defn- portable-warning [provider parameter]
   {:message (str provider " does not support the portable " parameter
                  " request parameter; it was omitted")
@@ -998,7 +986,7 @@
 (defn- gemini-generation-config [request]
   (let [format (:response_format request)
         format-type (field format :type)
-        effort (portable-reasoning-effort request)
+        effort (reasoning/normalize-effort (:reasoning_effort request))
         budget (gemini-25-thinking-budget (:model request) effort)]
     (cond-> {}
       (some? (:temperature request))
@@ -1298,7 +1286,7 @@
 
 (defn- openai-request-data [request api-key base-url]
   (let [key (request-api-key request api-key "OPENAI_API_KEY")
-        effort (portable-reasoning-effort request)
+        effort (reasoning/normalize-effort (:reasoning_effort request))
         url (resolve-openai-url (or base-url (:base_url request)))
         messages (or (:messages request) [])
         instructions (str/join "\n\n"
@@ -1386,7 +1374,7 @@
   (let [key (request-api-key request api-key "ANTHROPIC_API_KEY")
         model-info (models/get-model-info (:model request))
         adaptive? (= :adaptive (:reasoning_mode model-info))
-        effort (portable-reasoning-effort request)
+        effort (reasoning/normalize-effort (:reasoning_effort request))
         url (resolve-anthropic-url (or base-url (:base_url request)))
         system-messages (filter (fn [m]
                                   (or (= (:role m) :system)

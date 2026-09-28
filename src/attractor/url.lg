@@ -1,0 +1,14 @@
+(ns attractor.url
+  "UTF-8 percent encoding for query and form component values.")
+
+(defn encode-component
+  "Leave ASCII unreserved bytes intact; encode every other UTF-8 byte.
+   Spaces use %20 (valid in both query components and form values)."
+  [value]
+  (apply str
+    (map (fn [byte]
+           (if (or (<= 65 byte 90) (<= 97 byte 122) (<= 48 byte 57)
+                   (contains? #{45 46 95 126} byte))
+             (str (char byte))
+             (format "%%%02X" byte)))
+         (bytes (str value)))))

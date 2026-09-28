@@ -4,6 +4,7 @@
             [io :as io]
             [json :as json]
             [attractor.llm :as llm]
+            [attractor.reasoning :as reasoning]
             [attractor.context-discovery :as capacity]
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
@@ -270,18 +271,6 @@
     (str "Unknown tool: " tool-name)))
 
 ;; Create an Agent Session
-(defn- validated-reasoning-effort [value]
-  (when (some? value)
-    (let [normalized (str/lower-case
-                       (if (keyword? value) (name value) (str value)))]
-      (when-not (contains? #{"low" "medium" "high"} normalized)
-        (throw
-          (ex-info (str "Invalid reasoning_effort: " value)
-                   {:category :invalid-reasoning-effort
-                    :reasoning_effort value
-                    :valid_values ["low" "medium" "high"]})))
-      normalized)))
-
 (defn make-session [& [opts]]
   (let [options (or opts {})
         _capacity-config
@@ -292,7 +281,7 @@
                                  (<= 1 (:context_discovery_timeout_ms options) 60000)))))
           (throw (ex-info "Invalid context capacity or discovery time budget"
                           {:category :configuration})))
-        reasoning-effort (validated-reasoning-effort
+        reasoning-effort (reasoning/normalize-effort
                            (:reasoning_effort options))
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
         base-profile (or (:provider_profile options)
@@ -446,7 +435,7 @@
       session)))
 
 (defn set-reasoning-effort! [session value]
-  (let [effort (validated-reasoning-effort value)]
+  (let [effort (reasoning/normalize-effort value)]
     (with-session-lock
       session
       (fn []

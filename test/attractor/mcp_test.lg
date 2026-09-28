@@ -1220,3 +1220,20 @@
                        (get-in @session [:provider_profile :tool_registry]) "demo__update")))
           (finally (agent/close-session! session))))
       (finally (os/setenv "MCP_TEST_TOKEN" (or previous ""))))))
+
+(deftest discovery-keeps-project-precedence-and-falls-back-from-invalid-entries
+  (let [project (pr-str {:id "shared" :revision 1 :description "project" :endpoint "https://p.example"})
+        user (pr-str {:id "shared" :revision 2 :description "user"})
+        fallback (pr-str {:id "fallback" :revision 3 :description "fallback" :transport :stdio :command ["server"]})
+        files {"p/shared/mcp.edn" project "u/shared/mcp.edn" user
+               "p/fallback/mcp.edn" "not-edn[" "u/fallback/mcp.edn" fallback}
+        opts {:project-root "p" :user-root "u" :read-text #(get files %)
+              :list-dir (fn [_] ["shared" "fallback" "../invalid" "unreadable"])}]
+    (is (= [{:id "shared" :revision "1" :description "project"
+             :endpoint "https://p.example" :command nil :stdio false
+             :manifest-digest (hash/sha256 project) :root "project"}
+            {:id "fallback" :revision "3" :description "fallback"
+             :endpoint nil :command ["server"] :stdio true
+             :manifest-digest (hash/sha256 fallback) :root "user"}]
+           (mcp/discover opts)))
+    (is (= [] (mcp/discover (assoc opts :list-dir nil))))))
