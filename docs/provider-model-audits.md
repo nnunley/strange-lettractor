@@ -10,7 +10,7 @@ model and supported native-style protocol; their evidence is labeled gateway. `A
 available rows, model, protocol, endpoint and first-party/gateway origin. In-progress
 snapshots and missing credentials cannot become completed evidence.
 
-Current live evidence is partial:
+First-party live evidence remains partial; gateway follow-ups are recorded below:
 
 - **Anthropic / `claude-fable-5-1`: 15/15 parity rows across two runs.** Initial
   report `evidence/coding-conformance-1790548362398.edn` passed 13 rows. Parallel
@@ -64,6 +64,39 @@ full run. The final smoke is one retained-session 7/7 pass. Evidence records
 `:protocol :openai-responses`, endpoint `https://openrouter.ai/api/v1` and
 `:origin :gateway`; direct first-party OpenAI live access is not claimed.
 
+Anthropic-family checks now also have OpenRouter Messages evidence:
+
+```sh
+ATTRACTOR_CONFIG=test/live/openrouter_protocols.edn \
+ATTRACTOR_CODING_PROVIDERS=or-messages \
+ATTRACTOR_OR_MESSAGES_MODEL=anthropic/claude-haiku-4.5 \
+lgx live-coding-conformance
+```
+
+Report `evidence/coding-conformance-1790553400499.edn` passed **14/15 parity
+rows and all seven strengthened same-session smoke steps**. Steering parity
+failed because Haiku asked for clarification before making any tool call. An
+unchanged targeted rerun (`1790553772058`) reproduced that response. The prompt
+now supplies explicit `write_file` arguments and tells the model to make the
+first call before following the next user instruction. Injection, proof checks
+and exact file assertions are unchanged. Targeted report
+`evidence/coding-conformance-1790553802491.edn` passes steering with injected
+instructions, native continuation and verified files (`:aggregate_status
+:complete`, exit 0 for that single-row scope).
+
+Combined Messages/Haiku parity coverage is **15/15 across initial and targeted
+runs**, not a single clean full run. The initial smoke is a single retained-session
+**7/7 pass**, including child-owned tests that reject both output-removal mutants
+and observed ten-second timeout recovery. Evidence records `:protocol
+:anthropic-messages`, endpoint `https://openrouter.ai/api/v1` and `:origin :gateway`.
+This supplies Anthropic-family smoke coverage through OpenRouter; the earlier
+first-party Anthropic quota result remains unchanged. The sandbox-only attempt
+(`1790552770436`) failed DNS resolution and is excluded from provider evidence.
+
+After the prompt clarification, the fresh named audit passed **261 tests /
+2530 assertions, zero failures or errors**, exit 0
+(`/tmp/attractor-or-messages-audit.log`).
+
 The same-session smoke is now implemented in
 `test/live/coding_smoke_journey.lg`, with deterministic proof controls in
 `test/attractor/coding_smoke_journey_test.lg`. It checks one retained session,
@@ -92,7 +125,9 @@ the new live-conformance and smoke proof namespaces. The earlier full-suite
 
 All three model families now have fifteen-row live coverage across the recorded
 runs: first-party Anthropic and Gemini, and OpenAI through OpenRouter Responses.
-This is not 45 first-party live cells or three passing live smokes: Anthropic
+All three model families also have seven-step smoke passes: first-party Gemini,
+OpenRouter Responses/OpenAI, and OpenRouter Messages/Anthropic. This is not
+45 first-party live cells or three first-party smoke passes: direct Anthropic
 smoke stopped at quota exhaustion. First-party OpenAI wire evidence remains
 accepted, and the user-requested gateway run supplies additional live proof. Generated
 reports are local evidence; reproducible test/runner source belongs in Git.

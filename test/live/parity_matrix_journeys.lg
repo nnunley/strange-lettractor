@@ -179,7 +179,7 @@
     :prompt "In one assistant turn, call write_file twice in parallel: create parallel-a.txt with exactly alpha and parallel-b.txt with exactly beta, both with no trailing newline. Wait for both successful results."
     :proof-check checks/parallel-evidence}
    {:row :steering
-    :prompt "Create steering-first.txt with exactly before and no trailing newline, then create a second file as instructed at the next tool boundary."
+    :prompt "First call write_file with file_path=\"steering-first.txt\" and content=\"before\" (six ASCII characters, no trailing newline). Make that call now without asking for clarification. After its tool result, follow the next user instruction to create the second file."
     :proof-check checks/steering-evidence}
    {:row :reasoning-change
     :prompt "Call write_file with file_path=\"reasoning.txt\" and content=\"changed\" (seven ASCII characters, no trailing newline). Continue after the tool result."

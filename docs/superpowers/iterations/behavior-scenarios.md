@@ -1,5 +1,12 @@
 # Behavior Scenarios
 
+OpenRouter Messages follow-up (2026-09-27): `anthropic/claude-haiku-4.5`
+passes 7/7 strengthened same-session smoke steps in report `1790553400499`.
+Parity covers 15/15 across that initial 14-row pass and steering rerun
+`1790553802491`, after clarifying the first write call; assertions are unchanged.
+This is gateway evidence. First-party Anthropic's quota-limited smoke remains
+historical partial evidence. See [current provider results](../../provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
+
 OpenRouter follow-up: user-requested `or-responses/openai/gpt-5.2` checks use
 the OpenAI Responses adapter/profile with gateway provenance. Combined parity
 coverage is 15/15 across initial, targeted and final runs; the final strengthened
