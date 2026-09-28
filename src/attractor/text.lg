@@ -1,0 +1,13 @@
+(ns attractor.text
+  "Shared byte-safe text operations.")
+
+(defn utf8-prefix [text max-bytes]
+  ;; Binary-search character boundaries rather than slicing encoded bytes.
+  ;; A rune can consume more than one byte; the resulting prefix stays valid UTF-8.
+  (loop [low 0 high (min (count text) (max 0 max-bytes))]
+    (if (= low high)
+      (subs text 0 low)
+      (let [middle (quot (+ low high 1) 2)]
+        (if (<= (count (bytes (subs text 0 middle))) max-bytes)
+          (recur middle high)
+          (recur low (dec middle)))))))

@@ -1988,6 +1988,43 @@
     (is (= "google-key"
            (get-in client [:providers "gemini" :options :api_key])))))
 
+(deftest test-high-level-request-preparation-preserves-api-option-boundaries
+  ;; Retry options historically reach completion adapters, but streaming owns
+  ;; them itself. Consolidating input preparation must preserve this boundary.
+  (doseq [stream? [false true]]
+    (let [captured (atom nil)
+          response {:message {:role :assistant :content "Done"}
+                    :tool_calls [] :usage {} :finish_reason :stop}
+          adapter (llm/make-adapter
+                    "mock"
+                    (fn [request] (reset! captured request) response)
+                    (fn [request]
+                      (reset! captured request)
+                      [{:type :finish :finish_reason :stop
+                        :usage {} :response response}]))
+          client (llm/make-client {:providers {"mock" adapter}
+                                  :default_provider "mock"})
+          options {:client client :prompt "From options" :system "Be precise"
+                   :temperature 0.25 :max_tool_rounds 2
+                   :stop_when (fn [_] false)
+                   :repair_tool_call (fn [_] nil)
+                   :retry_policy {:base_delay 0.0} :max_retries 0}]
+      (if stream?
+        (doall (:events (llm/stream "native-model" nil options)))
+        (llm/generate "native-model" nil options))
+      (is (= "native-model" (:model @captured)))
+      (is (= [{:role :system :content "Be precise"}
+              {:role :user :content "From options"}]
+             (:messages @captured)))
+      (is (= 0.25 (:temperature @captured)))
+      (doseq [key [:client :prompt :system :max_tool_rounds :stop_when :repair_tool_call]]
+        (is (not (contains? @captured key))))
+      (if stream?
+        (do (is (not (contains? @captured :retry_policy)))
+            (is (not (contains? @captured :max_retries))))
+        (do (is (= {:base_delay 0.0} (:retry_policy @captured)))
+            (is (= 0 (:max_retries @captured))))))))
+
 (deftest test-high-level-generate-standardizes-input-and-result
   (let [captured (atom nil)
         adapter (llm/make-adapter

@@ -67,15 +67,8 @@
         diags (v/validate g)]
     (is (some (fn [d] (and (= (:rule d) "reachability") (= (:severity d) :error))) diags))))
 
-;; Parity Matrix Case 7: Execute a linear 3-node pipeline end-to-end
-(deftest test-parity-07-execute-linear
-  (let [dot "digraph G { start [shape=Mdiamond] mid [shape=box] exit [shape=Msquare] start -> mid -> exit }"
-        g (p/parse-dot dot)
-        logs (test-logs "07")
-        res (e/run-pipeline g {:logs-root logs})]
-    (is (= :success (:status res)))
-    (is (= ["start" "mid" "exit"] (:completed_nodes res)))
-    ))
+;; Parity case 7: engine-test/test-linear-pipeline-execution owns this
+;; scenario, including status-artifact verification.
 
 ;; Parity Matrix Case 8: Execute with conditional branching (success/fail paths)
 (deftest test-parity-08-conditional-branching
@@ -122,54 +115,9 @@
     (is (= 3 @attempts))
     ))
 
-;; Parity Matrix Case 10 & 11: Goal gate blocks exit when unsatisfied and allows when satisfied
-(deftest test-parity-10-11-goal-gates
-  (let [dot "digraph G {
-    start [shape=Mdiamond]
-    work  [shape=box, goal_gate=true, retry_target=\"fix\"]
-    fix   [shape=box]
-    exit  [shape=Msquare]
-
-    start -> work -> exit
-    fix -> work
-}"
-        g (p/parse-dot dot)
-        visits (atom 0)
-        backend (fn [node _ _]
-                  (if (= (:id node) "work")
-                    (let [v (swap! visits inc)]
-                      (if (= v 1) {:status :fail} {:status :success}))
-                    {:status :success}))
-        reg (h/make-handler-registry (i/make-auto-approve-interviewer) backend)
-        logs (test-logs "10-11")
-        res (e/run-pipeline g {:registry reg :logs-root logs})]
-    (is (= :success (:status res)))
-    (is (= ["start" "work" "fix" "work" "exit"] (:completed_nodes res)))
-    ))
-
-;; Parity Matrix Case 12: Wait.human presents choices and routes on selection
-(deftest test-parity-12-wait-human
-  (let [dot "digraph G {
-    start [shape=Mdiamond]
-    gate  [shape=hexagon, type=\"wait.human\", label=\"Approval\"]
-    a     [shape=box]
-    b     [shape=box]
-    exit  [shape=Msquare]
-
-    start -> gate
-    gate -> a [label=\"[A] Choice A\"]
-    gate -> b [label=\"[B] Choice B\"]
-    a -> exit
-    b -> exit
-}"
-        g (p/parse-dot dot)
-        q (i/make-queue-interviewer [{:value "A" :text "Choice A"}])
-        reg (h/make-handler-registry q nil)
-        logs (test-logs "12")
-        res (e/run-pipeline g {:registry reg :logs-root logs})]
-    (is (= :success (:status res)))
-    (is (= ["start" "gate" "a" "exit"] (:completed_nodes res)))
-    ))
+;; Parity cases 10/11: engine-test/test-goal-gate-enforcement.
+;; Parity case 12: engine-test/test-human-gate-selection covers both A and B.
+;; These map to existing tests rather than rerunning the same scenarios here.
 
 ;; Parity Matrix Case 13: Edge selection: condition match wins over weight
 (deftest test-parity-13-condition-wins-over-weight

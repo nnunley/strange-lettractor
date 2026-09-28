@@ -10,6 +10,7 @@
    evidence carries digests and redaction flags, never secret values.
    Every failure is fail-closed with an :mcp-* category."
   (:require [attractor.auth :as auth]
+            [attractor.text :as text]
              [attractor.context-discovery :as capacity]
             [attractor.ids :as ids]
             [attractor.mcp-client :as mcp-client]
@@ -527,30 +528,18 @@
                         (get body "refresh_token"))})))
 
 (defn perform-registration
-  "Perform dynamic client registration against a public-client endpoint.
-   Returns {:client-id}. Fails closed with :auth-registration-conflict
-   when the server issues a secret against auth method none: the value
-   is NEVER returned or stored by the harness."
+  "Register caller-supplied public-client metadata using the bounded auth
+   transport (15s default), preserving MCP failure categories."
   [transport registration-endpoint client-metadata]
-  (let [response (try
-                   (transport {:method :post :url registration-endpoint
-                               :headers {"content-type" "application/json"
-                                         "accept" "application/json"}
-                               :body (json/write-json client-metadata)})
-                   (catch Object _
-                     (fail! :mcp-protocol-error {:reason :registration-transport-failed})))]
-    (when-not (contains? #{200 201} (:status response))
-      (fail! :mcp-protocol-error {:reason :registration-rejected
-                                 :status (:status response)}))
-    (let [body (try (json/read-json (str (:body response)))
-                    (catch Object _
-                      (fail! :mcp-protocol-error {:reason :registration-malformed})))]
-      (when-not (non-blank-string? (get body "client_id"))
-        (fail! :mcp-protocol-error {:reason :registration-without-client-id}))
-      (when (non-blank-string? (get body "client_secret"))
-        (fail! :auth-registration-conflict
-               {:reason :server-issued-secret-for-public-client}))
-      {:client-id (get body "client_id")})))
+  (try
+    (auth/register-public-client transport registration-endpoint client-metadata)
+    (catch Object error
+      (let [data (ex-data error)]
+        (case (:category data)
+          :auth-registration-conflict (throw error)
+          :auth-registration-failed
+          (fail! :mcp-protocol-error (select-keys data [:reason :status]))
+          (fail! :mcp-protocol-error {:reason :registration-transport-failed}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Result text, labels, and audit.
@@ -587,14 +576,6 @@
        "\" provenance=\"externally-supplied\">\n"
        (escape-label-text text) "\n</mcp>"))
 
-(defn- utf8-prefix [text max-bytes]
-  (loop [low 0 high (min (count text) (max 0 max-bytes))]
-    (if (= low high)
-      (subs text 0 low)
-      (let [middle (quot (+ low high 1) 2)]
-        (if (<= (count (bytes (subs text 0 middle))) max-bytes)
-          (recur middle high)
-          (recur low (dec middle)))))))
 
 (defn- truncate-output [text max-bytes]
   (let [size (count (bytes (str text)))]
@@ -602,7 +583,7 @@
       {:text (str text) :truncated false}
       (let [marker (str "\n" result-truncation-marker)
             room (max 0 (- max-bytes (count (bytes marker))))]
-        {:text (str (utf8-prefix (str text) room) marker)
+        {:text (str (text/utf8-prefix (str text) room) marker)
          :truncated true}))))
 
 (defn- audit-entry [base]

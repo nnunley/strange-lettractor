@@ -394,29 +394,6 @@
 ;; Registration, guidance, lookup, approvals, session integration.
 ;; ---------------------------------------------------------------------------
 
-(deftest perform-registration-returns-client-id-never-secret
-  (let [calls (atom [])
-        transport (fn [request]
-                    (swap! calls conj request)
-                    {:status 201 :headers {"content-type" "application/json"}
-                     :body (json/write-json {:client_id "cid-1"})})
-        result (mcp/perform-registration
-                 transport "https://api.example/register" {:client_name "t"})]
-    (is (= "cid-1" (:client-id result)))
-    (is (= 1 (count @calls)))
-    (is (not (str/includes? (pr-str result) "shh"))))
-  (testing "secret-issuing server fails closed without returning the value"
-    (let [err (try (mcp/perform-registration
-                     (fn [_] {:status 201 :headers {"content-type" "application/json"}
-                              :body (json/write-json {:client_id "cid-1" :client_secret "shh"})})
-                     "https://api.example/register" {})
-                   (catch Object e e))]
-      (is (= :auth-registration-conflict (:category (ex-data err))))))
-  (let [err (try (mcp/perform-registration
-                   (fn [_] {:status 400 :headers {} :body "no"})
-                   "https://api.example/register" {})
-                 (catch Object e e))]
-    (is (= :mcp-protocol-error (:category (ex-data err))))))
 (deftest authorize-guidance-names-endpoint-scope-and-exports
   (let [m (assoc (manifest-for "demo" "https://m.example/mcp" [(query-tool)])
                  :authorization-endpoint "https://api.example/authorize"

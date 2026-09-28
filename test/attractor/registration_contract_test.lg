@@ -1,0 +1,82 @@
+(ns attractor.registration-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.core :as core] [clojure.string :as str]
+            [json :as json] [attractor.auth :as auth] [attractor.mcp :as mcp]))
+
+(def callers
+  [{:name :auth :failure :auth-registration-failed :transport-error :auth-transport-error
+    :register (fn [transport] (auth/register-client transport "https://fixture.invalid/register"
+                                                   "fixture" "http://127.0.0.1/callback" "test"))}
+   {:name :mcp :failure :mcp-protocol-error :transport-error :mcp-protocol-error
+    :register (fn [transport] (mcp/perform-registration transport "https://fixture.invalid/register"
+                                                       {:client_name "fixture" :custom "preserved"}))}])
+
+(defn outcome [register response]
+  (try (register (fn [_] response)) (catch Object error (ex-data error))))
+
+(deftest registration-response-contract-for-both-callers
+  (doseq [{:keys [name register failure]} callers]
+    (testing (str name)
+      (doseq [status [200 201]]
+        (is (= {:client-id "fixture-id"}
+               (outcome register {:status status :body "{\"client_id\":\"fixture-id\"}"}))))
+      (doseq [status [204 302 400 401 429 500 503]]
+        (is (= failure (:category (outcome register
+                                   {:status status :body "{\"client_id\":\"fixture-id\"}"})))
+            (str name " must reject HTTP " status " even with a valid-looking client id")))
+      (doseq [body ["no" "[]" "{}" "{\"client_id\":\"\"}"]]
+        (is (= failure (:category (outcome register {:status 201 :body body})))))
+      (let [result (outcome register {:status 201 :body "{\"client_id\":\"fixture-id\",\"client_secret\":\"never-expose\"}"})]
+        (is (= :auth-registration-conflict (:category result)))
+        (is (not (str/includes? (pr-str result) "never-expose")))))))
+
+(deftest registration-callers-preserve-request-metadata
+  (doseq [{:keys [name register]} callers]
+    (let [requests (atom [])]
+      (register (fn [request] (swap! requests conj request)
+                  {:status 201 :body "{\"client_id\":\"fixture-id\"}"}))
+      (is (= 1 (count @requests)))
+      (is (= :post (:method (first @requests))))
+      (is (= "https://fixture.invalid/register" (:url (first @requests))))
+      (let [body (json/read-json (:body (first @requests)))]
+        (is (= (if (= name :auth)
+                 {"client_name" "fixture" "redirect_uris" ["http://127.0.0.1/callback"]
+                  "grant_types" ["authorization_code"] "response_types" ["code"]
+                  "token_endpoint_auth_method" "none" "scope" "test"}
+                 {"client_name" "fixture" "custom" "preserved"}) body))))))
+
+(deftest registration-transports-are-bounded-and-redacted
+  (doseq [{:keys [register transport-error]} callers]
+    (let [result (try (register (fn [_] (throw (ex-info "never-expose" {:token "never-expose"}))))
+                     (catch Object error (ex-data error)))]
+      (is (= transport-error (:category result)))
+      (is (not (str/includes? (pr-str result) "never-expose")))))
+  (with-redefs [auth/default-timeout-ms 5]
+    (doseq [{:keys [register transport-error]} callers]
+      (let [result (try (register (fn [_] (core/sleep 100)
+                                   {:status 201 :body "{\"client_id\":\"late-id\"}"}))
+                       (catch Object error (ex-data error)))]
+        (is (= transport-error (:category result)))))))
+
+(deftest failed-registration-stops-authorization-and-closes-listener
+  (let [urls (atom []) calls (atom []) stored (atom []) closed (atom [])
+        listener {:port 12345}]
+    (with-redefs [auth/start-listener (fn [_ _] listener)
+                  auth/close-code-listener! (fn [server] (swap! closed conj server))]
+      (let [error (try
+                    (auth/authorize
+                      (fn [request] (swap! calls conj (:url request))
+                        {:status 500 :body "{\"client_id\":\"rejected-id\"}"})
+                      "https://fixture.invalid/resource"
+                      {:authorization-endpoint "https://fixture.invalid/authorize"
+                       :token-endpoint "https://fixture.invalid/token"
+                       :registration-endpoint "https://fixture.invalid/register"}
+                      {:pkce-run (fn [_] "challenge")
+                       :on-url #(swap! urls conj %)
+                       :store {:store #(swap! stored conj %)}})
+                    (catch Object e (ex-data e)))]
+        (is (= :auth-registration-failed (:category error)))
+        (is (= ["https://fixture.invalid/register"] @calls))
+        (is (empty? @urls))
+        (is (empty? @stored))
+        (is (= [listener] @closed))))))

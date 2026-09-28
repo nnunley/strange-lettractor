@@ -1,2 +1,0 @@
-(defn handle-start [_node _context _graph _logs-root]
-  {:status :success :notes "Start node"})

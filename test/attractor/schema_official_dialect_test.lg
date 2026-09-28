@@ -1,15 +1,10 @@
 (ns attractor.schema-official-dialect-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
-            [json :as json]
-            [attractor.schema.trusted-metas :as trusted]
-            [attractor.llm :as llm]))
+            [attractor.schema-official-fixtures :as fixtures]
+            [attractor.schema.trusted-metas :as trusted]))
 
-(def fixture-root "test/fixtures/json-schema/mandatory2020-12/")
 (def dialect "https://json-schema.org/draft/2020-12/schema")
-(defn- fixture [path] (json/read-json (slurp (str fixture-root path))))
-(defn- remote [uri]
-  (fixture (str "remotes/" (second (re-find #"/draft2020-12/(.+)$" uri)))))
 
 (defn- references-standard-meta? [document]
   (cond
@@ -24,24 +19,18 @@
     :else false))
 
 (deftest all-mandatory-draft2020-12-cases
-  (let [manifest (fixture "registries.json")
+  (let [manifest (fixtures/fixture "mandatory2020-12/registries.json")
         count-cases (atom 0)]
     (doseq [[filename registries] manifest]
-      (let [groups (fixture (str "tests/" filename))]
+      (let [groups (fixtures/corpus filename)]
         (is (= (count groups) (count registries)) filename)
-        (doseq [[index group] (map-indexed vector groups)
-                example (get group "tests")]
-          (let [remotes (into {} (map (fn [uri] [uri (remote uri)])
+        (doseq [[index group] (map-indexed vector groups)]
+          (let [remotes (into {} (map (fn [uri] [uri (fixtures/remote uri)])
                                       (get registries index)))
                 meta-needed? (or (references-standard-meta? (get group "schema"))
                                  (some references-standard-meta? (vals remotes)))
-                registry (merge (if meta-needed? trusted/documents {}) remotes)
-                result (llm/validate-json-schema (get example "data")
-                         (get group "schema")
-                         {:schema_default_dialect dialect
-                          :schema_registry registry})]
-            (swap! count-cases inc)
-            (is (= (get example "valid") (first result))
-                (str filename " / " (get group "description") " / "
-                     (get example "description") " / " (pr-str result))))))
-    (is (pos? @count-cases)))))
+                registry (merge (if meta-needed? trusted/documents {}) remotes)]
+            (swap! count-cases + (count (get group "tests")))
+            (fixtures/check-group filename group
+              {:schema_default_dialect dialect :schema_registry registry})))))
+    (is (= 1301 @count-cases))))

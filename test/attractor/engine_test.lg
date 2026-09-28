@@ -52,7 +52,8 @@ digraph Linear {
     (is (not (contains? checkpoint :workflow_manifest)))))
 
 (deftest test-human-gate-selection
-  (let [dot "
+  (doseq [[choice target] [["A" "opt_a"] ["B" "opt_b"]]]
+   (let [dot "
 digraph Review {
     start  [shape=Mdiamond]
     gate   [shape=hexagon, label=\"Choose path\", type=\"wait.human\"]
@@ -68,13 +69,13 @@ digraph Review {
 }
 "
         g (p/parse-dot dot)
-        queue (i/make-queue-interviewer [{:value "B" :text "Option B"}])
+        queue (i/make-queue-interviewer [{:value choice :text (str "Option " choice)}])
         reg (h/make-handler-registry queue nil)
-        logs (test-logs "human")
+        logs (test-logs (str "human-" choice))
         res (e/run-pipeline g {:registry reg :logs-root logs})]
     (is (= :success (:status res)))
-    (is (= ["start" "gate" "opt_b" "exit"] (:completed_nodes res)))
-    ))
+    (is (= ["start" "gate" target "exit"] (:completed_nodes res)))
+    )))
 
 (deftest test-goal-gate-enforcement
   (let [dot "

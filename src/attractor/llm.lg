@@ -3417,10 +3417,11 @@
            :total_tokens (+ (or (:total_tokens left) 0) (or (:total_tokens right) 0))}
           [:reasoning_tokens :cache_read_tokens :cache_write_tokens]))
 
-;; High-level generate API
-(defn generate [model prompt & [opts]]
-  (let [options (or opts {})
-        prompt-present (or (some? prompt) (contains? options :prompt))
+;; Preparation is pure: each API still owns client/control construction and
+;; teardown. Generate retains retry options on completion requests for adapter
+;; compatibility; high-level-stream removes them before invoking stream adapters.
+(defn- prepare-generation-request [model prompt options]
+  (let [prompt-present (or (some? prompt) (contains? options :prompt))
         messages-present (contains? options :messages)
         prompt-value (if (some? prompt) prompt (:prompt options))]
     (when (= prompt-present messages-present)
@@ -3433,19 +3434,17 @@
                      (vec (cons {:role :system :content (:system options)}
                                 input-messages))
                      (vec input-messages))
-          request-options
-          (dissoc
-            (dissoc
-              (dissoc
-                (dissoc
-                  (dissoc
-                    (dissoc options :client)
-                    :prompt)
-                  :system)
-                :messages)
-              :max_tool_rounds)
-            :stop_when)
-          request (merge (dissoc request-options :repair_tool_call) {:model model :messages messages})
+          request-options (reduce dissoc options
+                                  [:client :prompt :system :messages
+                                   :max_tool_rounds :stop_when :repair_tool_call])]
+      (merge request-options {:model model :messages messages}))))
+
+;; High-level generate API
+(defn generate [model prompt & [opts]]
+  (let [options (or opts {})
+        prepared (prepare-generation-request model prompt options)]
+    (let [request prepared
+          messages (:messages request)
           client (generation-client options)
           tools (or (:tools options) [])
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))
@@ -4095,36 +4094,9 @@
 
 (defn high-level-stream [model prompt & [opts]]
   (let [options (or opts {})
-        prompt-present (or (some? prompt) (contains? options :prompt))
-        messages-present (contains? options :messages)
-        prompt-value (if (some? prompt) prompt (:prompt options))]
-    (when (= prompt-present messages-present)
-      (throw (ex-info "Exactly one of prompt or messages must be provided"
-                      {:category :invalid-request})))
-    (let [input-messages (if messages-present
-                           (:messages options)
-                           [{:role :user :content prompt-value}])
-          messages (if (some? (:system options))
-                     (vec (cons {:role :system :content (:system options)}
-                                input-messages))
-                     (vec input-messages))
-          request-options
-          (dissoc
-            (dissoc
-              (dissoc
-                (dissoc
-                  (dissoc
-                    (dissoc
-                      (dissoc
-                        (dissoc options :client)
-                        :prompt)
-                      :system)
-                    :messages)
-                  :max_tool_rounds)
-                :stop_when)
-              :retry_policy)
-            :max_retries)
-          request (merge (dissoc request-options :repair_tool_call) {:model model :messages messages})
+        prepared (prepare-generation-request model prompt options)]
+    (let [request (dissoc (dissoc prepared :retry_policy) :max_retries)
+          messages (:messages request)
           client (generation-client options)
           tools (or (:tools options) [])
           max-tool-rounds (max 0 (or (:max_tool_rounds options) 1))

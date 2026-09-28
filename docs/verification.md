@@ -86,3 +86,37 @@ Record the command, date, result, and material limitations in concise review or
 release notes. Retain raw output locally or in CI when investigation needs it.
 Promote a captured response into a regression fixture only when a test uses it
 to verify behavior. A green subset does not establish the full specification.
+
+## Coverage ownership after consolidation
+
+The 2026-09-27 consolidation gives repeated scenarios one owner. Requirement
+labels point to these tests; they do not require duplicate executions:
+
+| Behavior | Owning tests |
+|---|---|
+| Runtime parity case 7: linear execution | `engine_test.lg/test-linear-pipeline-execution`, including status artifact |
+| Runtime parity cases 10/11: goal-gate repair | `engine_test.lg/test-goal-gate-enforcement` |
+| Runtime parity case 12: human selection | `engine_test.lg/test-human-gate-selection`, table-driven A and B choices |
+| Public-client registration response and transport contract | `registration_contract_test.lg`, both auth and MCP entry points, with caller-specific metadata/error mapping |
+| Failed registration prevents authorization | `registration_contract_test.lg/failed-registration-stops-authorization-and-closes-listener` |
+| Shared generation request preparation | `llm_test.lg/test-high-level-request-preparation-preserves-api-option-boundaries` |
+
+The schema runners share one pinned corpus and loader. Their 323 compatibility
+cases and 1,301 explicit-2020-12 cases remain distinct executions; see the
+[fixture contract](../test/fixtures/json-schema/README.md). Independent test
+meta-schemas remain separate from embedded runtime schemas.
+
+Coding-loop component, native-wire, and shared-session smoke tests remain:
+they exercise different boundaries and ownership/order invariants. Likewise,
+project-document and MCP truncation retain their own integration checks around
+the shared UTF-8 prefix helper. Test counts are not a coverage metric.
+
+Unused, incomplete split modules under `llm/`, `cli/`, `handlers/`, and `hub/`
+were removed. The supported monolithic namespaces remain the implementation;
+there were no repository callers or documented public APIs for those copies.
+
+Consolidation verification: `lgx suite` passed **1,594 tests / 14,305 assertions,
+zero failures**, exit 0. The shared registration matrix first reproduced eight
+failures before the fix; its final four tests / 49 assertions pass. Source and
+coverage reviews passed, as did `lgx run main.lg help`. Full output is retained
+locally at `/tmp/attractor-consolidation-full.log`.

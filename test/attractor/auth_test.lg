@@ -134,30 +134,6 @@
       (is (= "https://auth.example/o" (:authorization-endpoint endpoints)))
       (is (= 0 (count @calls))))))
 
-(deftest registration-returns-client-id-never-secret
-  (let [calls (atom [])
-        transport (fn [request]
-                    (swap! calls conj request)
-                    {:status 201 :headers {"content-type" "application/json"}
-                     :body (json/write-json {:client_id "cid-9"})})
-        result (auth/register-client transport "https://api.example/reg"
-                                     "test-client" "http://127.0.0.1:9/callback" "internal")]
-    (is (= "cid-9" (:client-id result)))
-    (is (= 1 (count @calls))))
-  (testing "secret-issuing server is refused without returning the value"
-    (let [result (try (auth/register-client
-                        (fn [_] {:status 201 :headers {"content-type" "application/json"}
-                                 :body (json/write-json {:client_id "cid-9" :client_secret "shh"})})
-                        "https://api.example/reg" "t" "http://127.0.0.1:9/callback" "internal")
-                      (catch Object e e))]
-      (is (= :auth-registration-conflict (:category (ex-data result))))))
-  (testing "rejected registration fails closed"
-    (let [err (try (auth/register-client
-                     (fn [_] {:status 400 :headers {} :body "no"})
-                     "https://api.example/reg" "t" "http://127.0.0.1:9/callback" "internal")
-                   (catch Object e e))]
-      (is (= :auth-registration-failed (:category (ex-data err)))))))
-
 (deftest exchange-happens-exactly-once-per-code
   (let [calls (atom [])
         transport (fn [request]

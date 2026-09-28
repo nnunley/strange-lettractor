@@ -335,32 +335,42 @@
            {:reason :confidential-auth-method-required
             :methods methods})))
 
-(defn register-client
-  "Register a public OAuth client with a dynamic registration endpoint.
-   Fails closed with :auth-registration-conflict when the server issues
-   a secret against auth method none; the secret value is never returned."
-  [transport registration-url client-name redirect-uri scope & [opts]]
-  (let [payload {:client_name client-name :redirect_uris [redirect-uri]
-                 :grant_types ["authorization_code"] :response_types ["code"]
-                 :token_endpoint_auth_method "none" :scope scope}
-        response (bounded-call
+(defn register-public-client
+  "Send public-client registration metadata through the bounded auth transport.
+   Only successful registration statuses may supply a client ID. Server-issued
+   secrets and transport details never escape the response validator."
+  [transport registration-url metadata & [opts]]
+  (let [response (bounded-call
                    transport
                    {:method :post :url registration-url
-                    :body (json/write-json payload)
+                    :body (json/write-json metadata)
                     :headers {"content-type" "application/json"
                               "accept" "application/json"}}
-                   (:timeout-ms opts))
-        body (try (json/read-json (str (:body response)))
-                  (catch Object _
-                    (fail! :auth-registration-failed {:reason :registration-malformed})))]
-    (when-not (map? body)
-      (fail! :auth-registration-failed {:reason :registration-not-an-object}))
-    (when (non-blank-string? (get body "client_secret"))
-      (fail! :auth-registration-conflict
-             {:reason :server-issued-secret-for-public-client}))
-    (when-not (non-blank-string? (get body "client_id"))
-      (fail! :auth-registration-failed {:reason :registration-without-client-id}))
-    {:client-id (get body "client_id")}))
+                   (:timeout-ms opts))]
+    (when-not (contains? #{200 201} (:status response))
+      (fail! :auth-registration-failed {:reason :registration-rejected
+                                        :status (:status response)}))
+    (let [body (try (json/read-json (str (:body response)))
+                    (catch Object _
+                      (fail! :auth-registration-failed {:reason :registration-malformed})))]
+      (when-not (map? body)
+        (fail! :auth-registration-failed {:reason :registration-not-an-object}))
+      (when (non-blank-string? (get body "client_secret"))
+        (fail! :auth-registration-conflict
+               {:reason :server-issued-secret-for-public-client}))
+      (when-not (non-blank-string? (get body "client_id"))
+        (fail! :auth-registration-failed {:reason :registration-without-client-id}))
+      {:client-id (get body "client_id")})))
+
+(defn register-client
+  "Register an OAuth authorization-code public client. Response validation and
+   bounded transport are shared with metadata-driven MCP registration."
+  [transport registration-url client-name redirect-uri scope & [opts]]
+  (register-public-client transport registration-url
+    {:client_name client-name :redirect_uris [redirect-uri]
+     :grant_types ["authorization_code"] :response_types ["code"]
+     :token_endpoint_auth_method "none" :scope scope}
+    opts))
 
 (defn exchange-code
   "Single authorization-code exchange. Returns {:access-token

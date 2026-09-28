@@ -61,3 +61,13 @@ failures or errors** across `mcp_test.lg`, `mcp_client_test.lg` and
 transports; they do not establish the behavior of an external write-capable
 server. Full repository integration also passes: `lgx test`, 1566 tests / 14159
 assertions, zero failures (exit 0).
+
+## Public-client registration
+
+`mcp/perform-registration` and OAuth authorization share bounded registration
+transport and response validation. The default request deadline is 15 seconds.
+Only HTTP 200/201 with a nonblank client ID succeed; an error response cannot
+supply a usable ID even when its JSON resembles a successful registration.
+Server-issued client secrets are rejected without exposing their values.
+MCP retains its `:mcp-protocol-error` category for registration/transport failures
+and `:auth-registration-conflict` for an unexpected client secret.

@@ -1,32 +1,23 @@
 (ns attractor.schema-official-reference-test
-  (:require [clojure.test :refer [deftest is]]
-            [json :as json]
-            [attractor.llm :as llm]))
-
-(def fixture-root "test/fixtures/json-schema/")
-
-(defn- fixture [path] (json/read-json (slurp (str fixture-root path))))
+  (:require [clojure.test :refer [deftest]]
+            [attractor.schema-official-fixtures :as fixtures]))
 
 (defn- registry []
   (into (into {} (map (fn [name]
-                       [(str "http://localhost:1234/draft2020-12/" name ".json")
-                        (fixture (str "draft2020-12/" name ".json"))])
+                       (let [uri (str "http://localhost:1234/draft2020-12/" name ".json")]
+                         [uri (fixtures/remote uri)]))
                      ["detached-dynamicref" "tree" "extendible-dynamic-ref"]))
         (map (fn [name]
-               (let [schema (fixture (str "meta/" name ".json"))]
+               (let [schema (fixtures/fixture (str "meta/" name ".json"))]
                  [(get schema "$id") schema]))
              ["schema" "core" "applicator" "unevaluated" "validation"
               "meta-data" "format-annotation" "content"])))
 
 (defn- check-corpus [name]
   (let [resources (registry)]
-    (doseq [group (fixture (str "draft2020-12/" name ".json"))
-            example (get group "tests")]
-      (let [result (llm/validate-json-schema (get example "data") (get group "schema")
-                     {:schema_registry resources})]
-        (is (= (get example "valid") (first result))
-            (str name " / " (get group "description") " / " (get example "description")
-                 " / " (pr-str result)))))))
+    ;; Omitting a default dialect deliberately exercises compatibility mode.
+    (doseq [group (fixtures/corpus (str name ".json"))]
+      (fixtures/check-group name group {:schema_registry resources}))))
 
 (deftest official-static-references (check-corpus "ref"))
 (deftest official-dynamic-references (check-corpus "dynamicRef"))

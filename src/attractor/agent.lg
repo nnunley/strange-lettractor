@@ -1,5 +1,5 @@
 (ns attractor.agent
-  (:require [attractor.tools :as tools] [attractor.ids :as ids] [attractor.mcp :as mcp] [attractor.skills :as skills] [clojure.string :as str]
+  (:require [attractor.tools :as tools] [attractor.text :as text] [attractor.ids :as ids] [attractor.mcp :as mcp] [attractor.skills :as skills] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
@@ -150,16 +150,6 @@
     "gemini" ["AGENTS.md" "GEMINI.md"]
     ["AGENTS.md"]))
 
-(defn- utf8-prefix [text max-bytes]
-  ;; Binary-search character boundaries rather than slicing encoded bytes.
-  ;; A rune can consume more than one byte; the resulting prefix stays valid UTF-8.
-  (loop [low 0 high (min (count text) (max 0 max-bytes))]
-    (if (= low high)
-      (subs text 0 low)
-      (let [middle (quot (+ low high 1) 2)]
-        (if (<= (count (bytes (subs text 0 middle))) max-bytes)
-          (recur middle high)
-          (recur low (dec middle)))))))
 
 (defn discover-project-docs [environment provider]
   (let [working-dir ((:working_directory environment))
@@ -191,7 +181,7 @@
                     ;; Keep labels, separators and marker inside the same budget.
                     ;; A single truncated fragment renders identically in prompts
                     ;; and can reclaim space from an exactly-full earlier entry.
-                    [(str (utf8-prefix rendered (- 32768 (count (bytes marker))))
+                    [(str (text/utf8-prefix rendered (- 32768 (count (bytes marker))))
                           marker)]))))))))))
 
 (defn- valid-metadata-string [value]
