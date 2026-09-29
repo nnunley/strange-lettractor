@@ -1,5 +1,5 @@
 (ns edit-format.report-test
-  (:require [clojure.test :refer [deftest is run-tests *test-result*]]
+  (:require [clojure.test :refer [deftest is run-tests successful?]]
             [edit-format.core :as core]
             [edit-format.fixtures :as fixtures]
             [edit-format.report :as report]
@@ -94,4 +94,5 @@
     (is (= 1 (get-in result [:totals :provider_errors])))
     (is (= 12840 (get-in result [:totals :usage :total_tokens])))))
 
-(do (run-tests) (os/exit (if *test-result* 0 1)))
+(let [summary (run-tests)]
+  (os/exit (if (successful? summary) 0 1)))

@@ -68,16 +68,18 @@
   (if (str/blank? model)
     (do (prn {:scenario "SCN-ATTR-SMOKE-LIVE" :status :skipped :reason "ATTRACTOR_LIVE_MODEL not set"})
         (os/exit 3))
-    (let [output (with-out-str (clojure.test/run-tests))]
+    (let [summary (atom nil)
+          output (with-out-str (reset! summary (clojure.test/run-tests)))
+          ok (clojure.test/successful? @summary)]
       (io/mkdir evidence-root)
       (io/spit (str evidence-root "/result.edn")
                (pr-str {:scenario "SCN-ATTR-SMOKE-LIVE" :model model
-                        :status (if clojure.test/*test-result* :pass :fail)
-                        :counts clojure.test/*report-counters*
+                        :status (if ok :pass :fail)
+                        :counts @summary
                         :recorded_at (str (System/currentTimeMillis))
                         :logs_root (str evidence-root "/logs")}))
-      (prn clojure.test/*report-counters*)
+      (prn @summary)
       (println (str "Retained evidence: " evidence-root))
-      (when-not clojure.test/*test-result* (println output))
-      (os/exit (if clojure.test/*test-result* 0 1)))))
+      (when-not ok (println output))
+      (os/exit (if ok 0 1)))))
 (when *command-line-args* (apply -main *command-line-args*))
