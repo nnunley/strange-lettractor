@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [io :as io]
             [os :as os]
-            [attractor.execution :as execution]))
+            [attractor.execution :as execution]
+            [attractor.patch :as patch]))
 
 (deftest test-apply-patch-add-update-move-and-delete
   (let [root (str (os/temp-dir) "/lettractor-patch-test-" (random-uuid))
@@ -80,3 +81,74 @@
                  "*** Begin Patch\n*** Add File: ../escape.txt\n+x\n*** End Patch\n")
                 false)
             (catch Object _ true))))))
+
+(defn- memory-files [state]
+  {:file_exists (fn [path] (contains? @state path))
+   :read_file (fn [path] (get @state path))
+   :write_file (fn [path content] (swap! state assoc path content))
+   :delete_file (fn [path] (swap! state dissoc path))})
+
+(deftest test-hunk-anchors-constrain-exact-and-fuzzy-search
+  (doseq [[content hint eof? expected]
+          [["value = 1\nsection two\nother\n" "section two" false nil]
+           ["value = 1\n" "missing section" false nil]
+           ["value = 1\nsection two\nvalue   =   1\n"
+            "section two" false "value = 1\nsection two\nvalue = 2\n"]
+           ["value = 1\nmiddle\nvalue = 1\n" "" true
+            "value = 1\nmiddle\nvalue = 2\n"]
+           ["value = 1\nmiddle\nvalue   =   1\n" "" true
+            "value = 1\nmiddle\nvalue = 2\n"]
+           ["value = 1\ntrailer\n" "" true nil]]]
+    (let [state (atom {"sample.txt" content})
+          result (try
+                   (patch/apply-patch-with-files
+                     (memory-files state)
+                     (str "*** Begin Patch\n*** Update File: sample.txt\n@@ " hint
+                          "\n-value = 1\n+value = 2\n"
+                          (when eof? "*** End of File\n") "*** End Patch\n"))
+                   :applied
+                   (catch Object e (:category (ex-data e))))]
+      (is (= (if expected :applied :invalid-patch) result))
+      (is (= (or expected content) (get @state "sample.txt"))))))
+
+(deftest test-insertion-only-hunks-respect-hints-and-eof
+  (doseq [[hint eof? expected]
+          [["anchor" false "before\nanchor\nadded\nafter\n"]
+           ["anchor" true "before\nanchor\nafter\nadded\n"]
+           ["" true "before\nanchor\nafter\nadded\n"]
+           ["missing" true nil]
+           ["missing" false nil]]]
+    (let [original "before\nanchor\nafter\n"
+          state (atom {"sample.txt" original})
+          result (try
+                   (patch/apply-patch-with-files
+                     (memory-files state)
+                     (str "*** Begin Patch\n*** Update File: sample.txt\n@@ " hint
+                          "\n+added\n" (when eof? "*** End of File\n")
+                          "*** End Patch\n"))
+                   :applied
+                   (catch Object e (:category (ex-data e))))]
+      (is (= (if expected :applied :invalid-patch) result))
+      (is (= (or expected original) (get @state "sample.txt"))))))
+
+(deftest test-patch-result-identifies-every-path-and-operation
+  (let [state (atom {"old.txt" "old\n" "edit.txt" "old\n" "delete.txt" "gone\n"})
+        result (patch/apply-patch-with-files
+                 (memory-files state)
+                 (str "*** Begin Patch\n*** Add File: added.txt\n+new\n"
+                      "*** Update File: edit.txt\n@@\n-old\n+edited\n"
+                      "*** Update File: old.txt\n*** Move to: moved.txt\n@@\n-old\n+updated\n"
+                      "*** Delete File: delete.txt\n*** End Patch\n"))]
+    (is (= (str "Applied 4 operation(s)\n"
+                "Add: added.txt\nUpdate: edit.txt\n"
+                "Update and move: old.txt -> moved.txt\nDelete: delete.txt")
+           result))))
+
+(deftest test-insertion-only-hunks-into-empty-file
+  (doseq [eof? [false true]]
+    (let [state (atom {"empty.txt" ""})]
+      (patch/apply-patch-with-files
+        (memory-files state)
+        (str "*** Begin Patch\n*** Update File: empty.txt\n@@\n+added\n"
+             (when eof? "*** End of File\n") "*** End Patch\n"))
+      (is (= "added" (get @state "empty.txt"))))))

@@ -111,7 +111,7 @@
                                      "@@ flag = false\n-flag = false\n+flag = true\n"
                                      "*** End Patch")}
                        environment)]
-    (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+    (is (= "Applied 2 operation(s)\nAdd: nested/new.txt\nUpdate: sample.txt" (:result result)) (pr-str result))
     (is (= "created\n" (get @files "nested/new.txt")))
     (is (= "section one\nvalue = 1\nsection two\nvalue = 2\nflag = true\n"
            (get @files "sample.txt")))))
@@ -130,7 +130,7 @@
                                      "@@\n-before\n+after\n"
                                      "*** Delete File: obsolete.txt\n*** End Patch")}
                        environment)]
-    (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+    (is (= "Applied 2 operation(s)\nUpdate and move: old.txt -> nested/moved.txt\nDelete: obsolete.txt" (:result result)) (pr-str result))
     (is (= {"nested/moved.txt" "after\n"} @files))
     (is (= ["old.txt" "obsolete.txt"] @deletions))))
 
@@ -203,7 +203,7 @@
                                          "*** Move to: nested/moved.txt\n@@\n-before\n+after\n"
                                          "*** Delete File: " obsolete "\n*** End Patch")}
                            environment)]
-        (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+        (is (= (str "Applied 2 operation(s)\nUpdate and move: " source " -> nested/moved.txt\nDelete: " obsolete) (:result result)) (pr-str result))
         (is (false? ((:file_exists environment) source)))
         (is (false? ((:file_exists environment) obsolete)))
         (is (true? ((:file_exists environment) "nested/moved.txt")))
@@ -335,5 +335,5 @@
                          {"patch" (str "*** Begin Patch\n*** Add File: new.txt\n+created\n"
                                        "*** Delete File: obsolete.txt\n*** End Patch")}
                          environment)]
-      (is (= "Applied 2 operation(s)" (:result result)) (pr-str result))
+      (is (= "Applied 2 operation(s)\nAdd: new.txt\nDelete: obsolete.txt" (:result result)) (pr-str result))
       (is (= {"new.txt" "created\n"} @files)))))

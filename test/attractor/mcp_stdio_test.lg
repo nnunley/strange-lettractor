@@ -133,7 +133,9 @@
       (let [results (mapv #(deref % 15000 :timeout) (mapv run ["a" "b" "c" "d" "e"]))]
         (is (= 5 (count results)))
         (doseq [[symbol result] (map vector ["a" "b" "c" "d" "e"] results)]
-          (is (str/includes? (get-in result [:result "content" 0 "text"] "missing") symbol))))
+          (is (str/includes? (get-in result [:result "content" 0 "text"] "missing") symbol)
+              (pr-str {:symbol symbol :result result :error (ex-data result)
+                       :stats @(:stats @handle)}))))
       (finally (mcp-client/close-session! handle)))))
 
 (deftest double-close-is-idempotent

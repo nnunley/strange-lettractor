@@ -51,11 +51,10 @@
                                         :text (subs hunk-line 1)})))))))]
             (when (empty? hunk-lines)
               (invalid-patch "hunk must contain at least one line"))
-            (let [cursor (if (and (< next-index (count lines))
-                                  (= (get lines next-index) "*** End of File"))
-                           (inc next-index)
-                           next-index)]
-              (recur cursor (conj hunks {:hint hint :lines hunk-lines})))))))))
+            (let [eof? (and (< next-index (count lines))
+                            (= (get lines next-index) "*** End of File"))
+                  cursor (if eof? (inc next-index) next-index)]
+              (recur cursor (conj hunks {:hint hint :lines hunk-lines :eof eof?})))))))))
 
 (defn parse-patch [patch]
   (let [lines (vec (str/split (str patch) #"\r?\n"))]
@@ -148,34 +147,32 @@
                (= actual expected))))
          (range (count old-lines)))))
 
-(defn- find-hunk-index [content-lines old-lines hint]
-  (let [indices (range 0 (inc (- (count content-lines) (count old-lines))))
-        exact (vec (filter (fn [index]
-                             (matches-at? content-lines old-lines index false))
-                           indices))
-        fuzzy (when (empty? exact)
-                (vec (filter (fn [index]
-                               (matches-at? content-lines old-lines index true))
-                             indices)))
-        candidates (if (seq exact) exact fuzzy)
+(defn- find-hunk-index [content-lines old-lines hint eof?]
+  (let [hinted? (not (str/blank? hint))
         normalized-hint (normalize-match-line hint)
-        hint-index
-        (when-not (str/blank? hint)
-          (first
-            (filter
-              (fn [index]
-                (str/includes? (normalize-match-line (get content-lines index))
-                               normalized-hint))
-              (range (count content-lines)))))
-        hinted-match (when (and (some? hint-index) (seq candidates))
-                       (or (first (filter (fn [index] (>= index hint-index))
-                                          candidates))
-                           (last candidates)))]
-    (or hinted-match (first candidates)
-        (when (empty? old-lines)
-          (if (str/blank? hint)
-            (count content-lines)
-            (when (some? hint-index) (inc hint-index)))))))
+        hint-index (when hinted?
+                     (first
+                       (filter
+                         (fn [index]
+                           (str/includes? (normalize-match-line (get content-lines index))
+                                          normalized-hint))
+                         (range (count content-lines)))))
+        last-index (- (count content-lines) (count old-lines))]
+    ;; An explicit hint is a constraint, never permission to edit an earlier
+    ;; matching block. Search exact and fuzzy matches within the same region.
+    (when (or (not hinted?) (some? hint-index))
+      (if (empty? old-lines)
+        (if (or eof? (not hinted?)) (count content-lines) (inc hint-index))
+        (let [start (or hint-index 0)
+              indices (if eof?
+                        (if (>= last-index start) [last-index] [])
+                        (range start (inc last-index)))]
+          (or (first (filter (fn [index]
+                               (matches-at? content-lines old-lines index false))
+                             indices))
+              (first (filter (fn [index]
+                               (matches-at? content-lines old-lines index true))
+                             indices))))))))
 
 (defn- apply-hunk [content-lines hunk]
   (let [old-lines (mapv :text
@@ -184,7 +181,7 @@
         new-lines (mapv :text
                         (remove (fn [line] (= :delete (:kind line)))
                                 (:lines hunk)))
-        index (find-hunk-index content-lines old-lines (:hint hunk))]
+        index (find-hunk-index content-lines old-lines (:hint hunk) (:eof hunk))]
     (when (nil? index)
       (invalid-patch (str "hunk did not match"
                           (when-not (str/blank? (:hint hunk))
@@ -194,7 +191,7 @@
                  (subvec content-lines (+ index (count old-lines)))))))
 
 (defn- split-content [content]
-  {:lines (let [parts (vec (str/split content #"\n"))]
+  {:lines (let [parts (if (= content "") [] (vec (str/split content #"\n")))]
             (if (and (str/ends-with? content "\n")
                      (seq parts)
                      (= "" (last parts)))
@@ -255,7 +252,22 @@
                            source)]
               ((:write_file files) target (join-content updated-lines (:trailing_newline split)))
               (when (not= target source) ((:delete_file files) source)))))))
-    (str "Applied " (count operations) " operation(s)")))
+    (str "Applied " (count operations) " operation(s)"
+         (when (seq operations)
+           (str "\n"
+                (str/join "\n"
+                  (map (fn [operation]
+                         (str (case (:op operation)
+                                :add "Add: "
+                                :delete "Delete: "
+                                :update (if (and (:move_to operation)
+                                                 (not= (:path operation) (:move_to operation)))
+                                          "Update and move: " "Update: "))
+                              (:path operation)
+                              (when (and (:move_to operation)
+                                         (not= (:path operation) (:move_to operation)))
+                                (str " -> " (:move_to operation)))))
+                       operations)))))))
 
 (defn apply-patch [working-dir patch]
   (apply-patch-with-files

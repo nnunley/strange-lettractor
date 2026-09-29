@@ -3,14 +3,15 @@
 For current native-provider and OpenRouter conformance results, report IDs,
 and gateway provenance, see the [canonical provider evidence](provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27).
 
-Current assessment: the [2026-09-27 audit](coding-loop-audit-2026-09-27.md)
-records repairs to local child-process cancellation, steering draining, shell
-error classification and supplied-environment timeout limits. The named audit
-passes 261 tests / 2529 assertions, zero failures/errors; earlier repair full suite passed
-1566 tests / 14159 assertions with zero failures. Custom environments need
-optional `:fork_scope` for independently owned child cancellation. Run `lgx audit-coding-loop` for
-the deterministic baseline plus regular repair regressions. The evidence below
-supports individual behaviors, not full block completion. Complete live parity and the same-session smoke remain open.
+Current assessment: the [coding-loop audit](coding-loop-audit-2026-09-27.md)
+records repaired implementation defects and the September 29 patch follow-up.
+It now explicitly resolves streaming-event applicability and the conflicting
+question-state/provider-alignment clauses under documented local contracts.
+It does not claim literal compliance with mutually contradictory statements.
+Run `lgx audit-coding-loop` for deterministic contracts and repair regressions.
+All three families have fifteen-row live coverage and seven-step same-session
+smoke passes, with the native/gateway provenance in the canonical evidence above.
+Custom environments need `:fork_scope` for independently owned child cancellation.
 
 Checklist blocks of the upstream coding-agent-loop spec mapped to supporting
 tests on the local runtime; this is not a claim of complete coverage. "Wire" means a real session drives
@@ -28,7 +29,7 @@ Historical baseline: 2026-09-10, full suite 916 tests / 8733 assertions / 0 fail
 | 9.7 Reasoning effort | `agent_loop_wire_test.lg` (effort change on the next request), `llm_test.lg` (translation per provider) |
 | 9.8 System prompts | `project_docs_contract_test.lg`, `prompt_metadata_test.lg`, `profiles_test.lg` |
 | 9.9 Subagents | `subagent_lifecycle_test.lg`, `agent_subagent_wire_test.lg`, `coding_loop_audit_test.lg` and `execution_scope_test.lg` (local child cancellation and isolation; custom environments need `:fork_scope`) |
-| 9.10 Event system | `agent_test.lg` (stamps, delivery, lifecycle), `agent_loop_wire_test.lg`, `agent_error_wire_test.lg` (terminal order), `agent_event_origin_test.lg`. `event_families_test.lg` covers pipeline events, not coding-agent events. No streaming-tool output-delta emitter exists; see the current audit's applicability discussion. |
+| 9.10 Event system | `agent_test.lg` (stamps, delivery, lifecycle), `agent_loop_wire_test.lg`, `agent_error_wire_test.lg` (terminal order), `agent_event_origin_test.lg`. `event_families_test.lg` covers pipeline events, not coding-agent events. Output deltas are not applicable to the current completed-result executor API under §2.9; see the audit's explicit interpretation. |
 | 9.11 Error handling | `agent_error_wire_test.lg` (429/503 retried, auth fatal), `session_error_contract_test.lg` (context overflow warning), `turn_ownership_test.lg` (shutdown sequence) |
 | 9.12 Parity matrix | **Live coverage with explicit gateway provenance.** `lgx live-coding-conformance` runs all fifteen rows per native provider. Anthropic `claude-fable-5-1` passes 15/15 across the initial 13-row pass and a corrected-prompt two-row rerun; assertions were unchanged. Gemini also passes 15/15 across its repaired full run and targeted loop-warning rerun. First-party OpenAI is wire verified, direct live not run, explicitly accepted by the user for publication. OpenRouter `openai/gpt-5.2` covers 15/15 across three runs using Responses and the OpenAI profile. See [current provider evidence](provider-model-audits.md#live-coding-conformance-follow-up--2026-09-27). Scripted adapters remain deterministic evidence, not substitutes for these live cells. |
 | 9.13 Integration smoke | **Implemented, all three families have live smoke evidence with explicit gateway provenance.** `coding_smoke_journey.lg` retains one session across seven steps; `coding_smoke_journey_test.lg` includes negative proof controls. Initial weaker Anthropic smoke evidence is excluded. The strengthened Anthropic smoke passed five steps, then hit quota-exceeded in the subagent step; timeout remained unrun. Gemini strengthened smoke passes all seven steps; First-party OpenAI wire evidence is accepted for publication; direct live is not run. OpenRouter Responses and Messages smokes each pass 7/7. Anthropic's profile default is explicitly capped to ten seconds. |
