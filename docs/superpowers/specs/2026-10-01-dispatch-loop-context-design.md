@@ -34,6 +34,14 @@ Each turn dispatches a fresh agent session with a fixed budget. A tool-free
 summarizer folds the turn's result into a capped state document, and only that
 document carries forward. Raw outputs stay on disk as handles.
 
+Prior art: evener (`~/development/evener/docs/design/context.md`) compacts one
+long-lived session under pressure: a deterministic checkpoint at 80% of the
+window, then a model summary at 95%, plus a forced step that lists IDs and
+numbers to keep verbatim, added after its evals showed facts eroding across
+summaries. It avoids editing the middle of history because that invalidates
+provider prefix caches. This design borrows its verbatim-fact prompt, its token
+estimate, its output clamp and its recall eval.
+
 Considered and set aside: summarizing large tool results inside one long-lived
 session and compacting its history under pressure. That bounds context by
 estimation and recovery; the dispatch loop bounds it by construction. The
@@ -62,7 +70,12 @@ plan → dispatch(kind) → summarize → check ─continue→ plan (loop_restar
   Its sub-task names the files and the change. The caller's allowlist guard runs
   after it, and the turn's diff is saved as `turns/<n>/diff.patch`.
 - **summarize**: a tool-free model call. It reads `state.edn`, `next.edn` and
-  `result.md` and returns a new `state.edn`, written by a tool node.
+  the full `result.md` and returns a new `state.edn`, written by a tool node.
+  Its prompt asks explicitly for opaque IDs, hashes, exact numbers and paths
+  that came from tool output, and those go into `:facts` verbatim. If the call
+  fails or returns unparseable output, it is retried once on the class's
+  fallback model (`--summary-fallback-model`); a second failure makes the turn
+  invalid.
 - **check**: a let-go tool node. Its verdict is mechanical and is written to
   `turns/<n>/check.edn`.
 
@@ -128,11 +141,14 @@ These apply to every agent session, inside the fragment or not.
    `:tool_hook_context`.
 2. **Usage event.** After each model call, emit `:usage` with `:input_tokens`
    and `:output_tokens`. Today usage is stored only on the assistant turn.
-3. **Pre-send backstop.** Before each request, estimate its size from history
-   characters, calibrated by the last `:usage` `:input_tokens`, and add
-   `:context_reserve_tokens` (default 8192). If that exceeds the known window,
-   fail with a `:context-length` error before calling the provider. No
-   compaction: the dispatch turn fails, and `check` sees a failed turn.
+3. **Pre-send backstop.** Before each request, estimate its size: the last
+   provider-reported input tokens (cache reads and writes included) plus
+   characters/4 for the history added since that request, or characters/4 for
+   the whole history when no report exists yet. Add `:context_reserve_tokens`
+   (default 8192). If that exceeds the known window, fail with a
+   `:context-length` error before calling the provider. Otherwise clamp the
+   request's output-token limit to the remaining headroom. No compaction: the
+   dispatch turn fails, and `check` sees a failed turn.
 4. **Per-node tool allowlist.** Attractor's own agent nodes cannot restrict
    tools today (`--tools` exists only for the external `claude` worker). A
    `--tools` node attribute (comma list) removes every other tool from the
@@ -151,6 +167,7 @@ These apply to every agent session, inside the fragment or not.
 | `--context-window` | `:context_window_size` (existing) | discovered |
 | `--context-reserve-tokens` | `:context_reserve_tokens` | 8192 |
 | `--tools` | tool allowlist | all |
+| `--summary-fallback-model` | summarizer retry model (summarize nodes) | none |
 
 The fragment is a let-go fn following the skeleton's fragment contract:
 
@@ -194,9 +211,20 @@ Offline, scripted through `:complete_fn` or the mock adapter:
 8. Node attributes from a stylesheet reach the session options.
 9. `pipeline/prepare` accepts the fragment's emitted DOT, and the standalone DOT
    runs end to end on the mock provider.
+10. A summarizer failure retries once on the fallback model; a second failure
+    makes the turn invalid and restores the previous state.
+11. The backstop's estimate uses the last reported input tokens plus
+    characters/4 for newer history, and clamps the output-token limit to the
+    remaining headroom.
 
-Live, opt-in (skipped without the server): the research loop's new `propose`
-runs on `qwen3.8-27b`, and its transcripts show every request below the window.
+Live, opt-in (skipped without the server):
+
+- The research loop's new `propose` runs on `qwen3.8-27b`, and its transcripts
+  show every request below the window.
+- Recall eval: a scripted task plants exact facts (an ID, a hash, a number, a
+  path) in early turns' tool output; after 10 turns, `state.edn` still holds
+  each one verbatim. This measures summary erosion, following the method in
+  evener's compaction retention evals.
 
 ## Out of scope
 
