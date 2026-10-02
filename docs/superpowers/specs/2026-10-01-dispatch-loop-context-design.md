@@ -1,8 +1,20 @@
 # Dispatch loop: bounded context for long agent stages
 
-Status: design approved in conversation on 2026-10-01; implementation planning
-has not started. Stage 1 (workflow fragment) is specified here; stage 2 (an
-in-session strategy) gets its own short spec later.
+Status: design approved in conversation on 2026-10-01; split and revised on
+2026-10-02. Implementation planning has not started. Stage 1 (workflow
+fragment) is specified here; stage 2 (an in-session strategy) gets its own short
+spec later.
+
+## Prerequisites
+
+- **Agent context foundations** (`2026-10-02-agent-context-foundations-design.md`):
+  transcripts, the usage event, the pre-send backstop, the per-node tool
+  allowlist and `read_handle`.
+- **Stylesheet constraints** (`2026-09-19-stylesheet-constraints-design.md`):
+  every budget in the loop is a constraint. Each dispatch class is bounded with
+  `tokens` and `turns` (for example `.reader { tokens <= 64000; turns <= 30; }`),
+  and the loop as a whole is bounded by the enclosing token budget. This design
+  adds no limits of its own.
 
 ## Problem
 
@@ -110,7 +122,10 @@ entry count and characters per entry, so the plan packet stays bounded.
 - **done**: `:done-claim` is true and the caller's done-check command exits 0. A
   model claim alone never ends the loop.
 - **stuck**: no new `:facts`, `:decisions` or `:changes` IDs for `stall-turns`
-  turns (default 3), or `max-turns` reached (default 12).
+  consecutive turns (default 3). This is a progress rule, not a resource limit:
+  resource limits come from constraints. Constraint `turns` counts agent turns
+  within one node run, so it cannot count loop iterations; a loop that keeps
+  producing new IDs ends when the enclosing token budget is exhausted.
 - **invalid**: the new `state.edn` fails the schema or the caps. The previous
   state is restored and the turn is retried once; a second invalid result counts
   as stuck.
@@ -128,46 +143,22 @@ turns/<n>/transcript.jsonl  every event of the dispatch session
 turns/<n>/check.edn         check verdict
 ```
 
-## General agent changes
+## Uses of the foundations
 
-These apply to every agent session, inside the fragment or not.
-
-1. **Transcripts.** A `:transcript_path` session option attaches an `:on_event`
-   writer that appends each session event to a JSONL file. The `:tool_call_end`
-   event already carries the untruncated tool output (`agent.lg`
-   `execute-single-tool`), so the transcript holds full tool results. The
-   codergen handler sets the path to `<stage-dir>/transcript.jsonl` for every
-   agent stage; the stage directory reaches the session through
-   `:tool_hook_context`.
-2. **Usage event.** After each model call, emit `:usage` with `:input_tokens`
-   and `:output_tokens`. Today usage is stored only on the assistant turn.
-3. **Pre-send backstop.** Before each request, estimate its size: the last
-   provider-reported input tokens (cache reads and writes included) plus
-   characters/4 for the history added since that request, or characters/4 for
-   the whole history when no report exists yet. Add `:context_reserve_tokens`
-   (default 8192). If that exceeds the known window, fail with a
-   `:context-length` error before calling the provider. Otherwise clamp the
-   request's output-token limit to the remaining headroom. No compaction: the
-   dispatch turn fails, and `check` sees a failed turn.
-4. **Per-node tool allowlist.** Attractor's own agent nodes cannot restrict
-   tools today (`--tools` exists only for the external `claude` worker). A
-   `--tools` node attribute (comma list) removes every other tool from the
-   session's registry at creation. A call to a removed tool is a tool error.
-5. **`read_handle(path, offset, limit)`.** Pages through a file under the
-   current run's logs root. Registered like the subagent tools.
+- Each dispatch session writes `turns/<n>/transcript.jsonl` (foundations §1).
+- A dispatch whose request would exceed its window fails before sending
+  (foundations §3); `check` sees a failed turn.
+- `investigate` classes set `--tools: read_file,grep,glob,read_handle`
+  (foundations §4).
+- `plan` and later turns reread evidence through `read_handle` (foundations §5).
 
 ## Configuration
 
-`session_options_fn` for agent nodes reads these node attributes, which a
-`model_stylesheet` class can set. The integer parser moves out of
-`task_review_bindings.lg` into a shared place.
+One new node attribute, read by summarize nodes:
 
-| Attribute | Session option | Default |
+| Attribute | Meaning | Default |
 |---|---|---|
-| `--context-window` | `:context_window_size` (existing) | discovered |
-| `--context-reserve-tokens` | `:context_reserve_tokens` | 8192 |
-| `--tools` | tool allowlist | all |
-| `--summary-fallback-model` | summarizer retry model (summarize nodes) | none |
+| `--summary-fallback-model` | model for the summarizer's one retry | none |
 
 The fragment is a let-go fn following the skeleton's fragment contract:
 
@@ -177,7 +168,7 @@ The fragment is a let-go fn following the skeleton's fragment contract:
    :state-dir  "attractor_runs/research-loop/state/loop"
    :done-check "test -s attractor_runs/research-loop/state/proposal.md"
    :caps       {:facts 40 :decisions 20 :changes 20 :open 10 :chars-per-entry 400}
-   :max-turns 12 :stall-turns 3
+   :stall-turns 3
    :classes    {:plan "planner" :investigate "reader" :code "maker" :summarize "planner"}})
 ;; => {:nodes :edges :entry :exits {:success :fail}}
 ```
@@ -201,21 +192,16 @@ Offline, scripted through `:complete_fn` or the mock adapter:
 2. Three turns with no new IDs end `stuck`.
 3. A `state.edn` over caps or failing the schema is `invalid`; the previous
    state is restored and the turn retried once.
-4. An investigate session has no write tools; calling `edit_file` is a tool
-   error.
+4. The emitted investigate nodes carry the read-only `--tools` list.
 5. A code turn writes `diff.patch` and records the change in `:changes`.
-6. `transcript.jsonl` holds the untruncated tool output and `:usage` events in
-   order.
-7. With a tiny window and large history, the backstop raises `:context-length`
-   and the mock records zero provider calls.
-8. Node attributes from a stylesheet reach the session options.
-9. `pipeline/prepare` accepts the fragment's emitted DOT, and the standalone DOT
+6. A failed dispatch (for example a backstop `:context-length`) is recorded in
+   `check.edn` and does not end the loop by itself.
+7. `pipeline/prepare` accepts the fragment's emitted DOT, and the standalone DOT
    runs end to end on the mock provider.
-10. A summarizer failure retries once on the fallback model; a second failure
-    makes the turn invalid and restores the previous state.
-11. The backstop's estimate uses the last reported input tokens plus
-    characters/4 for newer history, and clamps the output-token limit to the
-    remaining headroom.
+8. A summarizer failure retries once on the fallback model; a second failure
+   makes the turn invalid and restores the previous state.
+9. With an enclosing `tokens` constraint, a loop that keeps producing new IDs
+   stops when the budget is exhausted.
 
 Live, opt-in (skipped without the server):
 
