@@ -1,7 +1,7 @@
 # Dispatch loop: bounded context for long agent stages
 
 Status: design approved in conversation on 2026-10-01; split and revised on
-2026-10-02. Implementation planning has not started. Stage 1 (workflow
+2026-10-02 after a pushback review. Implementation planning has not started. Stage 1 (workflow
 fragment) is specified here; stage 2 (an in-session strategy) gets its own short
 spec later.
 
@@ -9,7 +9,7 @@ spec later.
 
 - **Agent context foundations** (`2026-10-02-agent-context-foundations-design.md`):
   transcripts, the usage event, the pre-send backstop, the per-node tool
-  allowlist and `read_handle`.
+  allowlist, `read_handle` and the versioning adapter.
 - **Stylesheet constraints** (`2026-09-19-stylesheet-constraints-design.md`):
   every budget in the loop is a constraint. Each dispatch class is bounded with
   `tokens` and `turns` (for example `.reader { tokens <= 64000; turns <= 30; }`),
@@ -73,21 +73,31 @@ plan → dispatch(kind) → summarize → check ─continue→ plan (loop_restar
 - **plan**: a tool-free model call. Its packet is the task, `state.edn` and the
   last summary. Its output, written to `turns/<n>/next.edn` by a small tool node,
   is one sub-task: `{:kind :investigate|:code :goal :scope [file:line spans]
-  :answer-shape}`.
+  :files [paths] :answer-shape}`. The writer takes the first EDN map in the
+  response, so a code fence or surrounding prose is tolerated, and checks it:
+  `:kind` is `:investigate` or `:code`, `:goal` is not blank, and a `:code`
+  sub-task names at least one file, all inside the caller's allowlist. Scope
+  spans naming missing files are kept and flagged in `check.edn`, since a turn
+  may create a file. A failed check retries once on `--fallback-model`; a second
+  failure makes the turn invalid and nothing is dispatched.
 - **dispatch, `:investigate`**: a fresh agent session with read-only tools
   (`read_file`, `grep`, `glob`, `read_handle`). It answers the sub-task in
   `turns/<n>/result.md`. `shell` is excluded because it can write.
 - **dispatch, `:code`**: attractor's coding agent with its full toolset
   (`edit_file`, `apply_patch`, `shell`). It is the only node that changes code.
-  Its sub-task names the files and the change. The caller's allowlist guard runs
-  after it, and the turn's diff is saved as `turns/<n>/diff.patch`.
+  Its sub-task names the files and the change. The fragment calls the
+  versioning adapter's `snapshot!` before and after it, and the caller's
+  allowlist guard runs after it. The two refs and the changed files go into
+  `:changes`; the diff text stays retrievable through `diff_refs` and never
+  enters state or transcripts.
 - **summarize**: a tool-free model call. It reads `state.edn`, `next.edn` and
   the full `result.md` and returns a new `state.edn`, written by a tool node.
   Its prompt asks explicitly for opaque IDs, hashes, exact numbers and paths
-  that came from tool output, and those go into `:facts` verbatim. If the call
-  fails or returns unparseable output, it is retried once on the class's
-  fallback model (`--summary-fallback-model`); a second failure makes the turn
-  invalid.
+  that came from tool output, and those go into `:facts` verbatim. It also says
+  never to record a credential: a fact may cite the file a credential appeared
+  in, never the value. Its output passes through `providers/redact` before it is
+  written. If the call fails or returns unparseable output, it is retried once
+  on `--fallback-model`; a second failure makes the turn invalid.
 - **check**: a let-go tool node. Its verdict is mechanical and is written to
   `turns/<n>/check.edn`.
 
@@ -102,7 +112,7 @@ entry count and characters per entry, so the plan packet stays bounded.
 {:goal      "..."      ; copied from the task; never rewritten
  :facts     [{:id "F7" :text "..." :evidence "turns/3/result.md"}]
  :decisions [{:id "D2" :text "..." :because ["F7"]}]
- :changes   [{:turn 5 :files ["..."] :summary "..." :diff "turns/5/diff.patch"}]
+ :changes   [{:turn 5 :from {ref} :to {ref} :files ["..."] :summary "..."}]
  :open      ["..."]
  :done      ["T1: ..."]
  :next-hint "..."
@@ -116,6 +126,10 @@ entry count and characters per entry, so the plan packet stays bounded.
   within caps. It cannot change `:goal`.
 - Default caps: 40 facts, 20 decisions, 20 changes, 10 open questions, 400
   characters per entry.
+- `state.edn` never holds a secret. `check` rejects one that contains a
+  configured secret or a credential-shaped value (a Bearer/Token header value,
+  a known API-key prefix).
+- A ref in `:changes` is the versioning adapter's ref: `{:repo :base :patch}`.
 
 ## Check rules
 
@@ -126,9 +140,14 @@ entry count and characters per entry, so the plan packet stays bounded.
   resource limits come from constraints. Constraint `turns` counts agent turns
   within one node run, so it cannot count loop iterations; a loop that keeps
   producing new IDs ends when the enclosing token budget is exhausted.
-- **invalid**: the new `state.edn` fails the schema or the caps. The previous
-  state is restored and the turn is retried once; a second invalid result counts
-  as stuck.
+- **stuck, budget**: a dispatch, plan or summarize node failed with
+  `:constraint_violated` or a budget-exhausted reason. The loop exits with
+  `stop_reason: budget`; `state.edn` stays at its last valid version, and the
+  interrupted turn's files, refs and transcript stay on disk for whoever
+  resumes.
+- **invalid**: the new `state.edn` fails the schema, the caps or the secret
+  rule. The previous state is restored and the turn is retried once; a second
+  invalid result counts as stuck.
 - Otherwise **continue**.
 
 ## Turn files
@@ -138,7 +157,8 @@ state.edn                   current state
 turns/<n>/state.before.edn  state the turn started from
 turns/<n>/next.edn          plan's sub-task
 turns/<n>/result.md         dispatch answer
-turns/<n>/diff.patch        :code turns only
+turns/<n>/before.patch      :code turns: the snapshot before the dispatch
+turns/<n>/after.patch       :code turns: the snapshot after it
 turns/<n>/transcript.jsonl  every event of the dispatch session
 turns/<n>/check.edn         check verdict
 ```
@@ -151,14 +171,19 @@ turns/<n>/check.edn         check verdict
 - `investigate` classes set `--tools: read_file,grep,glob,read_handle`
   (foundations §4).
 - `plan` and later turns reread evidence through `read_handle` (foundations §5).
+- `:code` turns are recorded as versioning refs, and any turn can read a diff
+  through `diff_refs` (foundations §6).
 
 ## Configuration
 
-One new node attribute, read by summarize nodes:
+One new node attribute, read by plan and summarize nodes:
 
 | Attribute | Meaning | Default |
 |---|---|---|
-| `--summary-fallback-model` | model for the summarizer's one retry | none |
+| `--fallback-model` | model for the one retry after a malformed response | none |
+
+The fragment takes the versioning adapter as an option (`:versioning`); when
+absent it builds one for the working directory.
 
 The fragment is a let-go fn following the skeleton's fragment contract:
 
@@ -193,7 +218,9 @@ Offline, scripted through `:complete_fn` or the mock adapter:
 3. A `state.edn` over caps or failing the schema is `invalid`; the previous
    state is restored and the turn retried once.
 4. The emitted investigate nodes carry the read-only `--tools` list.
-5. A code turn writes `diff.patch` and records the change in `:changes`.
+5. A code turn records before and after refs and the changed files in
+   `:changes`; the repository's refs, index and stash are unchanged; no diff
+   text appears in `state.edn` or the transcript.
 6. A failed dispatch (for example a backstop `:context-length`) is recorded in
    `check.edn` and does not end the loop by itself.
 7. `pipeline/prepare` accepts the fragment's emitted DOT, and the standalone DOT
@@ -201,7 +228,13 @@ Offline, scripted through `:complete_fn` or the mock adapter:
 8. A summarizer failure retries once on the fallback model; a second failure
    makes the turn invalid and restores the previous state.
 9. With an enclosing `tokens` constraint, a loop that keeps producing new IDs
-   stops when the budget is exhausted.
+   exits `stuck` with `stop_reason: budget` when the budget is exhausted, and
+   `state.edn` is the last valid version.
+10. A plan response wrapped in a code fence is accepted; one with an unknown
+    `:kind`, or a `:code` sub-task naming a file outside the allowlist, retries
+    on the fallback model and then makes the turn invalid without dispatching.
+11. A summarizer output containing a configured secret is written redacted, and
+    a `state.edn` holding a credential-shaped value is rejected as invalid.
 
 Live, opt-in (skipped without the server):
 
