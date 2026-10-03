@@ -8,7 +8,8 @@ logs the outcome to `results.tsv`. Then it asks you again. It does not stop.
 ## Each time you are called
 
 1. Read `research.env`: the goal, `EDITABLE` (the only files you may change),
-   `RUN_CMD` (how the experiment runs), and the metric and its direction.
+   `RUN_CMD` (how the experiment runs), the metric, and `DIRECTION`: whether a
+   lower (`min`) or a higher (`max`) metric is better.
 2. Read `notes.md` if it exists: the human's notes about this codebase and its
    language. Then read the editable files and anything they depend on. You may
    read any file.
