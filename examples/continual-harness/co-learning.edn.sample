@@ -1,0 +1,21 @@
+;; Copy to co-learning.edn and replace every path/command with your adapters.
+;; This is opt-in model training, not a requirement for the core harness.
+{:root "/absolute/private/training-run"
+ :working_dir "/absolute/persistent/task-environment"
+ :environment_files ["/absolute/persistent/task-environment/world-state.json"]
+ :initial_checkpoint "/absolute/models/pretrained.safetensors"
+ :initial_model "openai/local-policy"
+ :provenance {:kind "operator_pretrained"
+              :description "Record source, training stages, tokenizer and checkpoint identity here"}
+ :iterations 2 :steps 32 :timeout_ms 600000
+ :max_artifact_bytes 1073741824
+ :session_options {:auto_refine_interval 8 :auto_refine_warmup 0
+                   :refiner_model "openai/refiner"}
+ :rollout_prompt "Advance the persistent task by one action."
+ :scoring {:window_size 8 :stride 4 :threshold 0.5}
+ :trainer {:learning_rate 0.00001 :batch_size 4 :gradient_accumulation_steps 4
+           :tokenizer "/absolute/models/tokenizer"}
+ :commands {:score ["/absolute/adapters/score"]
+            :teacher ["/absolute/adapters/teacher"]
+            :train ["/absolute/adapters/train"]
+            :activate ["/absolute/adapters/activate"]}}

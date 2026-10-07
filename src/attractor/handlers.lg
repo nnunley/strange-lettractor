@@ -4,6 +4,7 @@
             [io :as io]
             [os :as os]
             [attractor.execution :as execution]
+            [attractor.co-learning :as co-learning]
             [attractor.context :as context]
             [attractor.parameters :as parameters]
             [attractor.composition :as composition]
@@ -617,6 +618,7 @@
             "wait.human" (make-wait-human-handler interviewer)
             "conditional" handle-conditional
             "tool" handle-tool
+            "co_learning" (co-learning/make-handler)
             "parallel" parallel-handler
             "parallel.fan_in" fan-in-handler
             "stack.manager_loop" manager-handler

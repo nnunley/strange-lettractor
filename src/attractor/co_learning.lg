@@ -1,0 +1,304 @@
+(ns attractor.co-learning
+  "Bounded native-agent rollouts and operator-owned model training adapters.
+   Stage evidence is durable. An interrupted rollout is never replayed implicitly."
+  (:require [attractor.agent :as agent] [attractor.execution :as execution]
+            [attractor.harness :as harness]
+            [attractor.operation-owner :as owner] [attractor.llm :as llm]
+            [attractor.workflow :as workflow]
+            [clojure.core :as core] [clojure.edn :as edn]
+            [clojure.string :as str] [clojure.walk :as walk]
+            [hash :as hash] [io :as io] [os :as os] [json :as json]))
+
+(defn- fail! [message & [data]]
+  (throw (ex-info message (merge {:category :co-learning-invalid} data))))
+(defn- ensure! [condition message] (when-not condition (fail! message)))
+(defn- positive-int? [x] (and (integer? x) (pos? x)))
+(defn- finite-number? [x]
+  (and (number? x) (<= (- Double/MAX_VALUE) x Double/MAX_VALUE)))
+(defn- quote-shell [s] (str "'" (str/replace (str s) "'" "'\"'\"'") "'"))
+(defn- mkdir! [path]
+  (let [r (os/sh "mkdir" "-p" "-m" "700" path)]
+    (ensure! (= 0 (:exit r)) (str "Cannot create " path))
+    (ensure! (= 0 (:exit (os/sh "chmod" "700" path))) "Cannot protect training directory")))
+(defn- write! [path value]
+  (let [tmp (str path "." (random-uuid) ".tmp")]
+    (let [text (pr-str value)]
+      (ensure! (<= (count (bytes text)) 16777216) "Training journal exceeds 16 MiB")
+      (io/spit tmp text))
+    (os/rename tmp path)
+    value))
+(defn- read! [path] (edn/read-string (io/slurp path)))
+(defn- bounded-file [path limit]
+  (let [stat (os/stat path)]
+    (ensure! (and stat (not (:dir? stat)) (<= (:size stat) limit))
+             (str "Missing, non-file or oversized artifact: " path))
+    (io/slurp path)))
+(defn- digest [path config] (hash/sha256 (bounded-file path (:max_artifact_bytes config))))
+(defn- environment-state [config]
+  (into {} (map (fn [path] [path (digest path config)]) (:environment_files config))))
+
+(defn select-windows
+  "Validate exact transition-score coverage and select contextual low-mean windows."
+  [transitions scores {:keys [window_size stride threshold]}]
+  (ensure! (and (positive-int? window_size) (positive-int? stride)
+                (<= stride window_size) (finite-number? threshold)) "Invalid window configuration")
+  (let [ids (mapv :id transitions) scored (mapv :id scores)]
+    (ensure! (and (= (count ids) (count (set ids)))
+                  (= (count scored) (count (set scored)))
+                  (= (set ids) (set scored))
+                  (every? #(and (string? (:id %)) (finite-number? (:reward %)) (<= 0 (:reward %) 1)) scores))
+             "Scores must cover each transition exactly once with finite rewards")
+    (let [by-id (into {} (map (fn [s] [(:id s) (:reward s)]) scores))]
+      (vec (keep
+             (fn [start]
+               (let [window (subvec (vec transitions) start (min (count transitions) (+ start window_size)))
+                     ids (mapv :id window)
+                     reward (/ (reduce + (map by-id ids)) (count ids))]
+                 (when (< reward threshold)
+                   {:id (str "window-" start) :transition_ids ids :transitions window :reward reward})))
+             (distinct (concat (range 0 (max 1 (inc (- (count transitions) window_size))) stride)
+                               [(max 0 (- (count transitions) window_size))])))))))
+
+(defn- validate-config [raw]
+  (let [c (merge {:timeout_ms 60000 :max_artifact_bytes 16777216} raw)]
+    (doseq [key [:iterations :steps :timeout_ms :max_artifact_bytes]]
+      (ensure! (positive-int? (get c key)) (str key " must be positive")))
+    (doseq [key [:root :working_dir :initial_checkpoint]]
+      (ensure! (and (string? (get c key)) (str/starts-with? (get c key) "/"))
+               (str key " must be an absolute path")))
+    (ensure! (and (string? (:initial_model c)) (seq (:initial_model c))
+                  (string? (:rollout_prompt c)) (seq (:rollout_prompt c))) "Model and rollout prompt required")
+    (ensure! (and (vector? (:environment_files c)) (seq (:environment_files c))
+                  (every? #(and (string? %) (str/starts-with? % "/")) (:environment_files c)))
+             "Declare absolute environment_files covering durable task state")
+    (ensure! (and (contains? #{"operator_pretrained" "sft_then_grpo"} (get-in c [:provenance :kind]))
+                  (string? (get-in c [:provenance :description]))
+                  (seq (get-in c [:provenance :description]))) "Initial checkpoint provenance required")
+    (doseq [stage [:score :teacher :train :activate]]
+      (let [argv (get-in c [:commands stage])]
+        (ensure! (and (vector? argv) (seq argv) (every? #(and (string? %) (seq %)) argv))
+                 (str "Command argv required for " stage))))
+    (select-windows [{:id "validate"}] [{:id "validate" :reward 0}] (:scoring c))
+    (ensure! (positive-int? (get-in c [:session_options :auto_refine_interval] 20))
+             "Co-learning requires a positive refinement interval")
+    (ensure! (not (get-in c [:session_options :frozen_harness])) "Co-learning requires a mutable harness")
+    c))
+
+(defn- check! [options]
+  (when (or (core/scope-cancelled?) (when-let [cancelled? (:cancelled? options)] (cancelled?)))
+    (throw (ex-info "Co-learning cancelled" {:category :cancelled}))))
+
+(defn- invoke-stage! [config options environment stage prefix payload]
+  (check! options)
+  (let [environment-before (environment-state config)
+        request (assoc payload :stage (name stage))
+        request (assoc request :request_id (hash/sha256 (workflow/canonical-edn request)))
+        input (str prefix ".request.json") output (str prefix ".response.json")
+        encoded (json/write-json request)
+        _ (ensure! (<= (count (bytes encoded)) (:max_artifact_bytes config)) "Adapter request exceeds artifact limit")
+        _ (io/spit input encoded)
+        ;; A unique output name prevents a failed retry from accepting old output.
+        fresh-output (str output "." (random-uuid))
+        command (str/join " " (map quote-shell (concat (get-in config [:commands stage]) [input fresh-output])))
+        deadline (+ (System/currentTimeMillis) (:timeout_ms config))
+        operation (owner/start! {:check! (fn []
+                                           (check! options)
+                                           (when (> (System/currentTimeMillis) deadline)
+                                             (throw (ex-info "Training adapter timeout" {:category :timeout}))))
+                                  :cleanup! (:cleanup environment)})]
+    (try
+      (let [result (owner/invoke! operation
+                     #((:exec_command environment) command (:timeout_ms config) (:working_dir config) nil))]
+        (when-not (= 0 (:exit_code result))
+          (write! (str prefix ".failure.edn") result)
+          (fail! (str "Adapter failed: " (name stage)) {:stage stage :exit_code (:exit_code result)}))
+        (let [response (walk/keywordize-keys
+                         (json/read-json (bounded-file fresh-output (:max_artifact_bytes config))))]
+          (ensure! (= environment-before (environment-state config)) "Training adapter changed task environment")
+          (ensure! (= (:request_id request) (:request_id response)) "Adapter response belongs to another request")
+          (os/rename fresh-output output)
+          response))
+      (finally (owner/finish! operation)))))
+
+(defn- targets! [windows response]
+  (let [targets (:targets response)]
+    (ensure! (and (vector? targets)
+                  (= (count windows) (count targets))
+                  (= (set (map :id windows)) (set (map :window_id targets)))) "Teacher targets must cover selected windows exactly")
+    (doseq [target targets]
+      (ensure! (and (string? (:context target)) (seq (:positions target))) "Teacher must supply context and token distributions")
+      (doseq [position (:positions target)]
+        (let [ids (:token_ids position) probabilities (:probabilities position)]
+          (ensure! (and (vector? ids) (seq ids) (= (count ids) (count (set ids)))
+                        (every? #(and (integer? %) (<= 0 %)) ids)
+                        (vector? probabilities) (= (count ids) (count probabilities))
+                        (every? #(and (finite-number? %) (<= 0 % 1)) probabilities)
+                        (< (abs (- 1 (reduce + probabilities))) 0.000001)) "Invalid teacher token distribution"))))
+    targets))
+
+(defn- activate! [config options environment prefix state checkpoint checkpoint-digest]
+  (let [response (invoke-stage! config options environment :activate prefix
+                   {:run_id (:run_id state) :iteration (:iteration state)
+                    :checkpoint checkpoint :checkpoint_sha256 checkpoint-digest
+                    :previous_checkpoint (:active_checkpoint state)})
+        model (:model response)]
+    (ensure! (= checkpoint-digest (:checkpoint_sha256 response)) "Activation did not acknowledge checkpoint digest")
+    (ensure! (and (string? model) (seq model)
+                  (= (:provider (llm/parse-model-spec (:initial_model config)))
+                     (:provider (llm/parse-model-spec model)))) "Activation must retain the provider protocol")
+    model))
+
+(defn- stage-environment [config]
+  (execution/make-local-environment {:working_dir (:working_dir config)
+                                      :default_command_timeout_ms (:timeout_ms config)
+                                      :max_command_timeout_ms (:timeout_ms config)}))
+
+(defn- stage! [config options stage prefix payload]
+  (let [environment (stage-environment config)]
+    (try (invoke-stage! config options environment stage prefix payload)
+         (finally ((:cleanup environment))))))
+
+(defn- activation! [config options prefix state checkpoint sha]
+  (let [environment (stage-environment config)]
+    (try (activate! config options environment prefix state checkpoint sha)
+         (finally ((:cleanup environment))))))
+
+(defn- rollout! [session config options state]
+  (let [transitions (atom [])]
+    (dotimes [step (:steps config)]
+      (check! options)
+      (let [before (:history @session)
+            observation (if (empty? before) (:rollout_prompt config) (peek before))
+            answer (agent/process-input! session (:rollout_prompt config))
+            added (subvec (:history @session) (count before))
+            calls (filter #(= :assistant (:type %)) added)]
+        (ensure! (= 1 (count calls)) "Rollout must produce exactly one bounded agent step per transition")
+        (swap! transitions conj {:id (str (:iteration state) ":" step)
+                                  :observation observation :action (first calls)
+                                  :result (vec (filter #(= :tool_results (:type %)) added))
+                                  :answer answer :model (:model state)
+                                  :checkpoint_sha256 (:checkpoint_sha256 state)})))
+    {:transitions @transitions :history (:history @session) :harness_steps (:harness_steps @session)
+     :harness @(:harness @session)}))
+
+(defn- owned-rollout! [session config options state]
+  (let [deadline (+ (System/currentTimeMillis) (:timeout_ms config))
+        operation (owner/start!
+                    {:check! (fn [] (check! options)
+                               (when (> (System/currentTimeMillis) deadline)
+                                 (throw (ex-info "Rollout deadline exceeded" {:category :timeout}))))
+                     :cleanup! (fn [] (when (= :processing (:state @session))
+                                         (agent/abort-session! session)))})]
+    (try (owner/invoke! operation #(rollout! session config options state))
+         (finally (owner/finish! operation)))))
+
+(defn run!
+  "Run/resume bounded co-learning. Options permit host session callbacks and cancellation.
+   Adapter argv receives request/output JSON paths. Activation must be idempotent
+   for request_id and transactionally acknowledge the checkpoint it actually serves."
+  [raw-config & [raw-options]]
+  (let [config (validate-config raw-config) options (or raw-options {})
+        root (:root config) state-path (str root "/state.edn") lock (str root "/writer.lock")
+        fingerprint (hash/sha256 (workflow/canonical-edn config))]
+    (mkdir! root)
+    (ensure! (= 0 (:exit (os/sh "mkdir" "-m" "700" lock))) "Co-learning run is already owned; recover a stale lock explicitly")
+    (try
+      (let [initial (if (io/file-exists? state-path)
+                      (read! state-path)
+                      {:schema 1 :run_id (str (random-uuid)) :config_sha256 fingerprint
+                       :iteration 0 :active_checkpoint (:initial_checkpoint config)
+                       :checkpoint_sha256 (digest (:initial_checkpoint config) config)
+                       :model (:initial_model config) :history [] :completed {}
+                       :environment_state (environment-state config)})
+            _ (ensure! (= fingerprint (:config_sha256 initial)) "Resume configuration differs from recorded run")
+            _ (ensure! (not (:rollout_in_progress initial)) "Interrupted rollout: inspect environment and supply recovery evidence; automatic replay refused")
+            _ (when (:harness_state initial)
+                (ensure! (= (:harness_state initial) (harness/load-harness (str root "/harness.edn")))
+                         "Harness differs from committed rollout; resume refused"))
+            _ (ensure! (= (:environment_state initial) (environment-state config)) "Environment files differ from committed rollout; resume refused")
+            _ (ensure! (= (:checkpoint_sha256 initial) (digest (:active_checkpoint initial) config)) "Active checkpoint changed outside training")]
+        (if (>= (:iteration initial) (:iterations config))
+          initial
+          (let [initial (write! state-path initial)
+                initial (if (:activated initial) initial
+                          (assoc initial :activated true :model
+                            (activation! config options (str root "/initial-activate") initial
+                                         (:active_checkpoint initial) (:checkpoint_sha256 initial))))
+                session (agent/make-session
+                          (merge {:auto_refine_interval 20 :auto_refine_warmup 0}
+                                 (:session_options config) (:session_options options)
+                                 {:model (:model initial) :harness_path (str root "/harness.edn")
+                                  :enable_continual_harness true :auto_refine true
+                                  :max_tool_rounds_per_input 1 :max_turns 0
+                                  :execution_env (execution/make-local-environment {:working_dir (:working_dir config)})}))]
+            (try
+              (swap! session assoc :history (:history initial) :harness_steps (or (:harness_steps initial) 0))
+              (when-let [observe (:on_session options)] (observe session))
+              (loop [state (write! state-path initial)]
+                (check! options)
+                (ensure! (= (:environment_state state) (environment-state config)) "Task environment changed between stages")
+                (if (>= (:iteration state) (:iterations config)) state
+                  (let [directory (str root "/iteration-" (:iteration state))
+                        _ (mkdir! directory)
+                        _ (ensure! (= (:checkpoint_sha256 state) (digest (:active_checkpoint state) config)) "Checkpoint mutated during training")
+                        rollout (or (get-in state [:completed :rollout])
+                                    (do (write! state-path (assoc state :rollout_in_progress true))
+                                        (owned-rollout! session config options state)))
+                        _ (harness/persist! (:harness @session))
+                        state (write! state-path (-> state (assoc :rollout_in_progress false)
+                                                     (assoc :history (:history rollout))
+                                                     (assoc :harness_steps (:harness_steps rollout))
+                                                     (assoc :harness_state (:harness rollout))
+                                                     (assoc :environment_state (environment-state config))
+                                                     (assoc-in [:completed :rollout] rollout)))
+                        payload {:run_id (:run_id state) :iteration (:iteration state)
+                                 :checkpoint (:active_checkpoint state) :checkpoint_sha256 (:checkpoint_sha256 state)
+                                 :scoring (:scoring config) :transitions (:transitions rollout)
+                                 :harness (:harness rollout)}
+                        scores (or (get-in state [:completed :scores])
+                                   (:scores (stage! config options :score (str directory "/score") payload)))
+                        windows (select-windows (:transitions rollout) scores (:scoring config))
+                        state (write! state-path (assoc-in state [:completed :scores] scores))]
+                    (if (empty? windows)
+                      (do (write! (str directory "/result.edn") (assoc state :training_skipped "no low-reward windows"))
+                          (recur (write! state-path (-> state (update :iteration inc) (assoc :completed {})))))
+                      (let [targets (or (get-in state [:completed :targets])
+                                        (targets! windows (stage! config options :teacher (str directory "/teacher")
+                                                                  (assoc payload :windows windows))))
+                            state (write! state-path (assoc-in state [:completed :targets] targets))
+                            checkpoint (str directory "/model.checkpoint")
+                            trained (or (get-in state [:completed :trained])
+                                        (let [response (stage! config options :train (str directory "/train")
+                                                         (assoc payload :windows windows :targets targets
+                                                                        :objective "soft_sft" :trainer (:trainer config)
+                                                                        :output_checkpoint checkpoint))
+                                              sha (digest checkpoint config)]
+                                          (ensure! (and (= checkpoint (:checkpoint response))
+                                                        (= "soft_sft" (:objective response))
+                                                        (not= sha (:checkpoint_sha256 state))) "Trainer must produce a changed soft-SFT checkpoint")
+                                          {:checkpoint checkpoint :sha256 sha}))
+                            state (write! state-path (assoc-in state [:completed :trained] trained))
+                            _ (ensure! (= (:checkpoint_sha256 state) (digest (:active_checkpoint state) config)) "Trainer modified the active checkpoint")
+                            _ (ensure! (= (:sha256 trained) (digest checkpoint config)) "Candidate checkpoint mutated")
+                            model (activation! config options (str directory "/activate") state checkpoint (:sha256 trained))
+                            _ (agent/set-model! session model)
+                            next (-> state (update :iteration inc)
+                                     (assoc :completed {} :model model :active_checkpoint checkpoint
+                                            :checkpoint_sha256 (:sha256 trained)))]
+                        (write! (str directory "/result.edn") (assoc state :activated_model model))
+                        (recur (write! state-path next)))))))
+              (finally (agent/close-session! session))))))
+      (finally (os/sh "rmdir" lock)))))
+
+(defn make-handler []
+  (fn [node _context _graph _logs-root]
+    (try
+      (let [path (get-in node [:attrs :co_learning.config])
+            _ (ensure! (and (string? path) (seq path)) "co_learning.config is required")
+            state (run! (read! path) {:cancelled? (:cancelled? node)})]
+        {:status :success :notes "Co-learning completed"
+         :context_updates {"co_learning.checkpoint" (:active_checkpoint state)
+                           "co_learning.iterations" (:iteration state)}})
+      (catch Object e
+        {:status (if (= :cancelled (:category (ex-data e))) :cancelled :fail)
+         :failure_reason (str e)}))))

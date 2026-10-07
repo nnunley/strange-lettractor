@@ -1,0 +1,203 @@
+(ns attractor.co-learning-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.co-learning :as learning]
+            [attractor.harness :as harness]
+            [attractor.agent :as agent]
+            [attractor.hub :as hub] [attractor.handlers :as handlers]
+            [clojure.edn :as edn]
+            [clojure.string :as str] [clojure.core :as core]
+            [io :as io] [os :as os] [json :as json]))
+
+(defn fixture-config [root]
+  {:root root :working_dir (os/cwd) :iterations 2 :steps 1
+   :initial_checkpoint (str root "/initial.json") :initial_model "mock/initial"
+   :environment_files [(str root "/world.json")]
+   :provenance {:kind "operator_pretrained" :description "Offline Bernoulli fixture; no foundation-model claim"}
+   :scoring {:window_size 1 :stride 1 :threshold 0.5}
+   :commands (into {} (map (fn [stage] [stage ["python3" "test/fixtures/co_learning.py" (name stage)]])
+                          [:score :teacher :train :activate]))
+   :rollout_prompt "Act once" :timeout_ms 30000 :max_artifact_bytes 1000000})
+
+(defn fixture-root []
+  (let [path (str (os/cwd) "/evidence/co-learning-test-" (random-uuid))]
+    (io/mkdir path)
+    (io/spit (str path "/initial.json") "{\"weight\":-1}")
+    (io/spit (str path "/world.json") "{\"cursor\":0}")
+    path))
+
+(deftest trained-checkpoint-is-consumed-with-live-harness
+  (let [root (fixture-root) seen (atom []) sessions (atom [])
+        result (learning/run! (fixture-config root)
+                 {:session_options
+                  {:project_docs [] :auto_refine_interval 1
+                   :refiner_complete_fn (fn [_] {:message {:role :assistant :content
+                     "{\"edits\":[{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"learned\",\"content\":\"retain improvement\"}]}"}})
+                   :complete_fn
+                   (fn [request]
+                     (let [weight (get (json/read-json (io/slurp (:model request))) "weight")]
+                       (swap! seen conj [weight (pr-str (:messages request))])
+                       {:message {:role :assistant :content (if (pos? weight) "one" "zero")}
+                        :tool_calls []}))}
+                  :on_session (fn [session] (swap! sessions conj session))})]
+    (is (= 2 (:iteration result)))
+    (is (= 1 (count @sessions)))
+    (is (neg? (first (first @seen))))
+    (is (pos? (first (second @seen))))
+    (is (str/includes? (second (second @seen)) "retain improvement"))
+    (is (= 2 (count (filter #(= :assistant (:type %)) (:history @(first @sessions))))))
+    (is (not= (:initial_checkpoint (fixture-config root)) (:active_checkpoint result)))
+    (is (= result (learning/run! (fixture-config root) {})))))
+
+(deftest contextual-window-selection
+  (let [trajectory [{:id "a" :action "first"} {:id "b" :action "second"}
+                    {:id "c" :action "third"}]
+        scores [{:id "a" :reward 1} {:id "b" :reward 0} {:id "c" :reward 1}]]
+    (is (= [["a" "b"] ["b" "c"]]
+           (mapv :transition_ids (learning/select-windows trajectory scores
+                                  {:window_size 2 :stride 1 :threshold 0.75}))))
+    (is (= [] (learning/select-windows trajectory scores
+                 {:window_size 2 :stride 1 :threshold 0})))
+    (is (try (learning/select-windows trajectory (pop scores)
+               {:window_size 2 :stride 1 :threshold 0.75})
+             false (catch Object _ true)))))
+
+(deftest window-tail-and-invalid-reward
+  (let [transitions (mapv #(hash-map :id (str %)) (range 4))
+        scores (mapv #(hash-map :id (str %) :reward (if (= 3 %) 0 1)) (range 4))]
+    (is (= [["1" "2" "3"]]
+           (mapv :transition_ids (learning/select-windows transitions scores
+                                  {:window_size 3 :stride 2 :threshold 0.9}))))
+    (is (try (learning/select-windows transitions (assoc-in scores [0 :reward] 2)
+               {:window_size 3 :stride 2 :threshold 0.9}) false (catch Object _ true)))))
+
+(defn offline-options [calls]
+  {:session_options {:project_docs []
+                     :refiner_complete_fn (fn [_] {:message {:content "{\"edits\":[]}"}})
+                     :complete_fn (fn [_] (swap! calls inc)
+                                    {:message {:role :assistant :content "action"} :tool_calls []})}})
+
+(deftest training-failure-resumes-without-replaying-environment-actions
+  (let [root (fixture-root) calls (atom 0)
+        config (assoc-in (fixture-config root) [:commands :train]
+                          ["python3" "test/fixtures/co_learning.py" "train_fail_once"])
+        options (offline-options calls)]
+    (is (try (learning/run! config options) false (catch Object _ true)))
+    (is (= 1 @calls))
+    (is (= 2 (:iteration (learning/run! config options))))
+    (is (= 2 @calls))))
+
+(deftest resume-rejects-changed-environment
+  (let [root (fixture-root) calls (atom 0)
+        config (assoc-in (fixture-config root) [:commands :train]
+                          ["python3" "test/fixtures/co_learning.py" "train_fail_once"])]
+    (is (try (learning/run! config (offline-options calls)) false (catch Object _ true)))
+    (io/spit (str root "/world.json") "{\"cursor\":99}")
+    (is (try (learning/run! config (offline-options calls)) false (catch Object _ true)))
+    (is (= 1 @calls))))
+
+(deftest resume-preserves-refinement-step-schedule
+  (let [root (fixture-root) calls (atom 0) passes (atom 0)
+        config (-> (fixture-config root)
+                   (assoc-in [:session_options :auto_refine_interval] 2)
+                   (assoc-in [:commands :train] ["python3" "test/fixtures/co_learning.py" "train_fail_once"]))
+        options (assoc-in (offline-options calls) [:session_options :refiner_complete_fn]
+                           (fn [_] (swap! passes inc) {:message {:content "{\"edits\":[]}"}}))]
+    (is (try (learning/run! config options) false (catch Object _ true)))
+    (is (= 0 @passes))
+    (is (= 2 (:harness_steps (learning/run! config options))))
+    (is (= 4 @passes))))
+
+(deftest trainer-cannot-reset-the-environment-between-rollouts
+  (let [root (fixture-root) calls (atom 0)
+        config (assoc-in (fixture-config root) [:commands :train]
+                         ["python3" "test/fixtures/co_learning.py" "train_reset_env"])]
+    (is (try (learning/run! config (offline-options calls)) false (catch Object _ true)))
+    (is (= 1 @calls))))
+
+(deftest cancellation-joins-training-process
+  (let [root (fixture-root) calls (atom 0)
+        config (assoc-in (fixture-config root) [:commands :train]
+                          ["python3" "test/fixtures/co_learning.py" "train_cancel"])
+        options (assoc (offline-options calls) :cancelled?
+                       #(io/file-exists? (str root "/training-entered")))]
+    (is (try (learning/run! config options) false
+             (catch Object e (= :cancelled (:category (ex-data e))))))
+    (core/sleep 2100)
+    (is (not (io/file-exists? (str root "/late-mutation"))))
+    (is (= 1 @calls))))
+
+(deftest interrupted-rollout-is-not-replayed
+  (let [root (fixture-root) entered (atom false) calls (atom 0)
+        options {:cancelled? (fn [] @entered)
+                 :session_options {:project_docs []
+                   :complete_fn (fn [_] (swap! calls inc) (reset! entered true)
+                                  (loop []
+                                    (when (core/scope-cancelled?)
+                                      (throw (ex-info "cancelled model" {:category :cancelled})))
+                                    (core/sleep 5) (recur)))}}
+        config (fixture-config root)]
+    (is (try (learning/run! config options) false (catch Object _ true)))
+    (is (= 1 @calls))
+    (reset! entered false)
+    (is (try (learning/run! config options) false (catch Object _ true)))
+    (is (= 1 @calls))))
+
+(deftest trainer-consumes-the-teacher-distribution
+  (let [root (fixture-root) weights
+        (mapv (fn [p]
+                (let [request (str root "/request-" p ".json")
+                      output (str root "/response-" p ".json")
+                      checkpoint (str root "/model-" p ".json")]
+                  (io/spit request (json/write-json
+                    {:request_id "fixture" :checkpoint (str root "/initial.json")
+                     :output_checkpoint checkpoint
+                     :targets [{:positions [{:token_ids [0 1] :probabilities [(- 1 p) p]}]}]}))
+                  (is (= 0 (:exit (os/sh "python3" "test/fixtures/co_learning.py" "train" request output))))
+                  (get (json/read-json (io/slurp checkpoint)) "weight"))) [0.1 0.9])]
+    (is (neg? (first weights)))
+    (is (pos? (second weights)))))
+
+(defn hub-request [h op fields]
+  (deref (hub/request! h (merge {:id "training-test" :op op} fields)) 5000 {}))
+(defn submit-learning [h root number]
+  (:value (hub-request h :workflow/run
+    {:logs_root (str root "/workflow-" number)
+     :dot_source (str "digraph Train { start [shape=Mdiamond]; learn [type=co_learning, co_learning.config="
+                      (pr-str (str root "/config.edn")) "]; exit [shape=Msquare]; start -> learn -> exit; }")})))
+
+(deftest public-hub-workflow-resumes-completed-rollout
+  (let [root (fixture-root)
+        config (-> (fixture-config root) (assoc :iterations 1)
+                   (assoc-in [:commands :train] ["python3" "test/fixtures/co_learning.py" "train_fail_once"]))
+        h (hub/start! {:workflow_registry_fn (fn [_] (handlers/make-handler-registry))})]
+    (io/spit (str root "/config.edn") (pr-str config))
+    (try
+      (let [first-run (submit-learning h root 1)
+            first-result (deref (:completion first-run) 60000 {})
+            second-run (submit-learning h root 2)
+            second-result (deref (:completion second-run) 60000 {})
+            state (edn/read-string (io/slurp (str root "/state.edn")))]
+        (is (= :fail (get-in first-result [:value :status])))
+        (is (= :success (get-in second-result [:value :status])))
+        (is (= 1 (:iteration state)))
+        (is (= 1 (count (filter #(= :assistant (:type %)) (:history state))))))
+      (finally (hub-request h :hub/stop {})))))
+
+(deftest public-hub-cancellation-joins-trainer
+  (let [root (fixture-root)
+        config (assoc-in (fixture-config root) [:commands :train]
+                         ["python3" "test/fixtures/co_learning.py" "train_cancel"])
+        h (hub/start! {:workflow_registry_fn (fn [_] (handlers/make-handler-registry))})]
+    (io/spit (str root "/config.edn") (pr-str config))
+    (try
+      (let [run (submit-learning h root 1) deadline (+ (System/currentTimeMillis) 30000)]
+        (loop []
+          (when (and (not (io/file-exists? (str root "/training-entered")))
+                     (< (System/currentTimeMillis) deadline))
+            (core/sleep 5) (recur)))
+        (is (io/file-exists? (str root "/training-entered")))
+        (hub-request h :workflow/cancel {:run_id (:run_id run)})
+        (is (not= :pending (deref (:completion run) 5000 :pending)))
+        (core/sleep 2100)
+        (is (not (io/file-exists? (str root "/late-mutation")))))
+      (finally (hub-request h :hub/stop {})))))
