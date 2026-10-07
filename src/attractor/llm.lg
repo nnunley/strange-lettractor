@@ -460,9 +460,12 @@
 
 (defn normalize-anthropic-tool-calls [content-blocks]
   (mapv (fn [block]
-          {:id (or (get block "id") "")
-           :name (or (get block "name") "")
-           :arguments (or (get block "input") {})})
+          (cond-> {:id (or (get block "id") "")
+                   :name (or (get block "name") "")
+                   :arguments (if (contains? block "input") (get block "input") {})}
+            (contains? block :partial_json) (assoc :raw_arguments (:partial_json block))
+            (and (not (contains? block :partial_json)) (contains? block "input"))
+            (assoc :raw_arguments (get block "input"))))
         (filter (fn [block] (= (get block "type") "tool_use"))
                 (or content-blocks []))))
 
@@ -556,15 +559,15 @@
 (defn- infer-media-type [location default-type]
   (let [value (str/lower-case (str (or location "")))]
     (cond
-      (some? (re-find #"\\.png(?:[?#].*)?$" value)) "image/png"
-      (some? (re-find #"\\.jpe?g(?:[?#].*)?$" value)) "image/jpeg"
-      (some? (re-find #"\\.gif(?:[?#].*)?$" value)) "image/gif"
-      (some? (re-find #"\\.webp(?:[?#].*)?$" value)) "image/webp"
-      (some? (re-find #"\\.heic(?:[?#].*)?$" value)) "image/heic"
-      (some? (re-find #"\\.heif(?:[?#].*)?$" value)) "image/heif"
-      (some? (re-find #"\\.pdf(?:[?#].*)?$" value)) "application/pdf"
-      (some? (re-find #"\\.wav(?:[?#].*)?$" value)) "audio/wav"
-      (some? (re-find #"\\.mp3(?:[?#].*)?$" value)) "audio/mpeg"
+      (some? (re-find #"\.png(?:[?#].*)?$" value)) "image/png"
+      (some? (re-find #"\.jpe?g(?:[?#].*)?$" value)) "image/jpeg"
+      (some? (re-find #"\.gif(?:[?#].*)?$" value)) "image/gif"
+      (some? (re-find #"\.webp(?:[?#].*)?$" value)) "image/webp"
+      (some? (re-find #"\.heic(?:[?#].*)?$" value)) "image/heic"
+      (some? (re-find #"\.heif(?:[?#].*)?$" value)) "image/heif"
+      (some? (re-find #"\.pdf(?:[?#].*)?$" value)) "application/pdf"
+      (some? (re-find #"\.wav(?:[?#].*)?$" value)) "audio/wav"
+      (some? (re-find #"\.mp3(?:[?#].*)?$" value)) "audio/mpeg"
       :else default-type)))
 
 (defn- content-data [part data-key]
@@ -931,8 +934,7 @@
     "auto" "auto"
     "none" "none"
     "required" "required"
-    "named" {:type "function"
-             :function {:name (tool-choice-name request)}}
+    "named" {:type "function" :name (tool-choice-name request)}
     nil))
 
 (defn- anthropic-tool-choice [request]
@@ -1325,7 +1327,10 @@
                     (assoc :reasoning {:effort effort}))
                   (openai-format request)
                   (provider-options request "openai"))
-        headers (request-headers request key :openai-responses {"Content-Type" "application/json"})]
+        headers (request-headers request key :openai-responses
+                  (cond-> {"Content-Type" "application/json"}
+                    (seq (:org_id request)) (assoc "OpenAI-Organization" (:org_id request))
+                    (seq (:project_id request)) (assoc "OpenAI-Project" (:project_id request))))]
     (require-api-key! (or (:provider request) "openai") key :openai-responses)
     {:url url :headers headers :payload payload}))
 
@@ -1535,7 +1540,7 @@
     {:kind :tool_call
      :tool_call {:id (or (get block "id") "")
                  :name (or (get block "name") "")
-                 :arguments (or (get block "input") {})}}
+                 :arguments (if (contains? block "input") (get block "input") {})}}
     "thinking"
     {:kind :thinking
      :thinking {:text (or (get block "thinking") "")
@@ -2386,7 +2391,7 @@
           "tool_use" {:type :tool_call_start
                       :tool_call {:id (or (get block "id") "")
                                   :name (or (get block "name") "")
-                                  :arguments (or (get block "input") {})}
+                                  :arguments (if (contains? block "input") (get block "input") {})}
                       :raw body}
           ("thinking" "redacted_thinking")
           {:type :reasoning_start :text_id (str "reasoning-" index) :raw body}
@@ -2434,13 +2439,14 @@
           "text" {:type :text_end :text_id (str "text-" index) :text (or (get block "text") "") :raw body}
           "tool_use"
           (let [raw-args (or (:partial_json block) "")
-                args (if (str/blank? raw-args)
-                       (or (get block "input") {})
+                args (if (not (contains? block :partial_json))
+                       (if (contains? block "input") (get block "input") {})
                        (try (json/read-json raw-args)
-                            (catch Object _ {})))
+                            (catch Object _ raw-args)))
                 tool-call {:id (or (get block "id") "")
                            :name (or (get block "name") "")
-                           :arguments args}]
+                           :arguments args
+                           :raw_arguments (if (contains? block :partial_json) raw-args args)}]
             (swap! state assoc-in [:blocks index "input"] args)
             {:type :tool_call_end :tool_call tool-call :raw body})
           ("thinking" "redacted_thinking")

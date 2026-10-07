@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [clojure.core :as core]
             [json :as json]
-            [attractor.llm :as llm]))
+            [attractor.llm :as llm]
+            [attractor.providers :as providers]))
 
 (deftest test-model-catalog-supports-provider-capability-and-alias-lookups
   (is (= "claude-opus-4-6" (:id (llm/get-model-info "opus"))))
@@ -682,7 +683,7 @@
            (get-in gemini-parts [2 "inlineData"])))))
 
 (deftest test-local-image-path-is-inlined-and-mime-type-is-inferred
-  (let [path (str "/tmp/strange-lettractor-image-" (random-uuid) ".png")
+  (let [path (str "/tmp/strange-lettractor-image-" (random-uuid) ".jpg")
         captured (atom nil)]
     (spit path (byte-array [0 255]))
     (try
@@ -699,7 +700,7 @@
       (let [inline-data
             (get-in (json/read-json (:body @captured))
                     ["contents" 0 "parts" 0 "inlineData"])]
-        (is (= "image/png" (get inline-data "mimeType")))
+        (is (= "image/jpeg" (get inline-data "mimeType")))
         (is (= "AP8=" (get inline-data "data"))))
       (finally
         (delete-file path)))))
@@ -1180,7 +1181,7 @@
         gemini-body (json/read-json (:body @gemini-captured))]
     (is (= "function" (get-in openai-body ["tool_choice" "type"])))
     (is (= "lookup"
-           (get-in openai-body ["tool_choice" "function" "name"])))
+           (get-in openai-body ["tool_choice" "name"])))
     (is (= "any" (get-in anthropic-body ["tool_choice" "type"])))
     (is (nil? (get anthropic-none-body "tools")))
     (is (nil? (get anthropic-none-body "tool_choice")))
@@ -1980,9 +1981,8 @@
     (is (= [:initialize :close] @events))))
 
 (deftest test-client-from-env-registers-only-configured-providers
-  (let [client (llm/client-from-env
-                 {"OPENAI_API_KEY" "openai-key"
-                  "GOOGLE_API_KEY" "google-key"})]
+  (let [client (with-redefs [providers/definitions (fn [] (providers/load-registry {:paths []}))]
+                 (llm/client-from-env {"OPENAI_API_KEY" "openai-key" "GOOGLE_API_KEY" "google-key"}))]
     (is (= #{"openai" "gemini"} (set (keys (:providers client)))))
     (is (= "openai" (:default_provider client)))
     (is (= "google-key"

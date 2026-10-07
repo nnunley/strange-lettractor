@@ -1,0 +1,36 @@
+(ns attractor.provider-convergence-test
+  (:require [clojure.test :refer [deftest is]] [attractor.llm :as llm]
+            [json :as json] [clojure.string :as str]))
+
+(deftest malformed-anthropic-arguments-never-execute
+  (doseq [malformed ["{bad" "null" "false" " " "" "[]" "42" "{}"]]
+  (let [executed (atom []) calls (atom 0)
+        sse (fn [events] (str/join "" (map #(str "data: " (json/write-json %) "\n\n") events)))
+        bad [{:type "message_start" :message {:id "m" :usage {}}}
+             {:type "content_block_start" :index 0 :content_block {:type "tool_use" :id "c" :name "side_effect" :input {}}}
+             {:type "content_block_delta" :index 0 :delta {:type "input_json_delta" :partial_json malformed}}
+             {:type "content_block_stop" :index 0}
+             {:type "message_delta" :delta {:stop_reason "tool_use"}} {:type "message_stop"}]
+        final [{:type "message_start" :message {:id "m2" :usage {}}}
+               {:type "message_delta" :delta {:stop_reason "end_turn"}} {:type "message_stop"}]
+        adapter (llm/make-provider-adapter "anthropic"
+                  {:api_key "fixture" :transport (fn [_] {:status 200 :body (sse (if (= 1 (swap! calls inc)) bad final))})})
+        client (llm/make-client {:providers {"anthropic" adapter} :default_provider "anthropic"})]
+    (try
+      (let [result (llm/stream "fixture" "go"
+                     {:client client :max_tool_rounds 1
+                      :tools [{:name "side_effect" :parameters {:type "object" :properties {}}
+                               :execute (fn [args] (swap! executed conj args) "ran")} ]})]
+        (doall (:events result))
+        (is (= (if (= malformed "{}") [{}] []) @executed)))
+      (finally (llm/client-close! client))))))
+
+(deftest openai-account-routing-headers
+  (let [captured (atom nil)]
+    (llm/openai-complete
+      {:model "fixture" :messages [] :api_key "fixture"
+       :org_id "org-fixture" :project_id "proj-fixture"
+       :transport (fn [request] (reset! captured request)
+                    {:status 200 :body "{\"status\":\"completed\",\"output\":[]}"})})
+    (is (= "org-fixture" (get-in @captured [:headers "OpenAI-Organization"])))
+    (is (= "proj-fixture" (get-in @captured [:headers "OpenAI-Project"])))))
