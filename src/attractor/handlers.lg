@@ -61,9 +61,11 @@
                     :retryable false}))))))
 
 (defn- tool-environment-options [timeout-ms]
-  {:working_dir (os/cwd)
-   :default_command_timeout_ms timeout-ms
-   :max_command_timeout_ms timeout-ms})
+  (if timeout-ms
+    {:working_dir (os/cwd)
+     :default_command_timeout_ms timeout-ms
+     :max_command_timeout_ms timeout-ms}
+    {:working_dir (os/cwd) :unbounded_command_timeout true}))
 
 (defn- tool-context-updates [stdout stderr]
   {"tool.output" (or stdout "")
@@ -78,21 +80,7 @@
                            [(str "ATTRACTOR_PARAM_" (str/upper-case (:name d))) v]))))
                    decls))))
 
-;; Note: handle-unbounded-tool shells out through os/sh directly and has no
-;; environment seam, so a tool node without a `timeout` attribute never
-;; receives exported parameters — only handle-timed-tool does.
-(defn- handle-unbounded-tool [cmd]
-  (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
-    (if (zero? (:exit res))
-      {:status :success
-       :context_updates {"tool.output" (:out res)}
-       :notes (str "Tool completed: " cmd)}
-      {:status :fail
-       :failure_reason (str "Tool exited with code " (:exit res) ": " (:err res))
-       :context_updates {"tool.output" (:out res)
-                         "tool.error" (:err res)}})))
-
-(defn- handle-timed-tool [node cmd timeout-ms env-vars]
+(defn- handle-owned-tool [node cmd timeout-ms env-vars]
   (let [environment (*tool-environment-factory*
                       (tool-environment-options timeout-ms))
         cancelled? (:cancelled? node)
@@ -150,11 +138,7 @@
           timeout-ms (parsed-tool-timeout-ms node)]
       (if (str/blank? cmd)
         {:status :fail :failure_reason "No tool_command specified"}
-        (if timeout-ms
-          ;; Only the timed path takes an environment; the unbounded path
-          ;; would discard it.
-          (handle-timed-tool node cmd timeout-ms (exported-environment graph context))
-          (handle-unbounded-tool cmd))))
+        (handle-owned-tool node cmd timeout-ms (exported-environment graph context))))
     (catch Object e
       (merge {:status :fail
               :failure_reason (str "Tool execution exception: " e)}

@@ -4,6 +4,7 @@
             [clojure.string :as str]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
+            [attractor.pipeline :as pipeline] [io :as io]
             [os :as os]))
 
 (deftest test-tool-handler-evaluates-complete-command-through-shell
@@ -381,3 +382,20 @@
     (reset! cancelled true)
     (deliver release :released)
     (is (= :cancelled (:status (deref task 1000 :timeout))))))
+
+(deftest public-pipeline-cancels-untimed-tools-before-later-side-effects
+  (let [root (str (os/temp-dir) "/untimed-cancel-" (System/nanoTime))
+        _ (io/mkdir root)
+        cancelled (atom false)
+        source (str "digraph G { start [shape=Mdiamond]; work [shape=parallelogram, tool_command=\"printf started > " root "/started; sleep 0.5; printf late > " root "/late\"]; exit [shape=Msquare]; start -> work -> exit; }")
+        task (core/future (pipeline/run source {:logs-root (str root "/logs") :cancelled? #(deref cancelled)}))]
+    (try
+      (loop [remaining 300]
+        (when (and (not (io/file-exists? (str root "/started"))) (pos? remaining))
+          (core/sleep 10) (recur (dec remaining))))
+      (is (io/file-exists? (str root "/started")))
+      (reset! cancelled true)
+      (is (= :cancelled (:status (deref task 4000 :unfinished))))
+      (core/sleep 600)
+      (is (not (io/file-exists? (str root "/late"))))
+      (finally (reset! cancelled true) (deref task 4000 nil)))))

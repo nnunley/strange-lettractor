@@ -391,6 +391,8 @@
     ;; never prints a "Killed: 9" job notification into the captured stderr
     ;; when the wrapper kills it (the spec requires exact separate stderr).
     "set +m\n"
+    "watchdog=\n"
+    "if [ -n \"$timeout_s\" ]; then\n"
     "(\n"
     "  sleep \"$timeout_s\"\n"
     "  : > \"$timeout_marker\"\n"
@@ -400,6 +402,7 @@
     ") >/dev/null 2>&1 &\n"
     "watchdog=$!\n"
     "disown \"$watchdog\" 2>/dev/null\n"
+    "fi\n"
     ;; The poller also watches the wrapper itself ($$ is still the wrapper
     ;; inside a subshell). A wrapper killed from outside cannot clean up, and
     ;; an orphaned poller would spin on the marker forever, so it takes the
@@ -470,7 +473,11 @@
              {:category :unsupported-environment-composition
               :operation operation :operations (vec changed)}))))
 
-(defn make-local-environment [& [opts]]
+(defn make-local-environment
+  "Create a cancellable command scope. :unbounded_command_timeout opts out of
+   the default deadline only when a command supplies no timeout; explicit
+   deadlines and cleanup ownership are preserved."
+  [& [opts]]
   (let [options (or opts {})
         working-dir (or (:working_dir options) (os/cwd))
         default-timeout (max 1 (or (:default_command_timeout_ms options) 10000))
@@ -512,7 +519,8 @@
         (fn [command timeout-ms requested-dir env-vars]
           (let [dir (if requested-dir (path-for requested-dir) working-dir)
                 started (System/currentTimeMillis)
-                timeout (min max-timeout (max 1 (or timeout-ms default-timeout)))
+                timeout (when-not (and (:unbounded_command_timeout options) (nil? timeout-ms))
+                          (min max-timeout (max 1 (or timeout-ms default-timeout))))
                 command-id (str environment-id "-" started "-"
                                 (swap! command-counter inc))
                 timeout-marker (str (os/temp-dir) "/lettractor-timeout-" command-id)
@@ -549,7 +557,7 @@
                              (concat ["/bin/bash" "--noprofile" "--norc"
                                       "-p" "-c" command-wrapper
                                       "lettractor" dir
-                                      (str (/ timeout 1000.0))
+                                      (if timeout (str (/ timeout 1000.0)) "")
                                       (str command) timeout-marker cancel-marker
                                       env-policy]
                                      environment-args))

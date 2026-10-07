@@ -276,6 +276,39 @@
         (recur (+ curr-idx 2) (conj chain target-id)))
       [chain curr-idx])))
 
+;; Every node receives the same attribute promotion, including edge-only nodes.
+(defn- make-node [id attrs existing-node explicit-class subgraph-classes sub-class]
+  (let [combined-class (reduce add-class-once explicit-class subgraph-classes)]
+    {:id id
+     :label (or (:label attrs) (:label existing-node) id)
+     :shape (or (:shape attrs) (:shape existing-node) "box")
+     :type (or (:type attrs) (:type existing-node) "")
+     :prompt (or (:prompt attrs) (:prompt existing-node) "")
+     :max_retries (typed-integer (or (:max_retries attrs) (:max_retries existing-node)))
+     :goal_gate (boolean (typed-boolean (or (:goal_gate attrs) false)))
+     :retry_target (or (:retry_target attrs) "")
+     :fallback_retry_target (or (:fallback_retry_target attrs) "")
+     :fidelity (:fidelity attrs)
+     :thread_id (:thread_id attrs)
+     :class combined-class
+     :explicit-class explicit-class
+     :subgraph-classes subgraph-classes
+     :subgraph_class sub-class
+     :timeout (:timeout attrs)
+     :llm_model (:llm_model attrs)
+     :llm_provider (:llm_provider attrs)
+     ;; Keep unset distinct from the system default so a
+     ;; stylesheet can supply this property.
+     :reasoning_effort (:reasoning_effort attrs)
+     :auto_status (boolean
+                    (if (contains? attrs :auto_status)
+                      (:auto_status attrs)
+                      false))
+     :allow_partial (boolean (or (:allow_partial attrs) false))
+     :attrs (assoc attrs
+                   :class combined-class
+                   :subgraph_class sub-class)}))
+
 ;; Step function for parser state
 (defn- step-parse [tokens n state]
   (let [idx (:idx state)
@@ -420,24 +453,8 @@
                             (:derived-class (:current-subgraph state)) "")
                 registered-nodes (reduce (fn [acc-nodes nid]
                                            (let [node (or (get acc-nodes nid)
-                                                          {:id nid
-                                                           :label nid
-                                                           :shape (or (:shape defaults) "box")
-                                                           :type (or (:type defaults) "")
-                                                           :prompt ""
-                                                           :max_retries (typed-integer (:max_retries defaults))
-                                                           :goal_gate false
-                                                           :retry_target ""
-                                                           :fallback_retry_target ""
-                                                           :fidelity (:fidelity defaults)
-                                                          :thread_id (:thread_id defaults)
-                                                          :class (or (:class defaults) "")
-                                                           :explicit-class (or (:class defaults) "")
-                                                           :subgraph-classes []
-                                                          :subgraph_class sub-class
-                                                           :attrs (assoc defaults
-                                                                     :class (or (:class defaults) "")
-                                                                     :subgraph_class sub-class)})]
+                                                          (make-node nid defaults nil
+                                                                     (or (:class defaults) "") [] sub-class))]
                                              (assoc acc-nodes nid
                                                     (apply-active-subgraph-classes node state))))
                                          (:nodes state)
@@ -471,39 +488,11 @@
                                              (conj classes derived-class)))
                                          (or (:subgraph-classes existing-node) [])
                                          (active-subgraph-classes state))
-                combined-class (reduce add-class-once explicit-class subgraph-classes)
                 sub-class (if (:current-subgraph state)
                             (:derived-class (:current-subgraph state))
                             (or (:subgraph_class existing-node) ""))
-                node-rec {:id first-id
-                          :label (or (:label merged-attrs) (:label existing-node) first-id)
-                          :shape (or (:shape merged-attrs) (:shape existing-node) "box")
-                          :type (or (:type merged-attrs) (:type existing-node) "")
-                          :prompt (or (:prompt merged-attrs) (:prompt existing-node) "")
-                          :max_retries (typed-integer (or (:max_retries merged-attrs) (:max_retries existing-node)))
-                          :goal_gate (boolean (typed-boolean (or (:goal_gate merged-attrs) false)))
-                          :retry_target (or (:retry_target merged-attrs) "")
-                          :fallback_retry_target (or (:fallback_retry_target merged-attrs) "")
-                          :fidelity (:fidelity merged-attrs)
-                          :thread_id (:thread_id merged-attrs)
-                          :class combined-class
-                          :explicit-class explicit-class
-                          :subgraph-classes subgraph-classes
-                          :subgraph_class sub-class
-                          :timeout (:timeout merged-attrs)
-                          :llm_model (:llm_model merged-attrs)
-                          :llm_provider (:llm_provider merged-attrs)
-                          ;; Keep unset distinct from the system default so a
-                          ;; stylesheet can supply this property.
-                          :reasoning_effort (:reasoning_effort merged-attrs)
-                          :auto_status (boolean
-                                         (if (contains? merged-attrs :auto_status)
-                                           (:auto_status merged-attrs)
-                                           false))
-                          :allow_partial (boolean (or (:allow_partial merged-attrs) false))
-                          :attrs (assoc merged-attrs
-                                        :class combined-class
-                                        :subgraph_class sub-class)}]
+                node-rec (make-node first-id merged-attrs existing-node
+                                    explicit-class subgraph-classes sub-class)]
             (-> state
                 (assoc :idx next-idx)
                 (assoc-in [:nodes first-id] node-rec)

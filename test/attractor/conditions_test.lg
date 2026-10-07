@@ -92,3 +92,13 @@
         (is (some #{"good"} (:completed_nodes outcome)))
         (is (not-any? #{"bad"} (:completed_nodes outcome))))
       (finally (os/sh "rm" "-rf" "--" root)))))
+
+(deftest empty-conjunction-clauses-are-rejected-before-execution
+  (doseq [condition ["&&" "&& outcome=success" "outcome=success &&" "outcome=success && && context.ok=true"]]
+    (is (some? (c/validate-condition-syntax condition)))
+    (is (= :condition_syntax
+           (try (c/evaluate-condition condition {:status :success} {"ok" "true"}) nil
+                (catch Object e (:category (ex-data e))))))
+    (let [prepared (pipeline/prepare
+                     (str "digraph G { start [shape=Mdiamond]; exit [shape=Msquare]; start -> exit [condition=\"" condition "\"]; }"))]
+      (is (some #(= "condition_syntax" (:rule %)) (:diagnostics prepared))))))

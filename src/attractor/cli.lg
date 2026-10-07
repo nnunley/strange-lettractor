@@ -135,20 +135,20 @@
       (:value reply))))
 
 (defn- pump-events!
-  "Attach to the hub log and deliver every envelope to `on-envelope` in
-   emission order until `completion` is realized, draining once more after
-   it so trailing events are not lost. Returns the completion value."
-  [hub completion on-envelope]
+  "Attach before starting work, then deliver every envelope in emission order.
+   Drain once after completion so trailing events are not lost."
+  [hub start-work on-envelope]
   (let [client (hub-call! hub :client/attach {})]
     (try
-      (loop [cursor (:cursor client) final? false]
-        (let [{:keys [events] next-cursor :cursor}
-              (hub/events-since hub (:client_id client) cursor)]
-          (doseq [envelope events] (on-envelope envelope))
-          (cond
-            final? (deref completion)
-            (realized? completion) (recur next-cursor true)
-            :else (do (core/sleep 20) (recur next-cursor false)))))
+      (let [completion (:completion (start-work))]
+        (loop [cursor (:cursor client) final? false]
+          (let [{:keys [events] next-cursor :cursor}
+                (hub/events-since hub (:client_id client) cursor)]
+            (doseq [envelope events] (on-envelope envelope))
+            (cond
+              final? (deref completion)
+              (realized? completion) (recur next-cursor true)
+              :else (do (core/sleep 20) (recur next-cursor false))))))
       (finally
         (try (hub-call! hub :client/detach {:client_id (:client_id client)})
              (catch Object _ nil))))))
@@ -228,9 +228,9 @@
               ;; EDN in emission order.
               (with-hub (fn [_] nil)
                 (fn [hub]
-                  (let [started (hub-call! hub :agent/run
-                                  (assoc (dissoc opts :agent :on_event) :agent (:agent opts) :prompt (io/slurp path)))
-                        result (pump-events! hub (:completion started)
+                  (let [result (pump-events! hub
+                                 #(hub-call! hub :agent/run
+                                    (assoc (dissoc opts :agent :on_event) :agent (:agent opts) :prompt (io/slurp path)))
                                  (fn [envelope]
                                    (when (= :agent (:source envelope)) (prn (:event envelope)))))]
                     (when-let [error (:error result)]
@@ -534,8 +534,7 @@
     (fn [hub]
       (let [stdin (interviewer/make-console-interviewer)
             questions (answer-questions-from-stdin! hub stdin)
-            started (hub-call! hub op request)
-            result (pump-events! hub (:completion started)
+            result (pump-events! hub #(hub-call! hub op request)
                      (fn [envelope]
                        (case (:source envelope)
                          :workflow (on-event (:event envelope))

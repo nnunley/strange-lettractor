@@ -548,3 +548,14 @@
       (is (= 130 (:exit_code result)))
       (is (true? (:cancelled result)))
       (is (false? (some? (os/stat survived)))))))
+
+(deftest unbounded-default-is-opt-in-and-explicit-timeouts-still-apply
+  (let [env (execution/make-local-environment
+              {:unbounded_command_timeout true :default_command_timeout_ms 20 :max_command_timeout_ms 20})]
+    (try
+      (let [result ((:exec_command env) "sleep 0.1; printf done" nil nil nil)]
+        (is (= 0 (:exit_code result)))
+        (is (= "done" (:stdout result)))
+        (is (false? (:timed_out result))))
+      (is (true? (:timed_out ((:exec_command env) "sleep 0.1" 20 nil nil))))
+      (finally ((:cleanup env))))))

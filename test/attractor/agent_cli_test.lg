@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [io :as io] [os :as os]
             [attractor.cli :as cli]
+            [attractor.hub :as hub]
             [attractor.context :as context]
             [attractor.handlers :as handlers]
             [attractor.pipeline :as pipeline]
@@ -12,11 +13,17 @@
 
 (deftest agent-command-reads-prompt-file-and-streams-worker-events
   (let [path (str (os/temp-dir) "/claude-cli-" (random-uuid) ".txt")
-        calls (atom []) exits (atom [])]
+        calls (atom []) exits (atom [])
+        request hub/request!]
     (try
       (io/spit path "Inspect literal $() and : (forms)\n")
       (let [output
             (with-redefs [os/exit #(swap! exits conj %)
+                          hub/request! (fn [h req]
+                                         (let [reply (request h req)]
+                                           (when (= :agent/run (:op req))
+                                             (deref (get-in @reply [:value :completion]) 3000 nil))
+                                           reply))
                           claude/run! (fn [opts]
                                         (swap! calls conj opts)
                                         ((:on_event opts) {:source :claude :agent_id "worker-1" :type :text_delta :text "hello"})

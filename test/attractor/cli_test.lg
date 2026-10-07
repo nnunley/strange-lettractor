@@ -4,6 +4,7 @@
             [io :as io]
             [os :as os]
             [attractor.cli :as cli]
+            [attractor.hub :as hub] [clojure.core :as core]
             [attractor.engine :as engine]
             [attractor.handlers :as handlers]
             [attractor.interviewer :as interviewer]
@@ -238,3 +239,62 @@
       (is (= :success (:status @resume-result)))
       (is (= 1 @handler-calls))
       (is (= [1 0] @exits)))))
+
+(deftest cli-subscribes-before-immediate-human-gates-on-run-and-resume
+  (doseq [resume? [false true]]
+    (let [root (str (os/temp-dir) "/cli-early-question-" (random-uuid))
+          _ (io/mkdir root)
+          path (str root "/workflow.dot")
+          checkpoint (str root "/checkpoint.edn")
+          _ (io/spit path "digraph G { start [shape=Mdiamond]; gate [shape=hexagon]; exit [shape=Msquare]; start -> gate; gate -> exit [label=\"[Y] Yes\"]; }")
+          _ (io/spit checkpoint "{}")
+          request hub/request! run pipeline/run
+          op (if resume? :workflow/resume :workflow/run)
+          captured (atom nil) asked (atom 0) exits (atom [])]
+      (with-redefs [hub/request!
+                    (fn [h req]
+                      (let [reply (request h req)]
+                        (when (= op (:op req))
+                          (reset! captured h)
+                          @reply
+                          ;; Force the question to precede the submission reply.
+                          (loop [remaining 300]
+                            (when (and (empty? @(:questions h)) (pos? remaining))
+                              (core/sleep 10) (recur (dec remaining)))))
+                        reply))
+                    pipeline/resume (fn [_ options] (run (io/slurp path) (assoc options :logs-root (str root "/resume"))))
+                    interviewer/make-console-interviewer
+                    (fn [] (interviewer/make-callback-interviewer
+                             (fn [_] (swap! asked inc) {:value "Y" :text "Y"})))
+                    os/exit #(swap! exits conj %)]
+        (let [task (core/future
+                     (if resume?
+                       (cli/cmd-resume ["--checkpoint" checkpoint "--mock"])
+                       (cli/cmd-run [path "--mock" "--logs-root" (str root "/run")])))]
+          (try
+            (is (not= :unfinished (deref task 4000 :unfinished)))
+            (is (= 1 @asked))
+            (is (= [0] @exits))
+            (finally
+              (when @captured
+                (doseq [[id _] @(:workflows @captured)]
+                  @(request @captured {:id "test-cancel" :op :workflow/cancel :run_id id})))
+              (deref task 4000 nil))))))))
+
+(deftest cli-detaches-its-subscription-when-launch-fails
+  (let [request hub/request! detached (atom false) remaining (atom nil)]
+    (with-redefs [hub/request!
+                  (fn [h req]
+                    (case (:op req)
+                      :workflow/run (throw (ex-info "Launch rejected" {:category :test-rejection}))
+                      :client/detach (let [reply (request h req)]
+                                       @reply
+                                       (reset! detached true)
+                                       (reset! remaining (:clients @(:log h)))
+                                       reply)
+                      (request h req)))]
+      (is (= :test-rejection
+             (try (cli/cmd-run ["examples/hello.dot" "--mock"])
+                  nil (catch Object e (:category (ex-data e)))))))
+    (is (true? @detached))
+    (is (empty? @remaining))))

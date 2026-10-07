@@ -77,14 +77,19 @@
    }")
 
 (deftest only-exported-parameters-reach-a-tool-node
-  (let [ctx (context/make-context)
-        _ (pipeline/run export-source
+  (doseq [source [export-source
+                  (str/replace export-source "timeout=\"30s\"," "")
+                  (-> export-source
+                      (str/replace "timeout=\"30s\"," "")
+                      (str/replace "probe [shape" "node [timeout=\"30s\"]; probe [shape"))]]
+   (let [ctx (context/make-context)
+        _ (pipeline/run source
                         {:parameters {:flags {"editable" "solve.lg" "secret_note" "hidden"}}
                          :context ctx
                          :logs-root (str (os/temp-dir) "/attractor-param-env-" (random-uuid))})
         out (context/ctx-get-string ctx "tool.output")]
     (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
-    (is (not (str/includes? out "SECRET_NOTE")))))
+    (is (not (str/includes? out "SECRET_NOTE"))))))
 
 ;; A parent's --param belongs to the parent alone. Implicit inheritance is out
 ;; of scope and input_map is the sanctioned path into a child, so a child
