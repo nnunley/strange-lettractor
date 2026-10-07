@@ -65,7 +65,7 @@ compatibility with an unpatched release runtime.
 
 At baseline `5e811b1`, all three native adapters emit text and reasoning end
 events without the final accumulated segment value required by the pinned
-[unified LLM spec §3.14](upstream/strongdm-attractor/unified-llm-spec.md).
+[unified LLM spec §3.14](../specs/unified-llm-spec.md).
 The event record in §3.13 is illustrative and does not list completion-value
 fields; §3.14 explicitly requires those values. The existing compatible-adapter
 reasoning fix uses `:reasoning`, keeping `:reasoning_delta` incremental-only.

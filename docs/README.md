@@ -29,6 +29,8 @@ are not current conformance evidence. Current status comes from the
 
 - **New to Attractor?** Start with the [Tutorial](tutorial.md).
 - **Shared console and HTTP host:** [Hub usage](hub.md).
+- **Whole-codebase convergence:** [2026-10-07 audit and repair evidence](codebase-audit-2026-10-07.md).
+- **Continual Harness:** [Current usage and optional model training](../examples/continual-harness/README.md).
 - **Current coding-loop findings:** [2026-09-27 original-spec audit](coding-loop-audit-2026-09-27.md).
 - **Project overview & future work:** [future_work.md](future_work.md).
 - **Iteration tracking:** See [`superpowers/iterations/`](superpowers/iterations/).
@@ -48,6 +50,12 @@ checkbox count establishes complete conformance.
 | [Coding Agent Loop Specification](../specs/coding-agent-loop-spec.md) | [Current audit](coding-loop-audit-2026-09-27.md): four repaired defects; deterministic audit passes; native conformance and same-session smoke implemented, live evidence partial |
 | [Unified LLM Client Specification](../specs/unified-llm-spec.md) | [Provider evidence](provider-model-audits.md) and [schema support contract](schema-validation.md) |
 | [Evaluation Harness Extension](evaluation-harness-extension.md) | Proposed extension: run scoring, independent evaluation, skills, MCP, and constrained generated let-go modules |
+
+The evaluation proposal and archived design documents are historical/proposed
+inputs, not proof of implemented behavior. The current Continual Harness target
+is arXiv:2605.09998, with its implementation contract in the linked usage guide.
+Its core does not require model training. Imported methodology references under
+`asdlc-skill/` are review guidance, not additional runtime requirements.
 
 ## Consolidated Audits & Implementation Docs
 

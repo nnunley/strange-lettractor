@@ -1,6 +1,6 @@
 # Codebase, specification and convergence audit — 2026-10-07
 
-## Judgment
+## Baseline judgment
 
 The implementation is substantial, but it is not consistently converged on its
 specifications or its public execution paths. The uncommitted Continual Harness
@@ -18,6 +18,80 @@ during the audit. The user then requested a working-branch checkpoint and revisi
 the pre-existing harness is preserved at `dfa3fed` on
 `audit/continual-harness-convergence`. No paid model calls, deployments or tracker
 posts were performed.
+
+## Repair checkpoints
+
+This section tracks revisions; findings below retain their original baseline
+locations and evidence. The user explicitly included model-training infrastructure,
+then clarified that the normal harness must not depend on a trainer. Training is
+therefore confined to the explicitly selected `co_learning` handler.
+
+| Findings | Repair checkpoint | Fresh evidence |
+|---|---|---|
+| R04, R11, R12, R23, R25 | `31208fe` | 87 tests / 532 assertions pass; malformed, null, false, blank, array and scalar arguments do not execute tools; valid `{}` does. Independent review approved. |
+| R19, R26 | `ea95ba0` | 48 tests / 219 assertions pass; valid no-coverage holds round-trip, forged contradictions remain rejected, header-only credentials require private files. Independent review approved. |
+
+The normal harness now runs without any trainer configuration. The optional
+co-learning path uses explicit scoring, teacher, trainer and activation commands;
+a deterministic local trainer updates a small policy and the next rollout consumes
+its checkpoint. This verifies the integration contract, not real-model learning
+performance or reproduction of the paper's reported results.
+
+| Findings | Repair checkpoint | Fresh evidence |
+|---|---|---|
+| R01, R02, R09, R10, R24 | `563486c` | 222 tests / 1,277 assertions pass; independent runtime review passes 106 tests / 450 assertions. Implicit defaults, untimed cancellation, parameters and initial CLI events covered. |
+| R03, R05–R07, R13–R18 | `e7ee6ae` | Final focused review regressions: 41 tests / 180 assertions pass. Specification and Google quality review approved after persistence, ownership, provider-text and nested-validation corrections. |
+| R22 | `e429317` | Root rerun: 28 tests / 122 assertions pass; acquisition race closes exactly once, partial startup releases child/files. Independent source and leak-probe review approved; standalone transport rerun passes 6 tests / 47 assertions. |
+| R27 (verification finding) | `23d0239` | 61 tests / 2,022 assertions pass, including both official schema corpora. Per-selector cache retains dialect/registry isolation; independent review passes 21 tests / 91 assertions. |
+| R20, R21 | `8a3e7a6` | Atomic MCP admission, acquired-handle rollback and independently bounded teardown covered; independent review approved. |
+| R08 and requested training infrastructure | `c7e88bd` | 12 tests / 44 assertions pass, including real subprocess training, changed next-rollout behavior, failed-stage resume, environment continuity and public cancellation. Specification and quality review approved. |
+
+Final integrated verification passes below. Authored evaluator loops have cooperative
+checkpoints and owned cancellation; arbitrary native callbacks are not an OS
+sandbox or a universal wall-clock bound. External training adapters must provide
+real teacher/reward/model services and idempotent activation. Environment continuity
+covers declared local state; external services need adapter-specific guarantees.
+
+R25 intentionally follows the native Responses protocol's top-level function name
+rather than the pinned spec's nested form. This interpretation is grounded in the
+[official Responses function-choice type](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/tool_choice_function_param.py).
+Chat Completions keeps its separate translation.
+
+## Integrated verification after repairs
+
+**Final result:** `LGX_LG=/opt/homebrew/bin/lg lgx suite` exits 0 with
+**1,676 tests / 14,691 assertions / zero failures** after the schema repair.
+The source checkpoint is `23d0239`; subsequent changes are documentation only.
+`final-suite-schema-fixed.log`, `final-build.log` and
+`final-http-question-probe.log` retain the final evidence. All R01–R27 findings
+have repair checkpoints above, with the explicit capability limits retained.
+The following intermediate results explain how full verification was reached.
+
+The fresh compiled HTTP human-question probe passes all seven checks, including
+answer delivery, cleanup and timeout defaults. A fresh `lgx build` succeeds.
+
+The first repaired monolithic suite was stopped after thirteen minutes with no
+final result. A diagnostic process-per-namespace run completed 177 of 179 selected
+namespaces: 1,659 tests / 12,948 assertions, zero assertion failures or errors.
+The two official schema dialect/reference corpora exceeded their 120-second
+limits. Codex agent tests were excluded while their repair was active; a subsequent
+independent Codex agent/transport/MCP-client run passes 28 tests / 122 assertions.
+These overlapping counts must not be added together.
+
+The schema timeout investigation identified repeated vocabulary URI validation
+while indexing the same immutable registry: a trivial reference example made
+2,329 selector calls, all recalculating vocabulary declarations. A per-selector
+cache reduced repeated calculations to 26 in the diagnostic probe. The cache repair is committed at `23d0239`; both official corpora plus focused
+schema contracts pass (61 tests / 2,022 assertions). This is R27, a performance
+defect uncovered by integrated verification, rather than a schema semantic change.
+The cache belongs to one immutable registry selector and cannot reuse another
+registry's vocabulary decisions. See `schema-timeout-diagnosis.md` and
+`schema-cache-review.md` in the evidence directory.
+
+A reviewer's concurrent Codex run observed four assertions fail in the existing
+partial-EOF timing test. Root's combined run and the reviewer's subsequent standalone
+transport run both passed. Timing contention is plausible but not established;
+the discrepancy remains recorded in `codex-final-review.md`.
 
 ## Baseline and authority
 
@@ -317,9 +391,11 @@ Fresh focused results:
 
 The ordinary `lgx suite` was interrupted after over twelve minutes without a
 result (exit 143). The identical generated harness was launched directly to expose
-progress. At this checkpoint it has observed CLI event-output failures, a Codex
-initialize timeout and the ambient-provider fixture failures; final totals are
-pending. No full-suite pass is claimed. Logs and reproduction scripts are collected
+progress. That baseline run was also stopped after fourteen minutes, having
+observed seven failed assertions in CLI event output, Codex initialization and
+the ambient-provider fixture. It had reached the official schema reference
+namespace but produced no final total. No baseline full-suite pass is claimed.
+Logs and reproduction scripts are collected
 under `evidence/codebase-audit-2026-10-07/`, ignored according to the existing
 verification-output policy. Some scripts intentionally create temporary fixture
 directories; production source is always the repository checkout.

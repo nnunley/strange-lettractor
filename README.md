@@ -30,6 +30,12 @@ See the [current specification audit](docs/superpowers/iterations/spec-closure.m
 for verified results and remaining gaps. Historical story counts alone do not
 establish full specification conformance.
 
+The [2026-10-07 convergence audit](docs/codebase-audit-2026-10-07.md) covers current
+and archived documentation, recent local history and public execution paths.
+[Continual Harness usage](examples/continual-harness/README.md) explains ordinary
+in-context adaptation and the separate, opt-in model-training workflow. The core
+harness needs no trainer.
+
 It is built with [lgx](https://github.com/abogoyavlensky/lgx) and runs on a
 stock [let-go](https://github.com/nooga/let-go) release.
 

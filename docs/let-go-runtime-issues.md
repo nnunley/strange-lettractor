@@ -157,8 +157,9 @@ yet evidence of a released runtime containing them. The reproducible build now
 pins fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755` and applies both
 tracked runtime patches; see [runtime build evidence](runtime-audits.md).
 
-2026-09-12: the configured local runtime also needs the JSON string-key fix in
-[`runtime-patches/README.md`](../runtime-patches/README.md). HTTP question IDs and
+2026-09-12 historical state: the local runtime needed the JSON string-key fix
+recorded in [runtime build evidence](runtime-audits.md). The patch directory has
+since been removed; `lgx.edn` records the current release pin. HTTP question IDs and
 context keys previously included reader quotes. The native compiled-server probe
 now passes with that patch. Empty lazy sequences still serialize incorrectly as
 `[null]` in the observed runtime; the pipeline listing now constructs a vector.
