@@ -1,197 +1,157 @@
 (ns attractor.harness
-  "Continual Harness state ledger and in-context adaptation engine.
-   Provides a durable, reset-free mutable store supporting online CRUD operations,
-   snapshot rollbacks, dynamic runtime tooling, and prompt injection."
-  (:require [attractor.ids :as ids]
-            [clojure.edn :as edn]
-            [clojure.string :as str]
-            [io :as io]
-            [json :as json]
-            [os :as os]))
+  "Durable continual harness ledger. All mutation paths share one validated transaction."
+  (:require [attractor.ids :as ids] [clojure.edn :as edn]
+            [clojure.string :as str] [io :as io] [json :as json] [os :as os]))
 
 (def schema-version 1)
-
 (def default-overview-entry-limit 10)
 (def default-overview-content-limit 240)
-
+(def kinds #{:prompt :memory :skill :subagent :tool})
 (defn empty-harness-state []
-  {:schema schema-version
-   :entries {:prompt {}
-             :memory {}
-             :skill {}
-             :subagent {}
-             :tool {}}
+  {:schema schema-version :entries {:prompt {} :memory {} :skill {} :subagent {} :tool {}}
    :refinements []})
-
-(defn- normalize-kind [k]
-  (cond
-    (keyword? k) k
-    (string? k) (keyword (str/lower-case (str/trim k)))
-    :else :memory))
-
-(defn- normalize-action [a]
-  (cond
-    (keyword? a) (name a)
-    (string? a) (str/lower-case (str/trim a))
-    :else "create"))
-
+(defn- normalize-kind [k] (if (keyword? k) k (keyword (str/lower-case (str k)))))
 (defn- now-iso []
-  (let [res (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ")]
-    (if (= 0 (:exit-code res))
-      (str/trim (:stdout res))
-      "1970-01-01T00:00:00Z")))
-
-(defn- random-id [prefix]
-  (ids/prefixed prefix))
-
-(defn- parent-path [path]
-  (let [index (str/last-index-of path "/")]
-    (cond
-      (nil? index) "."
-      (zero? index) "/"
-      :else (subs path 0 index))))
-
+  (let [r (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ")]
+    (if (= 0 (:exit r)) (str/trim (:out r))
+      (throw (ex-info "Unable to read clock" {:category :harness-clock})))) )
+(defn- random-id [prefix] (ids/prefixed prefix))
+(defn- keyword-fields [x]
+  (cond (map? x) (into {} (map (fn [[k v]] [(if (string? k) (keyword k) k) (keyword-fields v)]) x))
+        (vector? x) (mapv keyword-fields x)
+        :else x))
+(defn- validate-state [state]
+  (doseq [[kind entries] (:entries state)]
+    (when-not (and (contains? kinds kind) (map? entries))
+      (throw (ex-info "Invalid harness entries" {:category :harness-schema :kind kind})))
+    (doseq [[id entry] entries]
+      (when-not (and (map? entry) (string? id) (not (str/blank? id))
+                     (= id (:id entry)) (= (name kind) (:kind entry)))
+        (throw (ex-info "Invalid harness entry identity" {:category :harness-schema :id id})))
+      (doseq [field [:id :kind :title :content :path :created_at :updated_at]]
+        (when (and (contains? entry field) (not (string? (get entry field))))
+          (throw (ex-info "Harness entry field must be text" {:category :harness-schema :id id :field field}))))
+      (doseq [field [:arguments :reference :metadata]]
+        (when (and (contains? entry field) (not (map? (get entry field))))
+          (throw (ex-info "Harness entry field must be an object" {:category :harness-schema :id id :field field}))))
+      (let [arguments (:arguments entry)]
+        (when (and (contains? arguments :description) (not (string? (:description arguments))))
+          (throw (ex-info "Tool description must be text" {:category :harness-schema :id id})))
+        (when (and (contains? arguments :parameters) (not (map? (:parameters arguments))))
+          (throw (ex-info "Tool parameters must be a schema object" {:category :harness-schema :id id}))))
+      (when (and (contains? entry :version) (not (and (integer? (:version entry)) (pos? (:version entry)))))
+        (throw (ex-info "Invalid harness entry version" {:category :harness-schema :id id})))))
+  state)
+(defn- normalize-state [state]
+  (let [entries (or (:entries state) (get state "entries") {})]
+    {:schema (or (:schema state) (get state "schema") schema-version)
+     :entries (into {} (map (fn [k]
+                            [k (into {} (map (fn [[id entry]] [(str id) (keyword-fields entry)])
+                                            (or (get entries k) (get entries (name k)) {})))]) kinds))
+     :refinements (mapv keyword-fields (or (:refinements state) (get state "refinements") []))}))
 (defn load-harness [path]
   (when (and path (io/file-exists? path))
-    (try
-      (let [content (io/slurp path)]
-        (if (str/starts-with? (str/trim content) "{")
-          (try
-            (let [parsed (json/read-json content)]
-              (if (map? parsed)
-                (let [entries (or (get parsed "entries") (get parsed :entries) {})
-                      refinements (or (get parsed "refinements") (get parsed :refinements) [])]
-                  {:schema (or (get parsed "schema") (get parsed :schema) schema-version)
-                   :entries {:prompt (or (get entries "prompt") (get entries :prompt) {})
-                             :memory (or (get entries "memory") (get entries :memory) {})
-                             :skill (or (get entries "skill") (get entries :skill) {})
-                             :subagent (or (get entries "subagent") (get entries :subagent) {})
-                             :tool (or (get entries "tool") (get entries :tool) {})}
-                   :refinements (vec refinements)})
-                (edn/read-string content)))
-            (catch Object _
-              (edn/read-string content)))
-          (edn/read-string content)))
-      (catch Object _ nil))))
-
+    (let [content (io/slurp path)
+          parsed (if (str/ends-with? path ".json") (json/read-json content) (edn/read-string content))]
+      (when-not (and (map? parsed) (= schema-version (or (:schema parsed) (get parsed "schema"))))
+        (throw (ex-info "Invalid harness schema" {:category :harness-schema :path path})))
+      (validate-state (normalize-state parsed)))))
 (defn save-harness! [state path]
   (when (and path state)
-    (let [parent (parent-path path)]
-      (when (and parent (not= "." parent) (not (io/file-exists? parent)))
-        (os/sh "mkdir" "-p" parent)))
-    (if (str/ends-with? path ".json")
-      (io/spit path (json/write-json state))
-      (io/spit path (pr-str state)))
+    (let [index (str/last-index-of path "/")
+          parent (if index (subs path 0 index) ".")
+          temporary (str path "." (random-id "write") ".tmp")]
+      (when (and (seq parent) (not (io/file-exists? parent)))
+        (let [r (os/sh "mkdir" "-p" parent)]
+          (when-not (= 0 (:exit r)) (throw (ex-info "Cannot create harness directory" {:path parent})))))
+      (try
+        (io/spit temporary (if (str/ends-with? path ".json") (json/write-json state) (pr-str state)))
+        (os/rename temporary path)
+        (finally (when (io/file-exists? temporary) (os/sh "rm" "-f" temporary)))))
     path))
-
-(defn make-harness [& [initial-or-path]]
-  (let [state (cond
-                (string? initial-or-path) (or (load-harness initial-or-path) (empty-harness-state))
-                (map? initial-or-path) initial-or-path
-                :else (empty-harness-state))]
-    (atom state)))
-
-(defn- clone-entry [entry]
-  (when entry
-    (into {} entry)))
-
-(defn apply-edit! [harness-atom edit]
-  (let [action (normalize-action (or (:action edit) (get edit "action")))
-        kind (normalize-kind (or (:kind edit) (get edit "kind")))
-        id (or (:id edit) (get edit "id") (random-id (name kind)))
-        title (or (:title edit) (get edit "title") id)
-        content (or (:content edit) (get edit "content") "")
-        path (or (:path edit) (get edit "path") "")
-        reference (or (:reference edit) (get edit "reference") {})
-        arguments (or (:arguments edit) (get edit "arguments") {})
-        metadata (or (:metadata edit) (get edit "metadata") {})
-        reason (or (:reason edit) (get edit "reason") "")
-        before (clone-entry (get-in @harness-atom [:entries kind id]))]
-    (swap! harness-atom
-      (fn [state]
-        (case action
-          "create"
-          (let [new-entry {:id id
-                           :kind (name kind)
-                           :title title
-                           :content content
-                           :path path
-                           :reference reference
-                           :arguments arguments
-                           :metadata metadata
-                           :created_at (now-iso)
-                           :updated_at (now-iso)
-                           :version 1}]
-            (assoc-in state [:entries kind id] new-entry))
-          "update"
-          (let [existing (get-in state [:entries kind id])
-                updated (merge (or existing {:id id :kind (name kind) :created_at (now-iso) :version 0})
-                               {:title title
-                                :content content
-                                :updated_at (now-iso)
-                                :version (inc (or (:version existing) 0))}
-                               (when (seq path) {:path path})
-                               (when (seq reference) {:reference reference})
-                               (when (seq arguments) {:arguments arguments})
-                               (when (seq metadata) {:metadata metadata}))]
-            (assoc-in state [:entries kind id] updated))
-          "delete"
-          (update-in state [:entries kind] dissoc id)
-          state)))
-    (let [after (clone-entry (get-in @harness-atom [:entries kind id]))]
-      {:id id
-       :kind (name kind)
-       :action action
-       :title title
-       :reason reason
-       :before before
-       :after after
-       :applied true})))
-
-(defn apply-proposal! [harness-atom proposal]
-  (let [summary (or (:summary proposal) (get proposal "summary") "Harness refinement")
-        rationale (or (:rationale proposal) (get proposal "rationale") "")
-        expected-outcome (or (:expected_outcome proposal) (get proposal "expected_outcome")
-                             (:expectedOutcome proposal) (get proposal "expectedOutcome") "")
-        raw-edits (or (:edits proposal) (get proposal "edits") [])
-        applied-edits (mapv (fn [e] (apply-edit! harness-atom e)) raw-edits)
-        event-id (random-id "refine")
-        event {:id event-id
-               :summary summary
-               :rationale rationale
-               :expected_outcome expected-outcome
-               :applied_edits applied-edits
-               :created_at (now-iso)}]
-    (swap! harness-atom update :refinements (fnil conj []) event)
-    {:id event-id
-     :summary summary
-     :rationale rationale
-     :expected_outcome expected-outcome
-     :applied_edits applied-edits}))
-
-(defn rollback! [harness-atom refinement-id]
-  (let [state @harness-atom
-        refinements (:refinements state)
-        event (first (filter #(= refinement-id (:id %)) refinements))]
-    (if-not event
-      {:success false :error (str "Refinement event not found: " refinement-id)}
-      (do
-        (doseq [edit (reverse (:applied_edits event))]
-          (let [kind (normalize-kind (:kind edit))
-                id (:id edit)
-                before (:before edit)]
-            (swap! harness-atom
-              (fn [curr]
-                (if before
-                  (assoc-in curr [:entries kind id] before)
-                  (update-in curr [:entries kind] dissoc id))))))
-        (let [rollback-event-id (random-id "rollback")]
-          (swap! harness-atom update :refinements conj
-                 {:id rollback-event-id
-                  :summary (str "Rollback of " refinement-id)
-                  :rollback_of refinement-id
-                  :created_at (now-iso)})
-          {:success true :id rollback-event-id :rolled_back refinement-id})))))
+(defn make-harness [& [initial]]
+  (atom (cond (string? initial) (or (load-harness initial) (empty-harness-state))
+              (map? initial) (validate-state (normalize-state initial))
+              :else (empty-harness-state))
+        :meta {:lock (atom false) :path (when (string? initial) initial) :preparers {}}))
+(defn configure! [h options]
+  (alter-meta! h merge options)
+  h)
+(defn attach! "A preparer validates candidate state and returns a non-failing registry commit."
+  [h key prepare]
+  (alter-meta! h assoc-in [:preparers key] prepare)
+  h)
+(defn detach! [h key] (alter-meta! h update :preparers dissoc key))
+(defn- with-ledger-lock [h operation]
+  (let [lock (:lock (meta h))]
+    (when-not lock (throw (ex-info "Expected a harness created by make-harness" {})))
+    (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur)))
+    (try (operation) (finally (reset! lock false)))))
+(defn persist! [h]
+  ;; Read the snapshot only after admission, so lifecycle saves cannot overwrite
+  ;; a transaction that committed while this caller waited for the lock.
+  (with-ledger-lock h #(save-harness! @h (:path (meta h)))))
+(defn- transact! [h operation]
+  (with-ledger-lock h
+    (fn []
+      (when (:frozen (meta h)) (throw (ex-info "Harness is frozen" {:category :harness-frozen})))
+      (let [[candidate result] (operation @h)
+            _ (validate-state candidate)
+            commits (mapv (fn [prepare] (prepare @h candidate)) (vals (:preparers (meta h))))]
+        ;; Validation and durable replacement precede publishing either live view.
+        (save-harness! candidate (:path (meta h)))
+        (doseq [commit commits] (commit))
+        (reset! h candidate)
+        result))))
+(defn- edit-state [state edit]
+  (let [e (keyword-fields edit)
+        kind (normalize-kind (or (:kind e) "memory"))
+        action (name (or (:action e) "create"))
+        id (or (:id e) (random-id (name kind)))
+        before (get-in state [:entries kind id])]
+    (when-not (and (contains? kinds kind) (contains? #{"create" "update" "delete"} action)
+                   (string? id) (not (str/blank? id)))
+      (throw (ex-info "Invalid harness edit" {:category :harness-edit :edit e})))
+    (when (and (contains? #{"update" "delete"} action) (nil? before))
+      (throw (ex-info "Cannot edit missing harness entry" {:category :harness-edit :id id})))
+    (let [now (now-iso)
+          after (when-not (= action "delete")
+                  (merge {:id id :kind (name kind) :title id :content "" :path "" :arguments {}
+                          :reference {} :metadata {} :created_at now}
+                         before (select-keys e [:title :content :path :arguments :reference :metadata])
+                         {:updated_at now :version (inc (or (:version before) 0))}))
+          next-state (if after (assoc-in state [:entries kind id] after)
+                       (update-in state [:entries kind] dissoc id))]
+      [next-state {:id id :kind (name kind) :action action :title (:title after)
+                   :reason (or (:reason e) "") :before before :after after :applied true}])))
+(defn apply-edit! [h edit] (transact! h #(edit-state % edit)))
+(defn apply-proposal! [h proposal]
+  (transact! h
+    (fn [state]
+      (let [p (keyword-fields proposal)
+            [candidate edits] (reduce (fn [[s edits] e] (let [[next-state applied] (edit-state s e)]
+                                                         [next-state (conj edits applied)]))
+                                      [state []] (or (:edits p) []))
+            event {:id (random-id "refine") :summary (or (:summary p) "Harness refinement")
+                   :rationale (or (:rationale p) "") :expected_outcome (or (:expected_outcome p) "")
+                   :applied_edits edits :created_at (now-iso)}]
+        [(update candidate :refinements conj event) event]))))
+(defn rollback! [h refinement-id]
+  (transact! h
+    (fn [state]
+      (if-let [event (first (filter #(= refinement-id (:id %)) (:refinements state)))]
+        (let [candidate (reduce
+                          (fn [s edit]
+                            (let [kind (normalize-kind (:kind edit)) id (:id edit)]
+                              (when-not (= (:after edit) (get-in s [:entries kind id]))
+                                (throw (ex-info "Cannot roll back over a newer edit" {:category :harness-conflict :id id})))
+                              (if (:before edit) (assoc-in s [:entries kind id] (:before edit))
+                                (update-in s [:entries kind] dissoc id))))
+                          state (reverse (:applied_edits event)))
+              id (random-id "rollback")]
+          [(update candidate :refinements conj {:id id :rollback_of refinement-id :created_at (now-iso)})
+           {:success true :id id :rolled_back refinement-id}])
+        [state {:success false :error (str "Refinement event not found: " refinement-id)}]))))
 
 (defn format-harness-overview [state & [options]]
   (let [opts (or options {})
@@ -209,12 +169,12 @@
                      (or s "")))]
     (str
       "# Continual Harness State\n\n"
-      "Supplemental prompt notes, persistent memory, runtime skills, subagent specifications, and dynamic tools. "
-      "The base system prompt is immutable; continual harness entries below adapt online across turns.\n\n"
+      "Adaptive task instructions, persistent memory, runtime skills, subagent specifications, and dynamic tools. "
+      "Host policy is immutable. The adaptive task prompt and other harness entries below can be replaced across turns.\n\n"
       (when (seq prompts)
-        (str "## Supplemental Prompt Guidance\n"
+        (str "## Adaptive Task Prompt\n"
              (str/join "\n"
-                       (map (fn [p] (str "- **" (:title p) "**: " (truncate (:content p))))
+                       (map (fn [p] (str "- **" (:title p) "**: " (:content p)))
                             (take max-entries prompts)))
              "\n\n"))
       (when (seq memories)

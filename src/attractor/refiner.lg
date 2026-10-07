@@ -5,6 +5,7 @@
    (loops, repeated tool errors, stalled goals) and applying CRUD updates."
   (:require [attractor.harness :as harness]
             [attractor.llm :as llm]
+            [attractor.operation-owner :as owner]
             [clojure.string :as str]
             [json :as json]))
 
@@ -16,7 +17,7 @@ or newly discovered tactical solutions) and emit structured Create, Update, or D
 edits to the continual harness state H = (p, G, K, M).
 
 Components of H:
-- prompt: supplemental strategic prompt guidance. The base system prompt is immutable.
+- prompt: replaceable adaptive task instructions; immutable host policy is outside this interface.
 - memory: persistent facts, milestones, discovered environment/code realities, past failure lessons.
 - skill: reusable procedures, tool calling heuristics, or pathfinding algorithms.
 - subagent: specialized delegation roles (name, purpose, instructions, trigger criteria).
@@ -40,6 +41,7 @@ Return ONLY a valid JSON object with this exact schema:
       \"id\": \"entry-id\",
       \"title\": \"Title of entry\",
       \"content\": \"Full text content\",
+      \"arguments\": {\"description\": \"Tool description\", \"parameters\": {\"type\": \"object\", \"properties\": {}}},
       \"reason\": \"Why this edit is made\"
     }
   ]
@@ -67,7 +69,7 @@ Return ONLY a valid JSON object with this exact schema:
           (let [role (or (:role turn) (:type turn) "unknown")
                 content (or (:content turn) (:text turn) "")
                 tool-calls (or (:tool_calls turn) [])
-                tool-results (or (:tool_results turn) [])]
+                tool-results (or (:results turn) (:tool_results turn) [])]
             (str "Turn [" idx "] " (name role) ":\n"
                  (when (seq content) (str "Content: " (subs content 0 (min 300 (count content))) "\n"))
                  (when (seq tool-calls)
@@ -82,7 +84,7 @@ Return ONLY a valid JSON object with this exact schema:
                    (str "Tool Results: "
                         (str/join ", "
                           (map (fn [tr]
-                                 (let [out (str (or (:output tr) (get tr "output") tr))]
+                                 (let [out (str (when (:is_error tr) "error: ") (or (:content tr) (:output tr) (get tr "output") tr))]
                                    (subs out 0 (min 200 (count out)))))
                                tool-results))
                         "\n")))))
@@ -99,48 +101,80 @@ Return ONLY a valid JSON object with this exact schema:
         reason-text (if trigger-reason
                       (str "Refinement Trigger Reason: " (name trigger-reason) "\n\n")
                       "")
-        custom-instructions (if-let [ins (:instructions opts)]
+        custom-instructions (if-let [ins (str (:instructions opts) (when (:component opts) (str "\nThis pass edits ONLY " (:component opts) ". Return no edits for other components.")))]
                               (str "Operator Instructions: " ins "\n\n")
                               "")
         user-prompt (str reason-text
                          custom-instructions
                          "Current Continual Harness Overview:\n"
                          harness-overview "\n\n"
+                         "Retained failure evidence:\n"
+                         (get-in harness-state [:entries :memory "trajectory-failures" :content] "") "\n\n"
                          "Recent Trajectory Window:\n"
                          trajectory-text "\n\n"
                          "Analyze the trajectory failures and emit the JSON refinement proposal.")
         request {:model (or model "mock/default")
+                 :abort_signal (:abort_signal opts)
                  :messages [{:role :system :content refiner-system-prompt}
                             {:role :user :content user-prompt}]}
         response (complete-fn request)
-        message-content (get-in response [:message :content] "")
+        message-content (llm/response-text response)
         proposal (extract-json-object message-content)]
     (or proposal
-        {:summary "Failed to parse refiner proposal"
-         :rationale "Model did not return valid JSON"
-         :expected_outcome "No change"
-         :edits []})))
+        (throw (ex-info "Refiner did not return a valid JSON proposal" {:category :refiner-output})))))
+
+(def component-passes
+  [{:component "prompt" :kinds #{"prompt"}}
+   {:component "subagent" :kinds #{"subagent"}}
+   {:component "skill and executable tool" :kinds #{"skill" "tool"}}
+   {:component "memory" :kinds #{"memory"}}])
 
 (defn execute-refinement!
-  "Run the Refiner against the session harness and apply the resulting proposal."
+  "Four component passes use the same validated edit API as agent meta-tools.
+   Provider operations own a cancellation scope; callbacks run after it drains."
   [session trigger-reason & [options]]
-  (let [harness-atom (:harness @session)]
-    (when harness-atom
-      (let [config (:config @session)
-            model (or (:refiner_model config) (:model @session))
-            complete-fn (or (:refiner_complete_fn config)
-                            (:complete_fn config)
-                            (let [client (:llm_client @session)]
-                              (if client
-                                (fn [req] (llm/client-complete client req))
-                                (fn [req] (llm/complete req)))))
+  (let [h (:harness @session) config (:config @session)]
+    (when (and h (not (:frozen_harness config)))
+      (let [model (or (:refiner_model config) (:model @session))
+            complete (or (:refiner_complete_fn config) (:complete_fn config)
+                         (if-let [client (:llm_client @session)]
+                           #(llm/client-complete client %) #(llm/complete %)))
             history (:history @session)
-            proposal (plan-refinement complete-fn model @harness-atom history trigger-reason options)
-            result (harness/apply-proposal! harness-atom proposal)
-            event-fn (:event_fn @session)]
-        (when event-fn
-          (event-fn {:type :refine_complete
-                     :trigger trigger-reason
-                     :proposal proposal
-                     :result result}))
+            failures (filterv (fn [turn] (some :is_error (:results turn))) history)
+            check! (fn [] (when (or (:abort_signaled @session) (= :closed (:state @session)))
+                            (throw (ex-info "Refinement cancelled" {:category :cancelled}))))
+            cell (or (:refinement_owner @session)
+                     (:refinement_owner (swap! session assoc :refinement_owner (atom nil))))
+            operation (owner/start! {:check! check! :cleanup! (fn [] nil)})
+            admitted? (compare-and-set! cell nil operation)
+            proposals
+            (try
+              (when-not admitted? (throw (ex-info "Refinement already running" {:category :refiner-busy})))
+              (when (seq failures)
+                (owner/invoke! operation
+                  #(harness/apply-edit! h {:kind "memory" :id "trajectory-failures"
+                                           :action (if (get-in @h [:entries :memory "trajectory-failures"]) "update" "create")
+                                           :title "Retained tool failure evidence"
+                                           :content (format-trajectory-window failures (count failures))})))
+              (let [results
+                    (mapv
+                      (fn [pass]
+                        (owner/invoke! operation
+                          (fn []
+                            (let [proposal (plan-refinement complete model @h history trigger-reason
+                                               (merge options pass {:abort_signal (get-in @session [:llm_abort_controller :signal])}))
+                                  edits (filterv (fn [edit] (contains? (:kinds pass)
+                                                                     (name (or (:kind edit) (get edit "kind") ""))))
+                                                 (or (:edits proposal) (get proposal "edits") []))]
+                              (check!)
+                              (harness/apply-proposal! h (assoc proposal :edits edits)))))) component-passes)]
+                (owner/finish! operation)
+                results)
+              (finally
+                (try (owner/close! operation) (catch Object _ nil))
+                (compare-and-set! cell operation nil)))
+            result {:summary (:summary (last proposals)) :passes proposals
+                    :applied_edits (vec (mapcat :applied_edits proposals))}]
+        (when-let [event-fn (:event_fn @session)]
+          (event-fn {:type :refine_complete :trigger trigger-reason :result result}))
         result))))

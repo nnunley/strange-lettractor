@@ -1,6 +1,7 @@
 (ns attractor.refiner-test
   (:require [clojure.test :refer [deftest is]]
             [attractor.harness :as harness]
+            [attractor.llm :as llm] [json :as json]
             [attractor.refiner :as refiner]))
 
 (deftest extract-json-object-test
@@ -8,6 +9,21 @@
   (is (= {"hello" "world"}
          (refiner/extract-json-object "Some intro text ```json\n{\"hello\": \"world\"}\n``` outro text")))
   (is (nil? (refiner/extract-json-object "No json here"))))
+
+(deftest native-provider-content-parts-are-readable-proposals
+  (let [h (harness/make-harness)
+        adapter (llm/make-provider-adapter "openai"
+                  {:api_key "fixture" :transport
+                    (fn [_] {:status 200 :body (json/write-json
+                      {:id "r" :status "completed" :output
+                       [{:type "message" :role "assistant" :content
+                         [{:type "output_text" :text "{\"edits\":[{\"kind\":\"memory\",\"action\":\"create\",\"id\":\"native\",\"content\":\"retained\"}]}"}]}]})})})
+        client (llm/make-client {:providers {"openai" adapter} :default_provider "openai"})
+        session (atom {:harness h :llm_client client :model "openai/fixture" :config {} :history []})]
+    (try
+      (refiner/execute-refinement! session :test)
+      (is (= "retained" (get-in @h [:entries :memory "native" :content])))
+      (finally (llm/client-close! client)))))
 
 (deftest plan-and-execute-refinement-test
   (let [h (harness/make-harness)
@@ -45,3 +61,14 @@
       (is (= "Route 4 waypoint" (get-in @h [:entries :memory "waypoint-rule" :title])))
       (is (= 1 (count @events)))
       (is (= :refine_complete (:type (first @events)))))))
+
+(deftest actual-tool-result-history-retains-failure-evidence
+  (let [rendered (refiner/format-trajectory-window
+                   [{:type :tool_results :results [{:name "route" :content "EXIT BLOCKED" :is_error true}]}] 8)]
+    (is (clojure.string/includes? rendered "EXIT BLOCKED"))
+    (is (clojure.string/includes? rendered "error"))))
+
+(deftest invalid-refiner-output-is-a-visible-failure
+  (is (some? (try (refiner/plan-refinement (fn [_] {:message {:content "not a proposal"}})
+                                          "mock/default" @(harness/make-harness) [])
+                  nil (catch Object e e)))))

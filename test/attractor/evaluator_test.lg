@@ -82,3 +82,39 @@
     ;; Error evaluation returns formatted error diagnostics
     (let [err ((:executor eval-tool) {"code" "(/ 1 0)"} {})]
       (is (str/includes? err "Evaluation Error [runtime_error]")))))
+
+(deftest timed-out-evaluation-is-joined-before-return
+  (let [marker (atom false)
+        result (eval/eval-code "(do (core/sleep 250) (reset! (:marker env) true))"
+                              {:timeout_ms 100 :env {:marker marker}})]
+    (is (= :timeout (:status result)))
+    (core/sleep 350)
+    (is (false? @marker))))
+
+(deftest compilation-rejects-top-level-execution
+  (let [error (try (eval/compile-tool-fn "(do (fn [args env] 1))") nil (catch Object e e))]
+    (is (some? error))))
+
+(deftest tool-exceptions-are-never-replayed
+  (let [calls (atom 0)
+        tool (eval/make-dynamic-tool "fails" "" {}
+               (fn [& args] (swap! calls inc) (throw (ex-info "failure" {}))))]
+    (try ((:executor tool) {} {}) (catch Object _ nil))
+    (is (= 1 @calls))))
+
+(deftest recursive-and-macro-loops-cancel-and-join
+  (doseq [code ["((fn spin [] (spin)))" "(while true (swap! (:calls env) inc))"
+                "(loop [] (swap! (:calls env) inc) (recur))"]]
+    (let [calls (atom 0) result (eval/eval-code code {:timeout_ms 25 :env {:calls calls}})
+          after @calls]
+      (is (= :timeout (:status result)))
+      (core/sleep 30)
+      (is (= after @calls)))))
+
+(deftest restoration-cannot-overwrite-host-tools
+  (let [h (harness/make-harness) registry (profiles/make-tool-registry)
+        host {:definition {:name "shell" :description "host shell" :parameters {:type "object"}} :executor (fn [_ _] "host")}]
+    (profiles/register-tool! registry host)
+    (harness/apply-edit! h {:kind "tool" :id "shell" :action "create" :content "(fn [args env] 42)"})
+    (is (some? (try (eval/load-harness-tools! registry h) nil (catch Object e e))))
+    (is (= host (profiles/registry-get registry "shell")))))

@@ -91,3 +91,67 @@
     (let [loaded (harness/load-harness tmp-path)]
       (is (= "BFS Navigator" (get-in loaded [:entries :skill "skill-bfs" :title])))
       (os/sh "rm" "-f" tmp-path))))
+
+(deftest json-roundtrip-retains-typed-entries-and-chronology
+  (let [path (str (os/temp-dir) "/harness-json-" (System/currentTimeMillis) ".json")
+        h (harness/make-harness)]
+    (try
+      (harness/apply-edit! h {:kind "memory" :action "create" :id "fact" :content "retained"})
+      (harness/save-harness! @h path)
+      (let [entry (get-in (harness/load-harness path) [:entries :memory "fact"])]
+        (is (= "retained" (:content entry)))
+        (is (not= "1970-01-01T00:00:00Z" (:created_at entry))))
+      (finally (os/sh "rm" "-f" path)))))
+
+(deftest proposal-validation-is-atomic
+  (let [h (harness/make-harness) before @h
+        error (try
+                (harness/apply-proposal! h {:edits [{:kind "memory" :action "create" :id "valid"}
+                                                   {:kind "unknown" :action "create" :id "bad"}]})
+                nil (catch Object e e))]
+    (is (some? error))
+    (is (= before @h))))
+
+(deftest lifecycle-persistence-cannot-overwrite-a-newer-transaction
+  (let [path (str (os/temp-dir) "/harness-race-" (System/currentTimeMillis) ".edn")
+        h (harness/make-harness) entered (promise) release (promise)
+        original harness/save-harness! calls (atom 0)]
+    (harness/configure! h {:path path})
+    (try
+      (with-redefs [harness/save-harness!
+                    (fn [state target]
+                      (when (= 1 (swap! calls inc)) (deliver entered true) @release)
+                      (original state target))]
+        (let [closing (future (harness/persist! h))]
+          (is (= true (deref entered 1000 false)))
+          (let [editing (future (harness/apply-edit! h {:kind "memory" :id "new" :content "new"}))]
+            (is (= :waiting (deref editing 30 :waiting)))
+            (deliver release true)
+            @closing @editing
+            (is (= "new" (get-in (harness/load-harness path) [:entries :memory "new" :content]))))))
+      (finally (deliver release true) (os/sh "rm" "-f" path)))))
+
+(deftest malformed-entry-fields-are-rejected-before-publishing
+  (doseq [bad [{:content 42} {:title []} {:path {}} {:arguments "bad"}
+              {:metadata 1} {:reference []} {:arguments {:description 42}}
+              {:arguments {:parameters "not an object"}}]]
+    (let [h (harness/make-harness) before @h]
+      (is (some? (try (harness/apply-edit! h (merge {:kind "memory" :id "bad"} bad))
+                      nil (catch Object e e))))
+      (is (= before @h)))))
+
+(deftest malformed-loaded-entry-is-rejected
+  (let [path (str (os/temp-dir) "/harness-malformed-" (System/currentTimeMillis) ".edn")]
+    (try
+      (io/spit path (pr-str (assoc-in (harness/empty-harness-state) [:entries :memory "bad"]
+                                    {:id "bad" :kind "memory" :content 42})))
+      (is (some? (try (harness/load-harness path) nil (catch Object e e))))
+      (finally (os/sh "rm" "-f" path)))))
+
+(deftest frozen-harness-can-still-persist
+  (let [path (str (os/temp-dir) "/harness-frozen-" (System/currentTimeMillis) ".edn") h (harness/make-harness)]
+    (try
+      (harness/configure! h {:path path :frozen true})
+      (is (= path (harness/persist! h)))
+      (is (= @h (harness/load-harness path)))
+      (finally (os/sh "rm" "-f" path)))))
