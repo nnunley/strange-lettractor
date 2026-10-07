@@ -1,0 +1,185 @@
+(ns attractor.evaluator
+  "Scoped let-go tool evaluator and dynamic runtime tooling.
+   Provides interactive let-go evaluation with access to the session environment,
+   safe boundary isolation with timeout guarantees, and dynamic tool compilation."
+  (:require [attractor.harness :as harness]
+            [attractor.profiles :as profiles]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [io :as io]
+            [json :as json]
+            [os :as os]))
+
+(def default-eval-timeout-ms 5000)
+
+(defn- parse-schema [params]
+  (cond
+    (map? params)
+    (let [t (or (:type params) (get params "type"))]
+      (if (and t (= "object" (if (keyword? t) (name t) t)))
+        params
+        {:type "object" :properties params}))
+
+    (string? params)
+    (let [trimmed (str/trim params)]
+      (if (str/blank? trimmed)
+        {:type "object"}
+        (try
+          (let [parsed (if (str/starts-with? trimmed "{")
+                         (json/read-json trimmed)
+                         (edn/read-string trimmed))]
+            (parse-schema parsed))
+          (catch Object _
+            {:type "object"}))))
+
+    :else
+    {:type "object"}))
+
+(defn eval-code
+  "Evaluate a let-go expression or code block with session environment access and timeout.
+   Returns a map with :status (:ok, :timeout, or :error) and :result/:output or :error."
+  [code & [options]]
+  (let [opts (or options {})
+        timeout-ms (max 100 (or (:timeout_ms opts) default-eval-timeout-ms))
+        env (or (:env opts) {})
+        code-str (str/trim (or code ""))]
+    (if (str/blank? code-str)
+      {:status :ok :result nil :output "nil"}
+      (let [parsed-fn
+            (try
+              (eval (read-string (str "(fn [env] (do " code-str "\n))")))
+              (catch Object parse-err
+                {:parse-error (str parse-err)}))]
+        (if (map? parsed-fn)
+          {:status :error
+           :category :syntax_error
+           :error (:parse-error parsed-fn)}
+          (let [fut (future
+                      (try
+                        {:status :ok :result (parsed-fn env)}
+                        (catch Object run-err
+                          {:status :error
+                           :category :runtime_error
+                           :error (str run-err)})))
+                val (deref fut timeout-ms :timeout)]
+            (if (= val :timeout)
+              {:status :timeout
+               :category :timeout
+               :error (str "Execution timed out after " timeout-ms "ms")}
+              (if (= :ok (:status val))
+                (let [res (:result val)]
+                  {:status :ok
+                   :result res
+                   :output (if (nil? res) "nil" (if (string? res) res (pr-str res)))})
+                val))))))))
+
+(defn compile-tool-fn
+  "Compile a dynamic tool function from a code string or return an existing fn."
+  [code-str-or-fn]
+  (cond
+    (fn? code-str-or-fn) code-str-or-fn
+    (string? code-str-or-fn)
+    (let [code (str/trim code-str-or-fn)
+          compiled (try
+                     (eval (read-string code))
+                     (catch Object err
+                       (throw (ex-info (str "Compilation error in tool function: " err)
+                                       {:category :tool-compilation-failed
+                                        :error (str err)}))))]
+      (if (fn? compiled)
+        compiled
+        (throw (ex-info "Dynamic tool code must evaluate to a function (e.g. (fn [args env] ...))"
+                        {:category :invalid-tool-function
+                         :type (type compiled)}))))
+    :else
+    (throw (ex-info "Tool code must be a string or function"
+                    {:category :invalid-tool-code}))))
+
+(defn make-dynamic-tool
+  "Construct a registered tool specification from dynamic definition components."
+  [name description parameters code-str-or-fn]
+  (let [params (parse-schema parameters)
+        compiled-fn (compile-tool-fn code-str-or-fn)]
+    {:definition {:name (str name)
+                  :description (str (or description name))
+                  :parameters params}
+     :code (when (string? code-str-or-fn) code-str-or-fn)
+     :executor (fn [args env]
+                 (try
+                   (compiled-fn args env)
+                   (catch Object err1
+                     (try
+                       (compiled-fn args)
+                       (catch Object _
+                         (throw err1))))))}))
+
+(defn eval-letgo-tool
+  "Tool definition and executor for interactive let-go evaluation (eval_letgo)."
+  []
+  {:definition
+   {:name "eval_letgo"
+    :description "Evaluate let-go expressions in the session environment with access to filesystem, shell, and data utilities."
+    :parameters {:type "object"
+                 :properties {:code {:type "string" :description "The let-go expression or code block to evaluate"}
+                              :timeout_ms {:type "integer" :description "Optional execution timeout in milliseconds (default: 5000)"}}
+                 :required ["code"]}}
+   :executor (fn [arguments env]
+               (let [code (or (get arguments "code") (get arguments :code))
+                     timeout-ms (or (get arguments "timeout_ms") (get arguments :timeout_ms) default-eval-timeout-ms)
+                     res (eval-code code {:timeout_ms timeout-ms :env env})]
+                 (if (= :ok (:status res))
+                   (:output res)
+                   (str "Evaluation Error [" (name (or (:category res) :error)) "]: " (:error res)))))})
+
+(defn define-tool!
+  "Compile and register a dynamic let-go tool into the session registry and persist to the harness ledger."
+  [registry harness-atom name description parameters code-str]
+  (let [tool-spec (make-dynamic-tool name description parameters code-str)
+        _ (profiles/register-tool! registry tool-spec)]
+    (when harness-atom
+      (harness/apply-edit! harness-atom
+        {:action "create"
+         :kind "tool"
+         :id (str name)
+         :title (str name)
+         :content (str code-str)
+         :arguments {:description description
+                     :parameters (parse-schema parameters)}}))
+    (str "Defined and registered dynamic tool: " name)))
+
+(defn load-harness-tools!
+  "Restore all dynamic tools persisted in the harness ledger into the session tool registry."
+  [registry harness-atom]
+  (when (and registry harness-atom)
+    (let [tools (vals (get-in @harness-atom [:entries :tool] {}))]
+      (doseq [t tools]
+        (let [name (:id t)
+              content (:content t)
+              args (:arguments t)
+              desc (or (:description args) (get args "description") (:title t))
+              params (or (:parameters args) (get args "parameters") {:type "object"})]
+          (when (and (seq name) (seq content))
+            (try
+              (let [tool-spec (make-dynamic-tool name desc params content)]
+                (profiles/register-tool! registry tool-spec))
+              (catch Object _ nil)))))
+      (count tools))))
+
+(defn define-tool-tool
+  "Tool definition for define_tool callable by the agent."
+  [registry harness-atom]
+  {:definition
+   {:name "define_tool"
+    :description "Define a reusable dynamic tool in let-go and register it into the session tool registry and continual harness"
+    :parameters {:type "object"
+                 :properties {:name {:type "string" :description "Unique tool name"}
+                              :description {:type "string" :description "Tool description for LLM dispatch"}
+                              :parameters {:type "object" :description "JSON Schema object defining tool input properties"}
+                              :code {:type "string" :description "let-go function code: (fn [args env] ...)"}}
+                 :required ["name" "description" "code"]}}
+   :executor (fn [arguments _env]
+               (let [name (or (get arguments "name") (get arguments :name))
+                     description (or (get arguments "description") (get arguments :description))
+                     parameters (or (get arguments "parameters") (get arguments :parameters) {})
+                     code (or (get arguments "code") (get arguments :code))]
+                 (define-tool! registry harness-atom name description parameters code)))})

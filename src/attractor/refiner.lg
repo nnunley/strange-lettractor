@@ -1,0 +1,146 @@
+(ns attractor.refiner
+  "Continual Harness LLM Refiner.
+   Performs reset-free online in-context adaptation of the harness
+   state H = (p, G, K, M) by analyzing trajectory failure signatures
+   (loops, repeated tool errors, stalled goals) and applying CRUD updates."
+  (:require [attractor.harness :as harness]
+            [attractor.llm :as llm]
+            [clojure.string :as str]
+            [json :as json]))
+
+(def refiner-system-prompt
+  "You are Attractor's Continual Harness refinement engine.
+Your job is to analyze the agent's recent trajectory window for failure signatures
+(navigation loops, repeated tool-call errors, schema mismatches, stalled objectives,
+or newly discovered tactical solutions) and emit structured Create, Update, or Delete
+edits to the continual harness state H = (p, G, K, M).
+
+Components of H:
+- prompt: supplemental strategic prompt guidance. The base system prompt is immutable.
+- memory: persistent facts, milestones, discovered environment/code realities, past failure lessons.
+- skill: reusable procedures, tool calling heuristics, or pathfinding algorithms.
+- subagent: specialized delegation roles (name, purpose, instructions, trigger criteria).
+- tool: dynamic let-go tool definitions (function code, schema, description).
+
+Policy:
+1. Make targeted, evidence-backed edits based on what failed or succeeded in the trajectory.
+2. If the agent repeated tool calls in a loop, diagnose the root cause (e.g. wrong tool schema, incorrect mental model, missing precondition) and add a memory lesson or prompt rule to break it.
+3. If a repeated sub-task emerged, define a specialized subagent, skill, or dynamic tool.
+4. Keep edits concise and high-signal.
+
+Return ONLY a valid JSON object with this exact schema:
+{
+  \"summary\": \"One-sentence summary of refinement\",
+  \"rationale\": \"Why these edits are justified by trajectory evidence\",
+  \"expected_outcome\": \"What should improve on subsequent turns\",
+  \"edits\": [
+    {
+      \"action\": \"create\" | \"update\" | \"delete\",
+      \"kind\": \"prompt\" | \"memory\" | \"skill\" | \"subagent\" | \"tool\",
+      \"id\": \"entry-id\",
+      \"title\": \"Title of entry\",
+      \"content\": \"Full text content\",
+      \"reason\": \"Why this edit is made\"
+    }
+  ]
+}")
+
+(defn extract-json-object [raw-text]
+  (when (string? raw-text)
+    (let [trimmed (str/trim raw-text)
+          start (str/index-of trimmed "{")
+          end (str/last-index-of trimmed "}")]
+      (when (and start end (<= start end))
+        (try
+          (json/read-json (subs trimmed start (inc end)))
+          (catch Object _ nil))))))
+
+(defn format-trajectory-window [history window-size]
+  (let [turns (or history [])
+        size (max 1 (or window-size 8))
+        recent (if (> (count turns) size)
+                 (subvec turns (- (count turns) size))
+                 turns)]
+    (str/join "\n---\n"
+      (map-indexed
+        (fn [idx turn]
+          (let [role (or (:role turn) (:type turn) "unknown")
+                content (or (:content turn) (:text turn) "")
+                tool-calls (or (:tool_calls turn) [])
+                tool-results (or (:tool_results turn) [])]
+            (str "Turn [" idx "] " (name role) ":\n"
+                 (when (seq content) (str "Content: " (subs content 0 (min 300 (count content))) "\n"))
+                 (when (seq tool-calls)
+                   (str "Tool Calls: "
+                        (str/join ", "
+                          (map (fn [tc]
+                                 (str (or (:name tc) (get tc "name"))
+                                      " " (pr-str (or (:arguments tc) (get tc "arguments")))))
+                               tool-calls))
+                        "\n"))
+                 (when (seq tool-results)
+                   (str "Tool Results: "
+                        (str/join ", "
+                          (map (fn [tr]
+                                 (let [out (str (or (:output tr) (get tr "output") tr))]
+                                   (subs out 0 (min 200 (count out)))))
+                               tool-results))
+                        "\n")))))
+        recent))))
+
+(defn plan-refinement
+  "Generate a refinement proposal using an LLM call."
+  [complete-fn model harness-state trajectory & [trigger-reason options]]
+  (let [opts (or options {})
+        harness-overview (harness/format-harness-overview harness-state)
+        trajectory-text (if (string? trajectory)
+                          trajectory
+                          (format-trajectory-window trajectory (:window_size opts 8)))
+        reason-text (if trigger-reason
+                      (str "Refinement Trigger Reason: " (name trigger-reason) "\n\n")
+                      "")
+        custom-instructions (if-let [ins (:instructions opts)]
+                              (str "Operator Instructions: " ins "\n\n")
+                              "")
+        user-prompt (str reason-text
+                         custom-instructions
+                         "Current Continual Harness Overview:\n"
+                         harness-overview "\n\n"
+                         "Recent Trajectory Window:\n"
+                         trajectory-text "\n\n"
+                         "Analyze the trajectory failures and emit the JSON refinement proposal.")
+        request {:model (or model "mock/default")
+                 :messages [{:role :system :content refiner-system-prompt}
+                            {:role :user :content user-prompt}]}
+        response (complete-fn request)
+        message-content (get-in response [:message :content] "")
+        proposal (extract-json-object message-content)]
+    (or proposal
+        {:summary "Failed to parse refiner proposal"
+         :rationale "Model did not return valid JSON"
+         :expected_outcome "No change"
+         :edits []})))
+
+(defn execute-refinement!
+  "Run the Refiner against the session harness and apply the resulting proposal."
+  [session trigger-reason & [options]]
+  (let [harness-atom (:harness @session)]
+    (when harness-atom
+      (let [config (:config @session)
+            model (or (:refiner_model config) (:model @session))
+            complete-fn (or (:refiner_complete_fn config)
+                            (:complete_fn config)
+                            (let [client (:llm_client @session)]
+                              (if client
+                                (fn [req] (llm/client-complete client req))
+                                (fn [req] (llm/complete req)))))
+            history (:history @session)
+            proposal (plan-refinement complete-fn model @harness-atom history trigger-reason options)
+            result (harness/apply-proposal! harness-atom proposal)
+            event-fn (:event_fn @session)]
+        (when event-fn
+          (event-fn {:type :refine_complete
+                     :trigger trigger-reason
+                     :proposal proposal
+                     :result result}))
+        result))))

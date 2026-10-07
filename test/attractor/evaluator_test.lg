@@ -1,0 +1,84 @@
+(ns attractor.evaluator-test
+  "Unit tests for attractor.evaluator: scoped let-go execution,
+   bounded timeouts, error handling, and dynamic tool authoring."
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.evaluator :as eval]
+            [attractor.harness :as harness]
+            [attractor.profiles :as profiles]))
+
+(deftest eval-code-basic-and-env-test
+  ;; Basic arithmetic & string operations
+  (let [r1 (eval/eval-code "(+ 10 20 12)")]
+    (is (= :ok (:status r1)))
+    (is (= 42 (:result r1)))
+    (is (= "42" (:output r1))))
+
+  ;; String and JSON library access
+  (let [r2 (eval/eval-code "(str/upper-case \"attractor-engine\")")]
+    (is (= :ok (:status r2)))
+    (is (= "ATTRACTOR-ENGINE" (:result r2))))
+
+  ;; Access to env map
+  (let [r3 (eval/eval-code "(str \"Platform: \" (:platform env) \" Cwd: \" ((:cwd env)))"
+                           {:env {:platform "darwin" :cwd (fn [] "/tmp/project")}})]
+    (is (= :ok (:status r3)))
+    (is (= "Platform: darwin Cwd: /tmp/project" (:result r3)))))
+
+(deftest eval-code-error-handling-and-timeout-test
+  ;; Syntax error
+  (let [r-syntax (eval/eval-code "(+ 10 (* 2)")]
+    (is (= :error (:status r-syntax)))
+    (is (= :syntax_error (:category r-syntax))))
+
+  ;; Runtime error
+  (let [r-runtime (eval/eval-code "(/ 10 0)")]
+    (is (= :error (:status r-runtime)))
+    (is (= :runtime_error (:category r-runtime))))
+
+  ;; Bounded infinite loop timeout
+  (let [r-timeout (eval/eval-code "(loop [] (recur))" {:timeout_ms 150})]
+    (is (= :timeout (:status r-timeout)))
+    (is (= :timeout (:category r-timeout)))
+    (is (str/includes? (:error r-timeout) "timed out after 150ms"))))
+
+(deftest dynamic-tool-creation-and-execution-test
+  (let [reg (profiles/make-tool-registry)
+        h (harness/make-harness)
+        ;; Define dynamic tool
+        msg (eval/define-tool! reg h "multiply" "Multiply two numbers"
+              {:properties {:a {:type "number"} :b {:type "number"}} :required ["a" "b"]}
+              "(fn [args env] (* (get args \"a\") (get args \"b\")))")
+        tool (profiles/registry-get reg "multiply")]
+    (is (str/includes? msg "Defined and registered dynamic tool: multiply"))
+    (is (some? tool))
+    (is (= "multiply" (get-in tool [:definition :name])))
+
+    ;; Execute tool
+    (is (= 42 ((:executor tool) {"a" 6 "b" 7} {})))
+
+    ;; Check persistence in harness
+    (let [harness-tool (get-in @h [:entries :tool "multiply"])]
+      (is (some? harness-tool))
+      (is (= "multiply" (:title harness-tool)))
+      (is (str/includes? (:content harness-tool) "* (get args \"a\")")))
+
+    ;; Verify restoration in a fresh registry
+    (let [fresh-reg (profiles/make-tool-registry)
+          restored-count (eval/load-harness-tools! fresh-reg h)
+          restored-tool (profiles/registry-get fresh-reg "multiply")]
+      (is (= 1 restored-count))
+      (is (some? restored-tool))
+      (is (= 100 ((:executor restored-tool) {"a" 10 "b" 10} {}))))))
+
+(deftest eval-letgo-tool-test
+  (let [eval-tool (eval/eval-letgo-tool)]
+    (is (= "eval_letgo" (get-in eval-tool [:definition :name])))
+
+    ;; Successful evaluation returns output string
+    (let [out ((:executor eval-tool) {"code" "(+ 1 2 3)"} {})]
+      (is (= "6" out)))
+
+    ;; Error evaluation returns formatted error diagnostics
+    (let [err ((:executor eval-tool) {"code" "(/ 1 0)"} {})]
+      (is (str/includes? err "Evaluation Error [runtime_error]")))))

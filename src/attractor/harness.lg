@@ -1,0 +1,250 @@
+(ns attractor.harness
+  "Continual Harness state ledger and in-context adaptation engine.
+   Provides a durable, reset-free mutable store supporting online CRUD operations,
+   snapshot rollbacks, dynamic runtime tooling, and prompt injection."
+  (:require [attractor.ids :as ids]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [io :as io]
+            [json :as json]
+            [os :as os]))
+
+(def schema-version 1)
+
+(def default-overview-entry-limit 10)
+(def default-overview-content-limit 240)
+
+(defn empty-harness-state []
+  {:schema schema-version
+   :entries {:prompt {}
+             :memory {}
+             :skill {}
+             :subagent {}
+             :tool {}}
+   :refinements []})
+
+(defn- normalize-kind [k]
+  (cond
+    (keyword? k) k
+    (string? k) (keyword (str/lower-case (str/trim k)))
+    :else :memory))
+
+(defn- normalize-action [a]
+  (cond
+    (keyword? a) (name a)
+    (string? a) (str/lower-case (str/trim a))
+    :else "create"))
+
+(defn- now-iso []
+  (let [res (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ")]
+    (if (= 0 (:exit-code res))
+      (str/trim (:stdout res))
+      "1970-01-01T00:00:00Z")))
+
+(defn- random-id [prefix]
+  (ids/prefixed prefix))
+
+(defn- parent-path [path]
+  (let [index (str/last-index-of path "/")]
+    (cond
+      (nil? index) "."
+      (zero? index) "/"
+      :else (subs path 0 index))))
+
+(defn load-harness [path]
+  (when (and path (io/file-exists? path))
+    (try
+      (let [content (io/slurp path)]
+        (if (str/starts-with? (str/trim content) "{")
+          (try
+            (let [parsed (json/read-json content)]
+              (if (map? parsed)
+                (let [entries (or (get parsed "entries") (get parsed :entries) {})
+                      refinements (or (get parsed "refinements") (get parsed :refinements) [])]
+                  {:schema (or (get parsed "schema") (get parsed :schema) schema-version)
+                   :entries {:prompt (or (get entries "prompt") (get entries :prompt) {})
+                             :memory (or (get entries "memory") (get entries :memory) {})
+                             :skill (or (get entries "skill") (get entries :skill) {})
+                             :subagent (or (get entries "subagent") (get entries :subagent) {})
+                             :tool (or (get entries "tool") (get entries :tool) {})}
+                   :refinements (vec refinements)})
+                (edn/read-string content)))
+            (catch Object _
+              (edn/read-string content)))
+          (edn/read-string content)))
+      (catch Object _ nil))))
+
+(defn save-harness! [state path]
+  (when (and path state)
+    (let [parent (parent-path path)]
+      (when (and parent (not= "." parent) (not (io/file-exists? parent)))
+        (os/sh "mkdir" "-p" parent)))
+    (if (str/ends-with? path ".json")
+      (io/spit path (json/write-json state))
+      (io/spit path (pr-str state)))
+    path))
+
+(defn make-harness [& [initial-or-path]]
+  (let [state (cond
+                (string? initial-or-path) (or (load-harness initial-or-path) (empty-harness-state))
+                (map? initial-or-path) initial-or-path
+                :else (empty-harness-state))]
+    (atom state)))
+
+(defn- clone-entry [entry]
+  (when entry
+    (into {} entry)))
+
+(defn apply-edit! [harness-atom edit]
+  (let [action (normalize-action (or (:action edit) (get edit "action")))
+        kind (normalize-kind (or (:kind edit) (get edit "kind")))
+        id (or (:id edit) (get edit "id") (random-id (name kind)))
+        title (or (:title edit) (get edit "title") id)
+        content (or (:content edit) (get edit "content") "")
+        path (or (:path edit) (get edit "path") "")
+        reference (or (:reference edit) (get edit "reference") {})
+        arguments (or (:arguments edit) (get edit "arguments") {})
+        metadata (or (:metadata edit) (get edit "metadata") {})
+        reason (or (:reason edit) (get edit "reason") "")
+        before (clone-entry (get-in @harness-atom [:entries kind id]))]
+    (swap! harness-atom
+      (fn [state]
+        (case action
+          "create"
+          (let [new-entry {:id id
+                           :kind (name kind)
+                           :title title
+                           :content content
+                           :path path
+                           :reference reference
+                           :arguments arguments
+                           :metadata metadata
+                           :created_at (now-iso)
+                           :updated_at (now-iso)
+                           :version 1}]
+            (assoc-in state [:entries kind id] new-entry))
+          "update"
+          (let [existing (get-in state [:entries kind id])
+                updated (merge (or existing {:id id :kind (name kind) :created_at (now-iso) :version 0})
+                               {:title title
+                                :content content
+                                :updated_at (now-iso)
+                                :version (inc (or (:version existing) 0))}
+                               (when (seq path) {:path path})
+                               (when (seq reference) {:reference reference})
+                               (when (seq arguments) {:arguments arguments})
+                               (when (seq metadata) {:metadata metadata}))]
+            (assoc-in state [:entries kind id] updated))
+          "delete"
+          (update-in state [:entries kind] dissoc id)
+          state)))
+    (let [after (clone-entry (get-in @harness-atom [:entries kind id]))]
+      {:id id
+       :kind (name kind)
+       :action action
+       :title title
+       :reason reason
+       :before before
+       :after after
+       :applied true})))
+
+(defn apply-proposal! [harness-atom proposal]
+  (let [summary (or (:summary proposal) (get proposal "summary") "Harness refinement")
+        rationale (or (:rationale proposal) (get proposal "rationale") "")
+        expected-outcome (or (:expected_outcome proposal) (get proposal "expected_outcome")
+                             (:expectedOutcome proposal) (get proposal "expectedOutcome") "")
+        raw-edits (or (:edits proposal) (get proposal "edits") [])
+        applied-edits (mapv (fn [e] (apply-edit! harness-atom e)) raw-edits)
+        event-id (random-id "refine")
+        event {:id event-id
+               :summary summary
+               :rationale rationale
+               :expected_outcome expected-outcome
+               :applied_edits applied-edits
+               :created_at (now-iso)}]
+    (swap! harness-atom update :refinements (fnil conj []) event)
+    {:id event-id
+     :summary summary
+     :rationale rationale
+     :expected_outcome expected-outcome
+     :applied_edits applied-edits}))
+
+(defn rollback! [harness-atom refinement-id]
+  (let [state @harness-atom
+        refinements (:refinements state)
+        event (first (filter #(= refinement-id (:id %)) refinements))]
+    (if-not event
+      {:success false :error (str "Refinement event not found: " refinement-id)}
+      (do
+        (doseq [edit (reverse (:applied_edits event))]
+          (let [kind (normalize-kind (:kind edit))
+                id (:id edit)
+                before (:before edit)]
+            (swap! harness-atom
+              (fn [curr]
+                (if before
+                  (assoc-in curr [:entries kind id] before)
+                  (update-in curr [:entries kind] dissoc id))))))
+        (let [rollback-event-id (random-id "rollback")]
+          (swap! harness-atom update :refinements conj
+                 {:id rollback-event-id
+                  :summary (str "Rollback of " refinement-id)
+                  :rollback_of refinement-id
+                  :created_at (now-iso)})
+          {:success true :id rollback-event-id :rolled_back refinement-id})))))
+
+(defn format-harness-overview [state & [options]]
+  (let [opts (or options {})
+        max-entries (or (:max_entries opts) default-overview-entry-limit)
+        max-len (or (:max_content_length opts) default-overview-content-limit)
+        entries (or (:entries state) {})
+        prompts (vals (or (:prompt entries) {}))
+        memories (vals (or (:memory entries) {}))
+        skills (vals (or (:skill entries) {}))
+        subagents (vals (or (:subagent entries) {}))
+        tools (vals (or (:tool entries) {}))
+        truncate (fn [s]
+                   (if (and s (> (count s) max-len))
+                     (str (subs s 0 max-len) "...")
+                     (or s "")))]
+    (str
+      "# Continual Harness State\n\n"
+      "Supplemental prompt notes, persistent memory, runtime skills, subagent specifications, and dynamic tools. "
+      "The base system prompt is immutable; continual harness entries below adapt online across turns.\n\n"
+      (when (seq prompts)
+        (str "## Supplemental Prompt Guidance\n"
+             (str/join "\n"
+                       (map (fn [p] (str "- **" (:title p) "**: " (truncate (:content p))))
+                            (take max-entries prompts)))
+             "\n\n"))
+      (when (seq memories)
+        (str "## Long-Term Memory & Lessons\n"
+             (str/join "\n"
+                       (map (fn [m] (str "- [" (:id m) "] **" (:title m) "**: " (truncate (:content m))))
+                            (take max-entries memories)))
+             "\n\n"))
+      (when (seq subagents)
+        (str "## Dynamic Subagent Specifications\n"
+             (str/join "\n"
+                       (map (fn [sa]
+                              (str "- `" (:id sa) "` (" (:title sa) "): " (truncate (:content sa))))
+                            (take max-entries subagents)))
+             "\n\n"))
+      (when (seq skills)
+        (str "## Continual Harness Skills\n"
+             (str/join "\n"
+                       (map (fn [sk]
+                              (str "- `" (:id sk) "` (" (:title sk) "): " (truncate (:content sk))))
+                            (take max-entries skills)))
+             "\n\n"))
+      (when (seq tools)
+        (str "## Dynamic Tools\n"
+             (str/join "\n"
+                       (map (fn [t]
+                              (let [desc (or (get-in t [:arguments :description])
+                                             (get-in t [:arguments "description"])
+                                             (:title t))]
+                                (str "- `" (:id t) "`: " (truncate desc))))
+                            (take max-entries tools)))
+             "\n\n"))
+      "Use `refine` to propose harness edits when encountering repeated obstacles, newly discovered patterns, or stale assumptions.")))

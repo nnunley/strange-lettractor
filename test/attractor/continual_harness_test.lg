@@ -1,0 +1,213 @@
+(ns attractor.continual-harness-test
+  "Comprehensive tests for Continual Harness
+   integration in Attractor coding agent loop."
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.harness :as harness]
+            [attractor.refiner :as refiner]
+            [attractor.profiles :as profiles]
+            [attractor.execution :as execution]))
+
+(deftest continual-harness-session-init-and-prompt-test
+  (let [h (harness/make-harness)
+        _ (harness/apply-edit! h {:action "create"
+                                  :kind "memory"
+                                  :id "mem-test"
+                                  :title "Test Memory"
+                                  :content "Do not divide by zero"})
+        _ (harness/apply-edit! h {:action "create"
+                                  :kind "prompt"
+                                  :id "rule-test"
+                                  :title "Safety rule"
+                                  :content "Always sanitize inputs"})
+        requests (atom [])
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)
+                   :complete_fn (fn [req]
+                                  (swap! requests conj req)
+                                  {:message {:role :assistant :content "Processed turn"}
+                                   :tool_calls []})})]
+    (try
+      (is (some? (:harness @session)))
+      (is (= h (:harness @session)))
+
+      ;; Run turn and inspect the system prompt
+      (agent/process-input! session "Run task")
+      (let [sent-prompt (get-in (first @requests) [:messages 0 :content])]
+        (is (str/includes? sent-prompt "# Continual Harness State"))
+        (is (str/includes? sent-prompt "Safety rule"))
+        (is (str/includes? sent-prompt "Do not divide by zero")))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest harness-meta-tools-test
+  (let [h (harness/make-harness)
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)})]
+    (try
+      (let [tools (profiles/profile-tools (:provider_profile @session))
+            tool-names (set (map :name tools))]
+        (is (contains? tool-names "remember"))
+        (is (contains? tool-names "recall"))
+        (is (contains? tool-names "define_subagent"))
+        (is (contains? tool-names "refine_harness"))
+        (is (contains? tool-names "eval_letgo"))
+        (is (contains? tool-names "define_tool")))
+
+      ;; Test executing 'eval_letgo'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            eval-tool (profiles/registry-get reg "eval_letgo")
+            res ((:executor eval-tool) {"code" "(str \"Platform is: \" ((:platform env)))"} env)]
+        (is (str/includes? res "Platform is: test-platform")))
+
+      ;; Test executing 'define_tool'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            define-tool-exec (profiles/registry-get reg "define_tool")
+            res ((:executor define-tool-exec)
+                  {"name" "double_it"
+                   "description" "Double an input number"
+                   "parameters" {:properties {:val {:type "number"}}}
+                   "code" "(fn [args env] (* 2 (get args \"val\")))"}
+                  env)
+            new-tool (profiles/registry-get reg "double_it")]
+        (is (str/includes? res "Defined and registered dynamic tool: double_it"))
+        (is (some? new-tool))
+        (is (= 50 ((:executor new-tool) {"val" 25} env)))
+        (is (some? (get-in @h [:entries :tool "double_it"]))))
+
+      ;; Test executing 'remember'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            remember-tool (profiles/registry-get reg "remember")
+            res ((:executor remember-tool) {"title" "Map boundary" "content" "North exit is blocked"} env)]
+        (is (str/includes? res "Remembered"))
+        (is (= "Map boundary" (get-in @h [:entries :memory (first (keys (get-in @h [:entries :memory]))) :title]))))
+
+      ;; Test executing 'recall'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            recall-tool (profiles/registry-get reg "recall")
+            res ((:executor recall-tool) {"query" "boundary"} env)]
+        (is (str/includes? res "Map boundary"))
+        (is (str/includes? res "North exit is blocked")))
+
+      ;; Test executing 'define_subagent'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            define-tool (profiles/registry-get reg "define_subagent")
+            res ((:executor define-tool) {"id" "sql-expert" "title" "SQL Expert" "instructions" "Analyze SQL queries"} env)]
+        (is (str/includes? res "Defined subagent spec"))
+        (is (= "Analyze SQL queries" (get-in @h [:entries :subagent "sql-expert" :content]))))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest loop-detection-triggers-refinement-test
+  (let [h (harness/make-harness)
+        refine-calls (atom [])
+        mock-refine-response
+        {:message
+         {:role :assistant
+          :content "```json
+{
+  \"summary\": \"Loop detected: switch to alternate tool\",
+  \"rationale\": \"Tool calls repeating in a cycle\",
+  \"expected_outcome\": \"Break repeat cycle\",
+  \"edits\": [
+    {
+      \"action\": \"create\",
+      \"kind\": \"prompt\",
+      \"id\": \"anti-loop-rule\",
+      \"title\": \"Loop avoidance\",
+      \"content\": \"Stop repeating command X\"
+    }
+  ]
+}
+```"}}
+        mock-refine-complete
+        (fn [req]
+          (swap! refine-calls conj req)
+          mock-refine-response)
+        turn-count (atom 0)
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :enable_loop_detection true
+                   :loop_detection_window 2
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)
+                   :refiner_complete_fn mock-refine-complete
+                   :complete_fn (fn [_req]
+                                  (swap! turn-count inc)
+                                  ;; Return identical tool calls each turn to trigger detect-loop
+                                  (if (< @turn-count 4)
+                                    {:message {:role :assistant :content "Looping"}
+                                     :tool_calls [{:name "directory_list" :arguments {:path "/"}}]}
+                                    {:message {:role :assistant :content "Finished"}
+                                     :tool_calls []}))})]
+    (try
+      (agent/process-input! session "Start looping task")
+      ;; Loop detection should have fired and executed refinement!
+      (is (pos? (count @refine-calls)))
+      (is (= "Loop avoidance" (get-in @h [:entries :prompt "anti-loop-rule" :title])))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest bootstrap-transfer-test
+  (let [tmp-harness "/tmp/test-bootstrap-transfer.edn"
+        h1 (harness/make-harness)
+        _ (harness/apply-edit! h1 {:action "create"
+                                   :kind "skill"
+                                   :id "fast-pathfinder"
+                                   :title "Fast Pathfinder"
+                                   :content "A* search routine"})
+        _ (harness/apply-edit! h1 {:action "create"
+                                   :kind "tool"
+                                   :id "square"
+                                   :title "square"
+                                   :content "(fn [args env] (let [x (get args \"x\")] (* x x)))"
+                                   :arguments {:description "Square a number"
+                                               :parameters {:properties {:x {:type "number"}}}}})
+        _ (harness/save-harness! @h1 tmp-harness)
+        ;; Create second session bootstrapping from tmp-harness
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session2 (agent/make-session
+                   {:execution_env env
+                    :harness_bootstrap tmp-harness
+                    :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                             :supports_streaming false)})]
+    (try
+      (is (some? (:harness @session2)))
+      (is (= "Fast Pathfinder" (get-in @(:harness @session2) [:entries :skill "fast-pathfinder" :title])))
+      (let [tools (profiles/profile-tools (:provider_profile @session2))
+            tool-names (set (map :name tools))]
+        (is (contains? tool-names "square"))
+        (let [square-tool (profiles/registry-get (get-in @session2 [:provider_profile :tool_registry]) "square")]
+          (is (some? square-tool))
+          (is (= 49 ((:executor square-tool) {"x" 7} env)))))
+      (finally
+        (agent/close-session! session2)
+        (os/sh "rm" "-f" tmp-harness)))))

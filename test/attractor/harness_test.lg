@@ -1,0 +1,93 @@
+(ns attractor.harness-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.harness :as harness]
+            [io :as io]
+            [os :as os]))
+
+(deftest harness-lifecycle-test
+  (let [h (harness/make-harness)]
+    (is (= 1 (:schema @h)))
+    (is (empty? (get-in @h [:entries :memory])))
+
+    ;; 1. Create a memory entry
+    (let [res (harness/apply-edit! h {:action "create"
+                                      :kind "memory"
+                                      :id "mem-1"
+                                      :title "Observed bottleneck"
+                                      :content "Do not use command X because it hangs"})]
+      (is (:applied res))
+      (is (= "mem-1" (:id res)))
+      (is (= "Observed bottleneck" (get-in @h [:entries :memory "mem-1" :title]))))
+
+    ;; 2. Update memory entry
+    (let [res (harness/apply-edit! h {:action "update"
+                                      :kind "memory"
+                                      :id "mem-1"
+                                      :title "Observed bottleneck (updated)"
+                                      :content "Use command Y instead of X"})]
+      (is (:applied res))
+      (is (= "Observed bottleneck (updated)" (get-in @h [:entries :memory "mem-1" :title]))))
+
+    ;; 3. Create a prompt note
+    (harness/apply-edit! h {:action "create"
+                            :kind "prompt"
+                            :id "prompt-1"
+                            :title "Navigation rule"
+                            :content "Always check current map ID before moving"})
+    (is (contains? (get-in @h [:entries :prompt]) "prompt-1"))
+
+    ;; 4. Check overview text
+    (let [overview (harness/format-harness-overview @h)]
+      (is (clojure.string/includes? overview "# Continual Harness State"))
+      (is (clojure.string/includes? overview "Navigation rule"))
+      (is (clojure.string/includes? overview "Observed bottleneck (updated)")))
+
+    ;; 5. Delete entry
+    (let [res (harness/apply-edit! h {:action "delete"
+                                      :kind "prompt"
+                                      :id "prompt-1"})]
+      (is (:applied res))
+      (is (nil? (get-in @h [:entries :prompt "prompt-1"]))))))
+
+(deftest proposal-and-rollback-test
+  (let [h (harness/make-harness)
+        proposal {:summary "Adopt specialized subagent"
+                  :rationale "Need parallel worker for tests"
+                  :expected_outcome "Faster test cycles"
+                  :edits [{:action "create"
+                           :kind "subagent"
+                           :id "test-runner"
+                           :title "Test Runner"
+                           :content "Runs tests in background and reports failures"}
+                          {:action "create"
+                           :kind "prompt"
+                           :id "rule-delegate"
+                           :title "Delegate test execution"
+                           :content "Delegate all test commands to test-runner"}]}
+        result (harness/apply-proposal! h proposal)]
+    (is (= "Adopt specialized subagent" (:summary result)))
+    (is (= 2 (count (:applied_edits result))))
+    (is (contains? (get-in @h [:entries :subagent]) "test-runner"))
+    (is (contains? (get-in @h [:entries :prompt]) "rule-delegate"))
+    (is (= 1 (count (:refinements @h))))
+
+    ;; Rollback the proposal
+    (let [refine-id (:id result)
+          rb (harness/rollback! h refine-id)]
+      (is (:success rb))
+      (is (nil? (get-in @h [:entries :subagent "test-runner"])))
+      (is (nil? (get-in @h [:entries :prompt "rule-delegate"]))))))
+
+(deftest persistence-test
+  (let [tmp-path "/tmp/test-attractor-harness.edn"
+        h (harness/make-harness)]
+    (harness/apply-edit! h {:action "create"
+                            :kind "skill"
+                            :id "skill-bfs"
+                            :title "BFS Navigator"
+                            :content "Performs BFS pathfinding over ASCII grid"})
+    (harness/save-harness! @h tmp-path)
+    (is (io/file-exists? tmp-path))
+    (let [loaded (harness/load-harness tmp-path)]
+      (is (= "BFS Navigator" (get-in loaded [:entries :skill "skill-bfs" :title])))
+      (os/sh "rm" "-f" tmp-path))))

@@ -1,0 +1,57 @@
+digraph ContinualHarnessCoLearning {
+    graph [
+        goal="Reset-free continual harness adaptation and co-learning (arXiv:2605.09998)",
+        model_stylesheet="* { llm_model: gemini-3.1-pro; llm_provider: gemini; }"
+    ]
+
+    start [shape=Mdiamond, label="Start Run"]
+
+    // 1. Rollout Stage (K-step rollout through live-refining harness)
+    rollout [
+        shape=box,
+        label="Agent Rollout",
+        fidelity="full",
+        thread_id="continual-agent",
+        harness.enabled="true",
+        harness.auto_refine="true",
+        harness.interval="8",
+        prompt="Execute K=256 steps toward $goal. Use available meta-tools (remember, recall, define_subagent, refine_harness) when encountering repeated obstacles or discovering new strategies."
+    ]
+
+    // 2. Process Reward Model Evaluation
+    prm_score [
+        shape=box,
+        label="PRM Scoring Pass",
+        prompt="Score each transition pair in the recent rollout window across progress (0.4), action correctness (0.3), reasoning quality (0.2), and format compliance (0.1). Identify low-reward shards."
+    ]
+
+    // 3. Milestone Gate / Stop Condition
+    check_milestone [
+        shape=diamond,
+        label="Milestone Reached?"
+    ]
+
+    // 4. Frontier Teacher Relabeling
+    teacher_relabel [
+        shape=box,
+        label="Teacher Relabel",
+        prompt="Relabel low-reward trajectory shards using frontier teacher guidance to produce optimal action and reasoning trajectories."
+    ]
+
+    // 5. Reset-Free Soft SFT Update
+    soft_sft [
+        shape=box,
+        label="Soft SFT Update",
+        prompt="Apply soft SFT update on relabeled shard. Emulator and harness state carry forward reset-free into next rollout iteration."
+    ]
+
+    exit [shape=Msquare, label="Goal Completed"]
+
+    start -> rollout
+    rollout -> prm_score
+    prm_score -> check_milestone
+    check_milestone -> exit [label="complete"]
+    check_milestone -> teacher_relabel [label="iterate"]
+    teacher_relabel -> soft_sft
+    soft_sft -> rollout [label="next_iteration (reset-free)"]
+}

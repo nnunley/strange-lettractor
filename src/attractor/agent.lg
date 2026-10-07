@@ -9,7 +9,10 @@
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
             [attractor.tool-images :as tool-images]
-            [attractor.profiles :as profiles]))
+            [attractor.profiles :as profiles]
+            [attractor.harness :as harness]
+            [attractor.refiner :as refiner]
+            [attractor.evaluator :as evaluator]))
 
 ;; Provider-profile tool output limits (raw events keep everything; the
 ;; model sees bounded head/tail content).
@@ -223,42 +226,48 @@
      :model_display_name model_display_name
      :knowledge_cutoff knowledge_cutoff}))
 
-(defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions skills-block]
-  (let [base (profiles/build-system-prompt profile environment [])
-        tool-text
-        (str/join "\n"
-                  (map (fn [tool]
-                         (str (:name tool) ": " (:description tool)))
-                       (profiles/profile-tools profile)))
-        environment-text
-        (str "<environment>\n"
-             "Working directory: " (:working_directory snapshot) "\n"
-             "Is git repository: " (:is_git_repository snapshot) "\n"
-             "Git branch: " (:git_branch snapshot) "\n"
-             "Git changed files: " (:git_status_count snapshot) "\n"
-             (when-not (str/blank? (:recent_commits snapshot))
-               (str "Recent commits:\n" (:recent_commits snapshot) "\n"))
-             "Platform: " (:platform snapshot) "\n"
-             "OS version: " (:os_version snapshot) "\n"
-             "Today's date: " (:date snapshot) "\n"
-             "Model: " (:model_display_name snapshot) "\n"
-             "Knowledge cutoff: " (:knowledge_cutoff snapshot) "\n"
-             "</environment>")]
-    (str base
-         "\n\n" environment-text
-         "\n\n<tools>\n" tool-text "\n</tools>"
-         (when (seq project-docs)
-           (str "\n\n<project_instructions>\n"
-                (str/join "\n\n" project-docs)
-                "\n</project_instructions>"))
-         (when-not (str/blank? skills-block)
-           (str "\n\n" skills-block))
-         (when-not (str/blank? user-instructions)
-           (str "\n\n" user-instructions)))))
+(defn- assemble-system-prompt
+  ([profile environment snapshot project-docs user-instructions skills-block]
+   (assemble-system-prompt profile environment snapshot project-docs user-instructions skills-block nil))
+  ([profile environment snapshot project-docs user-instructions skills-block harness-block]
+   (let [base (profiles/build-system-prompt profile environment [])
+         tool-text
+         (str/join "\n"
+                   (map (fn [tool]
+                          (str (:name tool) ": " (:description tool)))
+                        (profiles/profile-tools profile)))
+         environment-text
+         (str "<environment>\n"
+              "Working directory: " (:working_directory snapshot) "\n"
+              "Is git repository: " (:is_git_repository snapshot) "\n"
+              "Git branch: " (:git_branch snapshot) "\n"
+              "Git changed files: " (:git_status_count snapshot) "\n"
+              (when-not (str/blank? (:recent_commits snapshot))
+                (str "Recent commits:\n" (:recent_commits snapshot) "\n"))
+              "Platform: " (:platform snapshot) "\n"
+              "OS version: " (:os_version snapshot) "\n"
+              "Today's date: " (:date snapshot) "\n"
+              "Model: " (:model_display_name snapshot) "\n"
+              "Knowledge cutoff: " (:knowledge_cutoff snapshot) "\n"
+              "</environment>")]
+     (str base
+          "\n\n" environment-text
+          "\n\n<tools>\n" tool-text "\n</tools>"
+          (when (seq project-docs)
+            (str "\n\n<project_instructions>\n"
+                 (str/join "\n\n" project-docs)
+                 "\n</project_instructions>"))
+          (when-not (str/blank? skills-block)
+            (str "\n\n" skills-block))
+          (when-not (str/blank? harness-block)
+            (str "\n\n" harness-block))
+          (when-not (str/blank? user-instructions)
+            (str "\n\n" user-instructions))))))
 
-(declare register-subagent-tools! close-subagent!)
+(declare register-subagent-tools! register-harness-tools! close-subagent!)
 
 (def subagent-tool-names #{"spawn_agent" "send_input" "wait" "close_agent"})
+(def harness-tool-names #{"refine_harness" "remember" "recall" "define_subagent"})
 
 ;; Tool Dispatcher
 (defn execute-tool [tool-name args]
@@ -357,12 +366,21 @@
           skill-roster-render (skills/render-roster skill-roster)
           skills-block (skills/render-skills-block
                          {:roster skill-roster :loaded (vec (:loaded skill-result))})
+          harness-initial (or (:harness options) (:harness_bootstrap options))
+          harness-atom (cond
+                         (nil? harness-initial) (when (or (:enable_continual_harness options)
+                                                          (:auto_refine options))
+                                                  (harness/make-harness))
+                         (= "let-go.lang.Atom" (str (type harness-initial))) harness-initial
+                         :else (harness/make-harness harness-initial))
           session
           (atom {:id (or (:id options) (ids/prefixed "agent"))
                  :model (:model profile)
                  :provider_profile profile
                  :context_capacity_fallback (:context_window_fallback profile)
                  :execution_env environment
+                 :harness harness-atom
+                 :turns_since_refine 0
                  :tool_hook_context (or (:tool_hook_context options) (atom (or (:tool_hooks options) {})))
                  :llm_client (:llm_client options)
                  :event_fn (:on_event options)
@@ -405,12 +423,16 @@
                                    :reasoning_effort nil
                                    :enable_loop_detection true
                                    :loop_detection_window 10
+                                   :auto_refine false
+                                   :auto_refine_interval 0
                                    :max_subagent_depth 1}
                                   options)
                            :reasoning_effort reasoning-effort)})]
       (when (< (:subagent_depth @session)
                (or (get-in @session [:config :max_subagent_depth]) 1))
         (register-subagent-tools! session))
+      (when (:harness @session)
+        (register-harness-tools! session))
       (when (seq selected-skills)
         (emit-event! session {:type :skills_loaded
                               :skills (:skill_evidence @session)
@@ -1010,13 +1032,17 @@
                   last-text)
 
                 :else
-                (let [system-prompt
+                (let [harness-atom (:harness @session)
+                      harness-block (when harness-atom
+                                      (harness/format-harness-overview @harness-atom))
+                      system-prompt
                       (assemble-system-prompt
                         profile environment
                         (:environment_snapshot @session)
                         (:project_docs @session)
                         (:user_instructions config)
-                        (:skills_block @session))
+                        (:skills_block @session)
+                        harness-block)
                       request {:model (:model profile)
                                :provider (:id profile)
                                :messages
@@ -1105,6 +1131,10 @@
                                       (let [warning
                                             (str "Loop detected: recent tool calls repeat. "
                                                  "Try a different approach.")]
+                                        (when (:harness @session)
+                                          (try
+                                            (refiner/execute-refinement! session :loop-detected {:instructions warning})
+                                            (catch Object _ nil)))
                                         (when (append-history-if-open!
                                                 session
                                                 {:type :steering :role :user
@@ -1128,6 +1158,15 @@
                   :else
                   (do
                     (swap! session assoc :state :idle)
+                    (when (and (:harness @session)
+                               (:auto_refine config)
+                               (pos? (or (:auto_refine_interval config) 0)))
+                      (swap! session update :turns_since_refine (fnil inc 0))
+                      (when (>= (or (:turns_since_refine @session) 0) (:auto_refine_interval config))
+                        (swap! session assoc :turns_since_refine 0)
+                        (try
+                          (refiner/execute-refinement! session :turn-interval)
+                          (catch Object _ nil))))
                     {:kind :idle}))))]
         (case (:kind decision)
           :stopped result
@@ -1299,10 +1338,19 @@
                           (profiles/create-profile (:id parent-profile)
                                                    requested-model))
           child-id (ids/prefixed "agent")
+          role-id (subagent-arg arguments "role")
+          harness-atom (:harness @parent)
+          role-spec (when (and harness-atom (not (str/blank? role-id)))
+                      (get-in @harness-atom [:entries :subagent role-id]))
+          role-instructions (when role-spec (:content role-spec))
+          explicit-instructions (subagent-arg arguments "instructions")
+          user-instructions (or explicit-instructions role-instructions)
           child
           (make-session
             (merge
              {:id child-id
+              :user_instructions user-instructions
+              :harness harness-atom
               :tool_hook_context (:tool_hook_context @parent)
              :provider_profile child-profile
              :execution_env child-environment
@@ -1374,10 +1422,11 @@
   (let [registry (get-in @session [:provider_profile :tool_registry])
         tools
         [(subagent-tool
-           "spawn_agent" "Spawn a scoped coding subagent with optional skill selection"
+           "spawn_agent" "Spawn a scoped coding subagent with optional skill or role selection"
            {:task {:type "string"} :working_dir {:type "string"}
             :model {:type "string"} :max_turns {:type "integer"}
             :max_total_tokens {:type "integer"}
+            :role {:type "string"} :instructions {:type "string"}
             :skills {:type "array" :items {:type "string"}}}
            ["task"]
            (fn [arguments _] (spawn-subagent! session arguments)))
@@ -1400,6 +1449,66 @@
            (fn [arguments _]
              (close-subagent! session (subagent-arg arguments "agent_id"))))]]
     (doseq [tool tools] (profiles/register-tool! registry tool))
+    session))
+
+(defn register-harness-tools! [session]
+  (let [registry (get-in @session [:provider_profile :tool_registry])
+        harness-atom (:harness @session)
+        tools
+        [(subagent-tool
+           "refine_harness"
+           "Propose online continual harness updates to prompt notes, memory, skills, or subagents"
+           {:instructions {:type "string"}}
+           []
+           (fn [arguments _]
+             (let [instructions (or (get arguments "instructions") (get arguments :instructions))
+                   res (refiner/execute-refinement! session :agent-requested {:instructions instructions})]
+               (if res
+                 (str "Harness refined: " (:summary res) " (" (count (:applied_edits res)) " edits applied)")
+                 "Harness refinement skipped or failed."))))
+         (subagent-tool
+           "remember"
+           "Save a durable fact, lesson, milestone, or heuristic to Continual Harness long-term memory"
+           {:title {:type "string"} :content {:type "string"}}
+           ["title" "content"]
+           (fn [arguments _]
+             (let [title (or (get arguments "title") (get arguments :title))
+                   content (or (get arguments "content") (get arguments :content))
+                   res (harness/apply-edit! harness-atom {:action "create" :kind "memory" :title title :content content})]
+               (str "Remembered [" (:id res) "]: " title))))
+         (subagent-tool
+           "recall"
+           "Search or inspect entries from Continual Harness long-term memory"
+           {:query {:type "string"}}
+           []
+           (fn [arguments _]
+             (let [query (str/lower-case (or (get arguments "query") (get arguments :query) ""))
+                   memories (vals (get-in @harness-atom [:entries :memory] {}))
+                   matched (if (str/blank? query)
+                             memories
+                             (filter (fn [m]
+                                       (or (str/includes? (str/lower-case (or (:title m) "")) query)
+                                           (str/includes? (str/lower-case (or (:content m) "")) query)))
+                                     memories))]
+               (if (seq matched)
+                 (str/join "\n"
+                   (map (fn [m] (str "- [" (:id m) "] " (:title m) ": " (:content m))) matched))
+                 "No matching memories found in harness."))))
+         (subagent-tool
+           "define_subagent"
+           "Define a specialized subagent specification in the Continual Harness"
+           {:id {:type "string"} :title {:type "string"} :instructions {:type "string"}}
+           ["id" "instructions"]
+           (fn [arguments _]
+             (let [id (or (get arguments "id") (get arguments :id))
+                   title (or (get arguments "title") (get arguments :title) id)
+                   instructions (or (get arguments "instructions") (get arguments :instructions))
+                   res (harness/apply-edit! harness-atom {:action "create" :kind "subagent" :id id :title title :content instructions})]
+               (str "Defined subagent spec [" (:id res) "]: " title))))
+         (evaluator/eval-letgo-tool)
+         (evaluator/define-tool-tool registry harness-atom)]]
+    (doseq [tool tools] (profiles/register-tool! registry tool))
+    (evaluator/load-harness-tools! registry harness-atom)
     session))
 
 ;; CodergenBackend implementation backed by the Coding Agent Loop
@@ -1451,12 +1560,26 @@
             dynamic-options (if options-fn (or (options-fn node) {}) {})
             static-options (dissoc base-options :session_options_fn)
             node-model (:llm_model node)
+            node-attrs (or (:attrs node) {})
+            harness-bootstrap (or (get node-attrs "harness.bootstrap")
+                                  (get node-attrs :harness.bootstrap)
+                                  (:harness_bootstrap static-options))
+            harness-enabled? (or (= "true" (str (get node-attrs "harness.enabled")))
+                                 (= "true" (str (get node-attrs :harness.enabled)))
+                                 (:enable_continual_harness static-options)
+                                 (some? harness-bootstrap))
+            auto-refine? (or (= "true" (str (get node-attrs "harness.auto_refine")))
+                             (= "true" (str (get node-attrs :harness.auto_refine)))
+                             (:auto_refine static-options))
             session-options
             (assoc (merge static-options dynamic-options)
                    :model (or (:model dynamic-options)
                               (when-not (str/blank? node-model) node-model)
                               (:model static-options)
-                              "default"))
+                              "default")
+                   :enable_continual_harness harness-enabled?
+                   :auto_refine auto-refine?
+                   :harness_bootstrap harness-bootstrap)
             full? (= "full" (:resolved_fidelity node))
             thread-key (:resolved_thread_id node)
             threads (:fidelity_threads node)

@@ -1,0 +1,47 @@
+(ns attractor.refiner-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.harness :as harness]
+            [attractor.refiner :as refiner]))
+
+(deftest extract-json-object-test
+  (is (= {"a" 1} (refiner/extract-json-object "{\"a\": 1}")))
+  (is (= {"hello" "world"}
+         (refiner/extract-json-object "Some intro text ```json\n{\"hello\": \"world\"}\n``` outro text")))
+  (is (nil? (refiner/extract-json-object "No json here"))))
+
+(deftest plan-and-execute-refinement-test
+  (let [h (harness/make-harness)
+        mock-response
+        {:message
+         {:role :assistant
+          :content "```json
+{
+  \"summary\": \"Resolve navigation loop by adding waypoint memory\",
+  \"rationale\": \"Agent was cycling between node A and B\",
+  \"expected_outcome\": \"Proceed to node C\",
+  \"edits\": [
+    {
+      \"action\": \"create\",
+      \"kind\": \"memory\",
+      \"id\": \"waypoint-rule\",
+      \"title\": \"Route 4 waypoint\",
+      \"content\": \"Node B leads to dead end; use East exit to Route 5\",
+      \"reason\": \"Break 2-node cycle\"
+    }
+  ]
+}
+```"}}
+        mock-complete-fn (fn [_req] mock-response)
+        events (atom [])
+        session (atom {:harness h
+                       :model "mock/default"
+                       :config {:refiner_complete_fn mock-complete-fn}
+                       :history [{:type :assistant
+                                  :tool_calls [{:name "move" :arguments {:direction "north"}}]}]
+                       :event_fn (fn [e] (swap! events conj e))})]
+    (let [res (refiner/execute-refinement! session :loop-detected)]
+      (is (= "Resolve navigation loop by adding waypoint memory" (:summary res)))
+      (is (= 1 (count (:applied_edits res))))
+      (is (= "Route 4 waypoint" (get-in @h [:entries :memory "waypoint-rule" :title])))
+      (is (= 1 (count @events)))
+      (is (= :refine_complete (:type (first @events)))))))
