@@ -173,11 +173,15 @@
   (let [registry (or (:schema_registry options) {})
         base (or (:schema_base_uri options) "https://attractor.invalid/schema")
         indexed (registry-candidates registry base (:schema_default_dialect options))]
-    (fn [dialect keyword]
-      (let [vocabs (resource-vocabularies indexed dialect)]
-        (when (nil? vocabs)
-          (invalid! (str "Unsupported or unavailable schema dialect: " dialect)))
-        (active-resource-keyword? dialect keyword vocabs)))))
+    ;; The indexed registry is immutable for this validation call. Traversal
+    ;; visits the same dialect/keyword pairs thousands of times for meta-schemas;
+    ;; their vocabulary declarations need validation only on the first visit.
+    (memoize
+      (fn [dialect keyword]
+        (let [vocabs (resource-vocabularies indexed dialect)]
+          (when (nil? vocabs)
+            (invalid! (str "Unsupported or unavailable schema dialect: " dialect)))
+          (active-resource-keyword? dialect keyword vocabs))))))
 
 (def schema-map-keys
   #{"$defs" "definitions" "properties" "patternProperties" "dependentSchemas" "dependencies"})

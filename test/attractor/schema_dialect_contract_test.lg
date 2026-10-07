@@ -1,11 +1,31 @@
 (ns attractor.schema-dialect-contract-test
   (:require [clojure.test :refer [deftest is]]
-            [attractor.llm :as llm]))
+            [attractor.llm :as llm]
+            [attractor.schema.dialects :as dialects]
+            [attractor.schema.uri :as uri]))
 
 (def draft "https://json-schema.org/draft/2020-12/schema")
 (defn- check [value schema & [options]]
   (llm/validate-json-schema value schema options))
 (defn- valid? [value schema & [options]] (first (check value schema options)))
+
+(deftest registry-selector-reuses-decisions-without-cross-registry-leaks
+  (let [dialect "https://example.org/cached-dialect"
+        meta-schema (fn [applicator?]
+                      {:$id dialect :$schema draft
+                       :$vocabulary (cond-> {(str dialects/vocab-prefix "core") true}
+                                      applicator? (assoc (str dialects/vocab-prefix "applicator") true))})
+        enabled (dialects/resource-keyword-selector {:schema_registry {dialect (meta-schema true)}})
+        disabled (dialects/resource-keyword-selector {:schema_registry {dialect (meta-schema false)}})
+        parses (atom 0) original uri/parts]
+    (with-redefs [uri/parts (fn [value] (swap! parses inc) (original value))]
+      (is (true? (enabled dialect :properties)))
+      (is (false? (disabled dialect :properties)))
+      (let [initial @parses]
+        (dotimes [_ 50]
+          (enabled dialect :properties)
+          (disabled dialect :properties))
+        (is (= initial @parses) "Repeated traversal must not reparse unchanged vocabulary declarations")))))
 
 (deftest declared-and-default-dialects
   (is (false? (valid? 1 {:$schema draft :type "strng"})))
