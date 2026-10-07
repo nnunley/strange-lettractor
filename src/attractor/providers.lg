@@ -202,12 +202,12 @@
       (str (os/cwd) "/attractor.edn")))
 
 (defn- read-file
-  "Read one file. A file that holds :api_key values must be private to its
+  "Read one file. A file that holds credentials must be private to its
    owner."
   [path]
   (when (and path (os/stat path))
     (let [parsed (parse-config path (io/slurp path))]
-      (when (some :api_key (vals parsed))
+      (when (some #(or (:api_key %) (seq (:credential_headers %))) (vals parsed))
         (require-private! path))
       parsed)))
 

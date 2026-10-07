@@ -90,6 +90,15 @@
       (finally
         (os/sh "/bin/rm" "-f" "--" user project)))))
 
+(deftest credential-header-only-files-must-be-private
+  (let [path (temp-file "header-secret" "{:providers {\"x\" {:protocol :openai-responses :credential_headers {\"X-Secret\" \"fixture-token\"}}}}")]
+    (try
+      (os/sh "/bin/chmod" "644" path)
+      (is (str/includes? (message-of #(providers/load-registry {:paths [path]})) "chmod 600"))
+      (os/sh "/bin/chmod" "600" path)
+      (is (= "fixture-token" (get-in (providers/load-registry {:paths [path]}) ["x" :credential_headers "X-Secret"])))
+      (finally (os/sh "rm" "-f" path)))))
+
 (deftest a-file-holding-keys-must-be-private
   (let [path (temp-file "secret" "{:providers {\"x\" {:protocol :openai-responses :api_key \"sk-file\"}}}")]
     (try
@@ -315,4 +324,3 @@
       (finally
         (providers/reload! {:paths []})
         (os/sh "/bin/rm" "-f" "--" path)))))
-
