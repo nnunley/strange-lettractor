@@ -18,6 +18,31 @@
 ;; Fixture helpers.
 ;; ---------------------------------------------------------------------------
 
+(deftest failed-multi-server-admission-is-atomic
+  (doseq [mode [:collision :registration]]
+  (let [manifest (fn [id] {:id id :revision "1" :name id :description id
+                           :transport :streamable-http :endpoint "https://fixture.test/mcp"
+                           :token-env "FAKE" :task-types ["test"]
+                           :limits {:timeout-ms 100 :max-bytes 1024} :provenance {}
+                           :tools [{:name "query" :description "query" :class :pure-tool :side-effects :none}]})
+        reg (profiles/make-tool-registry (if (= mode :collision)
+              [{:definition {:name "b__query" :description "host" :parameters {:type "object"}}
+               :executor (fn [_ _] "host")}] []))
+        before @reg session (atom {:provider_profile {:tool_registry reg}})
+        files {"/fake/a/mcp.edn" (pr-str (manifest "a")) "/fake/b/mcp.edn" (pr-str (manifest "b"))}
+        closed (atom 0) real-close mcp-client/close-session! register profiles/register-tool!]
+    (with-redefs [mcp-client/close-session! (fn [handle] (swap! closed inc) (real-close handle))
+                  profiles/register-tool! (fn [registry tool]
+                    (if (and (= mode :registration) (= "b__query" (get-in tool [:definition :name])))
+                      (throw (ex-info "registration failed" {}))
+                      (register registry tool)))]
+      (is (try (mcp/admit-servers! session ["a" "b"]
+                 {:project-root "/fake" :read-text #(get files %) :file-exists #(contains? files %)
+                  :token-reader (fn [_] "synthetic")}) false (catch Object _ true))))
+    (is (= before @reg))
+    (is (= (if (= mode :collision) 1 2) @closed))
+    (is (empty? (:mcp_close_fns @session))))))
+
 (defn- fresh-dir [label]
   (str (os/temp-dir) "/mcp-" label "-" (random-uuid)))
 

@@ -829,7 +829,7 @@
          (catch Object error
            (fail! :auth-store-failed {:server_id server-id :reason :keychain-unavailable})))))
 
-(defn- admit-one-server [session resolved token-reader transport oauth-authorizer credential-store]
+(defn- admit-one-server [session resolved token-reader transport oauth-authorizer credential-store & [staged-registry]]
   (let [manifest (:manifest resolved)
         server-id (:id manifest)
         stdio? (stdio-transport? manifest)
@@ -860,7 +860,7 @@
                  (not refresh-available?)
                  (or (:registration-endpoint manifest) (:authorization-url manifest)))
         (println (str "[mcp] " server-id ": no token configured, OAuth will trigger on first 401."))))
-    (let [registry (get-in @session [:provider_profile :tool_registry])
+    (let [registry (or staged-registry (get-in @session [:provider_profile :tool_registry]))
           _ (when (nil? registry)
               (fail! :mcp-configuration {:server_id server-id
                                         :reason :no-tool-registry}))
@@ -890,8 +890,9 @@
                         :aborted? aborted?
                          :headers (if (str/blank? (str token))
                                      {}
-                                     (auth-headers token))}))
-            server-ctx {:manifest manifest
+                                     (auth-headers token))}))]
+        (try
+          (let [server-ctx {:manifest manifest
                         :manifest-digest (:manifest-digest resolved)
                         :token-state (atom {:token token :expires-at-ms nil :origin origin})
                         :refresh-lock (atom false)
@@ -961,7 +962,10 @@
                     :resources (mapv :uri (:resources manifest))
                     :token-source (:token-env manifest)
                     :redacted true
-                    :approvals-used (:approval resolved)}}))))
+                    :approvals-used (:approval resolved)}})
+          (catch Object error
+            (try (mcp-client/close-session! handle) (catch Object _ nil))
+            (throw error)))))))
 
 (defn- require-write-approval! [resolved approvals]
   (let [manifest (:manifest resolved)
@@ -1018,19 +1022,36 @@
           ;; Preflight the whole selection before credentials, transports, or
           ;; registry mutation: an unapproved later server opens none of them.
           authorized (mapv #(require-write-approval! % write-approvals) resolved)
-          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer credential-store) authorized)
-          config-digest (mcp-config-digest (map :evidence admitted))]
-      (swap! session assoc :mcp_servers (mapv :evidence admitted))
-      (swap! session assoc :mcp_config_digest config-digest)
-      (swap! session update :mcp_close_fns
-             (fn [existing]
-               (vec (concat (or existing [])
-                            (map (fn [entry]
-                                   (let [handle (:handle (:server-ctx entry))]
-                                     (fn [] (mcp-client/close-session! handle))))
-                                 admitted)))))
-      {:servers (mapv :evidence admitted)
-       :config-digest config-digest})))
+          registry (get-in @session [:provider_profile :tool_registry])
+          original (when registry @registry) staged (when registry (atom original)) acquired (atom [])]
+      (try
+        (doseq [server authorized]
+          (swap! acquired conj (admit-one-server session server token-reader transport oauth-authorizer credential-store staged)))
+        (let [admitted @acquired config-digest (mcp-config-digest (map :evidence admitted))
+              lock (:lifecycle_lock @session)]
+          (when lock
+            (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur))))
+          (try
+            (when (or (= :closed (:state @session)) (:abort_signaled @session))
+              (fail! :mcp-cancelled {:reason :session-closed-during-admission}))
+            (when-not (compare-and-set! registry original @staged)
+              (fail! :mcp-tool-collision {:reason :registry-changed-during-admission}))
+            (swap! session
+              (fn [state]
+                (-> state
+                    (assoc :mcp_servers (mapv :evidence admitted) :mcp_config_digest config-digest)
+                    (update :mcp_close_fns
+                      (fn [existing]
+                        (vec (concat (or existing [])
+                          (map (fn [entry]
+                                 (let [handle (:handle (:server-ctx entry))]
+                                   (fn [] (mcp-client/close-session! handle)))) admitted))))))))
+            (finally (when lock (reset! lock false))))
+          {:servers (mapv :evidence admitted) :config-digest config-digest})
+        (catch Object error
+          (doseq [entry @acquired]
+            (try (mcp-client/close-session! (:handle (:server-ctx entry))) (catch Object _ nil)))
+          (throw error))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Programmatic access.

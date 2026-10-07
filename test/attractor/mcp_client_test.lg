@@ -7,6 +7,19 @@
 
 ;; Fake transports: synchronous fns from request map to response map.
 
+(deftest legacy-close-has-an-independent-deadline
+  (let [entered (atom false) finished (atom false)
+        handle (atom {:mode :legacy :session-id "session" :endpoint "https://fixture.test"
+                      :timeout-ms 20 :aborted? (fn [] true)
+                      :transport (fn [_] (reset! entered true)
+                                   (try (core/sleep 500) {:status 200}
+                                        (finally (reset! finished true))))})
+        started (System/currentTimeMillis)]
+    (mcp-client/close-session! handle)
+    (is @entered "cleanup still attempts DELETE after caller abort")
+    (is @finished "owned cleanup joins its callback")
+    (is (< (- (System/currentTimeMillis) started) 400))))
+
 (defn- rpc-result [id result]
   (json/write-json {:jsonrpc "2.0" :id id :result result}))
 
