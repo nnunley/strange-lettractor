@@ -1,8 +1,43 @@
 (ns attractor.codex-agent-test
   (:require [harness.runtime :as runtime-path]
             [harness.deadline :as deadline]
-            [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os]
-            [attractor.agents.codex :as worker]))
+            [clojure.test :refer [deftest is]] [clojure.core :as core] [clojure.string :as str] [os :as os] [io :as io]
+            [attractor.agents.codex :as worker]
+            [attractor.codex.transport :as transport]))
+
+(deftest cancelled-startup-does-not-open-transport
+  (let [opened (atom 0)]
+    (with-redefs [transport/open! (fn [_] (swap! opened inc))]
+      (is (= :cancelled (:category (ex-data
+            (try (worker/run! {:prompt "x" :cancelled? (fn [] true) :timeout_ms 10})
+                 (catch Object e e)))))))
+    (is (= 0 @opened))))
+
+(deftest startup-observes-transport-failure-without-waiting-for-request-timeout
+  (let [callback (atom nil) closed (atom false) started (System/currentTimeMillis)]
+    (with-redefs [transport/open! (fn [options] (reset! callback (:on-failure options)) {})
+                  transport/send! (fn [_ _] (@callback "fixture EOF"))
+                  transport/close! (fn [_] (reset! closed true))]
+      (is (= :codex-protocol (:category (ex-data
+            (try (worker/run! {:prompt "x" :timeout_ms 1000}) (catch Object e e)))))))
+    (is @closed)
+    (is (< (- (System/currentTimeMillis) started) 500))))
+
+(deftest handshake-and-turn-share-one-deadline
+  (let [receive (atom nil) methods (atom [])]
+    (with-redefs [transport/open! (fn [opts] (reset! receive (:on-message opts)) {})
+                  transport/close! (fn [_] nil)
+                  transport/send!
+                  (fn [_ message]
+                    (when-let [id (get message "id")]
+                      (swap! methods conj (get message "method"))
+                      (core/sleep 30)
+                      (@receive {"id" id "result" {"thread" {"id" "thread"} "turn" {"id" "turn"}}})
+                      (when (= "turn/start" (get message "method"))
+                        (@receive {"method" "turn/completed" "params" {"turn" {"status" "completed"}}}))))]
+      (is (= :timeout (:category (ex-data
+            (try (worker/run! {:prompt "x" :timeout_ms 40}) (catch Object e e)))))))
+    (is (not (some #{"turn/start"} @methods)))))
 
 ;; SCN-CODEX-AGENT: one owned app-server turn against the let-go fake child.
 (defn- command [mode]
@@ -39,7 +74,75 @@
     ;; is demonstrably under way: a fixed sleep assumes a spawn and handshake
     ;; that a loaded machine does not finish in time, and cancelling before the
     ;; turn starts tests nothing.
-    (is (deadline/wait-until #(seq @events) 30000) "the turn started")
+    (is (deadline/wait-until #(some (fn [e] (= :turn_started (:type e))) @events) 30000) "the turn started")
     (reset! cancel true)
     (is (= :cancelled (get-in (deref job 30000 {:error {:category :test-timeout}}) [:error :category])))
     (is (some #(= "interrupted" (get-in % [:event "params" "turn" "status"])) @events) "interrupt reached the server")))
+
+(deftest startup-open-is-owned-and-joined-at-the-deadline
+  (let [entered (atom false) finished (atom false) closed (atom 0) start (System/currentTimeMillis)]
+    (with-redefs [transport/open! (fn [_]
+                                  (reset! entered true)
+                                  (try (core/sleep 500) {}
+                                       (finally (reset! finished true))))
+                  transport/close! (fn [_] (swap! closed inc))]
+      (is (= :timeout (get-in (attempt {:prompt "x" :timeout_ms 30}) [:error :category]))))
+    (is @entered)
+    (is @finished)
+    (is (= 1 @closed) "late acquired handle is closed exactly once")
+    (is (< (- (System/currentTimeMillis) start) 300))))
+
+(deftest blocked-fifo-writes-observe-timeout-and-cancellation-and-reap-child
+  (doseq [mode [:timeout :cancelled]]
+    (let [prompt (apply str (repeat 1048576 "x"))
+          root (str (os/temp-dir) "/codex-blocked-write-" (System/nanoTime))
+          _ (io/mkdir root)
+          marker (str root "/late")
+          script (str "import sys,json,time,pathlib\n"
+                      "for line in sys.stdin:\n"
+                      " m=json.loads(line)\n"
+                      " if m.get('method')=='initialize':\n"
+                      "  print(json.dumps({'id':m['id'],'result':{}}),flush=True)\n"
+                      " if m.get('method')=='thread/start':\n"
+                      "  print(json.dumps({'id':m['id'],'result':{'thread':{'id':'thread'}}}),flush=True)\n"
+                      "  time.sleep(1.2)\n"
+                      "  pathlib.Path(sys.argv[1]).write_text('late')\n"
+                      "  break\n")
+          opened (atom nil) child-pid (atom nil) cancelled (atom false)
+          writing (atom false) real-open transport/open! real-send transport/send!
+          started (System/currentTimeMillis)
+          result (with-redefs [transport/open! (fn [opts]
+                                                (let [t (real-open opts)]
+                                                  (reset! opened t)
+                                                  (deadline/wait-until #(some? (transport/pid t)) 1000)
+                                                  (reset! child-pid (transport/pid t)) t))
+                              transport/send! (fn [t message]
+                                                (when (= "turn/start" (get message "method"))
+                                                  (reset! writing true)
+                                                  (when (= mode :cancelled)
+                                                    (core/future (core/sleep 20) (reset! cancelled true))))
+                                                (real-send t message))]
+                   (attempt {:prompt prompt :command ["python3" "-c" script marker]
+                             :timeout_ms (if (= mode :timeout) 500 5000)
+                             :cancelled? #(deref cancelled)}))]
+      (is @writing "the large write was reached")
+      (is (= mode (get-in result [:error :category])) (pr-str result))
+      (is (< (- (System/currentTimeMillis) started) 2000))
+      (is (some? @child-pid))
+      (is (not= 0 (:exit (os/sh "/bin/kill" "-0" (str @child-pid)))))
+      (is (not (io/file-exists? (:dir @opened))))
+      (is (not (io/file-exists? marker))))))
+
+(deftest parent-scope-cancellation-joins-startup-with-a-typed-result
+  (let [entered (promise) finished (atom false)]
+    (with-redefs [transport/open! (fn [_]
+                                  (deliver entered true)
+                                  (try (core/sleep 5000) {}
+                                       (finally (reset! finished true))))
+                  transport/close! (fn [_] nil)]
+      (let [scope (core/scope-open)
+            task (core/future (attempt {:prompt "x" :timeout_ms 10000}))]
+        (is (= true (deref entered 1000 :not-started)))
+        (core/scope-close! scope 0)
+        (is (= :cancelled (get-in (deref task 1000 {}) [:error :category])))
+        (is @finished)))))

@@ -63,6 +63,8 @@
       (catch Object e (report-failure! transport e))
       (finally (io/close! reader)))))
 
+(declare close!)
+
 (defn open!
   "Start the child. Options: :command vector (argv), :on-message, :on-failure,
    :max-frame-bytes (default 1048576), :shutdown-ms (default 2000)."
@@ -70,24 +72,30 @@
   (let [command (:command options)]
     (when-not (and (vector? command) (seq command) (every? string? command))
       (fail! :invalid-command "Command must be a non-empty vector of strings"))
-    (let [dir (str/trim (sh! "/usr/bin/mktemp" "-d"))
+    ;; Validate framing before acquiring files or starting a child.
+    (let [decoder (framing/make-decoder (or (:max-frame-bytes options) 1048576))
+          dir (str/trim (sh! "/usr/bin/mktemp" "-d"))
           in (str dir "/in") stdout (str dir "/out") stderr (str dir "/err")
           pid-file (str dir "/pid") exit-file (str dir "/exit")
-          _ (sh! "/usr/bin/mkfifo" in)
-          script (str (str/join " " (map quote-arg command))
-                      " < " (quote-arg in) " > " (quote-arg stdout) " 2> " (quote-arg stderr)
-                      " & echo $! > " (quote-arg pid-file) "; wait $!; echo $? > " (quote-arg exit-file))
-          shell (core/future (os/sh "/bin/sh" "-c" script))
-          ;; Opening the FIFO for writing blocks until the shell has opened it
-          ;; for the child's stdin: the two rendezvous here.
-          writer (io/open in :write)
-          transport {:dir dir :stdin writer :stdout stdout :stderr stderr :pid-file pid-file :exit-file exit-file
-                     :shell shell :on-message (or (:on-message options) (fn [_] nil))
-                     :on-failure (or (:on-failure options) (fn [_] nil))
-                     :decoder (framing/make-decoder (or (:max-frame-bytes options) 1048576))
-                     :shutdown-ms (or (:shutdown-ms options) 2000)
-                     :failed (atom nil) :closing (atom false) :eof (atom false) :closed (atom nil)}]
-      (assoc transport :reader (core/future (reader-loop! transport))))))
+          resources (atom {:dir dir :stdout stdout :stderr stderr :pid-file pid-file :exit-file exit-file
+                           :on-message (or (:on-message options) (fn [_] nil))
+                           :on-failure (or (:on-failure options) (fn [_] nil))
+                           :decoder decoder :shutdown-ms (or (:shutdown-ms options) 2000)
+                           :failed (atom nil) :closing (atom false) :eof (atom false) :closed (atom nil)})]
+      (try
+        (sh! "/usr/bin/mkfifo" in)
+        (let [script (str (str/join " " (map quote-arg command))
+                          " < " (quote-arg in) " > " (quote-arg stdout) " 2> " (quote-arg stderr)
+                          " & echo $! > " (quote-arg pid-file) "; wait $!; echo $? > " (quote-arg exit-file))]
+          (swap! resources assoc :shell (core/future (os/sh "/bin/sh" "-c" script))))
+        ;; The FIFO rendezvous may fail after the shell has acquired a child.
+        ;; Keep every acquired resource available to the failure cleanup.
+        (swap! resources assoc :stdin (io/open in :write))
+        (let [transport @resources]
+          (assoc transport :reader (core/future (reader-loop! transport))))
+        (catch Object error
+          (try (close! (assoc @resources :shutdown-ms 0)) (catch Object _ nil))
+          (throw error))))))
 
 (defn pid [transport] (some-> (read-file-trim (:pid-file transport)) parse-long))
 (defn failed? [transport] (some? @(:failed transport)))
@@ -136,7 +144,17 @@
         (reset! (:closing transport) true)
         (try (io/close! (:stdin transport)) (catch Object _ nil))
         (let [ms (:shutdown-ms transport)
-              child-pid (pid transport)
+              ;; A failed FIFO acquisition can race the shell's PID record.
+              ;; Wait for that publication before signalling the owned child.
+              child-pid (let [deadline (+ (System/currentTimeMillis) 1000)]
+                          (loop []
+                            (if-let [child (pid transport)]
+                              child
+                              (when (and (:shell transport)
+                                         (not (realized? (:shell transport)))
+                                         (< (System/currentTimeMillis) deadline))
+                                (core/sleep 5)
+                                (recur)))))
               exited (or (await-exit transport ms)
                          (do (kill-tree! child-pid "TERM")
                              (when child-pid (os/sh "/bin/kill" "-TERM" (str child-pid)))
@@ -144,8 +162,8 @@
                          (do (kill-tree! child-pid "KILL")
                              (when child-pid (os/sh "/bin/kill" "-KILL" (str child-pid)))
                              (await-exit transport ms)))
-              _ (deref (:shell transport) (+ ms 1000) nil)
-              _ (deref (:reader transport) (+ ms 1000) nil)
+              _ (when-let [shell (:shell transport)] (deref shell (+ ms 1000) nil))
+              _ (when-let [reader (:reader transport)] (deref reader (+ ms 1000) nil))
               exit-code (some-> (read-file-trim (:exit-file transport)) parse-long)
               result {:closed? true :reaped? (boolean exited) :exit_code exit-code}]
           (os/sh "/bin/rm" "-rf" "--" (:dir transport))
