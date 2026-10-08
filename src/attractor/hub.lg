@@ -1,5 +1,6 @@
 (ns attractor.hub
   (:require [attractor.ids :as ids] [clojure.core :as core] [async :as async] [clojure.string :as str]
+            [attractor.repair :as repair] [attractor.repair-worker :as repair-worker] [attractor.llm :as llm]
             [attractor.agent :as agent] [attractor.refiner :as refiner] [attractor.pipeline :as pipeline]
             [attractor.context :as context] [attractor.workflow :as workflow] [os :as os]
             [attractor.interviewer :as interviewer]
@@ -43,7 +44,8 @@
         (reset! (:log hub) (assoc log :cursor seq :events (if (pos? excess) (subvec events excess) events)))))))
 (defn- append-event! [hub id event]
   (append-envelope! hub {:source :session :session_id id
-                         :turn_id (:hub_turn_id (:origin event)) :event event}))
+                         :turn_id (:hub_turn_id (:origin event)) :event event})
+  (repair/capture! @(:repair hub) {:session_id id :event event}))
 
 (defn events-since [hub client-id cursor]
   (locked (:event_lock hub)
@@ -324,6 +326,9 @@
     turn))
 
 (defn- operation! [hub request]
+  (when (and (contains? #{:session/open :session/submit :workflow/run :workflow/resume :agent/run :eval/submit} (:op request))
+             (some #(contains? #{:activation-queued :activating} (:status %)) (:jobs (repair/status @(:repair hub)))))
+    (fail! :repair-activation-busy))
   (case (:op request)
     :eval/submit
     (let [code (:code request)]
@@ -468,6 +473,18 @@
     :agent/list
     (mapv (fn [[id e]] {:agent_id id :agent (:agent e) :done (:done e) :cancelled @(:cancelled e)})
           @(:agents hub))
+    :repair/status (repair/status @(:repair hub))
+    :repair/detail (if-let [r @(:repair hub)] (repair/detail r (:repair_id request)) (fail! :repair-disabled))
+    :repair/cancel (if-let [r @(:repair hub)] (repair/cancel! r (:repair_id request)) (fail! :repair-disabled))
+    :repair/activate
+    (if-let [r @(:repair hub)]
+      (do
+        (when (or (some (fn [[_ entry]] (and (:turn entry) (not (realized? (:completion (:turn entry)))))) @(:sessions hub))
+                  (some #(not (:done %)) (vals @(:workflows hub)))
+                  (some #(not (:done %)) (vals @(:agents hub))) (:busy @(:eval hub)))
+          (fail! :busy))
+        (repair/request-activation! r (:repair_id request)))
+      (fail! :repair-disabled))
     :session/open
     (let [id (fresh-id "session")
           options (interactive-options hub id)
@@ -541,6 +558,7 @@
   (locked (:admission_lock hub) #(swap! (:admission hub) assoc :stopped true))
   (loop [] (when-let [packet (async/poll! (:mailbox hub))]
              (reply! packet {:error {:category :stopped}}) (recur)))
+  (repair/stop! @(:repair hub))
   (let [entries (vals @(:sessions hub))]
     ;; Hub-owned workflows and agent jobs stop cooperatively, then the scope
     ;; close below cancels and joins whatever they spawned.
@@ -613,7 +631,7 @@
     (when-not (and (integer? capacity) (pos? capacity) (integer? mailbox-capacity) (pos? mailbox-capacity))
       (fail! :invalid-capacity))
     (let [ready (promise)
-          hub {:event_capacity capacity :session_options (:session_options opts)
+          hub {:event_capacity capacity :session_options (:session_options opts) :repair (atom nil)
                :interactive_harness (:interactive_harness opts)
                :workflow_registry_fn (:workflow_registry_fn opts)
                ;; {:claude [argv...] :codex [argv...]}; an agent without an entry
@@ -630,8 +648,28 @@
         (core/future
           (try
             (let [scope (core/scope-open) failure (atom nil)]
-              (deliver ready {:value true})
               (try
+              (when-let [config (:repair_config opts)]
+                (reset! (:repair hub)
+                  (repair/start! config
+                    {:complete (or (:repair_complete_fn opts)
+                                   (when-let [client (get-in opts [:session_options :llm_client])]
+                                     #(llm/client-complete client %)) llm/complete)
+                     :worker repair-worker/run! :activate repair-worker/activate!
+                     :emit (fn [event]
+                             (when (contains? #{:repair_status :repair_phase} (:type event))
+                               (append-envelope! hub {:source :session :session_id (:session_id event) :event event})))
+                     :advise (fn [id diagnosis]
+                               (when-let [session (:agent (get @(:sessions hub) id))]
+                                 (when-not (= :closed (:state @session))
+                                   (agent/steer-session! session
+                                     (str "Repair triage advisory (do not replay side effects): "
+                                          (:summary diagnosis) "\n" (:advice diagnosis)))
+                                   (when (and (= "procedural" (:classification diagnosis)) (:harness @session))
+                                     (try (agent/request-refinement! session :repair-triage
+                                            {:instructions (str (:summary diagnosis) "\n" (:advice diagnosis))})
+                                          (catch Object _ nil))))))})))
+              (deliver ready {:value true})
                 (loop []
                   (let [packet (async/<! (:mailbox hub))]
                     (when-not packet (fail! :supervisor-stopped))
@@ -639,7 +677,8 @@
                       (reply! packet (try {:value (operation! hub (:request packet))}
                                           (catch Object e {:error (error-data e)})))
                       (recur))))
-                (catch Object e (reset! failure (error-data e)))
+                (catch Object e (reset! failure (error-data e))
+                                (deliver ready {:error (error-data e)}))
                 (finally (shutdown! hub scope @failure))))
             (catch Object e (deliver ready {:error (error-data e)}))))
         (catch Object e (deliver ready {:error (error-data e)})))

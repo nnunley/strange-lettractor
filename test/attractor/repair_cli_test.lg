@@ -1,0 +1,17 @@
+(ns attractor.repair-cli-test
+  (:require [clojure.test :refer [deftest is]] [attractor.cli :as cli]
+            [attractor.hub :as hub] [attractor.repair-test :as fixture] [io :as io]))
+
+(deftest host-loads-trusted-repair-config-and-attached-clients-reject-it
+  (let [root (fixture/fixture) path (str root "/repair.edn") cfg (fixture/config root) seen (atom nil)]
+    (io/spit path (pr-str cfg))
+    (with-redefs [hub/start! (fn [opts] (reset! seen opts) (throw (ex-info "captured" {:category :captured})))]
+      (is (= :captured (try (cli/cmd-serve ["--mock" "--repair-config" path])
+                            (catch Object e (:category (ex-data e))))))
+      (is (= cfg (:repair_config @seen))))
+    (doseq [command [cli/cmd-serve cli/cmd-console]]
+      (is (= :configuration_error
+             (try (command ["--connect" "4555" "--repair-config" path])
+                  (catch Object e (:category (ex-data e)))))))
+    (is (= :configuration_error (try (cli/cmd-serve ["--repair-config"])
+                                     (catch Object e (:category (ex-data e))))))))

@@ -89,6 +89,87 @@ and overflow-recovery behavior.
 `/harness` and `/refine` operate on the selected native session through the hub,
 including when the console is attached over nREPL.
 
+Framework repair is optional and configured on the host with `--repair-config
+PATH` (`hub`, standalone `console`, or standalone `serve`). It uses inference and
+coding tools, not model training. The stronger triage/review model is explicit;
+it does not silently reuse the working agent's model. Example trusted EDN:
+
+```clojure
+{:repository "/Users/ndn/development/attractor"
+ :triage_model "provider/strong-model"
+ :coding_model "provider/coding-model"
+ :test_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx suite"
+ :build_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx rebuild"
+ :timeout_ms 600000
+ :max_incidents 32
+ :max_model_calls 32
+ :max_turns 12
+ :max_total_tokens 60000}
+```
+
+Replace the model names with configured providers/models. Omit `:coding_model`
+to use the triage model for coding too. Commands run in the repair checkout;
+the test command must discover newly added files under `test/`. Increase the time
+budget if the repository's baseline suite, regression run, fixed suite and build
+need more than ten minutes. Limits also bound model calls and generated output;
+missing provider usage is charged conservatively from serialized request size.
+`:max_turns` is the cumulative worker call limit, including independent review.
+
+```sh
+bin/attractor console --llm --model llamacpp/qwen3.8 --repair-config repair.edn
+# Or expose the same host to HTTP and console clients:
+bin/attractor serve --llm --model llamacpp/qwen3.8 --repair-config repair.edn
+```
+
+`serve` prints the HTTP API URL, by default
+`http://localhost:7070/pipelines`. This is the pipeline API, not a browser UI.
+The separately printed nREPL port is used by `console --connect`.
+
+Native session and child-tool exceptions carry bounded history, arguments,
+working directory and delegation context into triage. These snapshots are sent
+to the configured triage provider. Tool-use, environment and provider diagnoses
+produce advice; procedural diagnoses can request existing harness refinement.
+Only a framework diagnosis with evidence and reproduction steps starts a coder.
+A missing path alone is not grounds for changing `read_file`.
+
+The host snapshots the configured **framework repository** revision at startup,
+independently of the working agent's task directory. Commit source changes and
+restart the host after changing framework revisions. Repairs require unchanged,
+clean tracked framework source and an ignored `attractor_runs/` directory. They
+use branches and worktrees under `attractor_runs/repairs/`, leaving the main
+checkout intact. Coding tools permit file reads and guarded edits within the
+worktree, with no shell/subagents; verification commands come only from the
+trusted host configuration. Those commands run with the host's permissions;
+this is not an OS sandbox.
+
+The host verifies a passing baseline, a new test that fails before source edits,
+unchanged regression tests that pass after the fix, a successful build, and
+independent strong-model review before committing. Failed attempts are retained
+for inspection and never automatically retried. There is no automatic replay of
+the operation that failed.
+
+Both console modes and attached consoles support:
+
+- `/repair` — list incidents and status.
+- `/repair ID` — inspect diagnosis, failures, worktree and prepared commit.
+- `/repair cancel ID` — cancel queued or active work.
+- `/repair activate ID` — explicitly fast-forward a clean, unchanged checkout to
+  a verified commit and rebuild. The host must be idle. **Restart after successful
+  activation**; this command does not replace the running process. A failed build
+  is reported separately; the source checkout may already have advanced.
+
+A compact `attractor_runs/repairs/index.edn` ledger retains bounded incident
+snapshots and verification excerpts across restarts. Interrupted work is marked
+interrupted rather than replayed. Identical failures at the same source revision
+are deduplicated. The incident limit applies to retained ledger entries; when
+full, new incidents are dropped and counted in status. It is diagnostic state,
+not part of the continual-harness ledger. To reset it, stop the host first,
+archive/remove that index and remove unneeded worktrees with `git worktree remove
+PATH`; keep prepared Git commits you want to retain. A repository permits one
+repair supervisor at a time. Normal shutdown releases `supervisor.lock`; after a
+crash, check that its owner has stopped before removing the empty lock directory.
+Ledger write failure stops admission and is reported by `/repair`.
+
 Stop the host explicitly:
 
 ```sh

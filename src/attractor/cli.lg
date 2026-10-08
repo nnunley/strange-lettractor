@@ -169,6 +169,17 @@
              :auto_refine (not (boolean (some #{"--no-auto-refine"} args))) :interval interval}
       path (assoc :path path))))
 
+(defn- repair-options [args]
+  (when (some #{"--repair-config"} args)
+    (let [path (find-arg-val args "--repair-config")]
+      (when (or (str/blank? path) (str/starts-with? path "--"))
+        (throw (ex-info "--repair-config requires an EDN configuration path" {:category :configuration_error})))
+      (try
+        (let [config (edn/read-string (io/slurp path))]
+          (when-not (map? config) (throw (ex-info "Expected EDN map" {}))) config)
+        (catch Object e (throw (ex-info (str "Cannot read repair configuration: " (ex-message e))
+                                       {:category :configuration_error :path path})))))))
+
 (defn- workflow-hub
   "Every CLI command owns an in-process hub built the same way: workflow
    handler registries come from the hub's request (auto-approve or the
@@ -177,6 +188,7 @@
   (let [working-dir (os/cwd)]
     (hub/start! {:interactive_harness (when interactive? (interactive-harness-options args))
                  :session_options (console-session-options args)
+                 :repair_config (repair-options args)
                  :workflow_registry_fn
                  (fn [request]
                    (task-review-bindings/bind-reviews
@@ -336,8 +348,8 @@
         _ (when (and connect? (not (and (integer? port) (<= 1 port 65535))))
             (throw (ex-info "--connect requires a loopback nREPL port between 1 and 65535"
                             {:category :configuration_error})))
-        _ (when (and connect? (some harness-flags args))
-            (throw (ex-info "Harness options belong to the host; configure attractor hub before attaching"
+        _ (when (and connect? (some (conj harness-flags "--repair-config") args))
+            (throw (ex-info "Harness and repair options belong to the host; configure attractor hub before attaching"
                             {:category :configuration_error})))
         agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
                          (find-arg-val args "--agent-model") (assoc :model (find-arg-val args "--agent-model"))
@@ -455,7 +467,8 @@
   (println "  console [--connect PORT] [--tui] [--mock|--llm] [--model <provider/name>] [--alias name=expansion]")
   (println "    Host options: [--harness PATH|--no-harness] [--harness-interval N] [--no-auto-refine]")
   (println "    Harness defaults on for console/hub; attached clients inherit host policy.")
-  (println "    Commands: /followup, /harness, /refine, : eval, /run, /agent <name>")
+  (println "    Repair: --repair-config PATH (trusted EDN; separate triage model and framework repository)")
+  (println "    Commands: /followup, /harness, /refine, /repair, : eval, /run, /agent <name>")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -671,6 +684,9 @@
         own-port? (boolean (some #{"--nrepl-port"} args))
         own-text (if own-port? (find-arg-val args "--nrepl-port") "0")
         own-port (when (and (string? own-text) (re-matches #"[0-9]+" own-text)) (parse-long own-text))]
+    (when (and connect? (some #{"--repair-config"} args))
+      (throw (ex-info "Repair options belong to the host; configure the hub before attaching"
+                      {:category :configuration_error})))
     (when (or (and connect? own-port?) (not (and (integer? own-port) (<= 0 own-port 65535))))
       (throw (ex-info "Use --nrepl-port 0..65535 for an owned hub or --connect PORT for an existing hub"
                       {:category :configuration_error})))

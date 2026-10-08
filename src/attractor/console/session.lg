@@ -116,6 +116,8 @@
       :compaction_start [(tagged tag "Preparing context checkpoint")]
       :compaction_end [(tagged tag "Context checkpoint applied; full history retained")]
       :compaction_failed [(tagged tag "Context checkpoint failed; original context retained")]
+      :repair_status [(tagged tag (str "Repair " (:repair_id event) ": " (name (:status event))
+                                         (when (:summary event) (str " — " (:summary event)))))]
       :refine_complete [(tagged tag (str "Harness refinement complete: " (get-in event [:result :summary])))]
       :refine_error [(tagged tag (str "Harness refinement failed: " (:error event)))]
       :warning [(tagged tag (str "warning: " (or (:message event) (pr-str event))))]
@@ -184,6 +186,8 @@
       :tool_call_end (if (contains? active id)
                        (assoc state :active (dissoc active id) :done (inc (:done state))) state)
       :assistant_text_delta (assoc state :phase "Responding")
+      :repair_phase (assoc state :phase (str "Repair: " (name (:phase event))))
+      :repair_status (assoc state :phase (str "Repair: " (name (:status event))))
       :compaction_start (assoc state :phase "Preparing context checkpoint")
       :compaction_end (assoc state :phase "Working")
       :compaction_failed (assoc state :phase "Checkpoint failed")
@@ -267,6 +271,7 @@
    "                        [--sandbox s] [--approval-policy p]   names: see /agent"
    "  /alias <name> <expansion>   define /<name> as a shortcut, e.g. /alias codex agent codex"
    "  /followup text  queue input after the current response and tools"
+   "  /repair [ID | cancel ID | activate ID]  inspect or activate framework repairs"
    "  /harness        show durable harness status and path"
    "  /context        show context estimate, capacity and checkpoint status"
    "  /compact        checkpoint before the next model request"
@@ -440,6 +445,33 @@
     :focus (if (str/blank? args)
              [(if-let [{:keys [kind id]} (:focus @console)] (str "focus: " (name kind) " " (short-id id)) "focus: none")]
              (focus-by-id! console (str/trim args)))
+    :repair
+    (let [[action id extra] (str/split (str/trim args) #"\s+")]
+      (cond
+        (str/blank? action)
+        (let [status (request! @console :repair/status {})]
+          (if-not (:enabled status) ["Repair supervisor disabled; configure --repair-config on the host"]
+            (into (vec (remove nil?
+                    [(str "Repair supervisor " (if (:running status) "enabled" "stopped") " — " (:repository status))
+                     (when (:error status) (str "Error: " (:error status)))
+                     (str "Ledger: " (:path status))
+                     (when (pos? (:dropped status)) (str "Incident limit reached; dropped: " (:dropped status)))]))
+                  (map (fn [job] (str (:id job) "  " (name (:status job))
+                                     (when-let [summary (get-in job [:diagnosis :summary])] (str " — " summary))))
+                       (:jobs status)))))
+        (and (contains? #{"cancel" "activate"} action) (not (str/blank? id)) (nil? extra))
+        (do (request! @console (if (= "cancel" action) :repair/cancel :repair/activate) {:repair_id id})
+            [(str "Repair " action " requested: " id
+                  (when (= "activate" action) "; watch status, then restart after successful activation"))])
+        (and (not (contains? #{"cancel" "activate"} action)) (nil? id))
+        (let [record (request! @console :repair/detail {:repair_id action})]
+          (vec (remove nil? [(str (:id record) "  " (name (:status record)))
+                            (when (:diagnosis record) (pr-str (:diagnosis record)))
+                            (:error record)
+                            (when (:worktree record) (str "Worktree: " (:worktree record)))
+                            (when (:commit record) (str "Commit: " (:commit record)))
+                            (when (:restart_required record) "Activation complete; restart the harness to use this version.")])) )
+        :else ["usage: /repair [ID | cancel ID | activate ID]"]))
     :harness (let [id (ensure-session! console) status (request! @console :session/harness {:session_id id})]
                [(str "Harness " (if (:enabled status) "enabled" "disabled")
                      (when (:frozen status) " (frozen)")

@@ -1,0 +1,97 @@
+(ns attractor.repair-hub-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.repair-test :as fixture] [attractor.repair-worker-test :as worker-fixture]
+            [attractor.repair-worker :as worker] [io :as io] [attractor.repair :as repair]
+            [attractor.hub :as hub] [attractor.agent :as agent]
+            [attractor.execution :as execution] [attractor.console.session :as console]
+            [attractor.nrepl-hub :as wire] [clojure.edn :as edn] [clojure.string :as str]))
+(defn req [h op fields]
+  (deref (hub/request! h (merge {:id "test" :op op} fields)) 3000 {:error {:category :timeout}}))
+
+(deftest real-tool-failure-reaches-strong-triage-without-blocking-console
+  (let [entered (promise) release (promise) requests (atom []) n (atom 0)
+        h (hub/start! {:repair_config (fixture/config (fixture/fixture))
+                       :repair_complete_fn (fn [r] (swap! requests conj r) (deliver entered true)
+                                             (deref release 3000 nil) (fixture/answer "tool_use"))
+                       :session_options {:model "mock/default" :project_docs []
+                         :complete_fn (fn [_] (if (= 1 (swap! n inc))
+                            {:message {:content "" :tool_calls [{:id "read" :name "read_file" :arguments {"file_path" "definitely-absent.lg"}}]}}
+                            {:message {:content "done"}}))}})
+        c (console/open! h)]
+    (try
+      (console/handle! c {:type :line :text "read missing file"})
+      (is (= true (deref entered 3000 false)))
+      (is (some #(str/includes? % "Repair supervisor enabled") (:lines (console/handle! c {:type :line :text "/repair"}))))
+      ;; Cancel the originating session: repair is host-owned and remains alive.
+      (req h :session/cancel {:session_id (:session @c)})
+      (deliver release true)
+      (is (fixture/wait-for #(= :advised (:status (first (:jobs (:value (req h :repair/status {}))))))))
+      (is (= "mock/strong" (:model (first @requests))))
+      (let [wire-result (wire/handle-message h {"id" "r" "op" "attractor/request" "payload" "{:op :repair/status}"})]
+        (is (true? (get-in (edn/read-string (get wire-result "value")) [:value :enabled]))))
+      (finally (deliver release true) (console/close! c) (req h :hub/stop {})))))
+
+(deftest default-hub-does-not-require-repair-configuration
+  (let [h (hub/start! {}) c (console/open! h)]
+    (try
+      (is (= {:enabled false} (:value (req h :repair/status {}))))
+      (is (some #(str/includes? % "disabled") (:lines (console/handle! c {:type :line :text "/repair"}))))
+      (finally (console/close! c) (req h :hub/stop {})))))
+
+(deftest shutdown-cancels-triage-and-releases-repository-ownership
+  (let [entered (promise) cfg (fixture/config (fixture/fixture))
+        h (hub/start! {:repair_config cfg :repair_complete_fn
+                       (fn [_] (deliver entered true) (core/sleep 100000) (fixture/answer "framework"))})
+        r @(:repair h) id (repair/capture! r (fixture/incident "engine.lg"))]
+    (is (true? (deref entered 3000 false)))
+    (is (true? (get-in (req h :hub/stop {}) [:value :stopped])))
+    (is (true? (deref (:done r) 1000 false)))
+    (is (= :cancelled (:status (repair/detail r id))))
+    (let [next (hub/start! {:repair_config cfg})]
+      (is (true? (get-in (req next :hub/stop {}) [:value :stopped]))))))
+
+(deftest console-shows-supervisor-storage-failure
+  (let [h (hub/start! {:repair_config (fixture/config (fixture/fixture))
+                       :repair_complete_fn (fn [_] (fixture/answer "tool_use"))})
+        c (console/open! h) r @(:repair h)]
+    (try
+      (io/mkdir (:path r))
+      (repair/capture! r (fixture/incident "engine.lg"))
+      (is (true? (deref (:done r) 3000 false)))
+      (let [lines (:lines (console/handle! c {:type :line :text "/repair"}))]
+        (is (some #(str/includes? % "stopped") lines))
+        (is (some #(str/includes? % (:error (repair/status r))) lines)))
+      (finally (console/close! c) (req h :hub/stop {})))))
+
+(deftest prepared-repair-survives-restart-and-console-activation-uses-verified-commit
+  (worker-fixture/fixture
+    (fn [root base]
+      (let [cfg (assoc (worker-fixture/config root) :max_total_tokens 200000)
+            worker-complete (worker-fixture/scripted (atom [])) first? (atom true)
+            complete (fn [r] (if (compare-and-set! first? true false)
+                                (fixture/answer "framework") (worker-complete r)))
+            first-host (hub/start! {:repair_config cfg :repair_complete_fn complete})
+            r @(:repair first-host) id (repair/capture! r (fixture/incident "engine.lg"))]
+        (try
+          (is (fixture/wait-for #(contains? #{:ready :failed} (:status (repair/detail r id)))))
+          (is (= :ready (:status (repair/detail r id))) (pr-str (repair/detail r id)))
+          (is (= base (worker-fixture/git root "rev-parse" "HEAD")))
+          (finally (req first-host :hub/stop {})))
+        (let [entered (promise) release (promise) original worker/activate!]
+          (with-redefs [worker/activate! (fn [cfg record cancelled?]
+                                          (deliver entered true) (deref release 3000 nil)
+                                          (original cfg record cancelled?))]
+          (let [h (hub/start! {:repair_config cfg}) c (console/open! h)]
+          (try
+            (is (= :ready (:status (repair/detail @(:repair h) id))))
+            (let [lines (:lines (console/handle! c {:type :line :text (str "/repair activate " id)}))]
+              (is (some #(str/includes? % "activate requested") lines)))
+            (is (true? (deref entered 3000 false)))
+            (doseq [op [:session/open :session/submit :workflow/run :workflow/resume :agent/run :eval/submit]]
+              (is (= :repair-activation-busy (get-in (req h op {}) [:error :category])) (str op)))
+            (deliver release true)
+            (is (fixture/wait-for #(contains? #{:activated :activation-failed :activation-build-failed}
+                                               (:status (repair/detail @(:repair h) id)))))
+            (is (= :activated (:status (repair/detail @(:repair h) id))) (pr-str (repair/detail @(:repair h) id)))
+            (is (= "fixed\n" (io/slurp (str root "/value"))))
+            (finally (deliver release true) (console/close! c) (req h :hub/stop {}))))))))))
