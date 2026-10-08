@@ -6,6 +6,7 @@
             [attractor.llm :as llm]
             [attractor.reasoning :as reasoning]
             [attractor.context-discovery :as capacity]
+            [attractor.context-management :as cm]
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
             [attractor.tool-images :as tool-images]
@@ -307,6 +308,11 @@
                                  (<= 1 (:context_discovery_timeout_ms options) 60000)))))
           (throw (ex-info "Invalid context capacity or discovery time budget"
                           {:category :configuration})))
+        _context-config
+        (doseq [key [:max_output_tokens :context_reserve_tokens :context_max_summary_calls]]
+          (when (and (contains? options key)
+                     (not (and (integer? (get options key)) (<= 1 (get options key) 1000000))))
+            (throw (ex-info "Invalid context management setting" {:category :configuration :setting key}))))
         reasoning-effort (reasoning/normalize-effort
                            (:reasoning_effort options))
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
@@ -410,6 +416,8 @@
                  :harness harness-atom
                  :turns_since_refine 0
                  :harness_steps 0
+                 :context_owner (atom nil)
+                 :context_aux_tokens 0
                  :refinement_owner (atom nil)
                  :interactive_refinement (atom nil)
                  :dynamic_tool_owners (atom {})
@@ -547,6 +555,19 @@
         (swap! session update (if (= :followup behavior) :followup-queue :steering-queue) conj text)
         true))))
 
+(defn take-idle-queued-inputs!
+  "Transfer accepted native input to the hub after a recoverable turn failure.
+   The hub holds its admission lock; this lock makes detaching both queues
+   atomic with native admission and cancellation. Steering keeps priority."
+  [session]
+  (with-session-lock session
+    (fn []
+      (when (and (= :idle (:state @session)) (not (:abort_signaled @session)))
+        (let [inputs (vec (concat (map #(hash-map :text % :behavior :steer) (:steering-queue @session))
+                                  (map #(hash-map :text % :behavior :followup) (:followup-queue @session))))]
+          (swap! session assoc :steering-queue [] :followup-queue [])
+          inputs)))))
+
 (defn steer-session! [session msg]
   (enqueue-session-message! session :steering-queue msg))
 
@@ -557,6 +578,11 @@
   (if (compare-and-set! (:cleanup_started @session) false true)
     (let [errors (atom [])]
       (try
+        (when-let [operation (some-> (:context_owner @session) deref)]
+          (try (operation-owner/close! operation)
+               (catch Object e
+                 (when-not (contains? #{:cancelled :operation-cancelled} (:category (ex-data e)))
+                   (swap! errors conj e)))))
         (when-let [operation (some-> (:refinement_owner @session) deref)]
           (try (operation-owner/close! operation)
                (catch Object e
@@ -913,6 +939,7 @@
         (fn []
           (when (compare-and-set! text-started false true)
             (event-fn {:type :assistant_text_start})))
+        _ (swap! session assoc :context_stream_partial false)
         stream-request
         (assoc request
                :register_stream_close
@@ -927,6 +954,7 @@
             :text_start (ensure-text-start!)
             :text_delta
             (do
+              (when (seq (:delta event)) (swap! session assoc :context_stream_partial true))
               (ensure-text-start!)
               (event-fn {:type :assistant_text_delta
                          :delta (:delta event)
@@ -1002,18 +1030,77 @@
               true)))
     (event-fn {:type :processing_end})))
 
-;; Tokens the session has spent so far. A provider that reports no total is
-;; counted as input plus output; one that reports no usage counts as zero.
-(defn- sum-usage-tokens [history]
-  (reduce (fn [total turn]
-            (let [usage (:usage turn)
-                  reported (or (:total_tokens usage) 0)]
-              (+ total
-                 (if (> reported 0)
-                   reported
-                   (+ (or (:input_tokens usage) 0) (or (:output_tokens usage) 0))))))
-          0
-          (filter #(= :assistant (:type %)) history)))
+(defn context-status [session]
+  (merge {:history_turns (count (:history @session))
+          :context_turns (count (cm/projected-history @session))
+          :compacted (boolean (:context_projection @session))
+          :auxiliary_tokens (:context_aux_tokens @session)}
+         (:context_measurement @session)))
+
+(defn request-compaction! [session]
+  (with-session-lock session
+    #(do (when (session-stopped? session)
+           (throw (ex-info "Session is closed" {:category :session-closed})))
+         (swap! session assoc :context_compaction_requested true)
+         {:accepted true :at :next-model-request})))
+
+(defn- context-callbacks [session owner event-fn reason]
+  {:reason reason :event! event-fn
+   :check! (fn [] (when (or (session-stopped? session)
+                            (not (identical? owner (:current_turn_owner @session))))
+                   (throw (ex-info "Context work cancelled" {:category :cancelled}))))
+   :publish! (fn [snapshot projection]
+               (with-session-lock session
+                 #(do (when (or (session-stopped? session)
+                                 (not (identical? owner (:current_turn_owner @session)))
+                                 (not= (:history snapshot) (:history @session))
+                                 (not= (:context_projection snapshot) (:context_projection @session)))
+                        (throw (ex-info "Context changed during compaction" {:category :cancelled})))
+                      (swap! session assoc :context_projection projection :context_compaction_requested false))))})
+
+(defn- generate-with-context! [session owner base stream-fn complete-fn event-fn]
+  (let [advisory? (true? (get-in @session [:config :context_advisory_only]))
+        generate (fn [request]
+                   (when-not (session-stopped? session)
+                     (if stream-fn (stream-response! session stream-fn request event-fn)
+                         (do (event-fn {:type :assistant_text_start}) (complete-fn request)))))]
+    (if advisory? (generate base)
+      (loop [attempt 0 window (let [configured (get-in @session [:provider_profile :context_window_size])
+                                    observed (:context_observed_limit @session)]
+                                (if (identical? owner (:owner observed))
+                                  (if (and (integer? configured) (pos? configured))
+                                    (min configured (:window observed)) (:window observed)) configured)) force? false]
+        (let [limits (cm/settings session window)
+              projected (cm/request session base history-to-messages)
+              measured (cm/measure projected limits)
+              manual? (:context_compaction_requested @session)
+              ;; An optional checkpoint starts only when there is older material;
+              ;; hard overflow always attempts compaction, then fails recoverably.
+              threshold? (and (integer? window) (pos? window) (cm/reducible? session)
+                              (> (*' (:input measured) 5) (*' (- window (:output limits) (:reserve limits)) 4)))
+              prepare? (or force? manual? threshold? (not (cm/fits? measured)))
+              prepared (if prepare?
+                         (cm/compact! session base limits history-to-messages
+                                      (context-callbacks session owner event-fn
+                                                         (if force? :overflow (if manual? :manual :capacity))))
+                         projected)
+              _ (cm/check-spend! session)
+              _ (swap! session assoc :context_measurement (cm/measure prepared limits))
+              outcome (try {:response (generate (assoc prepared :max_tokens (:output limits)))}
+                           (catch Object e {:error e}))]
+          (if-let [e (:error outcome)]
+            (let [data (ex-data e)]
+              (if (and (= :context-length (:category data)) (zero? attempt)
+                       (not (and stream-fn (:context_stream_partial @session))) (not (session-stopped? session)))
+                (let [reported (:context_window data)
+                      next-window (if (and (integer? reported) (pos? reported))
+                                    (if (and (integer? window) (pos? window)) (min window reported) reported)
+                                    window)]
+                  (if (and (integer? next-window) (pos? next-window))
+                    (do (swap! session assoc :context_observed_limit {:owner owner :window next-window})
+                        (recur 1 next-window true)) (throw e)))
+                (throw e)))
+            (:response outcome)))))))
 
 (defn request-refinement! [session trigger options]
   (refiner/request-interactive! session trigger options #(emit-event! session %)))
@@ -1120,7 +1207,7 @@
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))
-                  total-tokens (sum-usage-tokens (:history @session))]
+                  total-tokens (cm/spent session)]
               (cond
                 (session-stopped? session) last-text
 
@@ -1168,11 +1255,7 @@
                         (refresh-context-capacity! session owner request event-fn)
                         (check-context-usage! session event-fn)
                         (when-not (session-stopped? session)
-                          (if stream-fn
-                            (stream-response! session stream-fn request event-fn)
-                            (do
-                              (event-fn {:type :assistant_text_start})
-                              (complete-fn request))))
+                          (generate-with-context! session owner request stream-fn complete-fn event-fn))
                         (catch Object e
                           (if (session-stopped? session)
                             nil

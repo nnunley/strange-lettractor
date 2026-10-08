@@ -1,0 +1,231 @@
+(ns attractor.context-compaction-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.agent :as agent] [attractor.llm :as llm] [json :as json] [attractor.context-management :as cm] [attractor.profiles :as profiles]))
+(defn answer [text] {:message {:role :assistant :content text} :usage {:input_tokens 10 :output_tokens 5}})
+(defn caught [f] (try (f) nil (catch Object e e)))
+(defn session [opts]
+  (agent/make-session (merge {:model "mock/test" :project_docs [] :max_subagent_depth 0
+                             :context_window_size 5000 :max_output_tokens 128 :context_reserve_tokens 64}
+                            opts)))
+(def old-history
+  [{:type :user :role :user :content "Remember constraint: preserve the database."}
+   {:type :assistant :role :assistant :content (apply str (repeat 11000 "a")) :usage {:input_tokens 99 :output_tokens 1}}
+   {:type :user :role :user :content "Continue implementation"}
+   {:type :assistant :role :assistant :content (apply str (repeat 11000 "b"))}])
+(deftest compacts-model-context-without-erasing-history
+  (let [requests (atom []) summaries (atom [])
+        s (session {:complete_fn (fn [r] (swap! requests conj r) (answer "done"))
+                    :context_summary_fn (fn [r] (swap! summaries conj r) (answer "Preserve database. Implementation in progress."))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= "done" (agent/process-input! s "Finish the task")))
+      (is (seq @summaries))
+      (is (= old-history (subvec (:history @s) 0 4)))
+      (is (= 6 (count (:history @s))))
+      (is (= "Finish the task" (:content (last (:messages (first @requests))))))
+      (is (str/includes? (pr-str (:messages (first @requests))) "Preserve database"))
+      (is (< (count (pr-str (:messages (first @requests)))) 15000))
+      (is (every? #(empty? (:tools %)) @summaries))
+      (is (every? :context_managed @summaries))
+      (is (every? :context_managed @requests))
+      (finally (agent/close-session! s)))))
+(deftest irreducible-input-is-not-sent-and-session-stays-open
+  (let [calls (atom 0) s (session {:complete_fn (fn [_] (swap! calls inc) (answer "bad"))})]
+    (try
+      (is (= :context-length (:category (ex-data (caught #(agent/process-input! s (apply str (repeat 30000 "x"))))))))
+      (is (= 0 @calls)) (is (= :idle (:state @s)))
+      (is (= 1 (count (:history @s))))
+      (finally (agent/close-session! s)))))
+(deftest failed-summary-preserves-context-and-session
+  (let [calls (atom 0) s (session {:complete_fn (fn [_] (swap! calls inc) (answer "bad"))
+                                  :context_summary_fn (fn [_] (throw (ex-info "summarizer down" {})))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= :context-length (:category (ex-data (caught #(agent/process-input! s "finish"))))))
+      (is (= 0 @calls)) (is (= :idle (:state @s)))
+      (is (nil? (:context_projection @s)))
+      (is (= old-history (subvec (:history @s) 0 4)))
+      (finally (agent/close-session! s)))))
+(deftest overflow-uses-server-window-and-retries-generation-once
+  (let [calls (atom []) sums (atom 0)
+        error (llm/provider-error "llamacpp" {:status 400 :body {"error" {"code" 400 "type" "exceed_context_size_error" "n_ctx" 5000 "n_prompt_tokens" 6000}}})
+        s (session {:context_window_size 100000 :context_summary_fn (fn [_] (swap! sums inc) (answer "Old task checkpoint"))
+                    :complete_fn (fn [r] (swap! calls conj r) (if (= 1 (count @calls)) (throw error) (answer "recovered")))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= "recovered" (agent/process-input! s "finish")))
+      (is (= 2 (count @calls))) (is (pos? @sums))
+      (is (< (count (pr-str (second @calls))) (count (pr-str (first @calls)))))
+      (is (= 5000 (get-in @s [:context_measurement :window])))
+      (finally (agent/close-session! s)))))
+(deftest summary-spend-blocks-task-generation
+  (let [calls (atom 0) s (session {:max_total_tokens 110
+                                  :context_summary_fn (fn [_] (answer "checkpoint"))
+                                  :complete_fn (fn [_] (swap! calls inc) (answer "bad"))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= :token-budget (:reason (ex-data (caught #(agent/process-input! s "finish"))))))
+      (is (= 0 @calls)) (is (= :idle (:state @s)))
+      (is (= 15 (:context_aux_tokens @s)))
+      (is (nil? (:context_projection @s)))
+      (finally (agent/close-session! s)))))
+(deftest current-task-and-latest-tool-exchange-survive-compaction
+  (let [captured (atom nil)
+        s (session {:context_summary_fn (fn [_] (answer "Completed earlier operations."))
+                    :complete_fn (fn [r] (reset! captured r) (answer "done"))})
+        previous [{:type :user :content "ACTIVE OBJECTIVE"}
+                  {:type :assistant :content (apply str (repeat 9000 "a"))}
+                  {:type :assistant :tool_calls [{:id "old" :name "run" :arguments {}}]}
+                  {:type :tool_results :results [{:tool_call_id "old" :content (apply str (repeat 9000 "x"))}]}
+                  {:type :steering :content "DO NOT DELETE"}
+                  {:type :assistant :tool_calls [{:id "new" :name "run" :arguments {}}]}
+                  {:type :tool_results :results [{:tool_call_id "new" :content "already executed"}]}]]
+    (try
+      (swap! s assoc :history previous)
+      (is (= "done" (agent/process-input! s "continue")))
+      (is (str/includes? (pr-str @captured) "already executed"))
+      (is (str/includes? (pr-str @captured) "\"new\""))
+      (is (= previous (subvec (:history @s) 0 (count previous))))
+      (finally (agent/close-session! s)))))
+(deftest second-overflow-does-not-loop
+  (let [calls (atom 0) s (session {:context_window_size 100000
+                                  :context_summary_fn (fn [_] (answer "checkpoint"))
+                                  :complete_fn (fn [_] (swap! calls inc)
+                                                 (throw (llm/provider-error "llamacpp" {:status 400 :body {"error" {"type" "exceed_context_size_error" "n_ctx" 5000}}})))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= :context-length (:category (ex-data (caught #(agent/process-input! s "finish"))))))
+      (is (= 2 @calls)) (is (= :idle (:state @s)))
+      (finally (agent/close-session! s)))))
+(deftest closing-summary-cancels-and-never-publishes
+  (let [entered (promise) cleaned (promise) calls (atom 0)
+        s (session {:context_summary_fn (fn [_] (deliver entered true)
+                                         (try (sleep 10000) (answer "late checkpoint")
+                                              (finally (deliver cleaned true))))
+                    :complete_fn (fn [_] (swap! calls inc) (answer "bad"))})]
+    (swap! s assoc :history old-history)
+    (let [job (future (caught #(agent/process-input! s "finish")))]
+      (try
+        (is (= true (deref entered 2000 false)))
+        (agent/close-session! s)
+        (is (= true (deref cleaned 2000 false)))
+        (is (not= ::pending (deref job 2000 ::pending)))
+        (is (= 0 @calls)) (is (nil? (:context_projection @s)))
+        (finally (agent/close-session! s))))))
+(deftest partial-stream-overflow-is-not-retried
+  (let [calls (atom 0) sums (atom 0)
+        s (session {:context_window_size 100000
+                    :context_summary_fn (fn [_] (swap! sums inc) (answer "checkpoint"))
+                    :stream_fn (fn [_] (swap! calls inc)
+                                 [{:type :text_delta :delta "partial answer"}
+                                  {:type :error :error (llm/provider-error "llamacpp" {:status 400 :body {"error" {"type" "exceed_context_size_error" "n_ctx" 5000}}})}])})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= :context-length (:category (ex-data (caught #(agent/process-input! s "finish"))))))
+      (is (= 1 @calls)) (is (= 0 @sums)) (is (= :idle (:state @s)))
+      (finally (agent/close-session! s)))))
+(deftest original-user-and-steering-survive-within-turn-tool-compaction
+  (let [round (atom 0) requests (atom []) summaries (atom []) holder (atom nil)
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool! registry
+            {:definition {:name "large" :description "evidence" :parameters {:type "object"}}
+             :executor (fn [_ _] (apply str (repeat 7000 "x")))})
+        s (session {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false :tool_registry registry})
+                    :context_summary_fn (fn [r] (swap! summaries conj r) (answer "Earlier tool calls completed; keep objective and steering."))
+                    :complete_fn (fn [r]
+                                   (swap! requests conj r)
+                                   (let [n (swap! round inc)]
+                                     (when (= n 1) (agent/steer-session! @holder "DO NOT DELETE"))
+                                     (if (< n 4)
+                                       {:message {:role :assistant :content ""}
+                                        :tool_calls [{:id (str "call" n) :name "large" :arguments {}}]}
+                                       (answer "done"))))})]
+    (reset! holder s)
+    (try
+      (is (= "done" (agent/process-input! s "ACTIVE ORIGINAL OBJECTIVE")))
+      (is (some? (:context_projection @s)))
+      (is (str/includes? (pr-str (last @requests)) "ACTIVE ORIGINAL OBJECTIVE"))
+      (is (str/includes? (pr-str (last @requests)) "DO NOT DELETE"))
+      (is (= 3 (count (filter #(= :tool_results (:type %)) (:history @s)))))
+      (is (= 4 @round))
+      (is (>= (count @summaries) 2))
+      (is (str/includes? (get-in (last @summaries) [:messages 1 :content]) "Previous checkpoint:\nEarlier tool calls completed"))
+      (finally (agent/close-session! s)))))
+
+(deftest zero-total-usage-still-counts-input-and-output
+  (is (= 12 (cm/usage {:usage {:total_tokens 0 :input_tokens 7 :output_tokens 5}}))))
+(deftest manual-compaction-with-unknown-capacity-is-recoverable
+  (let [s (session {:context_window_size 100000 :complete_fn (fn [_] (answer "ok"))})]
+    (try
+      (is (= :unknown-capacity (:reason (ex-data (caught #(cm/compact! s {} {:window nil} identity {}))))))
+      (finally (agent/close-session! s)))))
+(deftest complete-request-estimate-includes-tool-schemas-and-native-parts
+  (let [base {:messages [{:role :system :content "policy"} {:role :user :content "task"}] :tools []}
+        larger (assoc base :tools [{:name "tool" :description (apply str (repeat 1000 "x"))}])]
+    (is (> (cm/estimate larger) (cm/estimate base)))
+    (is (> (cm/estimate (update base :messages conj {:role :assistant :parts [{:kind :thinking :thinking {:text (apply str (repeat 1000 "x"))}}]}))
+           (cm/estimate base)))
+    (is (false? (:exact? (cm/measure base {:window 10000 :output 4096 :reserve 1024}))))))
+
+(deftest server-limit-persists-for-subsequent-tool-round
+  (let [calls (atom 0) holder (atom nil) seen (atom [])
+        s (session {:context_window_size 500000
+                    :context_summary_fn (fn [_] (answer "Historical decisions and remaining work preserved."))
+                    :complete_fn (fn [_]
+                                   (swap! seen conj (get-in @@holder [:context_measurement :window]))
+                                   (case (swap! calls inc)
+                                     1 (throw (llm/provider-error "llamacpp" {:status 400 :body {"error" {"code" 400 "type" "exceed_context_size_error" "n_prompt_tokens" 134031 "n_ctx" 131072}}}))
+                                     2 {:message {:role :assistant :content ""}
+                                        :tool_calls [{:id "noop" :name "missing" :arguments {}}]}
+                                     (answer "recovered")))} )]
+    (reset! holder s)
+    (try
+      (swap! s assoc :history (vec (concat [{:type :user :content "Original task"}]
+                                           (repeat 5 {:type :assistant :content (apply str (repeat 90000 "x"))}))))
+      (is (= "recovered" (agent/process-input! s "Finish the task")))
+      (is (= [500000 131072 131072] @seen))
+      (is (= 1 (count (filter #(= :tool_results (:type %)) (:history @s)))))
+      (finally (agent/close-session! s)))))
+(deftest start-only-stream-overflow-can-recover-without-duplicating-text
+  (let [calls (atom 0) summaries (atom 0)
+        s (session {:context_window_size 100000
+                    :context_summary_fn (fn [_] (swap! summaries inc) (answer "checkpoint"))
+                    :stream_fn (fn [_]
+                                 (if (= 1 (swap! calls inc))
+                                   [{:type :stream_start} {:type :text_start}
+                                    {:type :text_delta :delta ""}
+                                    {:type :error :error (llm/provider-error "llamacpp" {:status 400 :body {"error" {"type" "exceed_context_size_error" "n_ctx" 5000}}})}]
+                                   [{:type :text_delta :delta "recovered"}
+                                    {:type :finish :response (answer "recovered")}]))})]
+    (try
+      (swap! s assoc :history old-history)
+      (is (= "recovered" (agent/process-input! s "finish")))
+      (is (= 2 @calls)) (is (pos? @summaries))
+      (finally (agent/close-session! s)))))
+(deftest managed-context-rejects-native-overrides-before-transport
+  (doseq [[provider complete options]
+          [["openai-compat" llm/openai-compatible-complete {:openai-compat {:max_tokens 99999}}]
+           ["openai" llm/openai-complete {"openai" {"tools" [{"type" "web_search"}]}}]
+           ["anthropic" llm/anthropic-complete {:anthropic {:system "unbudgeted"}}]
+           ["gemini" llm/gemini-complete {:gemini {:generationConfig {"maxOutputTokens" 99999}}}]
+           ["openai" llm/openai-complete {:openai {:model "different-context"}}]]]
+    (let [calls (atom 0)
+          e (caught #(complete {:provider provider :model "fixture" :api_key "fixture"
+                                :context_managed true :messages [{:role :user :content "checkpoint"}]
+                                :tools [] :max_tokens 128 :provider_options options
+                                :transport (fn [_] (swap! calls inc) {:status 200 :body "{}"})}))]
+      (is (= :configuration (:category (ex-data e))))
+      (is (= 0 @calls)))))
+
+(deftest managed-summary-payload-retains-sampling-options-without-tools-or-cap-override
+  (let [captured (atom nil)
+        base {:provider "openai-compat" :model "fixture" :api_key "fixture"
+              :messages [{:role :user :content "checkpoint"}] :tools [] :max_tokens 128
+              :transport (fn [r] (reset! captured (json/read-json (:body r))) {:status 200 :body "{}"})}]
+    (llm/openai-compatible-complete (assoc base :context_managed true :context_summary true
+                                              :provider_options {:openai-compat {:temperature 0.2}}))
+    (is (= 128 (get @captured "max_tokens")))
+    (is (= 0.2 (get @captured "temperature")))
+    (is (nil? (get @captured "tools")))
+    (llm/openai-compatible-complete (assoc base :provider_options {:openai-compat {:max_tokens 512}}))
+    (is (= 512 (get @captured "max_tokens")))))

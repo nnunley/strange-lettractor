@@ -301,9 +301,15 @@
                 next-input
                 (locked (:event_lock hub)
                   (fn []
-                    (let [pending @(:pending entry)
-                          cancelled (or @(:closed entry) (:abort_signaled @session))]
-                      (if (and (not cancelled) (not (:error result)) (seq pending))
+                    (let [cancelled (or @(:closed entry) (:abort_signaled @session))
+                          recoverable? (= :context-length (get-in result [:error :category]))
+                          transferred (when (and recoverable? (not cancelled))
+                                        (agent/take-idle-queued-inputs! session))
+                          ;; Native inputs predate the idle/publication window's
+                          ;; hub inputs. Preserve FIFO within each priority class.
+                          pending (vec (concat transferred @(:pending entry)))]
+                      (if (and (not cancelled) (or (not (:error result)) recoverable?)
+                               (seq pending))
                         (let [index (or (first (keep-indexed (fn [i p] (when (not= :followup (:behavior p)) i)) pending)) 0)
                               next (nth pending index)]
                           (reset! (:pending entry) (vec (concat (take index pending) (drop (inc index) pending))))
@@ -480,6 +486,10 @@
        :frozen (boolean (when h (:frozen (meta h))))
        :entries (when h (into {} (map (fn [[k v]] [k (count v)]) (:entries @h))))
        :refinements (if h (count (:refinements @h)) 0)})
+    :session/context
+    (agent/context-status (:agent (entry! hub (:session_id request))))
+    :session/compact
+    (agent/request-compaction! (:agent (entry! hub (:session_id request))))
     :session/refine
     (let [session (:agent (entry! hub (:session_id request)))]
       (when (and (:instructions request) (not (string? (:instructions request)))) (fail! :invalid-request))
@@ -542,6 +552,15 @@
         (when-not (or (:abort_signaled @(:agent entry)) (realized? @(:cancellation entry)))
           (core/sleep 1) (recur))))
     (core/scope-close! scope 0)
+    ;; The supervisor survives child-scope cancellation. A cancelled worker may
+    ;; exit before publishing its aggregate, so reconcile only after every owned
+    ;; worker has joined; stopped must never leave an accepted turn pending.
+    (locked (:event_lock hub)
+      (fn []
+        (doseq [entry entries]
+          (when-let [turn (:turn entry)]
+            (when-not (realized? (:completion turn))
+              (deliver (:completion turn) {:error {:category :cancelled :message "Turn cancelled"}}))))))
     (let [error (or failure (first (keep #(get (deref @(:cancellation %)) :error) entries)))
           result (if error {:error error} {:value {:stopped true}})]
       (locked (:admission_lock hub)

@@ -585,7 +585,7 @@
                                         :context_window_size 10})
         session
         (agent/make-session
-          {:provider_profile profile
+          {:context_advisory_only true :provider_profile profile
            :project_docs []
            :complete_fn
            (fn [_]
@@ -611,7 +611,7 @@
                                         :context_window_size 25})
         session
         (agent/make-session
-          {:provider_profile profile
+          {:context_advisory_only true :provider_profile profile
            :project_docs []
            :max_tool_rounds_per_input 1
            :complete_fn
@@ -634,7 +634,7 @@
                                         :context_window_size 60})
         session
         (agent/make-session
-          {:provider_profile profile
+          {:context_advisory_only true :provider_profile profile
            :project_docs []
            :max_tool_rounds_per_input 3
            :loop_detection_window 2

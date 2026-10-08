@@ -5,7 +5,7 @@
   #{:eval/submit :eval/result
     :workflow/run :workflow/resume :workflow/list :workflow/result :workflow/inspect :workflow/events :workflow/checkpoint :workflow/cancel
     :agent/run :agent/list :agent/result :agent/cancel
-    :session/harness :session/refine :session/open :session/list :session/submit :session/result :session/cancel
+    :session/context :session/compact :session/harness :session/refine :session/open :session/list :session/submit :session/result :session/cancel
     :question/list :question/answer :client/attach :client/detach :events/since})
 
 (defn- fail! [category] (throw (ex-info (name category) {:category category})))

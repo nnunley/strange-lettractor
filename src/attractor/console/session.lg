@@ -107,6 +107,9 @@
       :error (do (take-buffer! console sid) [(tagged tag (str "error: " (:error event)))])
       :processing_end (into (text-lines tag (take-buffer! console sid)) [(tagged tag "turn complete")])
       :session_end (do (take-buffer! console sid) [(tagged tag "session ended")])
+      :compaction_start [(tagged tag "Preparing context checkpoint")]
+      :compaction_end [(tagged tag "Context checkpoint applied; full history retained")]
+      :compaction_failed [(tagged tag "Context checkpoint failed; original context retained")]
       :refine_complete [(tagged tag (str "Harness refinement complete: " (get-in event [:result :summary])))]
       :refine_error [(tagged tag (str "Harness refinement failed: " (:error event)))]
       :warning [(tagged tag (str "warning: " (or (:message event) (pr-str event))))]
@@ -209,6 +212,8 @@
    "  /alias <name> <expansion>   define /<name> as a shortcut, e.g. /alias codex agent codex"
    "  /followup text  queue input after the current response and tools"
    "  /harness        show durable harness status and path"
+   "  /context        show context estimate, capacity and checkpoint status"
+   "  /compact        checkpoint before the next model request"
    "  /refine [text]  plan refinement in the background"
    "  /cancel         cancel the focused turn, run or agent job"
    "  /quit           detach this client (an in-process hub stops with the command)"])
@@ -384,6 +389,11 @@
                      (when (:frozen status) " (frozen)")
                      (when (:path status) (str " — " (:path status))))
                 (str "Entries: " (pr-str (:entries status)) "; refinements: " (:refinements status))])
+    :context (let [id (ensure-session! console)]
+               [(str "Context: " (pr-str (request! @console :session/context {:session_id id})))])
+    :compact (let [id (ensure-session! console)]
+               (request! @console :session/compact {:session_id id})
+               ["Context checkpoint requested for the next model request"])
     :refine (let [id (ensure-session! console)]
               (request! @console :session/refine {:session_id id :instructions args})
               ["Harness refinement planning started"])

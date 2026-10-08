@@ -245,3 +245,100 @@
       (let [id (sid h)]
         (is (= expected (get-in (req h :session/harness {:session_id id}) [:value :path]))))
       (finally (stop h)))))
+
+(deftest context-controls-and-late-input-survive-recoverable-error
+  (let [finished (promise) release (promise) original agent/process-input! calls (atom [])
+        h (hub/start! (opts (fn [r] (swap! calls conj (:content (last (:messages r)))) (answer r))))]
+    (try
+      (with-redefs [agent/process-input! (fn [s text]
+                                        (if (= text "overflow")
+                                          (do (deliver finished true) (deref release 3000 nil)
+                                              (throw (ex-info "too large" {:category :context-length})))
+                                          (original s text)))]
+        (let [id (sid h) first (:value (req h :session/submit {:session_id id :text "overflow"}))]
+          (is (= true (deref finished 3000 false)))
+          (is (= true (get-in (req h :session/submit {:session_id id :text "late" :queue true}) [:value :queued])))
+          (is (= 0 (get-in (req h :session/context {:session_id id}) [:value :history_turns])))
+          (deliver release true)
+          (is (= "late" (:value (deref (:completion first) 3000 {}))))
+          (is (= ["late"] @calls))
+          (is (= true (get-in (req h :session/compact {:session_id id}) [:value :accepted])))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest console-two-turns-share-executed-tool-state-and-durable-memory
+  (let [stored (atom nil) writes (atom 0) initialized (atom 0) cleaned (atom 0)
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool! registry
+              {:definition {:name "set_state" :description "Set environment state" :parameters {:type "object"}}
+               :executor (fn [_ env] ((:write_state env) "persistent-value") "stored")})
+        _ (profiles/register-tool! registry
+              {:definition {:name "get_state" :description "Read environment state" :parameters {:type "object"}}
+               :executor (fn [_ env] ((:read_state env)))})
+        requests (atom [])
+        h (hub/start! {:interactive_harness {:auto_refine false}
+                       :session_options
+                       {:project_docs []
+                        :provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false :tool_registry registry})
+                        :execution_env (execution/make-environment
+                                         {:initialize #(swap! initialized inc) :cleanup #(swap! cleaned inc)
+                                          :file_exists (fn [_] false)
+                                          :write_state (fn [value] (swap! writes inc) (reset! stored value))
+                                          :read_state #(deref stored)})
+                        :complete_fn (fn [r]
+                                       (swap! requests conj r)
+                                       (case (count @requests)
+                                         1 {:message {:role :assistant :content ""}
+                                            :tool_calls [{:id "write" :name "set_state" :arguments {}}
+                                                         {:id "memory" :name "remember" :arguments {"title" "chosen-port" "content" "Use port 8123"}}]}
+                                         2 {:message {:role :assistant :content "saved"}}
+                                         3 {:message {:role :assistant :content ""}
+                                            :tool_calls [{:id "read" :name "get_state" :arguments {}}]}
+                                         {:message {:role :assistant :content "read persistent state"}}))}})
+        c (console/open! h)]
+    (try
+      (console/handle! c {:type :line :text "Save state and remember port"})
+      (let [id (:session @c) first-turn (get-in @(:sessions h) [id :turn])]
+        (is (= "saved" (:value (deref (:completion first-turn) 3000 {}))))
+        (console/handle! c {:type :line :text "Read saved state"})
+        (let [second-turn (get-in @(:sessions h) [id :turn]) s (get-in @(:sessions h) [id :agent])]
+          (is (= "read persistent state" (:value (deref (:completion second-turn) 3000 {}))))
+          (is (= 1 @writes)) (is (= 1 @initialized)) (is (= 0 @cleaned))
+          (is (= "persistent-value" (get-in @s [:history 6 :results 0 :content])))
+          (is (clojure.string/includes? (pr-str (nth @requests 2)) "chosen-port"))
+          (is (= 1 (count (get-in @(:harness @s) [:entries :memory]))))
+          (is (some #(re-find #"Context:" %) (:lines (console/handle! c {:type :line :text "/context"}))))))
+      (finally (console/close! c) (stop h)))))
+
+(deftest native-queued-inputs-drain-before-overflow-aggregate-completes
+  (doseq [queued [[[:steer "steering"]]
+                  [[:followup "followup"]]
+                  [[:followup "followup"] [:steer "steering"]]]]
+    (let [entered (promise) release (promise) requests (atom [])
+          h (hub/start! (opts (fn [r]
+                               (swap! requests conj (:content (last (:messages r))))
+                               (if (= 1 (count @requests))
+                                 (do (deliver entered true) (deref release 3000 nil)
+                                     (throw (attractor.llm/provider-error
+                                              "llamacpp" {:status 400 :body {"error" {"code" 400
+                                                "type" "exceed_context_size_error" "n_ctx" 131072 "n_prompt_tokens" 134031}}})))
+                                 (answer r)))))]
+      (try
+        (let [id (sid h) submitted (:value (req h :session/submit {:session_id id :text "original"}))
+              s (get-in @(:sessions h) [id :agent])]
+          (is (= true (deref entered 3000 false)))
+          (doseq [[behavior text] queued]
+            (let [reply (:value (req h :session/submit {:session_id id :text text :behavior behavior :queue true}))]
+              (is (= true (:queued reply)))
+              (is (identical? (:completion submitted) (:completion reply)))))
+          (is (= (count queued) (+ (count (:steering-queue @s)) (count (:followup-queue @s)))))
+          (deliver release true)
+          (let [ordered (vec (concat (map second (filter #(= :steer (first %)) queued))
+                                     (map second (filter #(= :followup (first %)) queued))))
+                result (deref (:completion submitted) 3000 {})]
+            (is (= (last ordered) (:value result)))
+            (is (= (into ["original"] ordered) @requests))
+            (is (= (into ["original"] ordered) (mapv :content (filter #(= :user (:type %)) (:history @s))))))
+          (is (empty? (:steering-queue @s)))
+          (is (empty? (:followup-queue @s)))
+          (is (= :idle (:state @s))))
+        (finally (deliver release true) (stop h))))))

@@ -147,7 +147,9 @@
       ;; a client-side policy or billing rejection. Native status takes priority.
       (or (= grpc-category :server)
           (and (nil? grpc-category) (number? status) (<= 500 status 599))) :server
-      (or (str/includes? message "context length")
+      (or (contains? #{"exceed_context_size_error" "context_length_exceeded"} (error-field body-map "type"))
+          (contains? #{"exceed_context_size_error" "context_length_exceeded"} error-code)
+          (str/includes? message "context length")
           (str/includes? message "too many tokens")) :context-length
       (or (str/includes? message "content filter")
           (str/includes? message "safety")) :content-filter
@@ -195,7 +197,9 @@
                        (get (or (get raw "error") raw) "type"))
        :retryable retryable
        :retry_after (parse-retry-after response)
-       :raw raw})))
+       :raw raw
+       :context_window (let [n (error-field raw "n_ctx")] (when (and (= category :context-length) (integer? n) (pos? n) (<= n Long/MAX_VALUE)) n))
+       :input_tokens (let [n (error-field raw "n_prompt_tokens")] (when (and (= category :context-length) (integer? n) (>= n 0) (<= n Long/MAX_VALUE)) n))})))
 
 (defn malformed-body-error
   "A 2xx response whose body is not the provider's JSON object contract is a
@@ -842,7 +846,34 @@
                [(if (string? key) (keyword key) key) value])
              (or options {}))))
 
+(def managed-context-fields
+  #{:model :messages :input :instructions :system :systemInstruction :contents
+    :tools :tool_choice :toolConfig :functions :function_call :prompt
+    :max_tokens :max_output_tokens :max_completion_tokens :maxOutputTokens
+    :previous_response_id :conversation :n :stream})
+
+(defn validate-managed-context-options!
+  "Managed agent requests own their context, tools and output allowance.
+   Native options remain available for unrelated sampling parameters; unmanaged
+   unified-client calls retain their existing provider override semantics."
+  [request]
+  (when (:context_managed request)
+    (doseq [[provider raw] (or (:provider_options request) {})]
+      (let [options (canonical-option-map raw)
+            generation (:generationConfig options)
+            collision (or (first (filter managed-context-fields (keys options)))
+                          (when (and (contains? options :generationConfig)
+                                     (or (not (map? generation))
+                                         (contains? (canonical-option-map generation) :maxOutputTokens)))
+                            :generationConfig.maxOutputTokens))]
+        (when collision
+          (throw (ex-info "Native provider option overrides a managed context field"
+                          {:category :configuration :retryable false
+                           :provider (name provider) :field (name collision)}))))))
+  request)
+
 (defn- provider-options [request provider]
+  (validate-managed-context-options! request)
   (let [options (or (:provider_options request) {})]
     (canonical-option-map
       (or (get options (keyword provider))
