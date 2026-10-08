@@ -68,6 +68,7 @@ thin passthrough over the same tasks.
 # Layout: src/ code; test/attractor/ suites; test/fixtures/ loopback servers;
 # test/live/ credential-gated gates; test/probes/ manual checks and let-go
 # issue reproducers; lgx test discovers the full suite.
+export LGX_LG="$HOME/development/let-go/bin/lg"  # verified local runtime
 lgx install            # fetches tiny-tui (pinned in lgx.edn)
 lgx rebuild            # bin/attractor      (make build)
 lgx test               # full suite (lgx suite / make test are aliases)
@@ -89,6 +90,8 @@ The local `test/runner.lg` remains available for namespace selection, deadline
 diagnostics, and the per-namespace summary format used by `lgx runners`.
 
 Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
+The runtime must expose the typed `Cancelled` condition used by ownership
+boundaries; see [runtime requirements](docs/let-go-runtime-issues.md).
 
 ### Console
 
@@ -103,6 +106,9 @@ bin/attractor console --mock          # line console, mock model
 bin/attractor console --tui --mock    # full-screen tiny-tui console
 bin/attractor console --connect 4555  # attach to an existing loopback nREPL hub
 
+# interactive continual harness, reusing a durable ledger
+bin/attractor console --llm --model 'provider/model-name' --harness ./my-harness.edn
+
 # live model through an OpenAI-compatible endpoint (llama.cpp shown)
 OPENAI_COMPAT_BASE_URL=http://localhost:8080/v1 OPENAI_COMPAT_API_KEY=local \
   bin/attractor console --tui --model qwen3.8-27b --provider openai-compat
@@ -115,9 +121,18 @@ hub work; `bin/attractor hub --stop 4555` shuts down the host. See
 
 Inside the console:
 
+Native console sessions enable the continual harness by default. `/harness` shows
+its durable path; `--no-harness` disables it. The same session and environment
+continue across messages. Busy input steers the agent, while `/followup TEXT`
+queues work after the current task. [Harness usage](examples/continual-harness/README.md)
+covers refinement, persistence, host attachment and optional training.
+
 | Input | Effect |
 |---|---|
 | `text` | message the native agent session |
+| `/followup <text>` | queue a message after current work |
+| `/harness`, `/refine [instructions]` | inspect harness state or request refinement |
+| `/context`, `/compact` | inspect context usage or request a checkpoint before the next model call |
 | `: (form)` | evaluate let-go in the hub namespace (`hub`, `request!`, `*session*`, `*run*` are bound) |
 | `:{` … `:}` | multiline evaluation |
 | `\text` | literal agent text |

@@ -59,9 +59,11 @@ Chat Completions keeps its separate translation.
 
 ## Integrated verification after repairs
 
-**Final result:** `LGX_LG=/opt/homebrew/bin/lg lgx suite` exits 0 with
+**Initial repair result:** `LGX_LG=/opt/homebrew/bin/lg lgx suite` exits 0 with
 **1,676 tests / 14,691 assertions / zero failures** after the schema repair.
-The source checkpoint is `23d0239`; subsequent changes are documentation only.
+The source checkpoint is `23d0239`, documented at `be53efb`. The subsequent
+interactive-session and context follow-up below changes production code again;
+this earlier suite does not certify those changes.
 `final-suite-schema-fixed.log`, `final-build.log` and
 `final-http-question-probe.log` retain the final evidence. All R01–R27 findings
 have repair checkpoints above, with the explicit capability limits retained.
@@ -94,6 +96,62 @@ transport run both passed. Timing contention is plausible but not established;
 the discrepancy remains recorded in `codex-final-review.md`.
 
 ## Baseline and authority
+
+Follow-up review after this audit found the sibling checkout
+`/Users/ndn/development/prime-agent` at `75648beea`. Its interactive session owns
+conversation, steering/follow-up queues, persistent execution and background
+refinement. The original repairs did not complete that interaction model.
+Interactive integration is checkpointed at `93a860b`, and context recovery at
+`41fb759`. The [interactive iteration plan](superpowers/plans/2026-10-07-interactive-harness.md)
+records the added public journeys, specification review and Google quality review.
+
+The user's subsequent llama.cpp failure (134,031 prompt tokens versus 131,072
+capacity) exposed an additional main-branch gap: advisory history-size warnings
+did not budget or compact complete requests, and `exceed_context_size_error` was
+misclassified when accompanied by numeric code 400.
+
+The repair separates the full transcript from the model-context projection,
+admits estimated complete requests with output and uncertainty allowances, and
+uses bounded rolling checkpoints. It recognizes the actual server error and
+retries generation once after a smaller request, retaining the server limit for
+later tool rounds in that turn. Accepted steering/follow-up input survives
+recoverable overflow. Review also fixed start-only streaming events mistaken for
+visible output and native provider options bypassing managed context limits.
+Ordinary harness operation still requires no trainer. Exact tokenizer admission,
+live-model summary quality and full conversation recovery after restart remain
+outside this verification.
+
+October 8 verification uses the user-requested
+`/Users/ndn/development/let-go/bin/lg`. It exposed a shutdown publication gap:
+after joining cancelled workers, the host now resolves remaining aggregate turn
+promises. A baseline LLM timeout fixture assumed cancelled sleep resumed ordinary
+code; `eb3de5e` replaces that assumption with explicit acquisition/finalization
+handoffs and passes all 85 LLM tests / 525 assertions.
+
+The first complete run on this runtime produced 45 failed assertions across
+1,713 tests. Its typed cancellation semantics exposed both fixture assumptions
+and missing cancellation normalization. `636ea99` fixes owned cancellation at
+parallel, timed-handler and Codex boundaries, preserves steering provenance in
+recovered queues, and updates cleanup fixtures without dropping join/identity
+assertions. The affected groups and independent specification review pass;
+Google quality review approves the migration. The first-run log is retained as
+`full-suite-before-cancellation-migration.log` in the interactive evidence directory.
+
+**Final October 8 result:** at `636ea99`, the complete suite passes **1,713 tests /
+14,888 assertions / zero failures** using the requested `lg dev (0cfd343)` runtime.
+`lgx rebuild` and the compiled offline two-turn console journey pass, including
+context inspection, durable harness inspection and clean shutdown. Evidence is
+under `evidence/interactive-harness-2026-10-07/`: `full-suite.log`, `build.log`,
+and `compiled-console-transcript.log`. The public tool/environment/memory journey
+and repeated compaction are covered by the integrated regression suite. No live
+model quality or paper-result reproduction claim is made.
+
+This prompted deeper review of the unmerged context-foundations token counter.
+Its llama.cpp path tokenizes concatenated message text, excluding chat-template
+and tool-schema overhead, yet marks the result exact. Its heuristic fallback
+also excludes schemas. This qualifies the earlier aggregate branch review:
+those counters must not be adopted as exact admission evidence. That branch has
+not been merged or modified by this iteration.
 
 - Main checkout: `d81c047`, with an existing modified `agent.lg`, three untracked
   harness modules, four untracked test namespaces, and a continual-harness example.
@@ -353,8 +411,9 @@ The context-foundations branch is materially better integrated than the uncommit
 harness. Node settings reach the agent; tool allowlists affect declarations and
 dispatch; budget admission precedes model requests; usage baselines are invalidated;
 transcripts apply privacy/redaction; versioning has meaningful containment tests.
-Its focused verification passed 73 tests / 293 assertions. No new confirmed blocker
-was found in the reviewed aggregate production changes.
+Its focused verification passed 73 tests / 293 assertions. That initial aggregate
+review found no new blocker; the subsequent context investigation identified the
+counting limitations recorded in the follow-up above.
 
 All 40 commit subjects and 33 changed files were inventoried. The complete new
 context-budget, token-count, transcript, node-settings and versioning modules and

@@ -23,6 +23,24 @@ clients use the host's configuration. `/quit` detaches the console and preserves
 hub-owned work. `/answer <key or text>` answers a pending human gate, preferring
 the focused workflow. `--auto-approve` is optional.
 
+The `hub` and standalone `console` commands enable a durable continual harness
+for native sessions. Use `--harness PATH` to reopen an explicit ledger,
+`--harness-interval N` to change automatic refinement cadence, `--no-auto-refine`
+for manual refinement, or `--no-harness` to disable it. Set these on the host,
+not an attached client. See [interactive harness usage](../examples/continual-harness/README.md).
+
+Console input requests queuing: busy ordinary input steers at a safe boundary,
+and `/followup TEXT` waits behind the current work. Queued acknowledgments identify
+the same aggregate turn; its result settles after accepted inputs drain. Direct
+`:session/submit` calls retain busy rejection unless `:queue true` is supplied.
+`/context` inspects the selected session's context estimate; `/compact` requests a
+checkpoint before its next model call. Both use host operations, so they also work
+from attached clients. See [context capacity](context-capacity.md) for admission
+and overflow-recovery behavior.
+
+`/harness` and `/refine` operate on the selected native session through the hub,
+including when the console is attached over nREPL.
+
 Stop the host explicitly:
 
 ```sh

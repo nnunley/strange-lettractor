@@ -1,5 +1,27 @@
 # Let-go Runtime Issues — Consolidated
 
+## Cancellation behavior in the October 8 verification runtime
+
+Verification uses `/Users/ndn/development/let-go/bin/lg`, reporting
+`lg dev (0cfd343)`. Its implementation of
+let-go #920 raises the typed `Cancelled` condition from cancelled blocking
+operations, including sleep and channel waits. Code after such an operation is
+not cleanup and may never execute. Cleanup belongs in `finally`, and an adapter
+that deliberately models acquisition after cancellation must make that handoff
+explicit. Future boundaries absorb unhandled cancellation and may yield `nil`.
+
+Current ownership code uses explicit `catch Cancelled` boundaries and requires a
+runtime exposing that condition. Older binaries without it cannot load this code;
+use the verified runtime rather than relying on the version number alone.
+
+Attractor's ownership tests must prove acquisition, cancellation and joined
+finalization through handshakes rather than assume a cancelled wait returns
+normally. Parallel branch owners must distinguish local loser cancellation from
+an unrelated branch exception. These semantics explain why results from the older
+Homebrew runtime cannot certify this runtime; the October 7/8 audit records the
+separate verification runs. Historical reproductions below retain their original
+runtime identities and are not assertions that every listed issue remains open.
+
 ## Atom Update Gaps (#824)
 
 # Atomic update contract reproductions

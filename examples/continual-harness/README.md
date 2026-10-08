@@ -4,7 +4,56 @@ The core harness works without a trainer. It adapts task instructions, memory,
 skills, executable tools and subagent definitions during ordinary agent sessions.
 Model training is a separate, explicitly configured workflow.
 
-## Ordinary harness sessions
+## Interactive sessions
+
+Start the native console with a configured model:
+
+```sh
+bin/attractor console --llm --model 'provider/model-name'
+```
+
+The console enables a durable harness for its native sessions. To reopen an
+existing ledger, including one created by a workflow:
+
+```sh
+bin/attractor console --llm --model 'provider/model-name' --harness ./my-harness.edn
+```
+
+Replace `provider/model-name` with your configured provider and model. Type tasks
+and follow-up questions normally. Input submitted during work steers the current
+agent at a safe boundary; `/followup TEXT` waits behind that work. `/harness`
+shows the ledger path and state. `/refine [instructions]` requests a refinement;
+planning can overlap conversation, and applying changes waits for a safe boundary.
+An intervening ledger edit invalidates a stale plan instead of being overwritten.
+
+`/context` shows context usage and checkpoint status. `/compact` requests a
+checkpoint before the next model call. Long sessions automatically summarize
+older work while retaining their complete in-memory history and live environment;
+see [context capacity and recovery](../../docs/context-capacity.md).
+
+Automatic refinement defaults to every eight agent steps. Use
+`--harness-interval N` to change the cadence, `--no-auto-refine` to retain manual
+control, or `--no-harness` to disable the harness. No trainer is required.
+
+For a host that survives console detach:
+
+```sh
+bin/attractor hub --llm --model 'provider/model-name' --harness ./my-harness.edn --port 4555
+bin/attractor console --connect 4555
+```
+
+Attached clients inherit host configuration. Use `/list` and `/focus ID` to return
+to an existing session. Automatic ledger paths are separate for each new session;
+an explicit path has one live owner within the host. Do not use the same ledger
+from independent hosts concurrently. `/cancel` closes the focused native session;
+`/new` opens another and can reload its configured ledger. `/quit` detaches an
+attached console, while quitting a standalone console also stops its owned host.
+
+History, environment and tools survive conversation turns in the live session.
+Restarting a host restores the configured harness ledger, not the full conversation
+or arbitrary in-memory environment state.
+
+## Workflow harness sessions
 
 Enable `harness.enabled="true"` on a coding node. Set `harness.path` to an EDN or
 JSON file for durable state. `harness.auto_refine="true"`, `harness.interval="8"`
