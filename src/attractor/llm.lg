@@ -476,7 +476,7 @@
 (defn- finish-reason [provider-reason]
   (case (str/lower-case (str (or provider-reason "")))
     ("stop" "end_turn" "stop_sequence") :stop
-    ("max_tokens" "max_tokens_reached") :length
+    ("length" "max_tokens" "max_tokens_reached") :length
     ("tool_use" "tool_calls") :tool_calls
     ("safety" "content_filter") :content_filter
     :other))
@@ -1002,6 +1002,17 @@
       "json" {:text {:format {:type "json_object"}}}
       {})))
 
+(defn- openai-compatible-format [request]
+  (let [format (:response_format request)]
+    (case (field format :type)
+      "json" {:response_format {:type "json_object"}}
+      "json_schema" {:response_format
+                     {:type "json_schema"
+                      :json_schema {:name (or (field format :name) "response")
+                                    :schema (field format :json_schema)
+                                    :strict (boolean (field format :strict))}}}
+      {})))
+
 (defn- schema-instruction [request]
   (when-let [schema (structured-schema request)]
     (str "Return only valid JSON matching this JSON Schema: "
@@ -1265,6 +1276,7 @@
                     (assoc :max_tokens (:max_tokens request))
                     (some? (:stop_sequences request))
                     (assoc :stop (:stop_sequences request)))
+                  (openai-compatible-format request)
                   (provider-options request provider))
         headers (request-headers request key :openai-chat-completions {"Content-Type" "application/json"})]
     (require-api-key! provider key :openai-chat-completions)

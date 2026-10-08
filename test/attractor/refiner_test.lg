@@ -10,6 +10,14 @@
          (refiner/extract-json-object "Some intro text ```json\n{\"hello\": \"world\"}\n``` outro text")))
   (is (nil? (refiner/extract-json-object "No json here"))))
 
+(deftest json-extraction-preserves-the-top-level-container
+  (doseq [text ["[{\"edits\":[]}]" "```json\n[{\"edits\":[]}]\n```"]]
+    (is (nil? (refiner/extract-json-object text)))))
+
+(deftest code-fences-inside-proposal-content-are-not-envelope-fences
+  (let [proposal {"edits" [{"kind" "memory" "content" "Example: ```json {} ```"}]}]
+    (is (= proposal (refiner/extract-json-object (json/write-json proposal))))))
+
 (deftest native-provider-content-parts-are-readable-proposals
   (let [h (harness/make-harness)
         adapter (llm/make-provider-adapter "openai"
@@ -72,3 +80,53 @@
   (is (some? (try (refiner/plan-refinement (fn [_] {:message {:content "not a proposal"}})
                                           "mock/default" @(harness/make-harness) [])
                   nil (catch Object e e)))))
+
+(deftest refiner-json-mode-reaches-the-compatible-provider-wire
+  (let [body (atom nil)
+        proposal (refiner/plan-refinement
+                   #(llm/openai-compatible-complete
+                      (assoc % :provider "llamacpp" :api_key "fixture"
+                        :transport (fn [request]
+                                     (reset! body (json/read-json (:body request)))
+                                     {:status 200 :body (json/write-json
+                                       {:choices [{:message {:content "{\"edits\":[]}"} :finish_reason "stop"}]})})))
+                   "fixture" @(harness/make-harness) [])]
+    (is (= [] (get proposal "edits")))
+    (is (= {"type" "json_object"} (get @body "response_format")))))
+
+(deftest gemini-refinement-does-not-send-an-unsupported-open-object-schema
+  (let [body (atom nil)]
+    (refiner/plan-refinement
+      #(llm/gemini-complete
+         (assoc % :api_key "fixture" :transport
+           (fn [request]
+             (reset! body (json/read-json (:body request)))
+             {:status 200 :body (json/write-json
+               {:candidates [{:content {:parts [{:text "{\"edits\":[]}"}]} :finishReason "STOP"}]})})))
+      "gemini-fixture" @(harness/make-harness) [])
+    (is (= "application/json" (get-in @body ["generationConfig" "responseMimeType"])))
+    (is (not (contains? (get @body "generationConfig") "responseSchema")))))
+
+(deftest malformed-proposals-are-diagnosed-before-any-ledger-edit
+  (doseq [[content reason] [["Stable and converged." :invalid-json]
+                            ["" :empty-response]
+                            ["{}" :invalid-proposal]
+                            ["{\"edits\":null}" :invalid-proposal]
+                            ["{\"edits\":[{\"kind\":\"unknown\"}]}" :invalid-proposal]]]
+    (let [h (harness/make-harness) before @h
+          session (atom {:harness h :model "fixture" :history []
+                         :config {:refiner_complete_fn (fn [_] {:message {:content content}})}})
+          error (try (refiner/execute-refinement! session :test) nil (catch Object e e))]
+      (is (= :refiner-output (:category (ex-data error))))
+      (is (= reason (:reason (ex-data error))))
+      (is (= before @h)))))
+
+(deftest truncated-refinement-is-rejected-even-if-the-prefix-is-valid-json
+  (let [error (try (refiner/plan-refinement
+                    (fn [_] {:message {:content "{\"edits\":[]}"} :finish_reason :length})
+                    "fixture" @(harness/make-harness) [] :test {:component "memory"})
+                  nil (catch Object e e))]
+    (is (= :truncated (:reason (ex-data error))))
+    (is (= :length (:finish_reason (ex-data error))))
+    (is (= "memory" (:component (ex-data error))))
+    (is (clojure.string/includes? (str (ex-message error)) "truncated"))))

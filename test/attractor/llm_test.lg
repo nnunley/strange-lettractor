@@ -2864,3 +2864,19 @@
     (is (= "read_file" (get-in response [:tool_calls 0 :name])))
     (is (= 8 (get-in response [:usage :input_tokens])))
     (is (= :tool_calls (:finish_reason response)))))
+
+(deftest compatible-provider-translates-json-format-and-length-finish
+  (doseq [[format expected] [[{:type "json"} {"type" "json_object"}]
+                             [{:type "json_schema" :name "example" :strict true
+                               :json_schema {:type "object"}}
+                              {"type" "json_schema" :json_schema
+                               {"name" "example" "strict" true "schema" {"type" "object"}}}]]]
+    (let [captured (atom nil)
+          response (llm/openai-compatible-complete
+                     {:model "fixture" :api_key "fixture" :messages [] :response_format format
+                      :transport (fn [request]
+                                   (reset! captured (json/read-json (:body request)))
+                                   {:status 200 :body (json/write-json
+                                     {:choices [{:message {:content "{}"} :finish_reason "length"}]})})})]
+      (is (= (json/read-json (json/write-json expected)) (get @captured "response_format")))
+      (is (= :length (:finish_reason response))))))

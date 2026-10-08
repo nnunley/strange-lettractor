@@ -25,6 +25,11 @@ agent at a safe boundary; `/followup TEXT` waits behind that work. `/harness`
 shows the ledger path and state. `/refine [instructions]` requests a refinement;
 planning can overlap conversation, and applying changes waits for a safe boundary.
 An intervening ledger edit invalidates a stale plan instead of being overwritten.
+Refinement requests a JSON proposal and validates its edits before application.
+A failure reports the component, model, completion reason and response size;
+an empty, malformed or truncated response is not a successful no-op. Use
+`/refine` to retry after resolving the reported issue. Conversation continues
+independently of background refinement.
 
 `/context` shows context usage and checkpoint status. `/compact` requests a
 checkpoint before the next model call. Long sessions automatically summarize
