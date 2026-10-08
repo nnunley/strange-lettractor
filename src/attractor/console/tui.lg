@@ -29,22 +29,31 @@
 (defn- safe-text [text]
   (str/replace (style/strip (str text)) #"[\x00-\x1f\x7f-\x9f]" " "))
 
+(defn- character-cells [c] (if (< (int c) 128) 1 2))
+
 (defn- clip [text width]
   (loop [chars (seq (safe-text text)) out "" left (max 0 width)]
     (if-let [c (first chars)]
-      (let [cells (if (< (int c) 128) 1 2)]
+      (let [cells (character-cells c)]
         (if (<= cells left) (recur (rest chars) (str out c) (- left cells)) out))
       out)))
 
 (defn- editor-view [state width]
   ;; Window the model, not the ANSI-rendered widget, retaining its real caret.
   (let [input (:input state) text (safe-text (:text input))
-        space (max 1 (quot (max 1 (- width 3)) 2)) cursor (min (count text) (:cursor input))
-        start (max 0 (- cursor (dec space)))
-        end (min (count text) (+ start (dec space)))]
-    (str (when (> width 2) "> ") (tinput/view (assoc input :text (subs text start end)
-                                    :cursor (- cursor start)
-                                    :placeholder (clip (:placeholder input) (max 0 (dec space))))))))
+        prompt (if (> width 2) "> " "")
+        space (max 1 (- width (count prompt)))
+        cursor (max 0 (min (count text) (:cursor input)))
+        chars (vec (seq text))
+        caret-cells (if (< cursor (count chars)) (character-cells (get chars cursor)) 1)
+        [start used] (loop [start cursor used 0]
+                       (let [cells (when (pos? start) (character-cells (get chars (dec start))))]
+                         (if (and cells (<= (+ used cells) (- space (min space caret-cells))))
+                           (recur (dec start) (+ used cells))
+                           [start used])))
+        visible (str (subs text start cursor) (clip (subs text cursor) (- space used)))]
+    (str prompt (tinput/view (assoc input :text visible :cursor (- cursor start)
+                               :placeholder (clip (:placeholder input) (dec space)))))))
 
 (defn view [state]
   (let [[w height] (or (:tui/size state) [80 24]) width (max 1 (dec w))

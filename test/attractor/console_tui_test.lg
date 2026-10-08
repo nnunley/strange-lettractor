@@ -1,6 +1,6 @@
 (ns attractor.console-tui-test
   (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
-            [clojure.string :as str] [tiny-tui.key :as key]
+            [clojure.string :as str] [tiny-tui.key :as key] [tiny-tui.style :as style]
             [attractor.hub :as hub] [attractor.execution :as execution]
             [attractor.profiles :as profiles]
             [attractor.console.session :as session] [attractor.console.tui :as tui]))
@@ -30,6 +30,23 @@
             (empty? (first q)) (do (swap! queue #(vec (rest %))) (core/sleep 200) (recur))
             :else (let [k (first (first q))] (swap! queue #(vec (cons (rest (first %)) (rest %)))) k)))))))
 (defn- has? [lines s] (boolean (some #(str/includes? % s) lines)))
+
+(deftest editor-uses-the-available-width-and-keeps-the-cursor-visible
+  (doseq [inline? [true false]]
+    (let [text (apply str (repeat 70 "x"))
+          state {:console (atom {}) :transcript [] :inline? inline?
+                 :tui/size [80 12] :input {:text text :cursor 70}}
+          row (fn [s] (last (str/split (tui/view s) #"\n")))]
+      (is (= (str "> " text " ") (style/strip (row state))))
+      (is (= (str "> " (subs text 34) " ")
+             (style/strip (row (assoc state :tui/size [40 12])))))
+      (is (str/includes? (row (assoc-in state [:input :cursor] 45)) (style/inverse "x")))
+      (doseq [width [4 12 40 80]]
+        (let [wide (row (assoc state :tui/size [width 12]
+                              :input {:text (apply str (repeat 70 "界")) :cursor 70}))
+              cells (reduce + (map #(if (= % \界) 2 1) (seq (style/strip wide))))]
+          (is (<= cells (dec width)))
+          (is (str/includes? wide (style/inverse " "))))))))
 
 (deftest headless-tui-routes-text-eval-and-ctrl-c-by-state
   (let [h (hub/start! (hub-options)) c (session/open! h) frames (atom [])]
