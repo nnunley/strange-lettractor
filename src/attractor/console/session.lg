@@ -67,7 +67,7 @@
     (when-not (:detached c)
       (let [late (try (:lines (drain! console)) (catch Object _ []))]
         (try (request! c :client/detach {:client_id (get-in c [:client :client_id])}) (catch Object _ nil))
-        (swap! console assoc :detached true :quit true :final_lines late)))))
+        (swap! console assoc :detached true :quit true :activity nil :final_lines late)))))
 
 ;; --- rendering --------------------------------------------------------------
 
@@ -96,14 +96,20 @@
         event (:event envelope)]
     (case (:type event)
       :session_start [(tagged tag "session started")]
+      :subagent_event (let [child (:event event)]
+                        (when (or (= :error (:type child))
+                                  (and (= :tool_call_end (:type child)) (:error child)))
+                          [(str "[agent " (short-id (:agent_id event)) "] "
+                                (if (= :tool_call_end (:type child)) (str "tool " (:tool_name child) " failed: ") "error: ")
+                                (:error child))]))
       :assistant_text_delta (do (buffer-text! console sid (:delta event)) [])
       :assistant_text_end (let [buffered (take-buffer! console sid)]
                             (text-lines tag (or (:text event) buffered)))
-      :tool_call_start [(tagged tag (str "tool " (:tool_name event) " …"))]
+      :tool_call_start (if (:presentation @console) [] [(tagged tag (str "tool " (:tool_name event) " …"))])
       ;; Name, not call id: the id is only useful for correlating with a
       ;; transcript, and the start line already showed the name.
-      :tool_call_end [(tagged tag (str "tool " (or (:tool_name event) (short-id (:call_id event)))
-                                       (if (:error event) " failed" " done")))]
+      :tool_call_end (if (and (:presentation @console) (not (:error event))) [] [(tagged tag (str "tool " (or (:tool_name event) (short-id (:call_id event)))
+                                       (if (:error event) " failed" " done")))])
       :error (do (take-buffer! console sid) [(tagged tag (str "error: " (:error event)))])
       :processing_end (into (text-lines tag (take-buffer! console sid)) [(tagged tag "turn complete")])
       :session_end (do (take-buffer! console sid) [(tagged tag "session ended")])
@@ -166,7 +172,57 @@
       :inform [(str tag " " (:stage ev) ": " (:message ev))]
       [])))
 
+(defn- activity-event [state event child]
+  (let [state (or state {:active {} :done 0 :phase "Ready"})
+        id [child (:call_id event)]
+        active (:active state)
+        retire-child (fn [] (assoc state :active (into {} (remove (fn [[key _]] (= child (first key))) active))))]
+    (case (:type event)
+      :subagent_event (activity-event state (:event event) (:agent_id event))
+      :tool_call_start (if (and (:call_id event) (< (count active) 1024))
+                         (assoc state :active (assoc active id (:tool_name event)) :phase "Working") state)
+      :tool_call_end (if (contains? active id)
+                       (assoc state :active (dissoc active id) :done (inc (:done state))) state)
+      :assistant_text_delta (assoc state :phase "Responding")
+      :compaction_start (assoc state :phase "Preparing context checkpoint")
+      :compaction_end (assoc state :phase "Working")
+      :compaction_failed (assoc state :phase "Checkpoint failed")
+      :processing_end (if child (retire-child) (assoc state :active {} :phase "Ready"))
+      :session_end (if child (retire-child) (assoc state :active {} :phase "Session ended"))
+      :error (if child (retire-child) (assoc state :active {} :phase "Error"))
+      :pipeline.started (assoc state :phase "Running workflow")
+      :stage.started (assoc state :phase (str "Running " (:node_id event)))
+      :pipeline.completed (assoc state :active {} :phase "Complete")
+      :pipeline.failed (assoc state :active {} :phase "Failed")
+      :completed (assoc state :active {} :phase "Complete")
+      state)))
+
+(defn activity-text
+  "Current focused activity. Derived from event identities, never transcript text."
+  [console]
+  (let [{:keys [active done phase]} (:activity @console)
+        names (set (vals active))
+        label (cond
+                (contains? names "wait") "Waiting for agents"
+                (= names #{"read_file"}) "Reading files"
+                (= names #{"glob"}) "Finding files"
+                (= names #{"shell"}) "Running commands"
+                (= names #{"spawn_agent"}) "Starting agents"
+                (seq names) "Running tools"
+                :else (or phase "Ready"))]
+    (str label (when (or (seq active) (pos? (or done 0)))
+                 (str " · " (count active) " active · " (or done 0) " done")))))
+
+(defn- track-activity! [console envelope]
+  (let [{:keys [kind id]} (:focus @console)
+        matches (case kind
+                  :session (= id (:session_id envelope))
+                  :run (= id (:run_id envelope))
+                  :agent (= id (:agent_id envelope)) false)]
+    (when matches (swap! console update :activity activity-event (:event envelope) nil))))
+
 (defn render-envelope [console envelope]
+  (track-activity! console envelope)
   (case (:source envelope)
     :session (session-lines console envelope)
     :question (question-lines envelope)
@@ -192,7 +248,7 @@
             ;; Fell behind the bounded log: resync to its newest cursor and say so.
             (let [{:keys [cursor events]} ((:events_fn c) (get-in c [:client :client_id])
                                                        (:oldest_cursor (ex-data e)))]
-              (swap! console assoc :cursor cursor)
+              (swap! console assoc :cursor cursor :activity {:active {} :done 0 :phase "Activity unknown (events dropped)"})
               {:lines (into ["… older events dropped (client fell behind the hub log)"]
                             (mapcat #(render-envelope console %) events))})
             {:lines [(str "error: " (ex-message e))]}))))))
@@ -219,7 +275,7 @@
    "  /quit           detach this client (an in-process hub stops with the command)"])
 
 (defn- focus! [console kind id]
-  (swap! console (fn [c] (cond-> (assoc c :focus {:kind kind :id id})
+  (swap! console (fn [c] (cond-> (assoc c :focus {:kind kind :id id} :activity nil)
                            (= kind :session) (assoc :session id)))))
 
 (defn- ensure-session! [console]
@@ -355,7 +411,7 @@
     (case kind
       :agent (do (request! c :agent/cancel {:agent_id id}) [(str "cancel requested: agent " (short-id id))])
       :run (do (request! c :workflow/cancel {:run_id id}) [(str "cancel requested: run " (short-id id))])
-      :session (do (request! c :session/cancel {:session_id id}) [(str "cancel requested: session " (short-id id))])
+      :session (do (request! c :session/cancel {:session_id id}) (swap! console assoc :activity {:active {} :done 0 :phase "Cancelled"}) [(str "cancel requested: session " (short-id id))])
       ["nothing focused to cancel"])))
 
 (defn busy?

@@ -1,6 +1,6 @@
 (ns attractor.console-tui-test
   (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
-            [clojure.string :as str]
+            [clojure.string :as str] [tiny-tui.key :as key]
             [attractor.hub :as hub] [attractor.execution :as execution]
             [attractor.profiles :as profiles]
             [attractor.console.session :as session] [attractor.console.tui :as tui]))
@@ -62,3 +62,75 @@
         (is (nil? (:event result)))
         (is (session/closed? c)))
       (finally (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+(deftest activity-ticks-preserve-editor-and-inline-transcript
+  (let [events (atom []) c (atom {:focus {:kind :session :id "s"} :session "s" :cursor 0
+                                :events_fn (fn [_ _] {:events @events :cursor 1})
+                                :text_buffers {} :presentation true})
+        printed (atom [])
+        state {:console c :transcript [] :pending [] :inline? true :flush-lines #(swap! printed into %)
+               :input {:text "my unfinished input" :cursor 5}}
+        _ (reset! events [{:source :session :session_id "s" :event {:type :tool_call_start :call_id "x" :tool_name "read_file"}}
+                         {:source :session :session_id "s" :event {:type :assistant_text_end :text "Looking closely."}}])
+        next (first (tui/update state :attractor.console.tui/tick))
+        frame (tui/view (assoc next :tui/size [40 12]))]
+    (is (= (:input state) (:input next)))
+    (is (= ["Looking closely."] @printed))
+    (is (str/includes? frame "Reading files"))
+    (is (= 2 (count (str/split frame #"\n")))))
+  (let [c (atom {:activity {:phase "bad\nline\u001b[31m"}})
+        frame (tui/view {:console c :inline? true :tui/size [4 2] :input {:text "abcdef" :cursor 6}})]
+    (is (= 2 (count (str/split frame #"\n"))))))
+
+(deftest discarding-an-editor-draft-does-not-cancel-the-busy-session
+  (let [release (promise) started (promise)
+        opts (assoc-in (hub-options) [:session_options :complete_fn]
+                      (fn [_] (deliver started true) @release {:message {:role :assistant :content "done"}}))
+        h (hub/start! opts) c (session/open! h)]
+    (try
+      (session/handle! c {:type :line :text "work"})
+      (is (= true (deref started 2000 false)))
+      (let [state {:console c :transcript [] :pending [] :buffering false
+                   :input {:text "unsubmitted draft" :cursor 17}}
+            discarded (first (tui/update state :attractor.console.tui/interrupt))]
+        (is (= "" (get-in discarded [:input :text])))
+        (is (session/busy? c) "discarding a local editor draft leaves work running")
+        (is (not (:closed (first (:value (deref (hub/request! h {:id "list" :op :session/list}) 2000 nil))))))
+        (let [cancelled (first (tui/update discarded :attractor.console.tui/interrupt))]
+          (is (has? (:transcript cancelled) "cancel requested: session"))))
+      (finally (deliver release true)
+               (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+(deftest ctrl-d-preserves-a-whitespace-only-editor-draft
+  (let [c (atom {:quit false})
+        state {:console c :transcript [] :pending [] :input {:text "  " :cursor 0}}
+        next (first (tui/update state (key/parse (str (char 4)))))]
+    (is (= " " (get-in next [:input :text])) "Ctrl-D deletes forward in a nonempty draft")
+    (is (not (session/closed? c)))))
+
+(deftest discarding-a-whitespace-draft-does-not-cancel-the-busy-session
+  (let [release (promise) started (promise)
+        opts (assoc-in (hub-options) [:session_options :complete_fn]
+                      (fn [_] (deliver started true) @release {:message {:role :assistant :content "done"}}))
+        h (hub/start! opts) c (session/open! h)]
+    (try
+      (session/handle! c {:type :line :text "work"})
+      (is (= true (deref started 2000 false)))
+      (let [state {:console c :transcript [] :pending [] :buffering false
+                   :input {:text "  " :cursor 2}}
+            discarded (first (tui/update state :attractor.console.tui/interrupt))]
+        (is (= "" (get-in discarded [:input :text])))
+        (is (session/busy? c) "discarding a local editor draft leaves work running")
+        (is (not (:closed (first (:value (deref (hub/request! h {:id "list" :op :session/list}) 2000 nil))))))
+        (let [cancelled (first (tui/update discarded :attractor.console.tui/interrupt))]
+          (is (has? (:transcript cancelled) "cancel requested: session"))))
+      (finally (deliver release true)
+               (deref (hub/request! h {:id "stop" :op :hub/stop}) 5000 nil)))))
+
+
+(deftest parsed-ctrl-d-quits-an-empty-editor
+  (let [c (atom {:quit false})
+        [next event] (tui/update {:console c :transcript [] :pending [] :input {:text "" :cursor 0}}
+                                 (key/parse (str (char 4))))]
+    (is (= :quit event))
+    (is (session/closed? c))))

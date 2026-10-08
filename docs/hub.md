@@ -4,26 +4,53 @@ The hub owns native sessions, workflow runs, external-agent jobs, events,
 human questions and cancellation. CLI commands use the same request contract;
 tools execute in their owning sessions.
 
-## Live console activity (implementation plan)
+## Live console activity
 
-The approved design replaces routine tool start/done transcript lines with one
-updating activity row above the prompt in both interactive console modes. Assistant
-messages, errors and final results remain in the transcript. Activity comes from
-structured events, without extra model calls. The ordinary terminal uses tiny-tui
-inline rendering and preserves scrollback; `--tui` uses a fixed row. Pipes retain
-plain output. Counts describe observed active/completed work, not guessed progress.
+Both interactive consoles show one activity row above the editable prompt:
+`Reading files · 3 active · 12 done`, for example. The ordinary console uses
+inline tiny-tui rendering and preserves scrollback; `--tui` uses a fixed row.
+Assistant messages, errors and final results remain in the transcript. Pipes
+retain plain output. Counts describe tool calls observed since acquiring focus,
+not a percentage of the task or a count of agents. Missing events invalidate the
+previous counts. Activity summaries use structured events, without model calls.
 
-- [ ] Add failing console regressions for concurrent calls, focused-session
-  isolation, error retention, terminal completion and repeated waits.
-- [ ] Reduce activity from existing event identities; reuse console/session and
-  tiny-tui primitives, with at most one focused activity module. Keep raw hub
-  events intact and bound retained UI state.
-- [ ] Render one clipped status row in full-screen and inline terminals, preserving
-  the editable input during updates and transcript text in scrollback. Preserve
-  non-terminal/test-injected line-console behavior.
-- [ ] Verify console/session/CLI regressions and terminal behavior with
-  `LGX_LG=$HOME/development/let-go/bin/lg`; review, rebuild and commit. Keep the
-  resulting usage contract here instead of retaining disposable verification logs.
+Ctrl-C clears a nonempty draft first, cancels focused work when busy with no
+draft, and exits when idle. Ctrl-D exits on an empty editor; otherwise it deletes
+at the cursor. Activity updates preserve the draft. The full-screen transcript
+retains up to 2,000 lines; the inline console leaves transcript history in terminal
+scrollback. Unicode clipping currently reserves two cells per non-ASCII character.
+
+## Typed presentations: design direction
+
+Typed selection and command arguments are the next increment; the activity row
+above does not yet provide these interactions.
+
+[Ciccarelli's 1984 thesis](https://dspace.mit.edu/entities/publication/6540a5e7-e056-4542-a3d9-0dd7646ea004)
+separates application state, presentation state, presentation updates and recognition
+of user actions. Its sections 3.1–3.2 also distinguish proposed state and commands
+from executed changes. For this console, the hub remains authoritative; selection,
+expansion and command drafts belong to the client.
+
+[A Guided Tour of CLIM](https://mcclim.common-lisp.dev/static/documents/guided-tour.pdf)
+(original 1991, updated 2006), sections 6–6.1, explains reusable typed output and
+context-dependent input. The [CLIM translator contract](https://www.lispworks.com/documentation/lw81/clim/clim-ch8-1.htm)
+connects a selected object to an accepted argument or command. Our implementation
+should support both selecting an object and choosing an action, and starting a
+command and selecting a compatible argument, through the same host operations.
+
+BTRON supplies a complementary identity model: [real objects and virtual references](https://www.chokanji.com/ckv/qr/object.html),
+including [embedded expanded views](https://download.personal-media.co.jp/ckv/manual/01-03-19.html).
+This is a parallel influence, not an established historical descendant of the
+thesis. For the harness, several views should reference one tool call, agent or
+artifact. Expansion reads its recorded result; it never reruns the operation.
+
+Start with bounded tool-call and agent references, keyboard selection, inspection
+and a supported command accepting an agent reference. Preserve draft input and
+selection identity as events arrive. Revalidate live actions at dispatch; clearly
+mark expired references. A displayed path becomes actionable only when its origin
+and working directory are known. Keep proposed commands distinct from execution.
+Tiny-tui supplies terminal rendering and input; shared typed values and command
+semantics must remain independent of the frontend.
 
 ## Run a shared host
 
