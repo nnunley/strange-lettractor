@@ -4,6 +4,27 @@ The hub owns native sessions, workflow runs, external-agent jobs, events,
 human questions and cancellation. CLI commands use the same request contract;
 tools execute in their owning sessions.
 
+## Live console activity (implementation plan)
+
+The approved design replaces routine tool start/done transcript lines with one
+updating activity row above the prompt in both interactive console modes. Assistant
+messages, errors and final results remain in the transcript. Activity comes from
+structured events, without extra model calls. The ordinary terminal uses tiny-tui
+inline rendering and preserves scrollback; `--tui` uses a fixed row. Pipes retain
+plain output. Counts describe observed active/completed work, not guessed progress.
+
+- [ ] Add failing console regressions for concurrent calls, focused-session
+  isolation, error retention, terminal completion and repeated waits.
+- [ ] Reduce activity from existing event identities; reuse console/session and
+  tiny-tui primitives, with at most one focused activity module. Keep raw hub
+  events intact and bound retained UI state.
+- [ ] Render one clipped status row in full-screen and inline terminals, preserving
+  the editable input during updates and transcript text in scrollback. Preserve
+  non-terminal/test-injected line-console behavior.
+- [ ] Verify console/session/CLI regressions and terminal behavior with
+  `LGX_LG=$HOME/development/let-go/bin/lg`; review, rebuild and commit. Keep the
+  resulting usage contract here instead of retaining disposable verification logs.
+
 ## Run a shared host
 
 ```sh
