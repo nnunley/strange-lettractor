@@ -864,6 +864,28 @@
       (catch Object _ arguments))
     arguments))
 
+(defn- incident-text [value limit]
+  (let [text (if (string? value) value (pr-str value))]
+    (if (> (count text) limit) (str (subs text 0 limit) " …[truncated]") text)))
+
+(defn- exception-incident [session error fields]
+  ;; Preserve provenance at the failing session, before child forwarding or
+  ;; provider truncation loses cwd/arguments. Never capture credentials/config.
+  (merge {:session_id (:id @session)
+          :parent_session_id (get-in @session [:config :parent_session_id])
+          :delegation_task (when-let [task (get-in @session [:config :delegation_task])]
+                             (incident-text task 4000))
+          :cwd ((:working_directory (:execution_env @session)))
+          :exception {:message (incident-text (ex-message error) 4000)
+                      :category (:category (ex-data error))
+                      :data (into {} (map (fn [[k v]] [k (incident-text v 2000)])
+                                        (take 12 (ex-data error))))}
+          :history (mapv (fn [turn]
+                           {:role (:role turn) :content (incident-text (:content turn) 2000)
+                            :tool_calls (incident-text (:tool_calls turn) 2000)
+                            :results (incident-text (:results turn) 2000)})
+                         (take-last 6 (:history @session)))} fields))
+
 (defn- execute-single-tool [session tool-call event-fn]
   (let [tool-name (or (:name tool-call) (get tool-call "name") "")
         call-id (or (:id tool-call) (get tool-call "id") "")
@@ -905,6 +927,10 @@
                                       (error? raw-output)))
                  :skipped false})
               (catch Object error {:result (str "Tool error (" tool-name "): " error)
+                                   :incident (exception-incident session error
+                                               {:tool_name tool-name :call_id call-id
+                                                :arguments (if (<= (count (pr-str raw-args)) 8000)
+                                                             raw-args (incident-text raw-args 8000))})
                                    :is_error true :skipped (= :invalid-tool-arguments (:category (ex-data error)))})))
           raw-output (:result outcome)
           attachment? (tool-images/attachment-output? raw-output)
@@ -914,7 +940,7 @@
       (let [post (tool-hooks/run! hooks :post identity raw-args outcome (:execution_env @session) stopped? event-fn)]
         (when (:cancelled post) (abort-session! session)))
       (event-fn (merge {:type :tool_call_end :call_id call-id :tool_name tool-name}
-                       (if (:is_error outcome) {:error raw-text} {:output raw-text}) attachments
+                       (if (:is_error outcome) {:error raw-text :incident (:incident outcome)} {:output raw-text}) attachments
                        (when attachment? {:result raw-output})))
       (merge {:tool_call_id call-id :tool_name tool-name
        :content (tools/truncate-tool-output raw-text tool-name (:config @session))
@@ -1264,7 +1290,8 @@
                                 (recover-context-overflow! session e event-fn)
                                 (do
                                   (event-fn {:type :error :error (str e)
-                                             :category (:category (ex-data e))})
+                                             :category (:category (ex-data e))
+                                             :incident (exception-incident session e {:phase :generation})})
                                   (close-session-after-error! session e on-event)))
                               (throw e)))))]
                   (if (session-stopped? session)
@@ -1543,6 +1570,8 @@
           (make-session
             (merge
              {:id child-id
+              :parent_session_id (:id @parent)
+              :delegation_task (subagent-arg arguments "task")
               :user_instructions user-instructions
               :harness harness-atom
               :frozen_harness (get-in @parent [:config :frozen_harness])

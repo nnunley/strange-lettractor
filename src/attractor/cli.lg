@@ -651,7 +651,14 @@
 (defn- serve-connected [port remote-port]
   (let [connection (nrepl-client/connect! {:host "127.0.0.1" :port remote-port})]
     (try
-      (println (str "Attractor HTTP adapter on " port ", attached to hub " remote-port))
+      ;; http/serve blocks and does not expose its bound listener address.
+      ;; Announce the configured endpoint without claiming the bind succeeded.
+      (println (str "Starting Attractor HTTP adapter on " port ", attached to hub " remote-port))
+      (when-let [[_ host port-text] (re-matches #"(.*):([0-9]+)" port)]
+        (if (= 0 (parse-long port-text))
+          (println "The assigned HTTP port is unavailable; use --port :7070 for a known endpoint.")
+          (let [display-host (case host "" "localhost" "0.0.0.0" "localhost" "[::]" "[::1]" host)]
+            (println (str "HTTP API: http://" display-host ":" port-text "/pipelines")))))
       (io/flush *out*)
       (http/serve (hub-http/make-handler #(nrepl-client/request! connection %)) port)
       (finally (nrepl-client/close! connection)))))
