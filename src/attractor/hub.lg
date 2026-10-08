@@ -295,8 +295,10 @@
     (try
       (core/future
       (binding [agent/*event-origin* {:hub_turn_id turn-id}]
-        (loop [input text]
-          (let [result (try {:value (agent/process-input! session input)}
+        (loop [input text queued? false behavior nil]
+          (let [result (try {:value (if queued?
+                                     (agent/process-queued-input! session input behavior)
+                                     (agent/process-input! session input))}
                            (catch Object e {:error (error-data e)}))
                 next-input
                 (locked (:event_lock hub)
@@ -317,7 +319,7 @@
                         (do (reset! (:pending entry) [])
                             (deliver done (if cancelled {:error {:category :cancelled :message "Turn cancelled"}} result))
                             nil)))))]
-            (when next-input (recur (:text next-input)))))))
+            (when next-input (recur (:text next-input) true (:behavior next-input)))))))
       (catch Object e (deliver done {:error (error-data e)})))
     turn))
 

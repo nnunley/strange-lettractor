@@ -83,8 +83,13 @@
   (let [entered (atom false) finished (atom false) closed (atom 0) start (System/currentTimeMillis)]
     (with-redefs [transport/open! (fn [_]
                                   (reset! entered true)
-                                  (try (core/sleep 500) {}
-                                       (finally (reset! finished true))))
+                                  (try
+                                    ;; Simulate a native acquisition that completes
+                                    ;; during cancellation and still hands back its
+                                    ;; acquired handle: publication must close it.
+                                    (try (core/sleep 500) (catch Cancelled _ nil))
+                                    {}
+                                    (finally (reset! finished true))))
                   transport/close! (fn [_] (swap! closed inc))]
       (is (= :timeout (get-in (attempt {:prompt "x" :timeout_ms 30}) [:error :category]))))
     (is @entered)

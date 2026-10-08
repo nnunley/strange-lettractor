@@ -14,6 +14,17 @@
     (cond (pred) true
           (zero? remaining) false
           :else (do (core/sleep 2) (recur (dec remaining))))))
+(defn held-until-cancelled [entered cleanup release stop? cleanup-fn]
+  (try
+    (deliver entered true)
+    (await-predicate stop?)
+    {:status :cancelled}
+    (finally
+      ;; let-go cancellation raises at sleep/channel boundaries. The gated
+      ;; teardown belongs in finally so these assertions still prove join.
+      (deliver cleanup (stop?))
+      (deref release 5000 :timeout)
+      (cleanup-fn))))
 (defn graph-for [ids]
   {:edges (mapv (fn [id] {:from "fork" :to id}) ids)})
 (defn run-handler [callback attrs ids cancelled?]
@@ -46,10 +57,11 @@
                   (try
                     (deliver entered true)
                     (core/<! blocked)
-                    (deliver cleanup ((:cancelled? node)))
-                    (deref release 5000 :timeout)
                     {:status :cancelled}
-                    (finally (reset! cleaned true)))
+                    (finally
+                      (deliver cleanup ((:cancelled? node)))
+                      (deref release 5000 :timeout)
+                      (reset! cleaned true)))
                   (do (deref entered 3000 :timeout) {:status :success}))))
           fanins (atom [])
           _ (handlers/register-handler!
@@ -167,10 +179,7 @@
                  (fn [id _ _ _ cancelled?]
                    (swap! calls conj id)
                    (case id
-                     "slow" (do (deliver entered true)
-                                (when (await-predicate cancelled?) (deliver cleanup true))
-                                (deref release 5000 :timeout)
-                                {:status :cancelled})
+                     "slow" (held-until-cancelled entered cleanup release cancelled? (fn [] nil))
                      "winner" (do (deref entered 3000 :timeout) {:status :success})
                      {:status :success}))
                  {:join_policy "first_success" :max_parallel 2}
@@ -191,9 +200,7 @@
                (run-handler
                  (fn [id _ _ _ stop?]
                    (if (= id "slow")
-                     (do (deliver entered true)
-                         (when (await-predicate stop?) (deliver cleanup true))
-                         (deref release 5000 :timeout) {:status :cancelled})
+                     (held-until-cancelled entered cleanup release stop? (fn [] nil))
                      (do (deref entered 3000 :timeout) {:status :success})))
                  {:join_policy "first_success" :max_parallel 2}
                  ["slow" "winner"] #(deref cancelled)))]
@@ -287,11 +294,8 @@
                    (fn [id _ _ _ stop?]
                      (swap! calls conj id)
                      (if (= id "held")
-                       (do (deliver entered true)
-                           (when (await-predicate stop?) (deliver cleanup true))
-                           (deref release 5000 :timeout)
-                           (swap! writes conj :cleanup)
-                           (throw (ex-info "secondary-worker-error" {})))
+                       (held-until-cancelled entered cleanup release stop?
+                         (fn [] (swap! writes conj :cleanup) (throw (ex-info "secondary-worker-error" {}))))
                        (do (deref entered 3000 :timeout) (throw original))))
                    {:max_parallel 2} ["held" "throw" "queued"] (fn [] false))
                  (catch Exception e {:caught e})))]
@@ -320,11 +324,7 @@
                        (fn [id _ _ _ stop?]
                          (swap! calls conj id)
                          (if (= id "held")
-                           (do (deliver entered true)
-                               (when (await-predicate stop?) (deliver cleanup true))
-                               (deref release 5000 :timeout)
-                               (swap! writes conj :cleanup)
-                               {:status :cancelled})
+                           (held-until-cancelled entered cleanup release stop? (fn [] (swap! writes conj :cleanup)))
                            (do (deref entered 3000 :timeout) {:status :success})))
                        {:max_parallel 2} ["held" "done" "clone-fails" "queued"] (fn [] false))
                      (catch Exception e {:caught e})))]
@@ -394,10 +394,7 @@
                    (run-handler
                      (fn [id _ _ _ stop?]
                        (swap! calls conj id)
-                       (deliver entered true)
-                       (when (await-predicate stop?) (deliver cleanup true))
-                       (deref release 5000 :timeout)
-                       {:status :cancelled})
+                       (held-until-cancelled entered cleanup release stop? (fn [] nil)))
                      {:max_parallel 2} ["held" "launch-fails" "queued"] (fn [] false))
                    (catch Exception e {:caught e}))))]
     (try
@@ -437,7 +434,8 @@
                  (fn [_ _ _ _ _]
                    (deliver descendant
                             (core/future
-                              (try (deliver entered true) (core/<! blocked) :done
+                              (try (deliver entered true) (core/<! blocked) :unexpected-return
+                                   (catch Cancelled _ :cancelled)
                                    (finally (deliver cleanup true) (deref release 5000 :timeout)))))
                    (deref entered 3000 :timeout)
                    {:status :success})
@@ -449,7 +447,7 @@
     (is (= :success (:status (deref task 3000 :timeout))))
     (let [worker (deref descendant 3000 :timeout)]
       (is (not= :timeout worker))
-      (when (not= :timeout worker) (is (= :done (deref worker 3000 :timeout)))))))
+      (when (not= :timeout worker) (is (= :cancelled (deref worker 3000 :timeout)))))))
 
 (deftest invocation-close-preserves-sibling-and-restores-caller-scope
   (doseq [throws? [false true]]

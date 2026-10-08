@@ -383,6 +383,10 @@
             task (core/future
                    (try
                      {:outcome (handler timed-node ctx graph logs-root)}
+                     (catch Cancelled e
+                       (if ((:cancelled? timed-node))
+                         {:outcome {:status :cancelled :failure_reason "Pipeline cancelled"}}
+                         {:error e}))
                      (catch Object e {:error e})))
             pending ::pending]
         (loop []

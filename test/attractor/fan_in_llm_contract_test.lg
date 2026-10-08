@@ -221,20 +221,23 @@
     (is (= true (deref cleaned 0 false)))))
 
 (deftest normal-return-waits-for-provider-descendants
-  (let [entered (promise) release (promise) cleaned (promise) escape (atom false)
+  (let [entered (promise) started (promise) release (promise) cleaned (promise) escape (atom false)
         adapter (llm/make-adapter
                   "memory"
                   (fn [sent]
                     (core/future
                       (try
+                        (deliver started true)
                         (loop []
                           (when-not (or @escape
                                         ((get-in sent [:abort_signal :aborted?])))
                             (core/sleep 2)
                             (recur)))
-                        (deliver entered true)
-                        (deref release 1000 nil)
-                           (finally (deliver cleaned true))))
+                        (finally
+                          (deliver entered true)
+                          (deref release 1000 nil)
+                          (deliver cleaned true))))
+                    (deref started 1000 false)
                     (response "{\"candidate_index\":0}"))
                   (fn [_] []))
         client (llm/make-client {:providers {"memory" adapter}})
@@ -248,7 +251,7 @@
     (is (= true (deref cleaned 0 false)))))
 
 (deftest error-return-waits-for-descendants-and-preserves-primary-error
-  (let [entered (promise) release (promise) cleaned (promise) escape (atom false)
+  (let [entered (promise) started (promise) release (promise) cleaned (promise) escape (atom false)
         original (ex-info "primary provider failure"
                           {:category :authentication :retryable false})
         adapter (llm/make-adapter
@@ -256,14 +259,17 @@
                   (fn [sent]
                     (core/future
                       (try
+                        (deliver started true)
                         (loop []
                           (when-not (or @escape
                                         ((get-in sent [:abort_signal :aborted?])))
                             (core/sleep 2)
                             (recur)))
-                        (deliver entered true)
-                        (deref release 1000 nil)
-                           (finally (deliver cleaned true))))
+                        (finally
+                          (deliver entered true)
+                          (deref release 1000 nil)
+                          (deliver cleaned true))))
+                    (deref started 1000 false)
                     (throw original))
                   (fn [_] []))
         client (llm/make-client {:providers {"memory" adapter}})

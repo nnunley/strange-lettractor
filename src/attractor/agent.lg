@@ -1189,7 +1189,7 @@
                      (-> state
                          (assoc :state :processing)
                          (update :history conj
-                                 {:type :user :role :user :content prompt
+                                 {:type (or (:input_type invocation) :user) :role :user :content prompt
                                   :timestamp (System/currentTimeMillis)}))))
             true)))
       (let [closed? (session-stopped? session)]
@@ -1349,7 +1349,7 @@
                         next-input (first (get @session queue))]
                     (swap! session update queue
                            (fn [queued] (vec (rest queued))))
-                    {:kind :followup :input next-input})
+                    {:kind :followup :input next-input :input_type (if (= queue :steering-queue) :steering :user)})
                   :else
                   (do
                     (swap! session assoc :state :idle)
@@ -1359,7 +1359,7 @@
           :stopped result
           :followup
           (try
-            (process-input-cycle! session (:input decision) on-event true {:owner owner})
+            (process-input-cycle! session (:input decision) on-event true {:owner owner :input_type (:input_type decision)})
             (catch Object e
               (if (and (session-stopped? session)
                        (= :session-closed (:category (ex-data e))))
@@ -1371,6 +1371,13 @@
 
 (defn process-input! [session prompt & [on-event]]
   (process-input-cycle! session prompt on-event false))
+
+(defn process-queued-input!
+  "Resume accepted aggregate input after an idle boundary without turning
+   steering into a replacement user objective in the context ledger."
+  [session prompt behavior]
+  (process-input-cycle! session prompt nil false
+                        {:input_type (if (= :followup behavior) :user :steering)}))
 
 ;; Compatibility name used by the Attractor codergen backend.
 (defn run-agent-turn! [session prompt & [on-event]]

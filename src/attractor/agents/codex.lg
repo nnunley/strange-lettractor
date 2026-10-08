@@ -139,6 +139,10 @@
                 "interrupted" (fail! :cancelled "Codex turn interrupted")
                 "transport-failed" (fail! :codex-protocol (str "Codex transport failed: " (get error "message")))
                 (fail! :codex-result (str "Codex turn " status ": " (get error "message")) {:status status :error error})))))
+        (catch Cancelled e
+          (if (or (core/scope-cancelled?) (cancelled?))
+            (fail! :cancelled "Codex agent cancelled")
+            (throw e)))
         (catch Object e
           (case (:category (ex-data e))
             :operation-cancelled (fail! :cancelled "Codex agent cancelled")

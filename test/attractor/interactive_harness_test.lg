@@ -337,7 +337,9 @@
                 result (deref (:completion submitted) 3000 {})]
             (is (= (last ordered) (:value result)))
             (is (= (into ["original"] ordered) @requests))
-            (is (= (into ["original"] ordered) (mapv :content (filter #(= :user (:type %)) (:history @s))))))
+            (is (= (into ["original"] ordered) (mapv :content (filter #(= :user (:role %)) (:history @s))))))
+          (is (= (count (filter #(= :steer (first %)) queued))
+                 (count (filter #(= :steering (:type %)) (:history @s)))))
           (is (empty? (:steering-queue @s)))
           (is (empty? (:followup-queue @s)))
           (is (= :idle (:state @s))))
