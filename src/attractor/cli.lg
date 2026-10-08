@@ -155,13 +155,28 @@
 
 (declare make-codergen-backend-from-args make-fan-in-ranker-from-args console-session-options)
 
+(def ^:private harness-flags #{"--harness" "--no-harness" "--harness-interval" "--no-auto-refine"})
+(defn- interactive-harness-options [args]
+  (let [path (find-arg-val args "--harness") raw (find-arg-val args "--harness-interval")
+        interval (if (some #{"--harness-interval"} args)
+                   (when (and (string? raw) (re-matches #"[0-9]+" raw)) (parse-long raw)) 8)]
+    (when (or (not (and (integer? interval) (pos? interval)))
+              (and (some #{"--harness"} args) (or (str/blank? path) (str/starts-with? path "--")))
+              (and (some #{"--harness"} args) (some #{"--no-harness"} args)))
+      (throw (ex-info "Use --harness PATH or --no-harness; --harness-interval requires a positive integer"
+                      {:category :configuration_error})))
+    (cond-> {:enabled (not (boolean (some #{"--no-harness"} args)))
+             :auto_refine (not (boolean (some #{"--no-auto-refine"} args))) :interval interval}
+      path (assoc :path path))))
+
 (defn- workflow-hub
   "Every CLI command owns an in-process hub built the same way: workflow
    handler registries come from the hub's request (auto-approve or the
    hub-bound interviewer), the codergen backend and fan-in ranker from args."
-  [args]
+  [args & [interactive?]]
   (let [working-dir (os/cwd)]
-    (hub/start! {:session_options (console-session-options args)
+    (hub/start! {:interactive_harness (when interactive? (interactive-harness-options args))
+                 :session_options (console-session-options args)
                  :workflow_registry_fn
                  (fn [request]
                    (task-review-bindings/bind-reviews
@@ -321,6 +336,9 @@
         _ (when (and connect? (not (and (integer? port) (<= 1 port 65535))))
             (throw (ex-info "--connect requires a loopback nREPL port between 1 and 65535"
                             {:category :configuration_error})))
+        _ (when (and connect? (some harness-flags args))
+            (throw (ex-info "Harness options belong to the host; configure attractor hub before attaching"
+                            {:category :configuration_error})))
         agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
                          (find-arg-val args "--agent-model") (assoc :model (find-arg-val args "--agent-model"))
                          (find-arg-val args "--agent-tools") (assoc :tools (str/split (find-arg-val args "--agent-tools") #","))
@@ -330,7 +348,7 @@
         ;; Human gates are hub questions answered from the console; the stdin
         ;; interviewer is never used here.
         connection (when connect? (nrepl-client/connect! {:host "127.0.0.1" :port port}))
-        hub (when-not connection (workflow-hub args))
+        hub (when-not connection (workflow-hub args true))
         aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")
                                                      (let [[name expansion] (str/split (str value) #"=" 2)]
                                                        (when (and (seq name) (seq expansion)) [name expansion]))))
@@ -382,7 +400,7 @@
       (do
         (when (and port-file (os/stat port-file))
           (throw (ex-info "Port file already exists" {:category :configuration_error :path port-file})))
-        (let [h (workflow-hub args) adapter (atom nil) published (atom nil)]
+        (let [h (workflow-hub args true) adapter (atom nil) published (atom nil)]
           (try
             (reset! adapter (nrepl-server/start! h {:port port :allow_stop true}))
             (let [actual (get-in @adapter [:address :port])]
@@ -435,7 +453,9 @@
   (println "    DOT run/resume accept --agent <name> with the same options")
   (println "    Native task-review models and budgets are selected by the DOT model_stylesheet")
   (println "  console [--connect PORT] [--tui] [--mock|--llm] [--model <provider/name>] [--alias name=expansion]")
-  (println "                                                      Interactive console: chat, : eval, /run, /agent <name>")
+  (println "    Host options: [--harness PATH|--no-harness] [--harness-interval N] [--no-auto-refine]")
+  (println "    Harness defaults on for console/hub; attached clients inherit host policy.")
+  (println "    Commands: /followup, /harness, /refine, : eval, /run, /agent <name>")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -652,7 +672,7 @@
                       {:category :configuration_error})))
     (if connect?
       (serve-connected port remote-port)
-      (let [h (workflow-hub args) adapter (atom nil)]
+      (let [h (workflow-hub args true) adapter (atom nil)]
         (try
           (reset! adapter (nrepl-server/start! h {:port own-port}))
           (let [actual (get-in @adapter [:address :port])]

@@ -107,6 +107,8 @@
       :error (do (take-buffer! console sid) [(tagged tag (str "error: " (:error event)))])
       :processing_end (into (text-lines tag (take-buffer! console sid)) [(tagged tag "turn complete")])
       :session_end (do (take-buffer! console sid) [(tagged tag "session ended")])
+      :refine_complete [(tagged tag (str "Harness refinement complete: " (get-in event [:result :summary])))]
+      :refine_error [(tagged tag (str "Harness refinement failed: " (:error event)))]
       :warning [(tagged tag (str "warning: " (or (:message event) (pr-str event))))]
       [])))
 
@@ -205,6 +207,9 @@
    "  /agent <name> <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
    "                        [--sandbox s] [--approval-policy p]   names: see /agent"
    "  /alias <name> <expansion>   define /<name> as a shortcut, e.g. /alias codex agent codex"
+   "  /followup text  queue input after the current response and tools"
+   "  /harness        show durable harness status and path"
+   "  /refine [text]  plan refinement in the background"
    "  /cancel         cancel the focused turn, run or agent job"
    "  /quit           detach this client (an in-process hub stops with the command)"])
 
@@ -374,6 +379,18 @@
     :focus (if (str/blank? args)
              [(if-let [{:keys [kind id]} (:focus @console)] (str "focus: " (name kind) " " (short-id id)) "focus: none")]
              (focus-by-id! console (str/trim args)))
+    :harness (let [id (ensure-session! console) status (request! @console :session/harness {:session_id id})]
+               [(str "Harness " (if (:enabled status) "enabled" "disabled")
+                     (when (:frozen status) " (frozen)")
+                     (when (:path status) (str " — " (:path status))))
+                (str "Entries: " (pr-str (:entries status)) "; refinements: " (:refinements status))])
+    :refine (let [id (ensure-session! console)]
+              (request! @console :session/refine {:session_id id :instructions args})
+              ["Harness refinement planning started"])
+    :followup (if (str/blank? args) ["usage: /followup <text>"]
+                (let [id (ensure-session! console)
+                      result (request! @console :session/submit {:session_id id :text args :queue true :behavior :followup})]
+                  [(str (if (:queued result) "Queued follow-up" "Started follow-up") " for turn " (short-id (:turn_id result)))]))
     :run (run! console args)
     :answer (answer! console args)
     :agent (agent! console args)
@@ -385,8 +402,8 @@
 (defn- dispatch! [console action]
   (case (:type action)
     :agent (let [sid (ensure-session! console)
-                 {:keys [turn_id]} (request! @console :session/submit {:session_id sid :text (:text action)})]
-             [(str "→ agent " (short-id sid) " turn " (short-id turn_id))])
+                 {:keys [turn_id queued]} (request! @console :session/submit {:session_id sid :text (:text action) :queue true :behavior :steer})]
+             [(str (if queued "→ queued steering " "→ agent ") (short-id sid) " turn " (short-id turn_id))])
     :eval (let [f (:selection action)
                 {:keys [eval_id]} (request! @console :eval/submit {:code (:text action) :session_id (:session_id f) :run_id (:run_id f)})]
             [(str "→ eval " (short-id eval_id))])

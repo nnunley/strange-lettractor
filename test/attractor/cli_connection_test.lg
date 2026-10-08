@@ -28,3 +28,21 @@
                   remote/connect! (fn [_] (throw (ex-info "Network startup" {:category :wrong-startup})))]
       (is (= :configuration_error
              (try (cli/cmd-console args) nil (catch Object e (:category (ex-data e)))))))))
+
+(deftest attached-console-rejects-local-harness-policy
+  (doseq [flags [["--harness" "ledger.edn"] ["--no-harness"] ["--harness-interval" "4"] ["--no-auto-refine"]]]
+    (with-redefs [remote/connect! (fn [_] (throw (ex-info "Network startup" {:category :wrong-startup})))]
+      (is (= :configuration_error
+             (try (cli/cmd-console (into ["--connect" "4555"] flags)) nil
+                  (catch Object e (:category (ex-data e)))))))))
+
+(deftest local-console-configures-interactive-harness-only-at-host
+  (doseq [[args expected] [[[] {:enabled true :auto_refine true :interval 8}]
+                           [["--no-harness"] {:enabled false :auto_refine true :interval 8}]
+                           [["--harness" "test.edn" "--harness-interval" "3" "--no-auto-refine"]
+                            {:enabled true :path "test.edn" :auto_refine false :interval 3}]]]
+    (let [captured (atom nil) original hub/start!]
+      (with-redefs [hub/start! (fn [options] (reset! captured options) (original options))
+                    line/run! (fn [_ _] nil) os/exit (fn [_] nil)]
+        (cli/cmd-console args))
+      (is (= expected (:interactive_harness @captured))))))

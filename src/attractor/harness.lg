@@ -136,6 +136,15 @@
                    :rationale (or (:rationale p) "") :expected_outcome (or (:expected_outcome p) "")
                    :applied_edits edits :created_at (now-iso)}]
         [(update candidate :refinements conj event) event]))))
+(defn apply-snapshot!
+  "Publish a fully planned ledger only if its source snapshot is still current."
+  [h expected candidate]
+  (transact! h
+    (fn [current]
+      (when-not (= expected current)
+        (throw (ex-info "Harness changed during refinement planning" {:category :refiner-stale})))
+      [candidate candidate])))
+
 (defn rollback! [h refinement-id]
   (transact! h
     (fn [state]

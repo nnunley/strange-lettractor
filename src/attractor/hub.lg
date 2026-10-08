@@ -1,6 +1,6 @@
 (ns attractor.hub
   (:require [attractor.ids :as ids] [clojure.core :as core] [async :as async] [clojure.string :as str]
-            [attractor.agent :as agent] [attractor.pipeline :as pipeline]
+            [attractor.agent :as agent] [attractor.refiner :as refiner] [attractor.pipeline :as pipeline]
             [attractor.context :as context] [attractor.workflow :as workflow] [os :as os]
             [attractor.interviewer :as interviewer]
             [attractor.agents.registry :as registry]))
@@ -256,6 +256,65 @@
       (assoc identity :state :running)
       (assoc identity :state :completed :result result))))
 
+(defn- interactive-options [hub id]
+  (let [policy (:interactive_harness hub) options (:session_options hub)]
+    (if (and policy (not= false (:enabled policy)))
+      (let [path (or (:path policy) (str "attractor_runs/harness/" id ".edn"))
+            ;; Canonicalize the nearest existing ancestor, including symlinks,
+            ;; without requiring the new ledger or parent directories to exist.
+            absolute (if (str/starts-with? path "/") path (str (os/cwd) "/" path))
+            resolved (loop [candidate absolute suffix ""]
+                       (if (os/stat candidate)
+                         (str (os/canonical-path candidate) suffix)
+                         (let [i (str/last-index-of candidate "/")]
+                           (recur (if (= i 0) "/" (subs candidate 0 i))
+                                  (str "/" (subs candidate (inc i)) suffix)))))
+            ;; Resolve physical ancestors before collapsing missing suffixes:
+            ;; link/.. navigates from the symlink target, not its lexical parent.
+            canonical (str "/" (str/join "/" (reduce (fn [parts part]
+                              (cond (contains? #{"" "."} part) parts
+                                    (= ".." part) (vec (butlast parts))
+                                    :else (conj parts part))) [] (str/split resolved #"/"))))]
+        (doseq [[_ entry] @(:sessions hub)]
+          (when (and (= canonical (:harness_path entry))
+                     (not (:cleanup_done @(:agent entry))))
+            (fail! :harness-in-use)))
+        (merge options {:enable_continual_harness true :harness_path canonical
+                        :interactive_refinement true
+                        :auto_refine (not= false (:auto_refine policy))
+                        :auto_refine_interval (get policy :interval 8)}))
+      options)))
+
+(defn- start-session-turn! [hub id entry text]
+  ;; Admission, pending-input drain and aggregate publication share one lock.
+  ;; Never execute the agent or callbacks under that lock.
+  (let [turn-id (fresh-id "turn") done (promise)
+        turn {:session_id id :turn_id turn-id :completion done}
+        session (:agent entry)]
+    (swap! (:sessions hub) assoc-in [id :turn] turn)
+    (try
+      (core/future
+      (binding [agent/*event-origin* {:hub_turn_id turn-id}]
+        (loop [input text]
+          (let [result (try {:value (agent/process-input! session input)}
+                           (catch Object e {:error (error-data e)}))
+                next-input
+                (locked (:event_lock hub)
+                  (fn []
+                    (let [pending @(:pending entry)
+                          cancelled (or @(:closed entry) (:abort_signaled @session))]
+                      (if (and (not cancelled) (not (:error result)) (seq pending))
+                        (let [index (or (first (keep-indexed (fn [i p] (when (not= :followup (:behavior p)) i)) pending)) 0)
+                              next (nth pending index)]
+                          (reset! (:pending entry) (vec (concat (take index pending) (drop (inc index) pending))))
+                          next)
+                        (do (reset! (:pending entry) [])
+                            (deliver done (if cancelled {:error {:category :cancelled :message "Turn cancelled"}} result))
+                            nil)))))]
+            (when next-input (recur (:text next-input)))))))
+      (catch Object e (deliver done {:error (error-data e)})))
+    turn))
+
 (defn- operation! [hub request]
   (case (:op request)
     :eval/submit
@@ -403,38 +462,45 @@
           @(:agents hub))
     :session/open
     (let [id (fresh-id "session")
+          options (interactive-options hub id)
           session (binding [agent/*event-origin* nil]
                     (agent/make-session
-                      (assoc (:session_options hub) :id id :on_event #(append-event! hub id %))))
-          entry {:agent session :closed (atom false) :cancellation (atom nil) :turn nil}]
+                      (assoc options :id id :on_event #(append-event! hub id %))))
+          entry {:agent session :harness_path (:harness_path options) :pending (atom [])
+                 :closed (atom false) :cancellation (atom nil) :turn nil}]
       (swap! (:sessions hub) assoc id entry)
       {:session_id id})
     :session/list
     (mapv (fn [[id entry]] {:session_id id :closed (or @(:closed entry) (= :closed (:state @(:agent entry))))
                             :busy (boolean (and (:turn entry) (not (realized? (:completion (:turn entry))))))})
           @(:sessions hub))
+    :session/harness
+    (let [session (:agent (entry! hub (:session_id request))) h (:harness @session)]
+      {:enabled (boolean h) :path (when h (:path (meta h)))
+       :frozen (boolean (when h (:frozen (meta h))))
+       :entries (when h (into {} (map (fn [[k v]] [k (count v)]) (:entries @h))))
+       :refinements (if h (count (:refinements @h)) 0)})
+    :session/refine
+    (let [session (:agent (entry! hub (:session_id request)))]
+      (when (and (:instructions request) (not (string? (:instructions request)))) (fail! :invalid-request))
+      (agent/request-refinement! session :operator {:instructions (:instructions request)}))
     :session/submit
-    (let [id (:session_id request) entry (entry! hub id) session (:agent entry)]
-      (when (or @(:closed entry) (= :closed (:state @session))) (fail! :session-closed))
-      (when (and (:turn entry) (not (realized? (:completion (:turn entry))))) (fail! :busy))
-      (when-not (string? (:text request)) (fail! :invalid-request))
-      (let [turn-id (fresh-id "turn")
-            completion (launch! (fn []
-                                  (let [output (binding [agent/*event-origin* {:hub_turn_id turn-id}]
-                                                 (agent/process-input! session (:text request)))]
-                                    (when (or @(:closed entry) (:abort_signaled @session)) (fail! :cancelled))
-                                    output))
-                         (fn [done result]
-                           (locked (:event_lock hub)
-                             (fn []
-                               ;; Realization and final-result publication share
-                               ;; event sequencing with cancellation.
-                               (deliver done (if (or @(:closed entry) (:abort_signaled @session))
-                                               {:error {:category :cancelled :message "Turn cancelled"}}
-                                               result))))))
-            turn {:session_id id :turn_id turn-id :completion completion}]
-        (swap! (:sessions hub) assoc-in [id :turn] turn)
-        turn))
+    (let [id (:session_id request)]
+      (when-not (and (string? (:text request))
+                     (or (nil? (:behavior request)) (contains? #{:steer :followup} (:behavior request)))
+                     (or (not (contains? request :queue)) (boolean? (:queue request))))
+        (fail! :invalid-request))
+      (locked (:event_lock hub)
+        (fn []
+          (let [entry (entry! hub id) session (:agent entry) turn (:turn entry)]
+            (when (or @(:closed entry) (= :closed (:state @session))) (fail! :session-closed))
+            (if (and turn (not (realized? (:completion turn))))
+              (do
+                (when-not (:queue request) (fail! :busy))
+                (when-not (agent/queue-input-if-processing! session (:text request) (:behavior request))
+                  (swap! (:pending entry) conj (select-keys request [:text :behavior])))
+                (assoc turn :queued true))
+              (assoc (start-session-turn! hub id entry (:text request)) :queued false))))))
     :session/result
     (let [entry (entry! hub (:session_id request)) turn (:turn entry)]
       (when-not (and turn (string? (:turn_id request)) (= (:turn_id request) (:turn_id turn)))
@@ -527,6 +593,7 @@
       (fail! :invalid-capacity))
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts)
+               :interactive_harness (:interactive_harness opts)
                :workflow_registry_fn (:workflow_registry_fn opts)
                ;; {:claude [argv...] :codex [argv...]}; an agent without an entry
                ;; uses its connector's default command.

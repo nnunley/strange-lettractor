@@ -411,6 +411,7 @@
                  :turns_since_refine 0
                  :harness_steps 0
                  :refinement_owner (atom nil)
+                 :interactive_refinement (atom nil)
                  :dynamic_tool_owners (atom {})
                  :tool_hook_context (or (:tool_hook_context options) (atom (or (:tool_hooks options) {})))
                  :llm_client (:llm_client options)
@@ -536,6 +537,15 @@
       (throw (ex-info "Cannot enqueue input after the session is closed"
                       {:category :session-closed
                        :session_id (:id @session)})))))
+
+(defn queue-input-if-processing!
+  "Atomically admit input only while the active aggregate turn can drain it."
+  [session text behavior]
+  (with-session-lock session
+    (fn []
+      (when (and (= :processing (:state @session)) (not (:abort_signaled @session)))
+        (swap! session update (if (= :followup behavior) :followup-queue :steering-queue) conj text)
+        true))))
 
 (defn steer-session! [session msg]
   (enqueue-session-message! session :steering-queue msg))
@@ -1005,6 +1015,19 @@
           0
           (filter #(= :assistant (:type %)) history)))
 
+(defn request-refinement! [session trigger options]
+  (refiner/request-interactive! session trigger options #(emit-event! session %)))
+
+(defn- refine-session! [session trigger options]
+  (if (get-in @session [:config :interactive_refinement])
+    (try (request-refinement! session trigger options)
+         (catch Object e
+           (if (and (= :refiner-busy (:category (ex-data e)))
+                    (contains? #{:step-interval :loop-detected} trigger))
+             {:coalesced true}
+             (throw e))))
+    (refiner/execute-refinement! session trigger options)))
+
 (defn- refine-after-step! [session event-fn]
   (let [step (:harness_steps (swap! session update :harness_steps (fnil inc 0)))
         config (:config @session) interval (or (:auto_refine_interval config) 0)
@@ -1012,7 +1035,7 @@
     (when (and (:harness @session) (:auto_refine config) (not (:frozen_harness config))
                (pos? interval) (> step warmup) (zero? (mod (- step warmup) interval))
                (not (session-stopped? session)))
-      (try (refiner/execute-refinement! session :step-interval)
+      (try (refine-session! session :step-interval nil)
            (catch Object e
              (when-not (session-stopped? session)
                (event-fn {:type :refine_error :error (str e)})))))))
@@ -1056,6 +1079,10 @@
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)
         token-limit (or (:max_total_tokens config) 0)]
+    (when-let [event (with-session-lock session
+                       #(when (contains? #{:idle :awaiting_input} (:state @session))
+                          (refiner/apply-pending-locked! session)))]
+      (event-fn event))
     (when-not
       (with-session-lock
         session
@@ -1216,7 +1243,7 @@
                                         (when (and (:harness @session) (:auto_refine config)
                                                    (not (:frozen_harness config)))
                                           (try
-                                            (refiner/execute-refinement! session :loop-detected {:instructions warning})
+                                            (refine-session! session :loop-detected {:instructions warning})
                                             (catch Object _ nil)))
                                         (when (append-history-if-open!
                                                 session
@@ -1231,17 +1258,20 @@
             (with-session-lock
               session
               (fn []
-                (cond
+                (let [refinement-event (refiner/apply-pending-locked! session)]
+                  (assoc (cond
                   (= :closed (:state @session)) {:kind :stopped}
-                  (seq (:followup-queue @session))
-                  (let [next-input (first (:followup-queue @session))]
-                    (swap! session update :followup-queue
+                  (or (seq (:steering-queue @session)) (seq (:followup-queue @session)))
+                  (let [queue (if (seq (:steering-queue @session)) :steering-queue :followup-queue)
+                        next-input (first (get @session queue))]
+                    (swap! session update queue
                            (fn [queued] (vec (rest queued))))
                     {:kind :followup :input next-input})
                   :else
                   (do
                     (swap! session assoc :state :idle)
-                    {:kind :idle}))))]
+                    {:kind :idle})) :refinement_event refinement-event))))]
+        (when-let [event (:refinement_event decision)] (event-fn event))
         (case (:kind decision)
           :stopped result
           :followup
@@ -1537,10 +1567,10 @@
            []
            (fn [arguments _]
              (let [instructions (or (get arguments "instructions") (get arguments :instructions))
-                   res (refiner/execute-refinement! session :agent-requested {:instructions instructions})]
-               (if res
-                 (str "Harness refined: " (:summary res) " (" (count (:applied_edits res)) " edits applied)")
-                 "Harness refinement skipped or failed."))))
+                   res (refine-session! session :agent-requested {:instructions instructions})]
+               (cond (:accepted res) "Harness refinement planning started."
+                     res (str "Harness refined: " (:summary res) " (" (count (:applied_edits res)) " edits applied)")
+                     :else "Harness refinement skipped or failed."))))
          (subagent-tool
            "remember"
            "Save a durable fact, lesson, milestone, or heuristic to Continual Harness long-term memory"
