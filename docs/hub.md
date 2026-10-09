@@ -96,22 +96,26 @@ it does not silently reuse the working agent's model. Example trusted EDN:
 
 ```clojure
 {:repository "/Users/ndn/development/attractor"
- :triage_model "provider/strong-model"
- :coding_model "provider/coding-model"
+ :triage_model "openrouter/meta/muse-spark-1.3-contributor"
+ :coding_model "llamacpp/qwen3.8"
  :test_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx suite"
  :build_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx rebuild"
- :timeout_ms 600000
+ :timeout_ms 1800000
  :max_incidents 32
  :max_model_calls 32
  :max_turns 12
  :max_total_tokens 60000}
 ```
 
-Replace the model names with configured providers/models. Omit `:coding_model`
+The checked-in [repair.edn](../repair.edn) uses this configuration: Muse for
+triage and independent review, local Qwen for coding. OpenRouter credentials are
+resolved through the existing provider registry. [Muse Contributor](https://openrouter.ai/meta/muse-spark-1.3-contributor)
+prompts and outputs may be used to improve Meta’s products. Adjust the absolute
+repository/runtime paths for another checkout. Omit `:coding_model`
 to use the triage model for coding too. Commands run in the repair checkout;
 the test command must discover newly added files under `test/`. Increase the time
 budget if the repository's baseline suite, regression run, fixed suite and build
-need more than ten minutes. Limits also bound model calls and generated output;
+need more than thirty minutes. Limits also bound model calls and generated output;
 missing provider usage is charged conservatively from serialized request size.
 `:max_turns` is the cumulative worker call limit, including independent review.
 
