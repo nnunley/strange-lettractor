@@ -97,7 +97,6 @@ it does not silently reuse the working agent's model. Example trusted EDN:
 ```clojure
 {:repository "/Users/ndn/development/attractor"
  :triage_model "openrouter/meta/muse-spark-1.3-contributor"
- :coding_model "llamacpp/qwen3.8"
  :test_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx suite"
  :build_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx rebuild"
  :timeout_ms 1800000
@@ -108,7 +107,8 @@ it does not silently reuse the working agent's model. Example trusted EDN:
 ```
 
 The checked-in [repair.edn](../repair.edn) uses this configuration: Muse for
-triage and independent review, local Qwen for coding. OpenRouter credentials are
+triage, coding and independent review. The normal working session can still use
+local Qwen. OpenRouter credentials are
 resolved through the existing provider registry. [Muse Contributor](https://openrouter.ai/meta/muse-spark-1.3-contributor)
 prompts and outputs may be used to improve Meta’s products. Adjust the absolute
 repository/runtime paths for another checkout. Omit `:coding_model`
@@ -219,3 +219,65 @@ question answering and shared HTTP controls. Native/compiled probes live in
 The [archived nREPL notes](_archive/nrepl-hub.md) retain protocol details and
 dated verification; their old separate-HTTP-registry and patched-runtime
 statements are superseded by the current implementation and stock let-go 1.13.0.
+
+## Proposed browser session workbench and repair supervision
+
+This section is a design proposal, not implemented behavior. `serve` currently
+exposes the pipeline API; it does not serve an interactive session REPL.
+
+The inspected Evener checkout provides useful reference boundaries:
+`cmd/evener-hub/internal/hubcore/config.go` defines a spawner for session `serve`
+subprocesses; `internal/appsource/local_daemon.go` supplies read/start/steer
+operations, and `app_subagent_preview.go` derives bounded child previews from
+thread items. Its browser session pane is a client of those operations.
+The local let-go `examples/browser-inspector` demonstrates a browser evaluation
+workbench, but only for one embedded default session. It is not itself a remote
+agent-session manager; the intended Andrey example still needs identification.
+
+Recommended shape:
+
+- A stable hub owns browser/terminal attachments, session identities and parent/
+  child relationships, event cursors, durable conversation checkpoints, continual
+  harness ledgers, and repair supervision. Clients select typed sessions, agents,
+  tool calls and files to inspect or act on through the same hub operations.
+- A browser workbench attaches to existing sessions, streams transcripts and
+  current activity, sends steering or queued follow-ups, drills into subagents,
+  answers questions, and inspects refinement/repair activity. It reconnects using
+  a snapshot plus event cursor, recovering explicitly from cursor expiry. Lisp
+  evaluation is a distinct explicit mode, as in the terminal console. Exposing
+  these controls requires loopback defaults and same-origin/authenticated browser
+  requests, not the pipeline API's existing wildcard CORS behavior.
+- A supervised worker process owns the agent/tool loop for a session and its
+  subagent tree. The hub tracks worker generations, rejects stale replies, and
+  remains available if a worker crashes or fails to load an updated revision.
+  Conversation recovery must checkpoint transcript, context projection, queued
+  inputs and outstanding operation identities, not only adaptive harness state.
+  Interrupted side effects are reported as uncertain rather than replayed.
+- Normal triage, repair coding and review use the configured Muse model. A
+  bounded emergency advisory stage may invoke the existing Codex or Claude Code
+  connectors after normal repair fails or the worker cannot boot. It receives
+  incident/reproduction/patch evidence and can propose a remedy; host verification
+  and explicit activation still apply. Its failures never recursively escalate.
+- Continual improvement covers both adaptive refinement and source repair, with
+  one visible incident lifecycle. Successful verified repairs feed a concise
+  revision-linked outcome back into harness memory; attempted or unverified fixes
+  never become asserted lessons. Source commits and adaptive ledger edits keep
+  their existing distinct validation paths.
+
+There are three activation approaches: in-process reload only (simple, but shares
+failure state and captured callbacks), replacement workers only (clear recovery,
+but requires checkpoint/restore), or a hybrid. Prefer the hybrid: replace workers
+for framework/state changes; permit narrowly scoped dynamic reload only after
+pausing new work, verifying compatibility, rebinding affected handlers, and
+checking health. A local let-go probe confirmed that redefining a var updates a
+fresh call while a previously captured function still invokes the old code.
+
+Implementation order: first add hub operations for a session/subagent tree and
+bounded transcript snapshots, then the browser client; next add emergency advisor
+routing and verified outcomes to continual refinement; finally add worker
+checkpoint/restore and generation-aware replacement, with dynamic reload as a
+restricted optimization. Acceptance must demonstrate child interaction, browser
+reconnection, real worker death during a tool call, no duplicate side effects,
+failed-update recovery, and repair of an unbootable worker while the hub remains
+usable. This proposal does not yet implement emergency escalation, browser UI,
+worker subprocesses or reload activation.
