@@ -2,8 +2,9 @@
 
 Run GitHub Actions on every branch push and pull request, with manual dispatch
 available for diagnosis. Build and run the full deterministic suite on Ubuntu
-24.04 and macOS 14 using public, checksum-pinned let-go 1.13.0 and lgx 0.3.2
-release binaries. Include the shipped JavaScript interaction probe. No provider
+24.04 and macOS 14 using public let-go source revision
+`50786343e5511973d3ad724b1acf83b91c2775f8` (Go 1.27.1) and checksum-pinned
+lgx 0.3.2. Stock let-go 1.13.0 fails the descendant-cancellation contract. Include the shipped JavaScript interaction probe. No provider
 credentials or local configuration are needed.
 
 Use read-only workflow permissions, pinned action revisions, bounded job time,

@@ -37,7 +37,7 @@ in-context adaptation and the separate, opt-in model-training workflow. The core
 harness needs no trainer.
 
 It is built with [lgx](https://github.com/abogoyavlensky/lgx) and runs on a
-stock [let-go](https://github.com/nooga/let-go) release.
+a pinned [let-go](https://github.com/nooga/let-go) development revision (see below).
 
 ## Build and run
 
@@ -47,10 +47,12 @@ test commands and retention policy.
 
 Prerequisites:
 
-- [let-go](https://github.com/nooga/let-go) 1.13.0 on `PATH` as `lg`. That
-  release carries everything Attractor needs, including the native TCP listener
-  and correct JSON object keys that this project previously had to patch in
-  locally. `lgx.edn` pins the version; lgx refuses to run on a mismatch.
+- [let-go](https://github.com/nooga/let-go) revision
+  `50786343e5511973d3ad724b1acf83b91c2775f8`, built with Go 1.27.1. Stock
+  1.13.0 fails the descendant-cancellation contract; the version declaration in
+  `lgx.edn` alone does not capture this requirement. Set `LGX_LG` to the built
+  development binary. CI's `.github/scripts/install-tools.sh` shows the exact
+  source checkout and build commands.
 - [lgx](https://github.com/abogoyavlensky/lgx) 0.3.2 or newer.
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
@@ -93,8 +95,8 @@ diagnostics, and the per-namespace summary format used by `lgx runners`.
 
 GitHub Actions builds the executable, runs `lgx suite`, and checks the browser
 interaction script on Ubuntu 24.04 and macOS 14 for every branch push and pull
-request. CI uses checksum-pinned let-go 1.13.0 and lgx 0.3.2 releases and needs no
-provider credentials. Live provider tests remain separate, opt-in checks.
+request. CI builds the pinned let-go source revision above and verifies the checksum of
+the lgx 0.3.2 release. It needs no provider credentials. Live provider tests remain separate, opt-in checks.
 
 Merges into `main` require a pull request and both `Build and test` platform
 checks to pass against the current base. The local `make hooks` pre-push check
