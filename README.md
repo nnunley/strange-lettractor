@@ -89,6 +89,20 @@ lgx 0.3.2 includes the `clojure.test` runner fix for let-go 1.13.0.
 The local `test/runner.lg` remains available for namespace selection, deadline
 diagnostics, and the per-namespace summary format used by `lgx runners`.
 
+### Continuous integration
+
+GitHub Actions builds the executable, runs `lgx suite`, and checks the browser
+interaction script on Ubuntu 24.04 and macOS 14 for every branch push and pull
+request. CI uses checksum-pinned let-go 1.13.0 and lgx 0.3.2 releases and needs no
+provider credentials. Live provider tests remain separate, opt-in checks.
+
+Merges into `main` require a pull request and both `Build and test` platform
+checks to pass against the current base. The local `make hooks` pre-push check
+remains useful for catching failures before uploading; hosted checks enforce
+the merge requirement. Workflow jobs have a 20-minute limit and superseded runs
+are cancelled. Logs are available in the repository's Actions tab; application
+ledgers and generated artifacts are not uploaded.
+
 Rebuild after every pull: `bin/attractor` is a build artifact, not tracked.
 The runtime must expose the typed `Cancelled` condition used by ownership
 boundaries; see [runtime requirements](docs/let-go-runtime-issues.md).
