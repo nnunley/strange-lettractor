@@ -1,7 +1,8 @@
 (ns main
   (:require [attractor.llm :as llm] [attractor.http-fixture :as fixture]
-            [http :as http] [json :as json] [os :as os]
-            [clojure.test :refer [deftest is]] [clojure.core :as core]))
+            [http :as http] [json :as json]
+            [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [harness.tests :as tests]))
 
 (defn wait-for [f predicate milliseconds]
   (let [deadline (+ (System/currentTimeMillis) milliseconds)]
@@ -149,8 +150,5 @@
               (finally (core/scope-close! scope 1000)))))))))
 
 (defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))

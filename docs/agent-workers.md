@@ -102,7 +102,7 @@ Run from the Codex worktree root:
 
 ```sh
 /Users/ndn/development/let-go/lg test/probes/codex_fixture_smoke.lg
-/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
+/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote harness.tests) (quote attractor.codex-transport-test)) (harness.tests/run-and-exit! (quote attractor.codex-transport-test))'
 ```
 
 On 2026-09-07 the smoke harness exited zero: normal, split, coalesced, delayed,
@@ -428,7 +428,7 @@ accumulate the same text twice.
 Run the focused suite with the local runtime:
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.qwen-reasoning-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
+/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote harness.tests) (quote attractor.qwen-reasoning-test)) (harness.tests/run-and-exit! (quote attractor.qwen-reasoning-test))'
 ```
 
 The tests exercise low-level streaming, a configured client, the stream

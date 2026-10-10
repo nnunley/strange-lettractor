@@ -198,7 +198,7 @@ bundling, and returns a failing exit status when any assertion fails.
 
 - [x] Add `test/attractor/stream_completion_test.lg` with public `llm/stream` offline SSE cases. Assert completed values, exact Unicode/whitespace, empty segments, interleaved segments, duplicate completion, done-only and delta-only fallback, raw metadata, and final response/tool/usage preservation. Cover Anthropic redacted thinking without inventing plaintext. Cover compatible text as well as native text/reasoning.
 - [x] Run focused tests and observe assertion failures before changing production code:
-  `/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.stream-completion-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'`
+  `/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote harness.tests) (quote attractor.stream-completion-test)) (harness.tests/run-and-exit! (quote attractor.stream-completion-test))'`
 - [x] Implement missing end values and required segment isolation. Preserve IDs for unindexed/single-index-zero streams when possible, with collision-free IDs for additional indexed segments. All applicable OpenAI done paths must use the same segment state and suppress duplicate completion. Prefer explicit native done text when supplied (including empty), otherwise accumulated deltas. Do not broaden this into transport cancellation or whole-provider parity.
 - [x] Re-run focused tests, existing `attractor.llm-test` and `attractor.qwen-reasoning-test` together; fix regressions.
 - [x] Independent spec review, then quality review; resolve findings.

@@ -2,7 +2,7 @@
   (:require [attractor.context-discovery :as capacity] [attractor.execution :as execution]
             [attractor.http-fixture :refer [run-fixture quote-shell]]
             [http :as http] [os :as os] [io :as io] [clojure.string :as str]
-            [clojure.core :as core] [clojure.test :refer [deftest is]]))
+            [clojure.core :as core] [clojure.test :refer [deftest is]] [harness.tests :as tests]))
 
 (deftest native-discovery-refresh-validation-and-cleanup
   (run-fixture
@@ -97,8 +97,5 @@
       (finally (core/scope-close! scope 1000)))))
 
 (defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))
