@@ -38,9 +38,9 @@ this is **not an OS sandbox** and is not suitable for untrusted remote submissio
 From the repository/worktree root, using local let-go:
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:bench bench/edit_format/core_test.lg
-/Users/ndn/development/let-go/lg -source-paths bench bench/edit_format/fixtures_test.lg
-/Users/ndn/development/let-go/lg -source-paths src:bench bench/edit_format/runner_test.lg
+/Users/ndn/development/let-go/lg -source-paths src:bench:test bench/edit_format/core_test.lg
+/Users/ndn/development/let-go/lg -source-paths bench:test bench/edit_format/fixtures_test.lg
+/Users/ndn/development/let-go/lg -source-paths src:bench:test bench/edit_format/runner_test.lg
 /Users/ndn/development/let-go/lg -source-paths src:bench -e '(require (quote [edit-format.runner :as r])) (r/run! "/tmp/edit-pilot-new" :pilot) (r/run! "/tmp/edit-full-new" :full "/tmp/edit-pilot-new")'
 ```
 

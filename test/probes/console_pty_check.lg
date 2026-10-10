@@ -4,7 +4,7 @@
    real tty with the mock model. Run after lgx rebuild with lg -source-paths test."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
             [harness.deadline :as deadline]
-            [os :as os] [io :as io]))
+            [os :as os] [io :as io] [harness.tests :as tests]))
 
 (defn- temp-file [] (str/trim (:out (os/sh "/usr/bin/mktemp"))))
 (defn- drive [typescript args script]
@@ -40,7 +40,5 @@
 
 (defn -main [& _]
   (deadline/start! {:timeout-ms 45000 :describe (fn [] "compiled console PTY checks")})
-  (let [summary (clojure.test/run-tests)]
-    (prn summary)
-    (os/exit (if (zero? (+ (:fail summary) (:error summary))) 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))

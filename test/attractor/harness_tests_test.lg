@@ -1,0 +1,14 @@
+(ns attractor.harness-tests-test
+  (:require [clojure.test :refer [deftest is]]
+            [harness.tests :as tests]))
+
+(deftest a-run-with-no-tests-does-not-pass
+  (is (not (tests/passed? {:test 0 :pass 0 :fail 0 :error 0})))
+  (is (not (tests/passed? {}))))
+
+(deftest failures-and-errors-do-not-pass
+  (is (not (tests/passed? {:test 2 :pass 1 :fail 1 :error 0})))
+  (is (not (tests/passed? {:test 2 :pass 1 :fail 0 :error 1}))))
+
+(deftest a-clean-run-passes
+  (is (tests/passed? {:test 2 :pass 5 :fail 0 :error 0})))
