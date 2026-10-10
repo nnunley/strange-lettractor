@@ -281,3 +281,36 @@ reconnection, real worker death during a tool call, no duplicate side effects,
 failed-update recovery, and repair of an unbootable worker while the hub remains
 usable. This proposal does not yet implement emergency escalation, browser UI,
 worker subprocesses or reload activation.
+
+## Conversational threading implementation
+
+The interactive UI uses the existing EDN history shape as its conversation
+record. Each root session owns a tree of thread records; a thread identifies its
+root and parent, task, model, state, and ordered user/assistant/tool history.
+The hub supplies `thread/list`, `thread/read`, `thread/submit`, `thread/cancel`,
+and explicit `thread/resume`. Clients select a thread before sending input.
+A reconnect reads a complete thread snapshot; the bounded activity event stream
+is notification rather than the only copy of the conversation.
+
+Snapshots live under `attractor_runs/conversations/` for CLI-owned hubs, with
+one atomically replaced EDN file per root. Embedded hubs opt in with
+`:conversation_root`. Persist at meaningful conversation boundaries, not on
+streaming token deltas. Restored threads are inspectable archives; no provider
+call or tool is replayed on startup. Explicit resume creates a new root session
+linked to the archived thread, carrying completed history. Interrupted calls
+without results must be refused rather than fabricated or replayed. Host model,
+tools and permissions come from current startup configuration.
+
+Implementation sequence:
+
+- [ ] Add serializable thread snapshots and atomic EDN archive storage; test
+      nested threads, corrupt snapshots and restart inspection.
+- [ ] Integrate hub thread operations, child input/cancellation and explicit
+      history resume; test targeting and interrupted-call refusal.
+- [ ] Expose thread selection and transcript inspection in both consoles and a
+      same-origin browser workbench through the existing HTTP server.
+- [ ] Verify persisted thread recovery, HTTP boundaries, UI routing and existing
+      hub/console behavior, review, and commit the implementation.
+
+This extends the co-learning history representation and existing workflow and
+harness artifacts. It does not introduce a database or copy Samizdat code.
