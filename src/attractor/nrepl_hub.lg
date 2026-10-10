@@ -6,6 +6,7 @@
     :workflow/run :workflow/resume :workflow/list :workflow/result :workflow/inspect :workflow/events :workflow/checkpoint :workflow/cancel
     :agent/run :agent/list :agent/result :agent/cancel
     :repair/status :repair/detail :repair/cancel :repair/activate
+    :thread/list :thread/read :thread/submit :thread/cancel :thread/resume
     :session/context :session/compact :session/harness :session/refine :session/open :session/list :session/submit :session/result :session/cancel
     :question/list :question/answer :client/attach :client/detach :events/since})
 

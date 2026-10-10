@@ -56,7 +56,7 @@
     {:session_id (:session c)
      :run_id (when (= :run (:kind f)) (:id f))
      :agent_id (when (= :agent (:kind f)) (:id f))}))
-(declare drain!)
+(declare drain! history-lines)
 
 (defn close!
   "Detach this client. Hub-owned sessions, runs and agent jobs keep running.
@@ -217,23 +217,60 @@
     (str label (when (or (seq active) (pos? (or done 0)))
                  (str " · " (count active) " active · " (or done 0) " done")))))
 
+(defn- selected-thread-event
+  "Project a root envelope onto the selected thread's subtree. Sibling events
+   never reach activity accounting or notices for a child selection."
+  [id envelope]
+  (when (= :session (:source envelope))
+    (if (= id (:session_id envelope)) (:event envelope)
+      (loop [event (:event envelope)]
+        (when (= :subagent_event (:type event))
+          (if (= id (:agent_id event)) (:event event)
+            (recur (:event event))))))))
+
 (defn- track-activity! [console envelope]
   (let [{:keys [kind id]} (:focus @console)
-        matches (case kind
-                  :session (= id (:session_id envelope))
-                  :run (= id (:run_id envelope))
-                  :agent (= id (:agent_id envelope)) false)]
-    (when matches (swap! console update :activity activity-event (:event envelope) nil))))
+        event (if (= kind :thread) (selected-thread-event id envelope)
+                (when (case kind
+                        :session (= id (:session_id envelope))
+                        :run (= id (:run_id envelope))
+                        :agent (= id (:agent_id envelope)) false)
+                  (:event envelope)))]
+    (when event (swap! console update :activity activity-event event nil))))
+
+(defn- thread-notices [id event]
+  (if (= :subagent_event (:type event))
+    (thread-notices (:agent_id event) (:event event))
+    (let [tag (str "[thread " (short-id id) "] ")]
+      (case (:type event)
+        :error [(str tag "error: " (:error event))]
+        :warning [(str tag "warning: " (or (:message event) (pr-str event)))]
+        :repair_status [(str tag "Repair " (:repair_id event) ": " (name (:status event))
+                             (when (:summary event) (str " — " (:summary event))))]
+        :refine_error [(str tag "Harness refinement failed: " (:error event))]
+        :compaction_failed [(str tag "Context checkpoint failed; original context retained")]
+        []))))
 
 (defn render-envelope [console envelope]
   (track-activity! console envelope)
-  (case (:source envelope)
-    :session (session-lines console envelope)
-    :question (question-lines envelope)
-    :eval (eval-lines envelope)
-    :workflow (workflow-lines envelope)
-    :agent (agent-lines console envelope)
-    []))
+  (if (and (= :thread (get-in @console [:focus :kind])) (= :session (:source envelope)))
+    (let [id (get-in @console [:focus :id])]
+      (if-let [event (selected-thread-event id envelope)] (thread-notices id event) []))
+    (case (:source envelope)
+      :session (session-lines console envelope)
+      :question (question-lines envelope)
+      :eval (eval-lines envelope)
+      :workflow (workflow-lines envelope)
+      :agent (agent-lines console envelope)
+      [])))
+
+(defn- thread-updates! [console]
+  (when (= :thread (get-in @console [:focus :kind]))
+    (let [id (get-in @console [:focus :id]) t (request! @console :thread/read {:thread_id id})
+          seen (get-in @console [:thread_seen id] 0) history (vec (:history t))
+          start (if (> seen (count history)) 0 seen)]
+      (swap! console assoc-in [:thread_seen id] (count history))
+      (rest (history-lines (assoc t :history (subvec history start) :pending []))))))
 
 (defn drain!
   "Render every hub event published since the last drain."
@@ -246,7 +283,9 @@
       (try
         (let [{:keys [events cursor]} ((:events_fn c) (get-in c [:client :client_id]) (:cursor c))]
           (swap! console assoc :cursor cursor)
-          {:lines (vec (mapcat #(render-envelope console %) events))})
+          {:lines (if (= :thread (get-in @console [:focus :kind]))
+                    (into (vec (mapcat #(render-envelope console %) events)) (thread-updates! console))
+                    (vec (mapcat #(render-envelope console %) events)))})
         (catch Object e
           (if (= :cursor-expired (:category (ex-data e)))
             ;; Fell behind the bounded log: resync to its newest cursor and say so.
@@ -254,7 +293,9 @@
                                                        (:oldest_cursor (ex-data e)))]
               (swap! console assoc :cursor cursor :activity {:active {} :done 0 :phase "Activity unknown (events dropped)"})
               {:lines (into ["… older events dropped (client fell behind the hub log)"]
-                            (mapcat #(render-envelope console %) events))})
+                            (if (= :thread (get-in @console [:focus :kind]))
+                              (into (vec (mapcat #(render-envelope console %) events)) (thread-updates! console))
+                              (mapcat #(render-envelope console %) events)))})
             {:lines [(str "error: " (ex-message e))]}))))))
 
 ;; --- commands ---------------------------------------------------------------
@@ -265,6 +306,7 @@
    "  : form          evaluate let-go in the hub console namespace"
    "  :{ / :}         begin / submit a multiline evaluation"
    "  \\text           literal agent text"
+   "  /threads /thread <id> /resume <id>   inspect or explicitly resume a conversation"
    "  /help /list /new /focus <id> /run <file.dot> [--auto-approve]"
    "  /answer <key or text>   answer the waiting human gate (focused run first)"
    "  /agent <name> <prompt> [--cwd d] [--model m] [--tools a,b] [--permission-mode p]"
@@ -288,6 +330,29 @@
       (let [{:keys [session_id]} (request! @console :session/open {})]
         (focus! console :session session_id)
         session_id)))
+
+(defn- thread-record [console id]
+  (let [matches (filter #(or (= id (:thread_id %)) (= id (short-id (:thread_id %))))
+                        (request! @console :thread/list {}))]
+    (when-not (= 1 (count matches)) (fail! (str "Expected one thread matching " id)))
+    (request! @console :thread/read {:thread_id (:thread_id (first matches))})))
+
+(defn history-lines [thread]
+  (vec (concat
+    [(str "thread " (:thread_id thread) " · " (or (:state thread) "unknown")
+          (when (:archived thread) " (archive; /resume to continue)"))]
+    (mapcat (fn [turn]
+              (concat [(str (name (or (:role turn) (:type turn) :message)) ": " (:content turn))]
+                      (map #(str "tool call " (:id %) " · " (:name %) " " (pr-str (:arguments %))) (:tool_calls turn))
+                      (map #(str "tool result " (:tool_call_id %) " · " (or (:tool_name %) (:name %) "") " " (pr-str (:content %))) (:results turn))))
+            (:history thread))
+    (map #(str "pending: " (:text %)) (:pending thread)))))
+
+(defn- submit-text! [console text behavior]
+  (let [c @console f (:focus c)]
+    (if (= :thread (:kind f))
+      (request! c :thread/submit {:thread_id (:id f) :text text :behavior behavior})
+      (request! @console :session/submit {:session_id (ensure-session! console) :text text :queue true :behavior behavior}))))
 
 (def ^:private boolean-flags #{:auto-approve})
 (def ^:private agent-flag-keys
@@ -414,6 +479,7 @@
 (defn- cancel! [console]
   (let [c @console {:keys [kind id]} (:focus c)]
     (case kind
+      :thread (do (request! c :thread/cancel {:thread_id id}) [(str "cancel requested: thread " (short-id id))])
       :agent (do (request! c :agent/cancel {:agent_id id}) [(str "cancel requested: agent " (short-id id))])
       :run (do (request! c :workflow/cancel {:run_id id}) [(str "cancel requested: run " (short-id id))])
       :session (do (request! c :session/cancel {:session_id id}) (swap! console assoc :activity {:active {} :done 0 :phase "Cancelled"}) [(str "cancel requested: session " (short-id id))])
@@ -429,6 +495,7 @@
           find (fn [key op] (first (filter #(= id (get % key)) (request! c op {}))))]
       (boolean
         (case kind
+          :thread (contains? #{:processing :running :busy :active} (:state (request! c :thread/read {:thread_id id})))
           :session (:busy (find :session_id :session/list))
           :run (when-let [run (find :run_id :workflow/list)] (not (:done run)))
           :agent (when-let [job (find :agent_id :agent/list)] (not (:done job)))
@@ -437,6 +504,22 @@
 
 (defn- command! [console command args]
   (case command
+    :threads (let [threads (request! @console :thread/list {})
+                   by-id (into {} (map (fn [t] [(:thread_id t) t]) threads))
+                   depth (fn [t] (loop [id (:parent_id t) seen #{(:thread_id t)} n 0]
+                                   (if (or (nil? id) (contains? seen id) (nil? (get by-id id))) n
+                                     (recur (:parent_id (get by-id id)) (conj seen id) (inc n)))))]
+               (mapv (fn [t] (str (apply str (repeat (depth t) "  ")) (when (:parent_id t) "↳ ")
+                                  (:thread_id t) " · " (:task t) " · " (:state t)
+                                  (when (:archived t) " (archive)"))) threads))
+    :thread (let [t (thread-record console (str/trim args))]
+              (focus! console :thread (:thread_id t))
+              (swap! console assoc-in [:thread_seen (:thread_id t)] (count (:history t)))
+              (history-lines t))
+    :resume (let [t (thread-record console (str/trim args))
+                  resumed (request! @console :thread/resume {:thread_id (:thread_id t)})]
+              (focus! console :thread (:thread_id resumed))
+              [(str "resumed as thread " (:thread_id resumed))])
     :help help-lines
     :list (list-lines console)
     :new (let [{:keys [session_id]} (request! @console :session/open {})]
@@ -486,8 +569,7 @@
               (request! @console :session/refine {:session_id id :instructions args})
               ["Harness refinement planning started"])
     :followup (if (str/blank? args) ["usage: /followup <text>"]
-                (let [id (ensure-session! console)
-                      result (request! @console :session/submit {:session_id id :text args :queue true :behavior :followup})]
+                (let [result (submit-text! console args :followup)]
                   [(str (if (:queued result) "Queued follow-up" "Started follow-up") " for turn " (short-id (:turn_id result)))]))
     :run (run! console args)
     :answer (answer! console args)
@@ -499,9 +581,8 @@
 
 (defn- dispatch! [console action]
   (case (:type action)
-    :agent (let [sid (ensure-session! console)
-                 {:keys [turn_id queued]} (request! @console :session/submit {:session_id sid :text (:text action) :queue true :behavior :steer})]
-             [(str (if queued "→ queued steering " "→ agent ") (short-id sid) " turn " (short-id turn_id))])
+    :agent (let [{:keys [turn_id queued]} (submit-text! console (:text action) :steer)]
+             [(str (if queued "→ queued steering " "→ agent ") "turn " (short-id turn_id))])
     :eval (let [f (:selection action)
                 {:keys [eval_id]} (request! @console :eval/submit {:code (:text action) :session_id (:session_id f) :run_id (:run_id f)})]
             [(str "→ eval " (short-id eval_id))])

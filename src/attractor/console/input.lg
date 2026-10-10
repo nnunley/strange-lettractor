@@ -1,6 +1,6 @@
 (ns attractor.console.input (:require [clojure.string :as str]))
 
-(def ^:private commands #{:help :list :new :focus :run :answer :agent :alias :cancel :quit :followup :harness :refine :repair :context :compact})
+(def ^:private commands #{:threads :thread :resume :help :list :new :focus :run :answer :agent :alias :cancel :quit :followup :harness :refine :repair :context :compact})
 
 (defn command? "True for a built-in slash command name." [name] (contains? commands (keyword name)))
 

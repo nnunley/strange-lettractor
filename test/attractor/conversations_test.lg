@@ -1,0 +1,117 @@
+(ns attractor.conversations-test
+  (:require [clojure.test :refer [deftest is]] [clojure.edn :as edn]
+            [attractor.conversations :as c] [io :as io] [os :as os]))
+(defn fixture [] (str "/tmp/attractor-conversations-" (System/nanoTime)))
+(defn tree []
+  (let [grandchild (atom {:id "grandchild" :model "mock/child" :state :idle :history []})
+        child (atom {:id "child" :model "mock/child" :state :processing
+                     :config {:delegation_task "child task" :api_key "secret"}
+                     :history [{:role :tool :content {:ok true :items #{:a :b}}}]
+                     :subagents {"grandchild" {:session grandchild}}})]
+    (atom {:id "root/../safe" :model "mock/root" :state :idle :harness_steps 4
+           :history [{:role :user :content "root task"}]
+           :context_projection {:omitted_steps #{1 2}}
+           :provider_profile {:api_key "secret"} :callback (fn [])
+           :subagents {"child" {:session child :status :running}}})))
+(defn category [f] (try (f) nil (catch Object e (:category (ex-data e)))))
+(deftest nested-snapshot-retains-data-without-runtime-state
+  (let [s (c/snapshot (tree)) [r child grandchild] (:threads s)]
+    (is (= 1 (:schema s)))
+    (is (= s (edn/read-string (pr-str s))))
+    (is (= ["root/../safe" "child" "grandchild"] (mapv :thread_id (:threads s))))
+    (is (= [nil "root/../safe" "child"] (mapv :parent_id (:threads s))))
+    (is (= "root task" (:task r))) (is (= "child task" (:task child)))
+    (is (= 4 (:harness_steps r)))
+    (is (= {:omitted_steps #{1 2}} (:context_projection r)))
+    (is (nil? (:provider_profile r))) (is (nil? (:config child)))))
+(deftest saved-tree-reopens-as-inspectable-archive
+  (let [root (fixture) s (c/snapshot (tree)) store (c/open-store root)]
+    (c/save! store s) (c/close! store)
+    (let [again (c/open-store root)]
+      (try
+        (is (= 3 (count (c/threads again))))
+        (is (= :interrupted (:state (c/read-thread again "child"))))
+        (is (= :archived (:state (c/read-thread again "grandchild"))))
+        (is (= true (:archived (c/read-thread again "child"))))
+        (is (= (:history (second (:threads s))) (:history (c/read-thread again "child"))))
+        (is (nil? (c/read-thread again "absent")))
+        (finally (c/close! again))))))
+(deftest corrupt-snapshots-refused-and-owner-released
+  (doseq [bad ["{" "{:schema 1 :root_id \"r\" :threads []}" "{:schema 2}"]]
+    (let [root (fixture)]
+      (io/mkdir root) (io/spit (str root "/bad.edn") bad)
+      (is (= :conversation-corrupt (category #(c/open-store root))))
+      (is (= :conversation-corrupt (category #(c/open-store root)))))))
+(deftest owner-lock-and-close
+  (let [root (fixture) a (c/open-store root)]
+    (is (= :conversation-in-use (category #(c/open-store root))))
+    (c/close! a) (c/close! a)
+    (let [b (c/open-store root)] (c/close! b))
+    (is (= :conversation-closed (category #(c/save! a (c/snapshot (tree))))))))
+(deftest memory-store-and-concurrent-saves
+  (let [store (c/open-store nil)
+        jobs (mapv (fn [n] (future (c/save! store (c/snapshot (atom {:id (str n) :state :idle :history []}))))) (range 20))]
+    (doseq [job jobs] @job)
+    (is (= 20 (count (c/threads store))))
+    (c/close! store)))
+(deftest continuation-metadata-is-safe-and-pending-is-explicit
+  (let [a (tree)]
+    (swap! a assoc :model "root" :steering-queue ["steer"] :followup-queue ["later"] :resumed_from "old"
+           :provider_profile {:id "mock" :model "root" :api_key "secret"}
+           :config {:user_instructions "instructions" :api_key "secret"})
+    (let [r (first (:threads (c/snapshot a)))]
+      (is (= "mock/root" (:model r)))
+      (is (= "old" (:resumed_from r)))
+      (is (= "instructions" (:user_instructions r)))
+      (is (= [{:text "steer" :behavior :steer} {:text "later" :behavior :followup}] (:pending r))))))
+(deftest rejects-runtime-history-and-trailing-edn
+  (let [a (tree)]
+    (swap! a assoc :history [{:role :user :content (atom "opaque")}])
+    (is (= :conversation-corrupt (category #(c/snapshot a)))))
+  (let [root (fixture)]
+    (io/mkdir root)
+    (io/spit (str root "/bad.edn") (str (pr-str (c/snapshot (tree))) " {}"))
+    (is (= :conversation-corrupt (category #(c/open-store root))))))
+(deftest concurrent-disk-replacement-keeps-complete-last-snapshot
+  (let [root (fixture) store (c/open-store root) s (c/snapshot (tree))
+        jobs (mapv (fn [n] (future (c/save! store (assoc-in s [:threads 0 :harness_steps] n)))) (range 12))]
+    (doseq [job jobs] @job)
+    (let [before (c/threads store)]
+      (c/close! store)
+      (let [again (c/open-store root)]
+        (try (is (= before (c/threads again))) (finally (c/close! again)))))))
+(deftest duplicate-thread-identities-refused-across-roots
+  (let [store (c/open-store nil) s (c/snapshot (tree))
+        other {:schema 1 :root_id "child" :threads [{:thread_id "child" :root_id "child"
+                    :parent_id nil :state :idle :history []}]}]
+    (c/save! store s)
+    (is (= :conversation-corrupt (category #(c/save! store other))))
+    (is (= 3 (count (c/threads store))))
+    (c/close! store)))
+(deftest failed-publication-retains-memory-and-cleans-temp
+  (let [root (fixture) store (c/open-store root) s (c/snapshot (tree))]
+    (try
+      (c/save! store s)
+      (let [path (get @(:paths store) (:root_id s)) before (c/threads store)]
+        (io/delete-file path) (io/mkdir path)
+        (is (true? (try (c/save! store (assoc-in s [:threads 0 :harness_steps] 99)) false (catch Object _ true))))
+        (is (= before (c/threads store)))
+        (is (= 2 (count (os/ls root)))))
+      (finally (c/close! store)))))
+(deftest busy-child-followups-on-parent-handle-survive-snapshot
+  (let [root (tree) child (get-in @root [:subagents "child" :session])]
+    (swap! child assoc :steering-queue ["adjust current work"] :followup-queue ["child queue"])
+    (swap! root assoc-in [:subagents "child" :pending]
+           [{:input "next parent request" :origin {:callback (fn [])}}
+            {:input "last parent request" :origin {:turn_id "turn-2"}}])
+    (let [s (c/snapshot root) record (second (:threads s)) store (c/open-store nil)]
+      (try
+        (c/save! store s)
+        (is (= [{:text "adjust current work" :behavior :steer}
+                {:text "child queue" :behavior :followup}
+                {:text "next parent request" :behavior :followup}
+                {:text "last parent request" :behavior :followup}]
+               (:pending record)))
+        (is (= (:pending record) (:pending (c/read-thread store "child"))))
+        (is (= s (edn/read-string (pr-str s))))
+        (finally (c/close! store))))))

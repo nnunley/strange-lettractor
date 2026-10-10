@@ -45,3 +45,39 @@
       (is (= #{[nil "parent"] ["sibling" "same"]}
              (set (keys (get-in @c [:activity :active])))))
       (is (= 0 (get-in @c [:activity :done]))))))
+
+(deftest thread-drain-tracks-selected-subtree-with-snapshot-transcripts
+  (let [events (atom [])
+        c (session/open! nil {:request_fn (fn [r] {:value (case (:op r)
+                                            :client/attach {:client_id "c" :cursor 0}
+                                            :thread/list [{:thread_id "child"} {:thread_id "s"} {:thread_id "grandchild"}]
+                                            :thread/read {:thread_id (:thread_id r) :history []}
+                                            {})})
+                             :events_fn (fn [_ cursor] (let [batch @events] (reset! events []) {:events batch :cursor (inc cursor)}))})
+        child (fn [id event] (ev :subagent_event {:agent_id id :event event}))
+        start {:type :tool_call_start :tool_name "read_file" :call_id "same"}
+        end {:type :tool_call_end :tool_name "read_file" :call_id "same"}]
+    (session/handle! c {:type :line :text "/thread child"})
+    (reset! events [(child "sibling" start) (child "child" start)
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event start})])
+    (is (empty? (:lines (session/drain! c))))
+    (is (= #{[nil "same"] ["grandchild" "same"]} (set (keys (get-in @c [:activity :active])))))
+    (reset! events [(child "sibling" end) (child "child" end)])
+    (session/drain! c)
+    (is (= 1 (get-in @c [:activity :done])))
+    (is (= #{["grandchild" "same"]} (set (keys (get-in @c [:activity :active])))))
+    (reset! events [(child "sibling" {:type :error :error "irrelevant"})
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event {:type :error :error "relevant"}})])
+    (let [lines (:lines (session/drain! c))]
+      (is (= 1 (count lines)))
+      (is (= "[thread grandchild] error: relevant" (first lines))))
+    (is (empty? (get-in @c [:activity :active])))
+    (session/handle! c {:type :line :text "/thread grandchild"})
+    (reset! events [(child "child" start)
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event start})])
+    (session/drain! c)
+    (is (= #{[nil "same"]} (set (keys (get-in @c [:activity :active])))))
+    (session/handle! c {:type :line :text "/thread s"})
+    (reset! events [(ev :tool_call_start {:tool_name "wait" :call_id "root"}) (child "child" start) (child "sibling" start)])
+    (session/drain! c)
+    (is (= 3 (count (get-in @c [:activity :active]))))))

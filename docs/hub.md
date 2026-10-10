@@ -279,8 +279,8 @@ checkpoint/restore and generation-aware replacement, with dynamic reload as a
 restricted optimization. Acceptance must demonstrate child interaction, browser
 reconnection, real worker death during a tool call, no duplicate side effects,
 failed-update recovery, and repair of an unbootable worker while the hub remains
-usable. This proposal does not yet implement emergency escalation, browser UI,
-worker subprocesses or reload activation.
+usable. The conversational threading work below implements the browser UI. Emergency
+escalation, worker subprocesses and reload activation remain future work.
 
 ## Conversational threading implementation
 
@@ -295,7 +295,9 @@ is notification rather than the only copy of the conversation.
 Snapshots live under `attractor_runs/conversations/` for CLI-owned hubs, with
 one atomically replaced EDN file per root. Embedded hubs opt in with
 `:conversation_root`. Persist at meaningful conversation boundaries, not on
-streaming token deltas. Restored threads are inspectable archives; no provider
+streaming token deltas. The agent emits `:tool_results_recorded` after appending
+completed tool results and before starting another provider call; this is the
+durable tool-turn boundary (`:tool_call_end` occurs before the history append). Restored threads are inspectable archives; no provider
 call or tool is replayed on startup. Explicit resume creates a new root session
 linked to the archived thread, carrying completed history. Interrupted calls
 without results must be refused rather than fabricated or replayed. Host model,
@@ -303,14 +305,37 @@ tools and permissions come from current startup configuration.
 
 Implementation sequence:
 
-- [ ] Add serializable thread snapshots and atomic EDN archive storage; test
+- [x] Add serializable thread snapshots and atomic EDN archive storage; test
       nested threads, corrupt snapshots and restart inspection.
-- [ ] Integrate hub thread operations, child input/cancellation and explicit
+- [x] Integrate hub thread operations, child input/cancellation and explicit
       history resume; test targeting and interrupted-call refusal.
-- [ ] Expose thread selection and transcript inspection in both consoles and a
+- [x] Expose thread selection and transcript inspection in both consoles and a
       same-origin browser workbench through the existing HTTP server.
-- [ ] Verify persisted thread recovery, HTTP boundaries, UI routing and existing
+- [x] Verify persisted thread recovery, HTTP boundaries, UI routing and existing
       hub/console behavior, review, and commit the implementation.
 
 This extends the co-learning history representation and existing workflow and
 harness artifacts. It does not introduce a database or copy Samizdat code.
+
+### Using conversations
+
+Run `attractor serve` and open the printed Conversation UI URL (by default
+`http://127.0.0.1:7070/`). Select a root or child in the tree to inspect its
+transcript and tool-call presentations. Send a steering message at the next
+boundary, or choose a followup after current work. New conversation, Cancel work
+and Resume archive operate on the selected thread. The browser workbench accepts
+only loopback hosts and peers; use a local SSH tunnel for a remote hub.
+
+Both `console` and `console --tui` support `/threads`, `/thread <id>` and
+`/resume <id>`. Thread selection accepts a full ID or an unambiguous short ID.
+Subsequent messages and cancellation target that thread. Resume creates a new
+root linked to the archive; it does not restart old children or submit pending
+inputs automatically. Queued inputs remain visible in the archive for inspection.
+
+Restart from the same working directory to reopen its conversation archives.
+Only one hub may own a conversation directory; attach additional clients with
+`--connect <nrepl-port>`. A hard process kill can leave
+`attractor_runs/conversations/owner.lock`; remove that empty directory only after
+confirming the previous owning hub has stopped. Corrupt archives fail startup
+rather than being silently discarded. These files contain conversation and tool
+contents, so treat them as private working data.

@@ -187,6 +187,7 @@
   [args & [interactive?]]
   (let [working-dir (os/cwd)]
     (hub/start! {:interactive_harness (when interactive? (interactive-harness-options args))
+                 :conversation_root (when interactive? "attractor_runs/conversations")
                  :session_options (console-session-options args)
                  :repair_config (repair-options args)
                  :workflow_registry_fn
@@ -452,7 +453,7 @@
   (println "  validate <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]  Validate pipeline structure & syntax")
   (println "  graph <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]      Inspect graph nodes, edges, and flow")
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
-  (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Shared HTTP/nREPL server")
+  (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Conversation UI and HTTP API (default 127.0.0.1:7070)")
   (println "  hub [--port PORT] [--port-file PATH] [--mock|--llm]  Start a persistent loopback nREPL hub")
   (println "  hub --stop PORT                                    Request graceful hub shutdown")
   (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
@@ -468,7 +469,7 @@
   (println "    Host options: [--harness PATH|--no-harness] [--harness-interval N] [--no-auto-refine]")
   (println "    Harness defaults on for console/hub; attached clients inherit host policy.")
   (println "    Repair: --repair-config PATH (trusted EDN; separate triage model and framework repository)")
-  (println "    Commands: /followup, /harness, /refine, /repair, : eval, /run, /agent <name>")
+  (println "    Commands: /threads, /thread <id>, /resume <id>, /followup, /harness, /refine, /repair, : eval, /run, /agent <name>")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -671,13 +672,16 @@
         (if (= 0 (parse-long port-text))
           (println "The assigned HTTP port is unavailable; use --port :7070 for a known endpoint.")
           (let [display-host (case host "" "localhost" "0.0.0.0" "localhost" "[::]" "[::1]" host)]
+            (if (contains? #{"" "0.0.0.0" "[::]" "localhost" "127.0.0.1" "[::1]"} host)
+              (println (str "Conversation UI: http://" display-host ":" port-text "/"))
+              (println "Conversation UI requires a loopback listener or local tunnel."))
             (println (str "HTTP API: http://" display-host ":" port-text "/pipelines")))))
       (io/flush *out*)
       (http/serve (hub-http/make-handler #(nrepl-client/request! connection %)) port)
       (finally (nrepl-client/close! connection)))))
 
 (defn cmd-serve [args]
-  (let [port (or (find-arg-val args "--port") ":7070")
+  (let [port (or (find-arg-val args "--port") "127.0.0.1:7070")
         connect? (boolean (some #{"--connect"} args))
         text (find-arg-val args "--connect")
         remote-port (when (and connect? (string? text) (re-matches #"[0-9]+" text)) (parse-long text))

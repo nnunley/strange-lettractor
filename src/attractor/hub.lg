@@ -3,6 +3,7 @@
             [attractor.repair :as repair] [attractor.repair-worker :as repair-worker] [attractor.llm :as llm]
             [attractor.agent :as agent] [attractor.refiner :as refiner] [attractor.pipeline :as pipeline]
             [attractor.context :as context] [attractor.workflow :as workflow] [os :as os]
+            [attractor.conversations :as conversations]
             [attractor.interviewer :as interviewer]
             [attractor.agents.registry :as registry]))
 
@@ -33,6 +34,27 @@
   (merge (select-keys (ex-data error) [:stderr :exit_code :retryable])
          {:category (or (:category (ex-data error)) :hub-error) :message (ex-message error)}))
 (defn- reply! [packet result] (deliver (:reply packet) (assoc result :id (:id (:request packet)))))
+(defn- persist-conversation! [hub id]
+  ;; Snapshot under the persistence lock, so a delayed writer cannot replace a
+  ;; newer snapshot. Never acquire a session lifecycle lock from this callback.
+  (when-let [entry (get @(:sessions hub) id)]
+    (locked (:conversation_lock hub)
+      (fn []
+        (try
+          (let [snapshot (conversations/snapshot (:agent entry))
+                snapshot (update snapshot :threads
+                           (fn [threads]
+                             (mapv #(if (= id (:thread_id %))
+                                      (update % :pending into @(:pending entry)) %) threads)))]
+            (conversations/save! (:conversations hub) snapshot))
+          (catch Object e
+            (reset! (:conversation_error hub) (error-data e))
+            (throw e)))))))
+(defn- conversation-boundary? [event]
+  (if (= :subagent_event (:type event))
+    (conversation-boundary? (:event event))
+    (contains? #{:user_input :steering_injected :assistant_text_end :tool_call_start
+                 :tool_results_recorded :processing_end :session_end :error} (:type event))))
 (defn- append-envelope! [hub envelope]
   ;; Every source (session, eval, workflow, agent) shares one bounded log and
   ;; one sequence so a client sees interleaved events in emission order.
@@ -45,6 +67,8 @@
 (defn- append-event! [hub id event]
   (append-envelope! hub {:source :session :session_id id
                          :turn_id (:hub_turn_id (:origin event)) :event event})
+  (when (and (not (:stopped @(:admission hub))) (conversation-boundary? event))
+    (persist-conversation! hub id))
   (repair/capture! @(:repair hub) {:session_id id :event event}))
 
 (defn events-since [hub client-id cursor]
@@ -302,6 +326,10 @@
                                      (agent/process-queued-input! session input behavior)
                                      (agent/process-input! session input))}
                            (catch Object e {:error (error-data e)}))
+                result (try
+                         (when-not (:stopped @(:admission hub)) (persist-conversation! hub id))
+                         result
+                         (catch Object e {:error (assoc (error-data e) :category :conversation-storage)}))
                 next-input
                 (locked (:event_lock hub)
                   (fn []
@@ -325,11 +353,102 @@
       (catch Object e (deliver done {:error (error-data e)})))
     turn))
 
+(defn- live-thread
+  "Locate a native thread without adding another execution registry."
+  [hub id]
+  (letfn [(find-in [session root parent]
+            (if (= id (:id @session))
+              {:session session :root_id root :parent parent}
+              (some #(find-in (:session %) root session) (vals (:subagents @session)))))]
+    (some (fn [[root entry]] (find-in (:agent entry) root nil)) @(:sessions hub))))
+
+(defn- thread-record [hub id]
+  (or (when-let [{:keys [root_id]} (live-thread hub id)]
+        (let [entry (entry! hub root_id)
+              record (first (filter #(= id (:thread_id %))
+                                   (:threads (conversations/snapshot (:agent entry)))))]
+          (cond-> (assoc record :archived false)
+            (= root_id id) (update :pending into @(:pending entry))
+            @(:conversation_error hub) (assoc :persistence_error @(:conversation_error hub)))))
+      (conversations/read-thread (:conversations hub) id)
+      (fail! :unknown-thread)))
+
+(defn- complete-tool-history? [history]
+  ;; An interrupted side effect is never retried by constructing a new session.
+  ;; Match every call to a recorded result before admitting continuation.
+  (loop [turns history pending #{}]
+    (if-let [turn (first turns)]
+      (case (:type turn)
+        :assistant
+        (let [ids (mapv :id (:tool_calls turn))]
+          (and (empty? pending) (every? string? ids)
+               (= (count ids) (count (set ids)))
+               (recur (rest turns) (set ids))))
+        :tool_results
+        (let [ids (mapv :tool_call_id (:results turn))]
+          (and (= (count ids) (count (set ids)))
+               (every? pending ids)
+               (recur (rest turns) (reduce disj pending ids))))
+        (and (empty? pending) (recur (rest turns) pending)))
+      (empty? pending))))
+
+(declare operation!)
+(defn- thread-operation! [hub request]
+  (let [id (:thread_id request)]
+    (case (:op request)
+      :thread/list
+      (let [live (mapcat #(get (conversations/snapshot (:agent %)) :threads) (vals @(:sessions hub)))
+            live-ids (set (map :thread_id live))]
+        (mapv #(select-keys % [:thread_id :root_id :parent_id :task :model :state :archived :resumed_from])
+              (concat (map #(assoc % :archived false) live)
+                      (remove #(contains? live-ids (:thread_id %)) (conversations/threads (:conversations hub))))))
+      :thread/read (thread-record hub id)
+      :thread/resume
+      (let [record (thread-record hub id)]
+        (when-not (:archived record) (fail! :thread-live))
+        (when-not (complete-tool-history? (:history record)) (fail! :incomplete-tool-turn))
+        (let [opened (operation! hub {:op :session/open}) next-id (:session_id opened)
+              session (:agent (entry! hub next-id))]
+          ;; Host configuration owns model/tools/permissions. Only conversation
+          ;; data crosses this boundary; no serialized executable configuration.
+          (swap! session assoc :history (:history record) :resumed_from id
+                 :harness_steps (or (:harness_steps record) 0)
+                 :context_projection (:context_projection record))
+          (persist-conversation! hub next-id)
+          {:session_id next-id :thread_id next-id :resumed_from id}))
+      (:thread/submit :thread/cancel)
+      (let [{:keys [session root_id parent]} (live-thread hub id)]
+        (when-not session
+          (thread-record hub id)
+          (fail! :thread-archived))
+        (if-not parent
+          (operation! hub (assoc request :op (if (= :thread/submit (:op request)) :session/submit :session/cancel)
+                                        :session_id root_id :queue true))
+          (let [result
+                (if (= :thread/cancel (:op request))
+                  (agent/close-subagent! parent id)
+                  (do
+                    (when-not (and (string? (:text request))
+                                   (or (nil? (:behavior request)) (contains? #{:steer :followup} (:behavior request))))
+                      (fail! :invalid-request))
+                    (if (and (not= :followup (:behavior request))
+                             (agent/queue-input-if-processing! session (:text request) :steer))
+                      {:agent_id id :queued true}
+                      (agent/send-subagent-input! parent id (:text request)))))]
+            (persist-conversation! hub root_id)
+            (assoc result :thread_id id)))))))
+
 (defn- operation! [hub request]
-  (when (and (contains? #{:session/open :session/submit :workflow/run :workflow/resume :agent/run :eval/submit} (:op request))
+  (when (and @(:conversation_error hub)
+             (contains? #{:session/open :session/submit :thread/submit :thread/resume} (:op request)))
+    (throw (ex-info "Conversation persistence failed; restart after repairing storage"
+                    {:category :conversation-storage :cause @(:conversation_error hub)})))
+  (when (and (contains? #{:session/open :session/submit :thread/submit :thread/resume :workflow/run :workflow/resume :agent/run :eval/submit} (:op request))
              (some #(contains? #{:activation-queued :activating} (:status %)) (:jobs (repair/status @(:repair hub)))))
     (fail! :repair-activation-busy))
   (case (:op request)
+    (:thread/list :thread/read :thread/submit :thread/cancel :thread/resume)
+    (thread-operation! hub request)
     :eval/submit
     (let [code (:code request)]
       (when-not (string? code) (fail! :invalid-request))
@@ -494,6 +613,7 @@
           entry {:agent session :harness_path (:harness_path options) :pending (atom [])
                  :closed (atom false) :cancellation (atom nil) :turn nil}]
       (swap! (:sessions hub) assoc id entry)
+      (persist-conversation! hub id)
       {:session_id id})
     :session/list
     (mapv (fn [[id entry]] {:session_id id :closed (or @(:closed entry) (= :closed (:state @(:agent entry))))
@@ -519,7 +639,7 @@
                      (or (nil? (:behavior request)) (contains? #{:steer :followup} (:behavior request)))
                      (or (not (contains? request :queue)) (boolean? (:queue request))))
         (fail! :invalid-request))
-      (locked (:event_lock hub)
+      (let [result (locked (:event_lock hub)
         (fn []
           (let [entry (entry! hub id) session (:agent entry) turn (:turn entry)]
             (when (or @(:closed entry) (= :closed (:state @session))) (fail! :session-closed))
@@ -529,7 +649,9 @@
                 (when-not (agent/queue-input-if-processing! session (:text request) (:behavior request))
                   (swap! (:pending entry) conj (select-keys request [:text :behavior])))
                 (assoc turn :queued true))
-              (assoc (start-session-turn! hub id entry (:text request)) :queued false))))))
+              (assoc (start-session-turn! hub id entry (:text request)) :queued false)))))]
+        (persist-conversation! hub id)
+        result))
     :session/result
     (let [entry (entry! hub (:session_id request)) turn (:turn entry)]
       (when-not (and turn (string? (:turn_id request)) (= (:turn_id request) (:turn_id turn)))
@@ -556,6 +678,9 @@
   ;; Admission is closed before draining queued replies. Never wait on workers
   ;; while holding admission/event locks, and never publish via the mailbox.
   (locked (:admission_lock hub) #(swap! (:admission hub) assoc :stopped true))
+  ;; Preserve the last runnable state before shutdown closes live sessions.
+  (doseq [id (keys @(:sessions hub))]
+    (try (persist-conversation! hub id) (catch Object _ nil)))
   (loop [] (when-let [packet (async/poll! (:mailbox hub))]
              (reply! packet {:error {:category :stopped}}) (recur)))
   (repair/stop! @(:repair hub))
@@ -581,7 +706,9 @@
           (when-let [turn (:turn entry)]
             (when-not (realized? (:completion turn))
               (deliver (:completion turn) {:error {:category :cancelled :message "Turn cancelled"}}))))))
-    (let [error (or failure (first (keep #(get (deref @(:cancellation %)) :error) entries)))
+    (try (conversations/close! (:conversations hub))
+         (catch Object e (reset! (:conversation_error hub) (error-data e))))
+    (let [error (or failure @(:conversation_error hub) (first (keep #(get (deref @(:cancellation %)) :error) entries)))
           result (if error {:error error} {:value {:stopped true}})]
       (locked (:admission_lock hub)
         (fn []
@@ -632,6 +759,8 @@
       (fail! :invalid-capacity))
     (let [ready (promise)
           hub {:event_capacity capacity :session_options (:session_options opts) :repair (atom nil)
+               :conversations (conversations/open-store (:conversation_root opts))
+               :conversation_lock (atom false) :conversation_error (atom nil)
                :interactive_harness (:interactive_harness opts)
                :workflow_registry_fn (:workflow_registry_fn opts)
                ;; {:claude [argv...] :codex [argv...]}; an agent without an entry

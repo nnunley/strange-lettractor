@@ -1340,6 +1340,7 @@
                                 (if-not recorded?
                                   text
                                   (do
+                                    (event-fn {:type :tool_results_recorded})
                                     (drain-steering! session event-fn)
                                     (check-context-usage! session event-fn)
                                     (refine-after-step! session event-fn)

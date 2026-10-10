@@ -71,7 +71,7 @@
       (is (= "answer-3" (get-in @requests [3 :messages 8 :content])))
       (is (= "second" (get-in @requests [3 :messages 9 :content])))
       (is (= [:session_start :user_input :steering_injected
-              :assistant_text_start :assistant_text_end :tool_call_start :tool_call_end
+              :assistant_text_start :assistant_text_end :tool_call_start :tool_call_end :tool_results_recorded
               :steering_injected :assistant_text_start :assistant_text_end
               :user_input :assistant_text_start :assistant_text_end :processing_end
               :user_input :assistant_text_start :assistant_text_end :processing_end]
