@@ -7,6 +7,7 @@ class Element {
   append(...children){this.children.push(...children)}
   replaceChildren(...children){this.children=children}
   setAttribute(k,v){this[k]=v}
+  requestSubmit(){this.onsubmit({preventDefault(){}})}
   querySelectorAll(selector){const all=this.children.flatMap(c=>[c,...c.querySelectorAll(selector)]);return all.filter(c=>c.tag==='details'&&(!selector.includes('[open]')||c.open));}
 }
 const elements = Object.fromEntries(['tree','title','metadata','persistence','status','transcript','draft','behavior','send','cancel','resume','new','compose'].map(id=>[id,new Element(id)]));
@@ -22,7 +23,21 @@ const sandbox={document:{getElementById:id=>elements[id],createElement:tag=>new 
 vm.createContext(sandbox);vm.runInContext(page.match(/<script>([\s\S]*)<\/script>/)[1],sandbox);
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
 (async()=>{
- await settle();assert.equal(elements.tree.children.length,2);elements.tree.children[1].onclick();await settle();
+ await settle();
+ elements.draft.value='First message without setup';elements.behavior.value='steer';
+ elements.compose.onsubmit({preventDefault(){}});await settle();
+ assert(calls.some(c=>c.path==='/threads'&&c.options.method==='POST'),'First message must create a conversation');
+ assert(calls.some(c=>c.path==='/threads/new/messages'&&JSON.parse(c.options.body).text==='First message without setup'));
+ assert.equal(elements.draft.value,'');
+ elements.draft.value='Keyboard message';
+ let prevented=false;const keyBefore=calls.length;
+ elements.draft.onkeydown({key:'Enter',shiftKey:true,isComposing:false,preventDefault(){prevented=true}});await settle();
+ assert.equal(calls.length,keyBefore);assert.equal(prevented,false);
+ elements.draft.onkeydown({key:'Enter',shiftKey:false,isComposing:true,preventDefault(){prevented=true}});await settle();assert.equal(calls.length,keyBefore);
+ elements.draft.onkeydown({key:'Enter',shiftKey:false,isComposing:false,preventDefault(){prevented=true}});await settle();
+ assert(prevented);assert(calls.some(c=>c.path==='/threads/new/messages'&&JSON.parse(c.options.body).text==='Keyboard message'));
+ calls.length=0;
+ assert.equal(elements.tree.children.length,2);elements.tree.children[1].onclick();await settle();
  assert.equal(elements.title.textContent,'Small task title');assert(elements.metadata.textContent.includes('child'));assert(elements.metadata.textContent.includes('fixture/model'));
  assert.equal(elements.transcript.children[0].children[1].textContent,'<img src=x onerror=bad()>');
  const detail=elements.transcript.querySelectorAll('details')[0];assert.equal(detail.dataset.id,'call-7');assert.equal(detail.dataset.type,'tool-call');detail.open=true;

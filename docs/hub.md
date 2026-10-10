@@ -320,7 +320,8 @@ harness artifacts. It does not introduce a database or copy Samizdat code.
 ### Using conversations
 
 Run `attractor serve` and open the printed Conversation UI URL (by default
-`http://127.0.0.1:7070/`). Select a root or child in the tree to inspect its
+`http://127.0.0.1:7070/`). Type and send immediately to create a conversation;
+Enter sends and Shift+Enter inserts a newline. Select a root or child in the tree to inspect its
 transcript and tool-call presentations. Send a steering message at the next
 boundary, or choose a followup after current work. New conversation, Cancel work
 and Resume archive operate on the selected thread. The browser workbench accepts
