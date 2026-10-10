@@ -100,7 +100,7 @@
         callbacks {:complete (fn [_] (swap! calls inc) (answer "tool_use")) :emit (fn [_])}
         first (repair/start! cfg callbacks) id (repair/capture! first (incident "engine.lg"))]
     (is (wait-for #(= :advised (:status (repair/detail first id)))))
-    (is (nil? (repair/capture! first (incident "other.lg"))))
+    (is (nil? (repair/capture! first (assoc-in (incident "other.lg") [:event :event :incident :tool_name] "glob"))))
     (is (= 1 (:dropped (repair/status first))))
     (repair/stop! first) (deref (:done first) 3000 nil)
     (let [second (repair/start! cfg callbacks)]
@@ -109,3 +109,45 @@
         (is (= :advised (:status (repair/detail second id))))
         (is (= 1 @calls))
         (finally (repair/stop! second) (deref (:done second) 3000 nil))))))
+
+(deftest private-incident-payload-never-reaches-ledger-or-triage
+  (let [secret "fixture-private-credential-DO-NOT-COPY" calls (atom [])
+        cfg (config (fixture))
+        r (repair/start! cfg {:complete (fn [request] (swap! calls conj request) (answer "tool_use")) :emit (fn [_])})
+        envelope (assoc-in (incident "engine.lg") [:event :event :incident]
+                    {:session_id "child" :cwd "/task/repo" :tool_name "read_file"
+                     :arguments {"file_path" secret "authorization" secret}
+                     :delegation_task secret :unknown_field secret
+                     :exception {:message secret :data {:password secret :nested [secret]}}
+                     :history [{:role :user :content secret :tool_calls [{:arguments {:token secret}}]}]})]
+    (try
+      (let [id (repair/capture! r envelope)]
+        (is (wait-for #(= :advised (:status (repair/detail r id)))))
+        (doseq [value [(pr-str @calls) (pr-str @(:state r)) (io/slurp (:path r))]]
+          (is (not (str/includes? value secret)))))
+      (finally (repair/stop! r) (deref (:done r) 3000 nil)))))
+
+(deftest legacy-ledger-private-payload-is-scrubbed-before-reuse
+  (doseq [previous [:advised :ready]]
+   (let [root (fixture) cfg (config root) directory (str root "/attractor_runs/repairs")
+        path (str directory "/index.edn") secret "legacy-private-fixture-value"
+        _ (io/mkdir directory)
+        _ (io/spit path (pr-str {:schema 1 :records {"old" {:id "old" :status previous
+                 :fingerprint secret :diagnosis {:summary secret} :error secret
+                 :review {:summary secret} :verification {:stdout secret}
+                 :incident {:tool_name "read_file" :cwd "/repo" :arguments {"file_path" secret}
+                            :exception {:message secret :data {:secret secret}}
+                            :history [{:role :user :content secret}]}}}}))
+        r (repair/start! cfg {:complete (fn [_] (throw (ex-info "No replay" {}))) :emit (fn [_])})]
+    (try
+      (is (not (str/includes? (io/slurp path) secret)))
+      (is (not (str/includes? (pr-str (repair/detail r "old")) secret)))
+      (is (= (if (= previous :ready) :interrupted previous) (:status (repair/detail r "old"))))
+      (finally (repair/stop! r) (deref (:done r) 3000 nil))))))
+
+(deftest malformed-tool-arguments-remain-safe-to-capture
+  (let [safe (repair/sanitize-incident {:arguments "malformed private JSON" :exception {:message "secret"}})]
+    (is (= [] (:argument_names safe)))
+    (is (= :exception (get-in safe [:exception :kind])))
+    (is (not (str/includes? (pr-str safe) "secret"))))
+  (is (= ["file_path"] (:argument_names (repair/sanitize-incident {:arguments {:file_path "private"}})))))

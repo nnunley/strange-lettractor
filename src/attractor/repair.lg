@@ -6,6 +6,35 @@
             [attractor.harness :as harness] [attractor.operation-owner :as owner]
             [io :as io] [os :as os] [json :as json]))
 
+(defn sanitize-incident
+  "Only diagnostic metadata crosses into repair persistence and model prompts.
+   Free-form task/history/exception text and argument values are private."
+  [incident]
+  (let [exception (:exception incident)
+        message (str/lower-case (str (:message exception)))
+        kind (or (:kind exception)
+                 (cond (str/includes? message "no such file") :missing-path
+                       (str/includes? message "permission denied") :permission-denied
+                       :else :exception))]
+    (assoc (select-keys incident [:session_id :parent_session_id :root_session_id
+                                  :id :revision :tool_name :call_id :cwd :repair_worker])
+           :privacy_version 1
+           :argument_names (vec (filter #{"file_path" "path" "command" "content" "old_string" "new_string"
+                                         "pattern" "offset" "limit" "timeout_ms"}
+                                  (or (:argument_names incident) (when (map? (:arguments incident))
+                                    (map #(if (keyword? %) (name %) (str %)) (keys (:arguments incident)))))))
+           :exception {:kind (if (contains? #{:missing-path :permission-denied :exception} kind) kind :exception)
+                       :category (if (contains? #{:io :tool-error :internal :invalid-request :context-length
+                                                 :cancelled :timeout :authentication :rate-limit :server-error}
+                                               (:category exception)) (:category exception) :unknown)}
+           :history (mapv (fn [turn] {:role (if (contains? #{:user :assistant :tool :system} (:role turn))
+                                                   (:role turn) :unknown)})
+                          (take-last 6 (:history incident))))))
+
+(defn- incident-fingerprint [revision incident]
+  (pr-str [revision (:tool_name incident) (:cwd incident)
+           (:argument_names incident) (:exception incident)]))
+
 (defn- fail! [message category] (throw (ex-info message {:category category})))
 (defn- git [repository & args]
   (let [r (apply os/sh (concat ["git" "-c" "core.fsmonitor=false" "-C" repository] args))]
@@ -63,11 +92,11 @@
       (recur (:event event) (inc depth)) event)))
 (defn capture! [r envelope]
   (when (and r (not @(:stopped r)))
-    (let [event (leaf-event (:event envelope)) incident (:incident event)]
+    (let [event (leaf-event (:event envelope)) raw (:incident event)
+          incident (when (map? raw) (sanitize-incident raw))]
       (when (and (contains? #{:error :tool_call_end} (:type event)) (map? incident)
                  (not (:repair_worker incident)) (not (:repair_internal event)))
-        (let [fingerprint (pr-str [(:revision r) (:tool_name incident) (:cwd incident)
-                                    (:arguments incident) (:exception incident)])]
+        (let [fingerprint (incident-fingerprint (:revision r) incident)]
           (loop []
             (let [state @(:state r)]
               (if-let [id (get-in state [:fingerprints fingerprint])] id
@@ -76,7 +105,7 @@
                   (let [id (ids/prefixed "repair")
                         incident (assoc incident :id id :revision (:revision r)
                                                  :root_session_id (:session_id envelope))
-                        record {:id id :status :queued :fingerprint fingerprint :incident incident}
+                        record {:id id :privacy_version 1 :status :queued :fingerprint fingerprint :incident incident}
                         next (-> state (assoc-in [:records id] record)
                                        (assoc-in [:fingerprints fingerprint] id) (update :queue conj id))]
                     (if (compare-and-set! (:state r) state next) id (recur))))))))))))
@@ -215,12 +244,21 @@ is a recovery suggestion, not permission to replay writes or other side effects.
       (let [stored (when (io/file-exists? path) (edn/read-string (io/slurp path)))
             _ (when (and stored (or (not= 1 (:schema stored)) (not (map? (:records stored)))))
                 (fail! "Invalid repair ledger" :repair-ledger))
-            records (into {} (map (fn [[id record]] [id (if (contains? terminal (:status record)) record
-                                                        (assoc record :status :interrupted))]) (:records stored)))
+            records (into {} (map (fn [[id record]]
+                                  (let [incident (sanitize-incident (:incident record))
+                                        record (if (= 1 (:privacy_version record)) record
+                                                   (cond-> (dissoc record :diagnosis :error :verification :review)
+                                                     (= :ready (:status record)) (assoc :status :interrupted)))]
+                                    [id (assoc record :incident incident :privacy_version 1
+                                               :fingerprint (incident-fingerprint (:revision incident) incident)
+                                               :status (if (contains? terminal (:status record)) (:status record) :interrupted))]))
+                                (:records stored)))
             r {:config (assoc config :repository repository) :revision revision :callbacks callbacks :path path :lock_path lock-path
                :stopped (atom false) :done (promise)
                :state (atom {:records records :fingerprints (into {} (map (fn [[id v]] [(:fingerprint v) id]) records))
                              :queue [] :cancelled #{} :active nil :dropped 0})}]
+        ;; Rewrite legacy raw incidents before they can be inspected or reused.
+        (when stored (persist! r))
         (core/future (coordinator! r)) r)
       (catch Object e (os/sh "rmdir" lock-path) (throw e)))))
 

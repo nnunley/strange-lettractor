@@ -115,3 +115,34 @@
         (is (= (:pending record) (:pending (c/read-thread store "child"))))
         (is (= s (edn/read-string (pr-str s))))
         (finally (c/close! store))))))
+(deftest lock-owner-metadata-makes-contention-actionable
+  (let [root (fixture) store (c/open-store root) path (str root "/owner.lock/owner.edn")]
+    (try
+      (is (io/file-exists? path))
+      (when (io/file-exists? path)
+        (let [owner (edn/read-string (io/slurp path))
+              error (try (c/open-store root) nil (catch Object e e))]
+          (is (pos? (:pid owner))) (is (string? (:host owner)))
+          (is (pos? (:acquired_at_ms owner))) (is (string? (:token owner)))
+          (is (= owner (:owner (ex-data error))))
+          (is (= (str root "/owner.lock") (:lock_path (ex-data error))))
+          (is (some? (re-find #"Confirm that the owning host has stopped" (ex-message error))))))
+      (finally (c/close! store)))
+    (is (not (io/file-exists? (str root "/owner.lock"))))))
+(deftest unknown-lock-is-never-taken-over
+  (let [root (fixture) path (str root "/owner.lock")]
+    (io/mkdir path)
+    (let [error (try (c/open-store root) nil (catch Object e e))]
+      (is (= :conversation-in-use (:category (ex-data error))))
+      (is (some? (re-find #"Owner metadata is unavailable" (ex-message error)))))
+    (is (io/file-exists? path)) (is (= [] (vec (os/ls path))))))
+(deftest close-does-not-remove-a-different-owners-lock
+  (let [root (fixture) store (c/open-store root) path (str root "/owner.lock/owner.edn")]
+    (when (io/file-exists? path)
+      (let [original (io/slurp path)]
+        (try
+          (io/spit path "{:token \"different-owner\"}")
+          (is (= :conversation-lock (category #(c/close! store))))
+          (is (= "{:token \"different-owner\"}" (io/slurp path)))
+          (finally (io/spit path original) (c/close! store)))))
+    (when-not @(:closed store) (c/close! store))))

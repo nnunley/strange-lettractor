@@ -229,3 +229,26 @@
     (is (nil? (get @captured "tools")))
     (llm/openai-compatible-complete (assoc base :provider_options {:openai-compat {:max_tokens 512}}))
     (is (= 512 (get @captured "max_tokens")))))
+
+(deftest manual-compaction-with-no-old-history-is-consumed-without-blocking-input
+  (let [calls (atom 0) summaries (atom 0)
+        s (session {:complete_fn (fn [_] (swap! calls inc) (answer "hello"))
+                    :context_summary_fn (fn [_] (swap! summaries inc) (answer "checkpoint"))})]
+    (try
+      (is (:accepted (agent/request-compaction! s)))
+      (is (= "hello" (agent/process-input! s "hello")))
+      (is (= 1 @calls))
+      (is (= 0 @summaries))
+      (is (false? (:context_compaction_requested @s)))
+      (is (= :idle (:state @s)))
+      (is (= [:user :assistant] (mapv :type (:history @s))))
+      (finally (agent/close-session! s)))))
+
+(deftest empty-manual-checkpoint-does-not-bypass-real-context-overflow
+  (let [calls (atom 0) s (session {:complete_fn (fn [_] (swap! calls inc) (answer "must not send"))})]
+    (try
+      (agent/request-compaction! s)
+      (is (= :context-length (:category (ex-data (caught #(agent/process-input! s (apply str (repeat 30000 "x"))))))))
+      (is (= 0 @calls))
+      (is (= :idle (:state @s)))
+      (finally (agent/close-session! s)))))

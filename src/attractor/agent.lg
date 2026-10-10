@@ -5,6 +5,7 @@
             [json :as json]
             [attractor.llm :as llm]
             [attractor.reasoning :as reasoning]
+            [attractor.repair :as repair]
             [attractor.context-discovery :as capacity]
             [attractor.context-management :as cm]
             [attractor.execution :as execution]
@@ -869,22 +870,13 @@
     (if (> (count text) limit) (str (subs text 0 limit) " …[truncated]") text)))
 
 (defn- exception-incident [session error fields]
-  ;; Preserve provenance at the failing session, before child forwarding or
-  ;; provider truncation loses cwd/arguments. Never capture credentials/config.
-  (merge {:session_id (:id @session)
-          :parent_session_id (get-in @session [:config :parent_session_id])
-          :delegation_task (when-let [task (get-in @session [:config :delegation_task])]
-                             (incident-text task 4000))
-          :cwd ((:working_directory (:execution_env @session)))
-          :exception {:message (incident-text (ex-message error) 4000)
-                      :category (:category (ex-data error))
-                      :data (into {} (map (fn [[k v]] [k (incident-text v 2000)])
-                                        (take 12 (ex-data error))))}
-          :history (mapv (fn [turn]
-                           {:role (:role turn) :content (incident-text (:content turn) 2000)
-                            :tool_calls (incident-text (:tool_calls turn) 2000)
-                            :results (incident-text (:results turn) 2000)})
-                         (take-last 6 (:history @session)))} fields))
+  ;; Sanitize at capture, before forwarding to hub events or repair storage.
+  (repair/sanitize-incident
+    (merge {:session_id (:id @session)
+            :parent_session_id (get-in @session [:config :parent_session_id])
+            :cwd ((:working_directory (:execution_env @session)))
+            :exception {:message (ex-message error) :category (:category (ex-data error))}
+            :history (mapv #(select-keys % [:role]) (take-last 6 (:history @session)))} fields)))
 
 (defn- execute-single-tool [session tool-call event-fn]
   (let [tool-name (or (:name tool-call) (get tool-call "name") "")
@@ -1099,7 +1091,17 @@
         (let [limits (cm/settings session window)
               projected (cm/request session base history-to-messages)
               measured (cm/measure projected limits)
-              manual? (:context_compaction_requested @session)
+              manual? (with-session-lock session
+                        (fn []
+                          (when (and (identical? owner (:current_turn_owner @session))
+                                     (not (session-stopped? session))
+                                     (:context_compaction_requested @session))
+                            (if (cm/reducible? session)
+                              true
+                              ;; An empty checkpoint request is consumed here;
+                              ;; mandatory capacity checks below still apply.
+                              (do (swap! session assoc :context_compaction_requested false)
+                                  false)))))
               ;; An optional checkpoint starts only when there is older material;
               ;; hard overflow always attempts compaction, then fails recoverably.
               threshold? (and (integer? window) (pos? window) (cm/reducible? session)

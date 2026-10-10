@@ -41,8 +41,12 @@
                            [["--no-harness"] {:enabled false :auto_refine true :interval 8}]
                            [["--harness" "test.edn" "--harness-interval" "3" "--no-auto-refine"]
                             {:enabled true :path "test.edn" :auto_refine false :interval 3}]]]
-    (let [captured (atom nil) original hub/start!]
-      (with-redefs [hub/start! (fn [options] (reset! captured options) (original options))
+    (let [captured (atom nil) original hub/start!
+          store-root (str (os/cwd) "/attractor_runs/cli-host-test-" (random-uuid))]
+      (with-redefs [hub/start! (fn [options] (reset! captured options)
+                                  (original (assoc options :conversation_root store-root)))
                     line/run! (fn [_ _] nil) os/exit (fn [_] nil)]
         (cli/cmd-console args))
-      (is (= expected (:interactive_harness @captured))))))
+      (is (= expected (:interactive_harness @captured)))
+      (is (= "attractor_runs/conversations" (:conversation_root @captured)))
+      (os/delete-tree store-root))))

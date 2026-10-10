@@ -125,13 +125,14 @@ bin/attractor console --llm --model llamacpp/qwen3.8 --repair-config repair.edn
 bin/attractor serve --llm --model llamacpp/qwen3.8 --repair-config repair.edn
 ```
 
-`serve` prints the HTTP API URL, by default
-`http://localhost:7070/pipelines`. This is the pipeline API, not a browser UI.
+`serve` prints the browser UI URL (`http://127.0.0.1:7070/` by default) and
+the pipeline HTTP API URL (`http://127.0.0.1:7070/pipelines`).
 The separately printed nREPL port is used by `console --connect`.
 
-Native session and child-tool exceptions carry bounded history, arguments,
-working directory and delegation context into triage. These snapshots are sent
-to the configured triage provider. Tool-use, environment and provider diagnoses
+Native session and child-tool exceptions carry sanitized diagnostic metadata
+into triage: tool identity, working directory, argument names, turn roles and
+failure kind/category. Raw task, argument and exception payloads are omitted.
+These metadata snapshots are sent to the configured triage provider. Tool-use, environment and provider diagnoses
 produce advice; procedural diagnoses can request existing harness refinement.
 Only a framework diagnosis with evidence and reproduction steps starts a coder.
 A missing path alone is not grounds for changing `read_file`.
@@ -336,7 +337,30 @@ inputs automatically. Queued inputs remain visible in the archive for inspection
 Restart from the same working directory to reopen its conversation archives.
 Only one hub may own a conversation directory; attach additional clients with
 `--connect <nrepl-port>`. A hard process kill can leave
-`attractor_runs/conversations/owner.lock`; remove that empty directory only after
-confirming the previous owning hub has stopped. Corrupt archives fail startup
+`attractor_runs/conversations/owner.lock`. Its `owner.edn` records the owning
+PID, hostname, acquisition time and ownership token. Startup reports those
+details when another host holds the directory. Legacy or interrupted lock
+creation may leave no readable metadata; startup still refuses takeover.
+Confirm the previous owning hub has stopped before manually removing
+`owner.edn` (if present) and the empty lock directory. There is no automatic
+stale-lock recovery. Corrupt archives fail startup
 rather than being silently discarded. These files contain conversation and tool
 contents, so treat them as private working data.
+
+### Repair incident privacy
+
+Repair triage receives diagnostic metadata: session ancestry, tool identity,
+working directory, recognized argument names, turn roles and a coarse failure
+kind/category. Raw argument values, task text, conversation content and exception
+messages/data are omitted before incident events are forwarded, fingerprinted,
+persisted or sent to the triage model. The repair worker can inspect framework
+source to investigate; automatic incident capture does not copy the user's task
+payload into another model's prompt. Incidents with the same diagnostic metadata
+are grouped even if their private argument values differ.
+
+Existing repair ledgers are rewritten on startup with sanitized incidents and
+recomputed fingerprints. Legacy diagnosis, error, review and verification text is discarded because it
+may echo the old raw incident; previously ready repairs become interrupted and
+cannot activate using the discarded evidence. This migration does not scrub unrelated historical
+worker artifacts. Regression checks cover the capture event, coordinator state,
+on-disk ledger, triage request and legacy-ledger reload.

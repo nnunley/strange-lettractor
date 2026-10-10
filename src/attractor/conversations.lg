@@ -3,7 +3,7 @@
   (:refer-clojure :exclude [close!])
   (:require [clojure.core :as core] [clojure.edn :as edn]
             [clojure.string :as str] [attractor.ids :as ids]
-            [io :as io] [os :as os]))
+            [io :as io] [os :as os] [syscall :as syscall]))
 
 (defn- fail! [message category] (throw (ex-info message {:category category})))
 (defn- read-snapshot [text]
@@ -72,14 +72,47 @@
     (when (some #(contains? ids (:thread_id %)) (:threads snapshot))
       (fail! "Thread identity appears in multiple conversation roots" :conversation-corrupt))))
 
+(defn- owner-metadata [lock-path]
+  (try (read-snapshot (io/slurp (str lock-path "/owner.edn")))
+       (catch Object _ nil)))
+
+(defn- release-owner! [store]
+  (let [path (:lock_path store)]
+    (when-not (= (:owner store) (owner-metadata path))
+      (fail! (str "Conversation owner changed or metadata is missing; leaving lock untouched: " path)
+             :conversation-lock))
+    (io/delete-file (str path "/owner.edn"))
+    (let [result (os/sh "rmdir" path)]
+      (when-not (= 0 (:exit result))
+        (fail! (str "Cannot release conversation owner: " (:err result)) :conversation-lock)))))
+
 (defn open-store [root]
   (let [lock-path (when root (str root "/owner.lock"))
         store {:root root :lock_path lock-path :lock (atom false) :closed (atom false)
-               :snapshots (atom {}) :paths (atom {})}]
+               :snapshots (atom {}) :paths (atom {})
+               :owner (when root {:pid (syscall/getpid) :host (os/hostname)
+                                  :acquired_at_ms (System/currentTimeMillis) :token (ids/uuid-text)})}]
     (when root
       (io/mkdir root)
-      (when-not (= 0 (:exit (os/sh "mkdir" lock-path)))
-        (fail! (str "Conversation store already owned, or stale lock remains: " lock-path) :conversation-in-use)))
+      (let [result (os/sh "mkdir" lock-path)]
+        (when-not (= 0 (:exit result))
+          (if (io/file-exists? lock-path)
+            (let [owner (owner-metadata lock-path)]
+              (throw (ex-info
+                (str "Conversation store is locked: " lock-path ". "
+                     (if (and (map? owner) (:pid owner) (:host owner))
+                       (str "Owner PID " (:pid owner) " on " (:host owner) ". ")
+                       "Owner metadata is unavailable. ")
+                     "Confirm that the owning host has stopped before manually removing owner.edn and the lock directory; no automatic takeover is performed.")
+                {:category :conversation-in-use :lock_path lock-path :owner owner})))
+            (fail! (str "Cannot create conversation owner lock: " lock-path ": " (:err result))
+                   :conversation-lock))))
+      (try (io/spit (str lock-path "/owner.edn") (pr-str (:owner store)))
+           (catch Object e
+             (when (io/file-exists? (str lock-path "/owner.edn"))
+               (io/delete-file (str lock-path "/owner.edn")))
+             (os/sh "rmdir" lock-path)
+             (throw e))))
     (try
       (when root
         (doseq [entry (os/ls root)]
@@ -95,7 +128,7 @@
                 (swap! (:snapshots store) assoc id s)
                 (swap! (:paths store) assoc id path))))))
       store
-      (catch Object e (when root (os/sh "rmdir" lock-path)) (throw e)))))
+      (catch Object e (when root (release-owner! store)) (throw e)))))
 
 (defn save! [store snapshot]
   (locked store
@@ -125,7 +158,5 @@
     (locked store (fn []
       (when-not @(:closed store)
         (when (:lock_path store)
-          (let [result (os/sh "rmdir" (:lock_path store))]
-            (when-not (= 0 (:exit result))
-              (fail! (str "Cannot release conversation owner: " (:err result)) :conversation-lock))))
+          (release-owner! store))
         (reset! (:closed store) true))))))
