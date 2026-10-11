@@ -35,6 +35,16 @@ jobs:
           cache: false
       - name: Install pinned let-go and lgx
         run: bash .github/scripts/install-tools.sh
+      - name: Install Graphviz (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes graphviz
+      - name: Install Graphviz (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: brew install graphviz
       - name: Install project dependencies
         run: lgx install
       - name: Build and smoke test executable

@@ -84,7 +84,11 @@
                           (str "PATH=" root ":/usr/bin:/bin")
                           "/bin/bash" "--noprofile" "--norc" "-p" "-c"
                           execution/command-wrapper "command-wrapper"
-                          root "0.05" "/bin/sleep 0.1; printf late > late"
+                          ;; Wait for the watchdog to start before measuring its
+                          ;; effect: a loaded runner may schedule the command
+                          ;; more than 50ms before it schedules the watchdog.
+                          root "0.05"
+                          "for i in {1..200}; do [ ! -e timeout ] || break; /bin/sleep 0.01; done; /bin/sleep 0.1; printf late > late"
                           timeout-marker cancel-marker "all")]
         (is (= 124 (:exit result)))
         (is (some? (os/stat timeout-marker)))

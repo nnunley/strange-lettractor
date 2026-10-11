@@ -49,11 +49,13 @@ Prerequisites:
 
 - [let-go](https://github.com/nooga/let-go) revision
   `50786343e5511973d3ad724b1acf83b91c2775f8`, built with Go 1.27.1. Stock
-  1.13.0 fails the descendant-cancellation contract; the version declaration in
-  `lgx.edn` alone does not capture this requirement. Set `LGX_LG` to the built
+  1.13.0 fails the descendant-cancellation contract; `lgx.edn` pins the version
+  reported by a clean source build of this revision. Set `LGX_LG` to the built
   development binary. CI's `.github/scripts/install-tools.sh` shows the exact
   source checkout and build commands.
 - [lgx](https://github.com/abogoyavlensky/lgx) 0.3.2 or newer.
+- [Graphviz](https://graphviz.org/) (`dot` on `PATH`) for graph rendering and
+  the full test suite. CI installs it on both platforms.
 - Optional external agents on `PATH`: [Claude Code](https://code.claude.com)
   (`claude`) and [Codex](https://github.com/openai/codex) (`codex`). Optional: a
   OpenAI-compatible Chat Completions endpoint (llama.cpp, Ollama, vLLM) for

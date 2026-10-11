@@ -1,6 +1,8 @@
 {:paths ["src"]
  :main "main.lg"
- :lg-version "1.13.0"
+ ;; Public source pin: .github/scripts/install-tools.sh. Stock 1.13.0 lacks
+ ;; the descendant-cancellation behavior required by the ownership tests.
+ :lg-version "0.0.0-20261005155811-50786343e551"
  :deps {tiny-tui {:git/url "https://github.com/abogoyavlensky/tiny-tui"
                   :git/sha "3d2aeaa68e4647187c10cbbcba7df881b81b9a6c"}}
  :targets {:bin {:out "bin/attractor"}}
