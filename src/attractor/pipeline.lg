@@ -1,7 +1,9 @@
 (ns attractor.pipeline
   (:require [attractor.ids :as ids] [attractor.engine :as engine]
             [attractor.capture :as capture]
+            [attractor.conditions :as conditions]
             [attractor.context :as context]
+            [attractor.parameters :as parameters]
             [attractor.parser :as parser]
             [attractor.status :as status]
             [attractor.transforms :as transforms]
@@ -10,19 +12,52 @@
             [clojure.string :as str]
             [os :as os]))
 
+(defn- tagged-diagnostics [errors]
+  ;; resolve-values already carries the spec's rule name on each error.
+  (mapv (fn [e] {:rule (:rule e) :severity :error :message (:message e)}) errors))
+
+(defn- parameter-diagnostics [rule messages]
+  (mapv (fn [m] {:rule rule :severity :error :message m}) messages))
+
 (defn prepare
-  "Parse, transform, and validate the complete source closure without execution."
+  "Parse, resolve parameters, transform, and validate without execution."
   ([dot-source] (prepare dot-source {}))
   ([dot-source options]
    (capture/prepare-closure
      dot-source options
-     (fn [source]
+     (fn [source root?]
+       ;; Only the launched (root) source sees the caller's --param/--params-file.
+       ;; A child sub-pipeline is reached through input_map, never through the
+       ;; parent's launch, so resolving the parent's supplied values against the
+       ;; child's declarations would report the parent's names as undeclared on
+       ;; the child and demand the child's required parameters of the parent.
        (let [graph (parser/parse-dot source)
+             supplied (if root? (or (:parameters options) {}) {})
+             trust (parameters/effective-trust (:parent-trust options) (:trust options))
+             decl (parameters/parse-declarations (get-in graph [:attrs :params]))
+             delegation (if root?
+                          (parameters/check-delegation (:declarations decl) supplied trust)
+                          [])
+             ;; A child still resolves against its OWN declarations with nothing
+             ;; supplied, so a default it declares is substituted into its plan.
+             ;; Its errors are discarded: with no supplied values there is
+             ;; nothing to report but parameter_missing for the child's
+             ;; required-but-unsupplied names, which input_map, not the
+             ;; parent's launch, is responsible for.
+             resolved (if root?
+                        (parameters/resolve-values (:declarations decl) supplied)
+                        (assoc (parameters/resolve-values (:declarations decl) {})
+                               :errors []))
              prepared-graph (transforms/apply-transforms
-                              graph (or (:custom-transforms options) []))
-             diagnostics (validation/validate
-                           prepared-graph (or (:custom-rules options) []))]
-         {:graph prepared-graph :diagnostics diagnostics})))))
+                              graph (or (:custom-transforms options) [])
+                              (:values resolved))
+             diagnostics (vec (concat
+                                (validation/validate
+                                  prepared-graph (or (:custom-rules options) []))
+                                (parameter-diagnostics "parameter_not_delegable" delegation)
+                                (tagged-diagnostics (:errors resolved))))]
+         {:graph prepared-graph :diagnostics diagnostics
+          :parameters resolved :trust trust})))))
 
 (def ^:private wrapper-option-keys
   [:custom-transforms
@@ -70,13 +105,16 @@
          logs-root (or (:logs-root options) (fresh-logs-root))
          _ (workflow/publish! bundle logs-root)
          engine-options
-         (assoc (merge (apply dissoc options wrapper-option-keys)
-                       (captured-handoff bundle plan-id))
-                :logs-root logs-root
-                :workflow-fingerprint (:fingerprint bundle)
-                :attractor.engine/publish-restart
-                (fn [root] (publish-restart! bundle root options))
-                :workflow-manifest workflow/manifest-relative-path)
+         (cond->
+           (assoc (merge (apply dissoc options wrapper-option-keys)
+                         (captured-handoff bundle plan-id))
+                  :logs-root logs-root
+                  :workflow-fingerprint (:fingerprint bundle)
+                  :attractor.engine/publish-restart
+                  (fn [root] (publish-restart! bundle root options))
+                  :workflow-manifest workflow/manifest-relative-path)
+           (seq (get-in prepared [:parameters :values]))
+           (assoc :workflow-parameters (get-in prepared [:parameters :values])))
          outcome (engine/run-pipeline graph engine-options)]
      (assoc outcome :diagnostics diagnostics))))
 
@@ -190,6 +228,103 @@
       (declared-retry-transition?
         graph outcomes prior-node-ids from-id to-id)))
 
+(defn- valid-saved-transition?
+  [graph outcomes context-values prior-node-ids historical? transition]
+  (let [{:keys [kind from to edge_index]} transition
+        edge (when (and (integer? edge_index)
+                        (<= 0 edge_index)
+                        (< edge_index (count (:edges graph))))
+               (nth (:edges graph) edge_index))]
+    (and (map? transition)
+         (string? from)
+         (case kind
+           :edge (and (string? to)
+                      edge
+                      (= from (:from edge))
+                      (= to (:to edge))
+                      (= #{:kind :from :to :edge_index}
+                         (set (keys transition))))
+           :override (and (string? to)
+                          (parser/find-node graph to)
+                          (= #{:kind :from :to} (set (keys transition))))
+           :retry (and (string? to)
+                       (or historical?
+                           (failed-checkpoint-outcome? (get outcomes from)))
+                       (= to (node-retry-target (parser/find-node graph from)))
+                       (= #{:kind :from :to} (set (keys transition))))
+           :goal_gate (and (string? to)
+                           (some
+                             (fn [node-id]
+                               (let [node (parser/find-node graph node-id)]
+                                 (and (:goal_gate node)
+                                      (or historical?
+                                          (failed-checkpoint-outcome?
+                                            (get outcomes node-id)))
+                                      (= to (goal-gate-retry-target node graph)))))
+                             prior-node-ids)
+                           (= #{:kind :from :to} (set (keys transition))))
+           :none (and (nil? to)
+                      (= #{:kind :from :to} (set (keys transition)))
+                      (let [node (parser/find-node graph from)]
+                        (or (engine/terminal-node? node)
+                            (let [status (or (get context-values "outcome")
+                                             (get context-values :outcome))
+                                  route-outcome {:status status}]
+                              (not-any?
+                                (fn [edge]
+                                  (let [condition (:condition edge)]
+                                    (or (str/blank? condition)
+                                        ;; A skipped visit does not retain its
+                                        ;; optional preferred label. This case
+                                        ;; remains undecidable from a checkpoint.
+                                        (and (not (conditions/condition-references-key?
+                                                    condition "preferred_label"))
+                                             (conditions/evaluate-condition
+                                               condition route-outcome context-values)))))
+                                (parser/outgoing-edges graph from))))))
+           :failed_none (and (nil? to)
+                             (failed-checkpoint-outcome? (get outcomes from))
+                             (= #{:kind :from :to} (set (keys transition))))
+           false))))
+
+(defn- validate-saved-transitions! [checkpoint graph completed]
+  (let [any? (some #(contains? checkpoint %)
+                   [:selected_transition :transition_history :transition_history_start])]
+    (when any?
+      (let [selected (:selected_transition checkpoint)
+            history (:transition_history checkpoint)
+            start (:transition_history_start checkpoint)
+            n (count completed)
+            valid-shape?
+            (and (contains? checkpoint :selected_transition)
+                 (contains? checkpoint :transition_history)
+                 (contains? checkpoint :transition_history_start)
+                 (integer? start) (<= 0 start) (< start n)
+                 (vector? history)
+                 (= (- n start) (count history))
+                 (= selected (last history))
+                 (every?
+                   (fn [[offset transition]]
+                     (let [index (+ start offset)
+                           from (nth completed index)
+                           next-id (when (< (inc index) n)
+                                     (nth completed (inc index)))]
+                       (and (= from (:from transition))
+                            (valid-saved-transition?
+                              graph (:node_outcomes checkpoint)
+                              (:context_values checkpoint)
+                              (subvec completed 0 (inc index))
+                              (< (inc index) n)
+                              transition)
+                            (if next-id
+                              (= next-id (:to transition))
+                              true))))
+                   (map-indexed vector history)))]
+        (when-not valid-shape?
+          (snapshot-corrupt! "Workflow checkpoint transition is invalid"
+                             {:kind :checkpoint :field :selected_transition})))))
+  checkpoint)
+
 (defn- validate-checkpoint-map! [checkpoint graph completed-set field]
   (let [records (get checkpoint field)]
     (when-not (and (map? records)
@@ -276,14 +411,18 @@
     (validate-checkpoint-map! checkpoint graph completed-set :node_outcomes)
     (validate-checkpoint-map! checkpoint graph completed-set :node_retries)
     (validate-checkpoint-values! checkpoint graph)
+    (validate-saved-transitions! checkpoint graph completed)
     (when-not
       (every?
         (fn [[index transition]]
-          (valid-checkpoint-transition?
-            graph
-            (:node_outcomes checkpoint)
-            (subvec completed 0 (inc index))
-            transition))
+          (if (and (contains? checkpoint :transition_history)
+                   (>= index (:transition_history_start checkpoint)))
+            true
+            (valid-checkpoint-transition?
+              graph
+              (:node_outcomes checkpoint)
+              (subvec completed 0 (inc index))
+              transition)))
         (map-indexed vector (partition 2 1 completed)))
       (snapshot-corrupt! "Workflow checkpoint history does not match the captured plan"
                          {:kind :checkpoint
@@ -306,6 +445,11 @@
    context before execution; it cannot replace that context through options."
   ([checkpoint-path] (resume checkpoint-path {}))
   ([checkpoint-path options]
+   (doseq [[k flag] [[:parameters :--param] [:trust :--trust]]]
+     (when (contains? options k)
+       (throw (ex-info (str "option " (name flag) " is not permitted on resume")
+                       {:category :workflow_configuration_error
+                        :option flag}))))
    (let [resolved-checkpoint-path (resolve-checkpoint-path! checkpoint-path)
          checkpoint (load-pinned-checkpoint! resolved-checkpoint-path)
          expected-fingerprint (require-checkpoint-identity! checkpoint)
@@ -320,24 +464,27 @@
          changes (workflow/current-drift (:workflow verified) options)
          caller-on-event (or (:on-event options) (fn [_] nil))
          engine-options
-         (assoc (merge (select-keys options resume-runtime-option-keys)
-                       (captured-handoff bundle plan-id))
-                :logs-root run-root
-                :on-event caller-on-event
-                :workflow-fingerprint expected-fingerprint
-                :attractor.engine/on-resume-context
-                (fn [ctx]
-                  (when-let [observe (:on-resumed options)]
-                    (observe {:context ctx :logs_root run-root
-                              :dot_source (:source (first (filter #(= plan-id (:logical-id %))
-                                                                  (:source-records bundle))))
-                              :publication {:graph graph
-                                            :diagnostics (if (seq changes) [(drift-diagnostic changes)] [])
-                                            :manifest (str run-root "/" workflow/manifest-relative-path)
-                                            :fingerprint expected-fingerprint}})))
-                :attractor.engine/publish-restart
-                (fn [root] (publish-restart! (:captured-bundle verified) root options))
-                :workflow-manifest workflow/manifest-relative-path)
+         (cond->
+           (assoc (merge (select-keys options resume-runtime-option-keys)
+                         (captured-handoff bundle plan-id))
+                  :logs-root run-root
+                  :on-event caller-on-event
+                  :workflow-fingerprint expected-fingerprint
+                  :attractor.engine/on-resume-context
+                  (fn [ctx]
+                    (when-let [observe (:on-resumed options)]
+                      (observe {:context ctx :logs_root run-root
+                                :dot_source (:source (first (filter #(= plan-id (:logical-id %))
+                                                                    (:source-records bundle))))
+                                :publication {:graph graph
+                                              :diagnostics (if (seq changes) [(drift-diagnostic changes)] [])
+                                              :manifest (str run-root "/" workflow/manifest-relative-path)
+                                              :fingerprint expected-fingerprint}})))
+                  :attractor.engine/publish-restart
+                  (fn [root] (publish-restart! (:captured-bundle verified) root options))
+                  :workflow-manifest workflow/manifest-relative-path)
+           (seq (:parameters checkpoint))
+           (assoc :workflow-parameters (:parameters checkpoint)))
          _ (when (seq changes)
              (caller-on-event {:type :workflow.drift_detected
                                :changes changes}))
@@ -361,6 +508,12 @@
    (let [prepared (prepare dot-source options)
          diagnostics (:diagnostics prepared)
          diagnostics (validation/raise-on-errors diagnostics)
+         ctx (or (:context options) (context/make-context))
+         _ (context/ctx-apply-updates!
+             ctx
+             (into {} (map (fn [[k v]] [(str "param." k) v])
+                           (get-in prepared [:parameters :values]))))
+         options (assoc options :context ctx)
          _ (when-let [on-prepared (:on-prepared options)]
              (on-prepared prepared))
          logs-root (or (:logs-root options) (fresh-logs-root))

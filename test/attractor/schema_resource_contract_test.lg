@@ -1,0 +1,121 @@
+(ns attractor.schema-resource-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.llm :as llm]))
+
+(defn- valid? [value schema & [options]]
+  (first (llm/validate-json-schema value schema options)))
+
+(deftest bundled-resources-resolve-against-lexical-base
+  (let [schema {:$id "https://example.org/schemas/root.json"
+                :$defs {:number {:$id "numbers/positive.json" :type "integer" :minimum 1}
+                        :use {:$id "uses/value.json" :$ref "../numbers/positive.json"}}
+                :$ref "uses/value.json" :maximum 5}]
+    (is (true? (valid? 3 schema)))
+    (is (false? (valid? 0 schema)))
+    (is (false? (valid? 6 schema)))
+    (is (false? (valid? "3" schema)))
+    (is (true? (valid? 3 (assoc schema :$ref "#/$defs/use")))))
+  (is (true? (valid? 7 {:$id "urn:example:root" :$ref "urn:example:integer"
+                       :$defs {:value {:$id "urn:example:integer" :const 7}}}))))
+
+(deftest explicit-registry-resolves-external-resources-without-fetching
+  (let [registry {"https://example.org/types/number" {:type "integer" :minimum 1}
+                  "https://example.org/types/never" false}
+        options {:schema_base_uri "https://example.org/schemas/root"
+                 :schema_registry registry}]
+    (is (true? (valid? 2 {:$ref "../types/number"} options)))
+    (is (false? (valid? 0 {:$ref "../types/number"} options)))
+    (is (false? (valid? {} {:$ref "../types/never"} options)))
+    (is (false? (valid? {} {:$ref "https://unregistered.example/schema"} options))))
+  (let [options {:schema_registry {"https://example.org/download"
+                                   {:$id "https://example.org/canonical"
+                                    :$ref "child" :$defs {:child {:$id "child" :const 4}}}}}]
+    (doseq [reference ["https://example.org/download" "https://example.org/canonical"]]
+      (is (true? (valid? 4 {:$ref reference} options)))
+      (is (false? (valid? 5 {:$ref reference} options))))))
+
+(deftest schema-annotations-do-not-register-resources
+  (doseq [location [{:default {:$id "fake"}} {:examples [{:$id "fake"}]}
+                    {:unknown {:$id "fake"}}]]
+    (is (false? (valid? {} (assoc location :$ref "fake"))))))
+
+(deftest pointer-containers-are-not-schema-resources
+  (doseq [container [:$defs :properties]
+          reference [(str "#/" (name container) "/value")]]
+    (let [schema {container {:$id {:type "string"} :value {:type "integer"}}
+                  :$ref reference}]
+      (is (true? (valid? 1 schema)))
+      (is (false? (valid? "a" schema))))))
+
+(deftest conflicting-resource-identifiers-are-rejected
+  (is (false? (valid? 1 {:$defs {:a {:$id "same" :const 1}
+                                :b {:$id "same" :const 2}}
+                        :$ref "same"})))
+  (is (false? (valid? 1 {:$id "https://example.org/root" :const 1}
+               {:schema_registry {"https://example.org/root" {:const 2}}}))))
+
+(def dynamic-object
+  {:$id "https://example.org/derived" :$ref "base"
+   :$defs {:extension {:$dynamicAnchor "extra" :properties {"bar" {:type "string"}}}
+           :base {:$id "base" :type "object" :properties {"foo" {:type "string"}}
+                  :$dynamicRef "#extra" :unevaluatedProperties false
+                  :$defs {:fallback {:$dynamicAnchor "extra"}}}}})
+
+(deftest dynamic-anchors-use-outermost-resource-and-contribute-annotations
+  (is (true? (valid? {"foo" "a" "bar" "b"} dynamic-object)))
+  (is (false? (valid? {"bar" 1} dynamic-object)))
+  (is (false? (valid? {"foo" "a" "extra" true} dynamic-object)))
+  (let [schema {:$id "https://example.org/derived-array" :$ref "base-array"
+                :$defs {:extension {:$dynamicAnchor "extra" :prefixItems [true {:type "string"}]}
+                        :base {:$id "base-array" :prefixItems [{:type "integer"}]
+                               :$dynamicRef "#extra" :unevaluatedItems false
+                               :$defs {:fallback {:$dynamicAnchor "extra"}}}}}]
+    (is (true? (valid? [1 "a"] schema)))
+    (is (false? (valid? [1 2] schema)))
+    (is (false? (valid? [1 "a" 3] schema)))))
+
+(deftest dynamic-references-without-a-dynamic-anchor-are-static
+  (let [schema {:$id "https://example.org/root"
+                :$defs {:outer {:$dynamicAnchor "target" :const "outer"}
+                        :inner {:$id "inner" :$defs {:target {:$anchor "target" :const "inner"}}}}
+                :$dynamicRef "inner#target"}]
+    (is (true? (valid? "inner" schema)))
+    (is (false? (valid? "outer" schema))))
+  (is (false? (valid? 1 {:$dynamicRef "#/$defs/value" :$defs {:value {:const 2}}})))
+  (is (false? (valid? 1 {:$dynamicRef "#missing"}))))
+
+(deftest dynamic-reference-and-static-reference-both-apply-with-siblings
+  (let [schema {:$defs {:lower {:$anchor "lower" :minimum 1}
+                       :upper {:$dynamicAnchor "upper" :maximum 5}}
+                :$ref "#lower" :$dynamicRef "#upper" :type "integer"}]
+    (is (true? (valid? 3 schema)))
+    (doseq [value [0 6 "3"]] (is (false? (valid? value schema))))))
+
+(deftest dynamic-reference-cycles-cannot-be-negated-into-valid-results
+  (is (false? (valid? {} {:$dynamicAnchor "cycle" :not {:$dynamicRef "#cycle"}}))))
+
+(deftest unresolved-references-cannot-be-negated-or-bypassed-into-validation
+  (doseq [key [:$ref :$dynamicRef]
+          schema [{:not {key "https://unregistered.example/schema"}}
+                  {:anyOf [{key "#missing"} true]}
+                  {:if {key "#missing"} :else true}]]
+    (is (false? (valid? {} schema))))
+  ;; Unevaluated branches do not need to resolve their references.
+  (is (true? (valid? 3 {:if {:type "integer"} :then true :else {:$ref "#missing"}}))))
+
+(deftest registered-schemas-are-used-by-both-structured-output-apis
+  (doseq [text ["3" "0"]]
+    (let [response {:message {:role :assistant :content text}
+                    :tool_calls [] :usage {} :finish_reason :stop}
+          adapter (llm/make-adapter "fixture" (fn [_] response)
+                    (fn [_] [{:type :stream_start} {:type :text_delta :delta text}
+                             {:type :finish :finish_reason :stop :response response}]))
+          options {:client (llm/make-client {:providers {"fixture" adapter}})
+                   :schema_base_uri "https://example.org/root"
+                   :schema_registry {"https://example.org/positive" {:type "integer" :minimum 1}}}
+          schema {:$ref "positive"}
+          outcome (fn [f] (try {:output (f)}
+                              (catch Object e {:category (:category (ex-data e))})))
+          expected (if (= text "3") {:output 3} {:category :no-object-generated})]
+      (is (= expected (outcome #(:output (llm/generate-object "fixture/model" "json" schema options)))))
+      (is (= expected (outcome #((:object (llm/stream-object "fixture/model" "json" schema options)))))))))

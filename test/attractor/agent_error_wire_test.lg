@@ -125,7 +125,7 @@
                 (is (string? (:error end)))
                 (is (str/includes? (:error end) "weather service down")))
               (is (= [:session_start :user_input :assistant_text_start :assistant_text_end
-                      :tool_call_start :tool_call_end :assistant_text_start :assistant_text_end
+                      :tool_call_start :tool_call_end :tool_results_recorded :assistant_text_start :assistant_text_end
                       :processing_end]
                      (kinds @events)))
               (is (true? (get-in (first (filter #(= :tool_results (:type %)) (:history @session)))
@@ -134,3 +134,17 @@
             (finally (agent/close-session! session))))))))
 
 ;; SCN-CAL-ERRORS WIRE COMPLETE
+
+(deftest default-provider-path-retries-without-injected-client
+  (doseq [streaming? [false true]]
+    (let [calls (atom 0)
+          fail (fn [_] (swap! calls inc) (throw (ex-info "transient" {:category :server :retryable true})))
+          session (agent/make-session
+                    {:provider_profile (assoc (profiles/create-openai-profile "fixture") :supports_streaming streaming?)
+                     :execution_env (execution/make-environment {}) :project_docs [] :max_subagent_depth 0
+                     :retry_policy {:max_retries 2 :base_delay 0 :jitter false}})]
+      (try
+        (with-redefs [llm/complete fail llm/stream fail llm/discover-context (fn [& _] nil)]
+          (try (agent/process-input! session "go") (catch Object _ nil)))
+        (is (= 3 @calls))
+        (finally (agent/close-session! session))))))

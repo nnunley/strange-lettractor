@@ -1,5 +1,27 @@
 # Let-go Runtime Issues — Consolidated
 
+## Cancellation behavior in the October 8 verification runtime
+
+Verification uses `/Users/ndn/development/let-go/bin/lg`, reporting
+`lg dev (0cfd343)`. Its implementation of
+let-go #920 raises the typed `Cancelled` condition from cancelled blocking
+operations, including sleep and channel waits. Code after such an operation is
+not cleanup and may never execute. Cleanup belongs in `finally`, and an adapter
+that deliberately models acquisition after cancellation must make that handoff
+explicit. Future boundaries absorb unhandled cancellation and may yield `nil`.
+
+Current ownership code uses explicit `catch Cancelled` boundaries and requires a
+runtime exposing that condition. Older binaries without it cannot load this code;
+use the verified runtime rather than relying on the version number alone.
+
+Attractor's ownership tests must prove acquisition, cancellation and joined
+finalization through handshakes rather than assume a cancelled wait returns
+normally. Parallel branch owners must distinguish local loser cancellation from
+an unrelated branch exception. These semantics explain why results from the older
+Homebrew runtime cannot certify this runtime; the October 7/8 audit records the
+separate verification runs. Historical reproductions below retain their original
+runtime identities and are not assertions that every listed issue remains open.
+
 ## Atom Update Gaps (#824)
 
 # Atomic update contract reproductions
@@ -157,8 +179,9 @@ yet evidence of a released runtime containing them. The reproducible build now
 pins fork revision `46244c4fa8169b8138aa1c29f31c8a6102ed1755` and applies both
 tracked runtime patches; see [runtime build evidence](runtime-audits.md).
 
-2026-09-12: the configured local runtime also needs the JSON string-key fix in
-[`runtime-patches/README.md`](../runtime-patches/README.md). HTTP question IDs and
+2026-09-12 historical state: the local runtime needed the JSON string-key fix
+recorded in [runtime build evidence](runtime-audits.md). The patch directory has
+since been removed; `lgx.edn` records the current release pin. HTTP question IDs and
 context keys previously included reader quotes. The native compiled-server probe
 now passes with that patch. Empty lazy sequences still serialize incorrectly as
 `[null]` in the observed runtime; the pipeline listing now constructs a vector.

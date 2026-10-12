@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing run-tests]]
             [clojure.string :as str]
             [attractor.ids]
-            [attractor.parser :as p]))
+            [attractor.parser :as p]
+            [attractor.pipeline :as pipeline] [os :as os]))
 
 (deftest test-linear-dot-parsing
   (testing "Parses a simple linear pipeline"
@@ -180,3 +181,16 @@ digraph Chaining {
     (is (= "Fetch https://host/path /* literal */ and // text" (get-in graph [:nodes "work" :prompt])))
     (is (= "/* proceed */ // now" (:label (first (:edges graph)))))
     (is (= #{"start" "work" "exit"} (set (keys (:nodes graph)))))))
+
+(deftest implicit-nodes-promote-the-same-scoped-defaults-as-explicit-nodes
+  (let [source (fn [declaration]
+                 (str "digraph G { subgraph group { label=Loop; node [label=Default, prompt=Prompt, shape=box, type=codergen, timeout=5s, llm_model=model, llm_provider=provider, reasoning_effort=high, goal_gate=true, retry_target=retry, fallback_retry_target=fallback, auto_status=true, allow_partial=true, max_retries=2, fidelity=full, thread_id=thread, class=custom]; " declaration " a -> b; } }"))
+        implicit (get-in (p/parse-dot (source "")) [:nodes "a"])
+        explicit (get-in (p/parse-dot (source "a;")) [:nodes "a"])]
+    (is (= explicit implicit))))
+
+(deftest implicit-goal-gate-cannot-turn-failed-work-into-success
+  (doseq [declaration ["" "work;"]]
+    (let [source (str "digraph G { node [shape=parallelogram, tool_command=\"false\", goal_gate=true]; start [shape=Mdiamond, goal_gate=false]; exit [shape=Msquare, goal_gate=false]; " declaration "start -> work; work -> exit [condition=\"outcome=fail\"]; }")
+          result (pipeline/run source {:logs-root (str (os/temp-dir) "/implicit-gate-" (random-uuid))})]
+      (is (= :fail (:status result))))))

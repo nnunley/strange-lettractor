@@ -502,8 +502,13 @@
                         (:runs report))
           (fail! :skill-eval-report-invalid {:reason :runs-must-cover-task-kind
                                             :task_id task-id :kind kind}))))
-    (let [regressed? (boolean (seq (:regressions report)))]
-      (when-not (= (= :hold (:verdict report)) regressed?)
+    (let [expected (promotion-verdict comparisons)
+          regressions (vec (keep (fn [comparison]
+                                   (when (:regression comparison)
+                                     {:task-id (:task-id comparison)
+                                      :reasons (:regression-reasons comparison)})) comparisons))]
+      (when-not (and (= (:verdict report) (:verdict expected))
+                     (= (:regressions report) regressions))
         (fail! :skill-eval-report-invalid {:reason :verdict-must-match-regressions}))))
   (when-not (= (:digest report) (report-digest report))
     (fail! :skill-eval-report-invalid {:reason :digest-mismatch}))

@@ -1,0 +1,71 @@
+(ns attractor.manifests
+  "Shared root selection and best-effort discovery mechanics.
+   Callers own validation, admission, domain errors, and evidence shapes."
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [hash :as hash]))
+
+(defn same-digest? [project user]
+  (= (:manifest-digest project) (:manifest-digest user)))
+
+(defn- approval-matches? [approval project user]
+  (and (map? approval)
+       (contains? #{"project" "user"} (:winning-root approval))
+       (= (:project-digest approval) (:manifest-digest project))
+       (= (:user-digest approval) (:manifest-digest user))))
+
+(defn select-root
+  "Select already validated root entries. No I/O or domain errors.
+   Returns :missing or :conflict, or a selection retaining the original
+   winner and the approval used. Both roots must be read before calling."
+  [project user approval]
+  (cond
+    (and (nil? project) (nil? user)) {:status :missing}
+    (nil? user) {:winner project :root "project" :cross-root :sole-project}
+    (nil? project) {:winner user :root "user" :cross-root :sole-user}
+    (same-digest? project user) {:winner project :root "project" :cross-root :agree}
+    (approval-matches? approval project user)
+    (let [user-wins? (= "user" (:winning-root approval))]
+      {:winner (if user-wins? user project)
+       :root (:winning-root approval) :cross-root :approved
+       :loser-digest (:manifest-digest (if user-wins? project user))
+       :approval approval})
+    :else {:status :conflict}))
+
+(defn discover
+  "Read a project-first roster, skipping unreadable or malformed entries.
+   Entry decoration is domain-specific; discovery never admits a manifest.
+   Directory-listing errors retain the caller accessor's behavior."
+  [opts manifest-file valid-id? decorate]
+  (let [{:keys [project-root user-root read-text list-dir]} opts
+        entries-for
+        (fn [root root-name]
+          (if (or (nil? list-dir) (nil? root) (str/blank? root))
+            []
+            (vec
+              (keep (fn [id]
+                      (try
+                        (when-let [text (read-text (str root "/" id "/" manifest-file))]
+                          (let [manifest (edn/read-string text)]
+                            (when (and (map? manifest) (= id (:id manifest))
+                                       (string? (:description manifest))
+                                       (not (str/blank? (:description manifest))))
+                              (merge {:id id :revision (str (:revision manifest))
+                                      :description (:description manifest)
+                                      :manifest-digest (hash/sha256 text) :root root-name}
+                                     (decorate manifest)))))
+                        (catch Object _ nil)))
+                    (sort (filter valid-id? (or (list-dir root) [])))))))
+        project (entries-for project-root "project")
+        user (entries-for user-root "user")
+        project-ids (into #{} (map :id project))
+        user-by-id (into {} (map (fn [entry] [(:id entry) entry]) user))]
+    (vec (concat
+           (mapv (fn [entry]
+                   (let [other (get user-by-id (:id entry))]
+                     (assoc entry :cross-root
+                            (cond (nil? other) :sole-project
+                                  (same-digest? entry other) :agree
+                                  :else :divergent)))) project)
+           (mapv #(assoc % :cross-root :sole-user)
+                 (remove #(contains? project-ids (:id %)) user))))))

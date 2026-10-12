@@ -37,6 +37,60 @@
       (= (first rem) flag) (second rem)
       :else (recur (rest rem)))))
 
+(defn parse-parameter-args
+  "Parses repeatable --param name=value flags, an optional --params-file EDN
+   map and a --trust level out of a raw CLI argument vector. Returns
+   {:flags {...} :file {...} :trust :trusted|:delegated :errors [...]}."
+  [args]
+  (loop [rem (vec args) flags {} file {} trust nil errors []]
+    (cond
+      (empty? rem) {:flags flags :file file :trust (or trust :trusted) :errors errors}
+
+      (= "--param" (first rem))
+      (let [v (second rem)
+            idx (when (string? v) (str/index-of v "="))]
+        (if (and v idx (pos? idx))
+          (recur (subvec rem 2) (assoc flags (subs v 0 idx) (subs v (inc idx)))
+                 file trust errors)
+          (recur (if v (subvec rem 2) (subvec rem 1)) flags file trust
+                 (conj errors (str "--param expects name=value, got " (pr-str v))))))
+
+      (= "--params-file" (first rem))
+      (let [p (second rem)
+            parsed (try (edn/read-string (io/slurp p)) (catch Object e {::bad (str e)}))]
+        (cond
+          (nil? p) (recur (subvec rem 1) flags file trust
+                          (conj errors "--params-file expects a path"))
+          (and (map? parsed) (contains? parsed ::bad))
+          (recur (subvec rem 2) flags file trust
+                 (conj errors (str "--params-file " p " is not readable EDN: " (::bad parsed))))
+          (not (map? parsed))
+          (recur (subvec rem 2) flags file trust
+                 (conj errors (str "--params-file " p " must contain an EDN map")))
+          :else
+          (recur (subvec rem 2) flags
+                 (into file (map (fn [[k v]] [(name k) v]) parsed))
+                 trust errors)))
+
+      (= "--trust" (first rem))
+      (let [v (second rem)]
+        (if (contains? #{"trusted" "delegated"} v)
+          (recur (subvec rem 2) flags file (keyword v) errors)
+          (recur (if v (subvec rem 2) (subvec rem 1)) flags file trust
+                 (conj errors (str "--trust expects trusted or delegated, got " (pr-str v))))))
+
+      :else (recur (subvec rem 1) flags file trust errors))))
+
+(defn- parameter-args-or-exit
+  "Parses --param/--params-file/--trust from args, printing every error and
+   exiting non-zero before anything runs when parsing fails."
+  [args]
+  (let [res (parse-parameter-args args)]
+    (when (seq (:errors res))
+      (doseq [err (:errors res)] (println (str "Error: " err)))
+      (os/exit 2))
+    res))
+
 (def ^:private agent-option-flags
   #{"--prompt-file" "--cwd" "--model" "--tools" "--timeout-ms" "--permission-mode"
     "--sandbox" "--approval-policy" "--env-file"})
@@ -81,33 +135,61 @@
       (:value reply))))
 
 (defn- pump-events!
-  "Attach to the hub log and deliver every envelope to `on-envelope` in
-   emission order until `completion` is realized, draining once more after
-   it so trailing events are not lost. Returns the completion value."
-  [hub completion on-envelope]
+  "Attach before starting work, then deliver every envelope in emission order.
+   Drain once after completion so trailing events are not lost."
+  [hub start-work on-envelope]
   (let [client (hub-call! hub :client/attach {})]
     (try
-      (loop [cursor (:cursor client) final? false]
-        (let [{:keys [events] next-cursor :cursor}
-              (hub/events-since hub (:client_id client) cursor)]
-          (doseq [envelope events] (on-envelope envelope))
-          (cond
-            final? (deref completion)
-            (realized? completion) (recur next-cursor true)
-            :else (do (core/sleep 20) (recur next-cursor false)))))
+      (let [completion (:completion (start-work))]
+        (loop [cursor (:cursor client) final? false]
+          (let [{:keys [events] next-cursor :cursor}
+                (hub/events-since hub (:client_id client) cursor)]
+            (doseq [envelope events] (on-envelope envelope))
+            (cond
+              final? (deref completion)
+              (realized? completion) (recur next-cursor true)
+              :else (do (core/sleep 20) (recur next-cursor false))))))
       (finally
         (try (hub-call! hub :client/detach {:client_id (:client_id client)})
              (catch Object _ nil))))))
 
 (declare make-codergen-backend-from-args make-fan-in-ranker-from-args console-session-options)
 
+(def ^:private harness-flags #{"--harness" "--no-harness" "--harness-interval" "--no-auto-refine"})
+(defn- interactive-harness-options [args]
+  (let [path (find-arg-val args "--harness") raw (find-arg-val args "--harness-interval")
+        interval (if (some #{"--harness-interval"} args)
+                   (when (and (string? raw) (re-matches #"[0-9]+" raw)) (parse-long raw)) 8)]
+    (when (or (not (and (integer? interval) (pos? interval)))
+              (and (some #{"--harness"} args) (or (str/blank? path) (str/starts-with? path "--")))
+              (and (some #{"--harness"} args) (some #{"--no-harness"} args)))
+      (throw (ex-info "Use --harness PATH or --no-harness; --harness-interval requires a positive integer"
+                      {:category :configuration_error})))
+    (cond-> {:enabled (not (boolean (some #{"--no-harness"} args)))
+             :auto_refine (not (boolean (some #{"--no-auto-refine"} args))) :interval interval}
+      path (assoc :path path))))
+
+(defn- repair-options [args]
+  (when (some #{"--repair-config"} args)
+    (let [path (find-arg-val args "--repair-config")]
+      (when (or (str/blank? path) (str/starts-with? path "--"))
+        (throw (ex-info "--repair-config requires an EDN configuration path" {:category :configuration_error})))
+      (try
+        (let [config (edn/read-string (io/slurp path))]
+          (when-not (map? config) (throw (ex-info "Expected EDN map" {}))) config)
+        (catch Object e (throw (ex-info (str "Cannot read repair configuration: " (ex-message e))
+                                       {:category :configuration_error :path path})))))))
+
 (defn- workflow-hub
   "Every CLI command owns an in-process hub built the same way: workflow
    handler registries come from the hub's request (auto-approve or the
    hub-bound interviewer), the codergen backend and fan-in ranker from args."
-  [args]
+  [args & [interactive?]]
   (let [working-dir (os/cwd)]
-    (hub/start! {:session_options (console-session-options args)
+    (hub/start! {:interactive_harness (when interactive? (interactive-harness-options args))
+                 :conversation_root (when interactive? "attractor_runs/conversations")
+                 :session_options (console-session-options args)
+                 :repair_config (repair-options args)
                  :workflow_registry_fn
                  (fn [request]
                    (task-review-bindings/bind-reviews
@@ -174,9 +256,9 @@
               ;; EDN in emission order.
               (with-hub (fn [_] nil)
                 (fn [hub]
-                  (let [started (hub-call! hub :agent/run
-                                  (assoc (dissoc opts :agent :on_event) :agent (:agent opts) :prompt (io/slurp path)))
-                        result (pump-events! hub (:completion started)
+                  (let [result (pump-events! hub
+                                 #(hub-call! hub :agent/run
+                                    (assoc (dissoc opts :agent :on_event) :agent (:agent opts) :prompt (io/slurp path)))
                                  (fn [envelope]
                                    (when (= :agent (:source envelope)) (prn (:event envelope)))))]
                     (when-let [error (:error result)]
@@ -267,6 +349,9 @@
         _ (when (and connect? (not (and (integer? port) (<= 1 port 65535))))
             (throw (ex-info "--connect requires a loopback nREPL port between 1 and 65535"
                             {:category :configuration_error})))
+        _ (when (and connect? (some (conj harness-flags "--repair-config") args))
+            (throw (ex-info "Harness and repair options belong to the host; configure attractor hub before attaching"
+                            {:category :configuration_error})))
         agent-defaults (cond-> {:working_dir (or (find-arg-val args "--agent-cwd") (os/cwd))}
                          (find-arg-val args "--agent-model") (assoc :model (find-arg-val args "--agent-model"))
                          (find-arg-val args "--agent-tools") (assoc :tools (str/split (find-arg-val args "--agent-tools") #","))
@@ -276,7 +361,7 @@
         ;; Human gates are hub questions answered from the console; the stdin
         ;; interviewer is never used here.
         connection (when connect? (nrepl-client/connect! {:host "127.0.0.1" :port port}))
-        hub (when-not connection (workflow-hub args))
+        hub (when-not connection (workflow-hub args true))
         aliases (into {} (keep (fn [[flag value]] (when (= flag "--alias")
                                                      (let [[name expansion] (str/split (str value) #"=" 2)]
                                                        (when (and (seq name) (seq expansion)) [name expansion]))))
@@ -328,7 +413,7 @@
       (do
         (when (and port-file (os/stat port-file))
           (throw (ex-info "Port file already exists" {:category :configuration_error :path port-file})))
-        (let [h (workflow-hub args) adapter (atom nil) published (atom nil)]
+        (let [h (workflow-hub args true) adapter (atom nil) published (atom nil)]
           (try
             (reset! adapter (nrepl-server/start! h {:port port :allow_stop true}))
             (let [actual (get-in @adapter [:address :port])]
@@ -364,11 +449,11 @@
   (println "Usage: attractor <command> [options] [args]")
   (println "")
   (println "Commands:")
-  (println "  run <dotfile> [--logs-root <dir>] [--auto-approve]   Execute a DOT pipeline")
-  (println "  validate <dotfile>                                  Validate pipeline structure & syntax")
-  (println "  graph <dotfile>                                     Inspect graph nodes, edges, and flow")
+  (println "  run <dotfile> [--logs-root <dir>] [--auto-approve] [--param k=v]... [--params-file <path>] [--trust trusted|delegated]   Execute a DOT pipeline")
+  (println "  validate <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]  Validate pipeline structure & syntax")
+  (println "  graph <dotfile> [--param k=v]... [--params-file <path>] [--trust trusted|delegated]      Inspect graph nodes, edges, and flow")
   (println "  resume [dotfile] --checkpoint <path>                Resume pipeline from checkpoint")
-  (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Shared HTTP/nREPL server")
+  (println "  serve [--port <address>] [--nrepl-port PORT | --connect PORT]  Conversation UI and HTTP API (default 127.0.0.1:7070)")
   (println "  hub [--port PORT] [--port-file PATH] [--mock|--llm]  Start a persistent loopback nREPL hub")
   (println "  hub --stop PORT                                    Request graceful hub shutdown")
   (println "  models [--provider <id>] [--base-url <u>]            List models from one provider, or every queryable provider")
@@ -381,7 +466,10 @@
   (println "    DOT run/resume accept --agent <name> with the same options")
   (println "    Native task-review models and budgets are selected by the DOT model_stylesheet")
   (println "  console [--connect PORT] [--tui] [--mock|--llm] [--model <provider/name>] [--alias name=expansion]")
-  (println "                                                      Interactive console: chat, : eval, /run, /agent <name>")
+  (println "    Host options: [--harness PATH|--no-harness] [--harness-interval N] [--no-auto-refine]")
+  (println "    Harness defaults on for console/hub; attached clients inherit host policy.")
+  (println "    Repair: --repair-config PATH (trusted EDN; separate triage model and framework repository)")
+  (println "    Commands: /threads, /thread <id>, /resume <id>, /followup, /harness, /refine, /repair, : eval, /run, /agent <name>")
   (println "  clean [--all]                                       Clean execution artifacts, logs, and checkpoints")
   (println "  help                                                Show this help message")
   (println ""))
@@ -400,7 +488,8 @@
          (:message diagnostic))))
 
 (defn cmd-validate [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (str/blank? dot-file)
       (do
         (println "Error: Please provide a DOT file to validate.")
@@ -412,7 +501,10 @@
           (os/exit 1))
         (try
           (let [dot-content (io/slurp dot-file)
-                prepared (pipeline/prepare dot-content {:source-path dot-file})
+                prepared (pipeline/prepare dot-content
+                           {:source-path dot-file
+                            :parameters {:flags (:flags params) :file (:file params)}
+                            :trust (:trust params)})
                 graph (:graph prepared)
                 diags (:diagnostics prepared)]
             (if (empty? diags)
@@ -433,12 +525,16 @@
             (os/exit 1)))))))
 
 (defn cmd-graph [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (or (str/blank? dot-file) (not (os/stat dot-file)))
       (do
         (println "Error: Valid DOT file required.")
         (os/exit 1))
-      (let [prepared (pipeline/prepare (io/slurp dot-file) {:source-path dot-file})
+      (let [prepared (pipeline/prepare (io/slurp dot-file)
+                       {:source-path dot-file
+                        :parameters {:flags (:flags params) :file (:file params)}
+                        :trust (:trust params)})
             graph (:graph prepared)
             start-node (parser/find-start-node graph)
             exit-node (parser/find-exit-node graph)]
@@ -472,8 +568,7 @@
     (fn [hub]
       (let [stdin (interviewer/make-console-interviewer)
             questions (answer-questions-from-stdin! hub stdin)
-            started (hub-call! hub op request)
-            result (pump-events! hub (:completion started)
+            result (pump-events! hub #(hub-call! hub op request)
                      (fn [envelope]
                        (case (:source envelope)
                          :workflow (on-event (:event envelope))
@@ -484,7 +579,8 @@
           (:value result))))))
 
 (defn cmd-run [args]
-  (let [dot-file (first args)]
+  (let [dot-file (first args)
+        params (parameter-args-or-exit args)]
     (if (or (str/blank? dot-file) (not (os/stat dot-file)))
       (do
         (println "Error: Valid DOT file required.")
@@ -515,7 +611,9 @@
                          nil))
             outcome (run-through-hub! args :workflow/run
                       {:dot_source (io/slurp dot-file) :logs_root logs-root
-                       :source_path dot-file :auto_approve auto-approve?}
+                       :source_path dot-file :auto_approve auto-approve?
+                       :params (:flags params) :params_file (:file params)
+                       :trust (:trust params)}
                       on-event)]
         (println (str "\nExecution finished with status: " (:status outcome)))
         (println (str "Artifacts and checkpoints saved in: " logs-root))
@@ -523,16 +621,36 @@
           (os/exit 0)
           (os/exit 1))))))
 
+(defn- resume-forbidden-flags
+  "The launch-scoped flags a resume must refuse. The checkpoint's recorded
+   values are authoritative, and the resume path admits a fixed set of runtime
+   options and discards the rest, so accepting these would silently ignore
+   them."
+  [args]
+  (filterv (fn [flag] (boolean (some #{flag} args)))
+           ["--param" "--params-file" "--trust"]))
+
 (defn cmd-resume [args]
   (let [first-arg (first args)
         dot-file (when (and (string? first-arg)
                             (not (str/starts-with? first-arg "--")))
                    first-arg)
-        cp-path (find-arg-val args "--checkpoint")]
-    (if (or (str/blank? cp-path) (not (os/stat cp-path)))
+        cp-path (find-arg-val args "--checkpoint")
+        forbidden (resume-forbidden-flags args)]
+    (cond
+      (seq forbidden)
+      (do
+        (doseq [flag forbidden]
+          (println (str "workflow_configuration_error: option " flag
+                        " is not permitted on resume")))
+        (os/exit 1))
+
+      (or (str/blank? cp-path) (not (os/stat cp-path)))
       (do
         (println "Error: Valid --checkpoint path required.")
         (os/exit 1))
+
+      :else
       (let [outcome (run-through-hub! args :workflow/resume
                       (cond-> {:checkpoint_path cp-path :auto_approve false}
                         (not (str/blank? dot-file)) (assoc :current_source_path dot-file))
@@ -547,19 +665,32 @@
 (defn- serve-connected [port remote-port]
   (let [connection (nrepl-client/connect! {:host "127.0.0.1" :port remote-port})]
     (try
-      (println (str "Attractor HTTP adapter on " port ", attached to hub " remote-port))
+      ;; http/serve blocks and does not expose its bound listener address.
+      ;; Announce the configured endpoint without claiming the bind succeeded.
+      (println (str "Starting Attractor HTTP adapter on " port ", attached to hub " remote-port))
+      (when-let [[_ host port-text] (re-matches #"(.*):([0-9]+)" port)]
+        (if (= 0 (parse-long port-text))
+          (println "The assigned HTTP port is unavailable; use --port :7070 for a known endpoint.")
+          (let [display-host (case host "" "localhost" "0.0.0.0" "localhost" "[::]" "[::1]" host)]
+            (if (contains? #{"" "0.0.0.0" "[::]" "localhost" "127.0.0.1" "[::1]"} host)
+              (println (str "Conversation UI: http://" display-host ":" port-text "/"))
+              (println "Conversation UI requires a loopback listener or local tunnel."))
+            (println (str "HTTP API: http://" display-host ":" port-text "/pipelines")))))
       (io/flush *out*)
       (http/serve (hub-http/make-handler #(nrepl-client/request! connection %)) port)
       (finally (nrepl-client/close! connection)))))
 
 (defn cmd-serve [args]
-  (let [port (or (find-arg-val args "--port") ":7070")
+  (let [port (or (find-arg-val args "--port") "127.0.0.1:7070")
         connect? (boolean (some #{"--connect"} args))
         text (find-arg-val args "--connect")
         remote-port (when (and connect? (string? text) (re-matches #"[0-9]+" text)) (parse-long text))
         own-port? (boolean (some #{"--nrepl-port"} args))
         own-text (if own-port? (find-arg-val args "--nrepl-port") "0")
         own-port (when (and (string? own-text) (re-matches #"[0-9]+" own-text)) (parse-long own-text))]
+    (when (and connect? (some #{"--repair-config"} args))
+      (throw (ex-info "Repair options belong to the host; configure the hub before attaching"
+                      {:category :configuration_error})))
     (when (or (and connect? own-port?) (not (and (integer? own-port) (<= 0 own-port 65535))))
       (throw (ex-info "Use --nrepl-port 0..65535 for an owned hub or --connect PORT for an existing hub"
                       {:category :configuration_error})))
@@ -568,7 +699,7 @@
                       {:category :configuration_error})))
     (if connect?
       (serve-connected port remote-port)
-      (let [h (workflow-hub args) adapter (atom nil)]
+      (let [h (workflow-hub args true) adapter (atom nil)]
         (try
           (reset! adapter (nrepl-server/start! h {:port own-port}))
           (let [actual (get-in @adapter [:address :port])]

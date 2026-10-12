@@ -1,0 +1,13 @@
+;; Repair triage, coding and independent review use Muse through the configured
+;; OpenRouter provider. Credentials remain in the provider registry.
+;; Contributor prompts/outputs may be used to improve Meta's products.
+{:repository "/Users/ndn/development/attractor"
+ :triage_model "openrouter/meta/muse-spark-1.3-contributor"
+ :test_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx suite"
+ :build_command "LGX_LG=/Users/ndn/development/let-go/bin/lg lgx rebuild"
+ ;; Allow for three complete suite runs (baseline, reproduction, fixed) and build.
+ :timeout_ms 1800000
+ :max_incidents 32
+ :max_model_calls 32
+ :max_turns 12
+ :max_total_tokens 60000}

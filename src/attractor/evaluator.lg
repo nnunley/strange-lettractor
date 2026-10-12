@@ -1,0 +1,200 @@
+(ns attractor.evaluator
+  "Scoped let-go tool evaluator and dynamic runtime tooling.
+   Provides interactive let-go evaluation with access to the session environment,
+   owned cooperative cancellation, and dynamic tool compilation."
+  (:require [attractor.harness :as harness]
+            [attractor.operation-owner :as owner]
+            [attractor.profiles :as profiles]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [io :as io]
+            [json :as json]
+            [os :as os]))
+
+(def default-eval-timeout-ms 5000)
+
+(defn- parse-schema [params]
+  (cond
+    (map? params)
+    (let [t (or (:type params) (get params "type"))]
+      (if (and t (= "object" (if (keyword? t) (name t) t)))
+        params
+        {:type "object" :properties params}))
+
+    (string? params)
+    (let [trimmed (str/trim params)]
+      (if (str/blank? trimmed)
+        {:type "object"}
+        (try
+          (let [parsed (if (str/starts-with? trimmed "{")
+                         (json/read-json trimmed)
+                         (edn/read-string trimmed))]
+            (parse-schema parsed))
+          (catch Object _
+            {:type "object"}))))
+
+    :else
+    {:type "object"}))
+
+(defn- checkpoint-form [form]
+  ;; The VM cancels blocking operations, not bytecode back-edges. Instrument
+  ;; authored recur and function entries so tight loops join their owned scope.
+  ;; This is cooperative execution, not a sandbox for arbitrary native callbacks.
+  (cond
+    (vector? form) (mapv checkpoint-form form)
+    (map? form) (into {} (map (fn [[k v]] [(checkpoint-form k) (checkpoint-form v)]) form))
+    (seq? form)
+    (let [form (macroexpand form) head (first form)]
+      (cond
+        (= head 'quote) form
+        (= head 'recur) (list 'do '(when (core/scope-cancelled?) (throw (ex-info "Evaluation cancelled" {:category :cancelled}))) (apply list (map checkpoint-form form)))
+        (contains? #{'fn 'fn*} head)
+        (let [named? (symbol? (second form))
+              prefix (if named? (take 2 form) (take 1 form))
+              bodies (drop (count prefix) form)]
+          (if (vector? (first bodies))
+            (apply list (concat prefix [(first bodies) '(when (core/scope-cancelled?) (throw (ex-info "Evaluation cancelled" {:category :cancelled})))] (map checkpoint-form (rest bodies))))
+            (apply list (concat prefix (map (fn [arity]
+                                             (apply list (concat [(first arity) '(when (core/scope-cancelled?) (throw (ex-info "Evaluation cancelled" {:category :cancelled})))]
+                                                                 (map checkpoint-form (rest arity))))) bodies)))))
+        (contains? #{'if 'do 'let* 'loop* 'try 'catch 'finally 'throw 'def 'var 'set!} head)
+        (apply list (map checkpoint-form form))
+        :else (list 'do
+                    '(when (core/scope-cancelled?) (throw (ex-info "Evaluation cancelled" {:category :cancelled})))
+                    (apply list (map checkpoint-form form)))))
+    :else form))
+
+(defn eval-code
+  "Evaluate with an owned cancellation scope and join before returning.
+   Authored loops are instrumented; supplied native callbacks must cooperate
+   with cancellation. A blocking non-cooperative native delays return, never
+   detaches work behind a successful timeout report."
+  [code & [options]]
+  (let [opts (or options {}) timeout-ms (max 1 (or (:timeout_ms opts) default-eval-timeout-ms))
+        env (or (:env opts) {})
+        parsed (try
+                 {:fn (eval (checkpoint-form (read-string (str "(fn [env] (do " (or code "") "\n))"))))}
+                 (catch Object e {:error (str e)}))]
+    (if (:error parsed)
+      {:status :error :category :syntax_error :error (:error parsed)}
+      (let [deadline (+ (System/currentTimeMillis) timeout-ms)
+            operation (owner/start! {:check! (fn []
+                                              (when (>= (System/currentTimeMillis) deadline)
+                                                (throw (ex-info "Evaluation deadline" {:category :timeout}))))
+                                      :cleanup! (fn [] nil)})]
+        (try
+          (let [result (owner/invoke! operation #((:fn parsed) env))]
+            (owner/finish! operation)
+            {:status :ok :result result :output (if (string? result) result (pr-str result))})
+          (catch Object e
+            (if (= :timeout (:category (ex-data e)))
+              {:status :timeout :category :timeout :error (str "Execution timed out after " timeout-ms "ms")}
+              {:status :error :category :runtime_error :error (str e)}))
+          (finally (try (owner/close! operation) (catch Object _ nil))))))))
+
+(defn compile-tool-fn
+  "Compile exactly one fn [args env] literal. Compilation never invokes authored code."
+  [code]
+  (cond
+    (fn? code) code
+    (string? code)
+    (let [forms (read-string (str "[" code "\n]")) form (first forms)]
+      (when-not (and (= 1 (count forms)) (seq? form) (= 'fn (first form))
+                     (vector? (second form)) (= 2 (count (second form)))
+                     (every? symbol? (second form)) (not-any? #{'&} (second form)))
+        (throw (ex-info "Dynamic tool must be one (fn [args env] ...) literal"
+                        {:category :invalid-tool-function})))
+      (eval (checkpoint-form form)))
+    :else (throw (ex-info "Tool code must be a string or function" {:category :invalid-tool-code}))))
+
+(defn make-dynamic-tool
+  "Construct a registered tool specification from dynamic definition components."
+  [name description parameters code-str-or-fn]
+  (let [params (parse-schema parameters)
+        compiled-fn (compile-tool-fn code-str-or-fn)]
+    {:definition {:name (str name)
+                  :description (str (or description name))
+                  :parameters params}
+     :code (when (string? code-str-or-fn) code-str-or-fn)
+     :executor (fn [args env] (compiled-fn args env))}))
+
+(defn eval-letgo-tool
+  "Tool definition and executor for interactive let-go evaluation (eval_letgo)."
+  []
+  {:definition
+   {:name "eval_letgo"
+    :description "Evaluate let-go expressions in the session environment with access to filesystem, shell, and data utilities."
+    :parameters {:type "object"
+                 :properties {:code {:type "string" :description "The let-go expression or code block to evaluate"}
+                              :timeout_ms {:type "integer" :description "Optional execution timeout in milliseconds (default: 5000)"}}
+                 :required ["code"]}}
+   :executor (fn [arguments env]
+               (let [code (or (get arguments "code") (get arguments :code))
+                     timeout-ms (or (get arguments "timeout_ms") (get arguments :timeout_ms) default-eval-timeout-ms)
+                     res (eval-code code {:timeout_ms timeout-ms :env env})]
+                 (if (= :ok (:status res))
+                   (:output res)
+                   (str "Evaluation Error [" (name (or (:category res) :error)) "]: " (:error res)))))})
+
+(defn- compile-entries [entries h registry]
+  (into {} (map (fn [[id entry]]
+                 (let [tool (make-dynamic-tool id
+                              (or (get-in entry [:arguments :description]) (:title entry))
+                              (get-in entry [:arguments :parameters]) (:content entry))
+                       execute (:executor tool)]
+                   [id (assoc tool :harness_owner h
+                         :executor (fn [args env]
+                                     (if-let [run (:run_dynamic_tool (meta registry))]
+                                       (run #(execute args env))
+                                       (execute args env))))])) entries)))
+
+(defn load-harness-tools!
+  "Restore and bind a registry to validated ledger transactions. Invalid entries fail visibly."
+  [registry h]
+  (when (and registry h)
+    (let [compiled (compile-entries (get-in @h [:entries :tool] {}) h registry)]
+      (when-not (contains? (:preparers (meta h)) registry)
+        (doseq [id (keys compiled)]
+          (when (and (contains? @registry id) (not (identical? h (:harness_owner (get @registry id)))))
+            (throw (ex-info "Harness tool cannot replace host tool" {:category :harness-tool-collision :id id})))))
+      (swap! registry merge compiled)
+      (harness/attach! h registry
+        (fn [before after]
+          (let [old-tools (get-in before [:entries :tool] {})
+                tools (compile-entries (get-in after [:entries :tool] {}) h registry)]
+            (doseq [id (keys tools)]
+              (when (and (get @registry id) (not (contains? old-tools id)))
+                (throw (ex-info "Harness tool cannot replace host tool" {:category :harness-tool-collision :id id}))))
+            (fn [] (swap! registry (fn [current] (merge (apply dissoc current (keys old-tools)) tools)))))))
+      (count compiled))))
+
+(defn define-tool!
+  "Compile, register and persist through the same transaction as refiner edits."
+  [registry h name description parameters code]
+  (if h
+    (do
+      (load-harness-tools! registry h)
+      (harness/apply-edit! h {:action (if (get-in @h [:entries :tool (str name)]) "update" "create")
+                             :kind "tool" :id (str name) :title (str name) :content code
+                             :arguments {:description description :parameters (parse-schema parameters)}}))
+    (profiles/register-tool! registry (make-dynamic-tool name description parameters code)))
+  (str "Defined and registered dynamic tool: " name))
+
+(defn define-tool-tool
+  "Tool definition for define_tool callable by the agent."
+  [registry harness-atom]
+  {:definition
+   {:name "define_tool"
+    :description "Define a reusable dynamic tool in let-go and register it into the session tool registry and continual harness"
+    :parameters {:type "object"
+                 :properties {:name {:type "string" :description "Unique tool name"}
+                              :description {:type "string" :description "Tool description for LLM dispatch"}
+                              :parameters {:type "object" :description "JSON Schema object defining tool input properties"}
+                              :code {:type "string" :description "let-go function code: (fn [args env] ...)"}}
+                 :required ["name" "description" "code"]}}
+   :executor (fn [arguments _env]
+               (let [name (or (get arguments "name") (get arguments :name))
+                     description (or (get arguments "description") (get arguments :description))
+                     parameters (or (get arguments "parameters") (get arguments :parameters) {})
+                     code (or (get arguments "code") (get arguments :code))]
+                 (define-tool! registry harness-atom name description parameters code)))})

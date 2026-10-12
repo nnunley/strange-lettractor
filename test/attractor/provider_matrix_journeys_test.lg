@@ -1,0 +1,496 @@
+(ns attractor.provider-matrix-journeys-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [http :as http]
+            [io :as io]
+            [json :as json]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.llm-contract-adapters-test :as wire]
+            [live.provider-matrix-journeys :as journeys]))
+
+(def existing-row-names
+  [:text :stream :structured :tool-continuation :provider-options
+   :usage-accounting :prompt-cache :streaming-tools :parallel-tools
+   :multi-round-tools :image-base64 :image-url :reasoning :invalid-key
+   :agent-loop])
+
+(deftest shared-runner-exposes-existing-journeys-in-order
+  (let [loaded? (try (require 'live.provider-matrix-journeys) true
+                     (catch Object _ false))
+        make-journeys (when loaded? (ns-resolve 'live.provider-matrix-journeys 'journeys))]
+    (is loaded? "an ordinary shared namespace is available to tests")
+    (is (some? make-journeys))
+    (when make-journeys
+      (let [names (mapv first
+                        (make-journeys {:provider "gemini" :model "gemini-3-flash-preview"
+                                        :compat false}
+                                       {:api_key "fixture" :base_url "https://fixture.invalid/v1beta"}))]
+        (is (= existing-row-names (subvec names 0 (count existing-row-names))))
+        (is (= [:missing-model :rate-limit] (subvec names (count existing-row-names))))
+        (is (= (count names) (count (set names))))))))
+
+(deftest compatible-endpoint-preserves-supported-rows-and-intentional-skips
+  (let [target {:provider "openai-compat" :model "fixture-model" :compat true}
+        requests (atom [])
+        transport (fn [request]
+                    (swap! requests conj (json/read-json (:body request)))
+                    {:status 200
+                     :body (json/write-json
+                             {:id "chatcmpl-1" :choices [{:index 0
+                                                          :message {:role "assistant" :content "pong"}
+                                                          :finish_reason "stop"}]
+                              :usage {:prompt_tokens 11 :completion_tokens 7}})})
+        rows (into {} (journeys/journeys target
+                        {:api_key "fixture" :base_url "https://fixture.invalid/v1"
+                         :transport transport}))
+        skipped [:provider-options :usage-accounting :image-base64 :image-url
+                 :reasoning :invalid-key :missing-model :rate-limit]]
+    (doseq [name skipped]
+      (is (= :skipped (:status (journeys/run-journey target [name (get rows name)]))) name))
+    (is (empty? @requests))
+    (is (= :pass (:status (journeys/run-journey target [:text (:text rows)]))))
+    (is (= "fixture-model" (get (first @requests) "model")))
+    (is (= :complete (journeys/aggregate-status
+                       (mapv #(journeys/run-journey target [% (get rows %)]) skipped))))))
+
+(defn- text-reply [provider text]
+  (let [body (case provider
+               "openai" {:id "r1" :status "completed"
+                         :output [{:type "message" :role "assistant"
+                                   :content [{:type "output_text" :text text}]}]
+                         :usage {:input_tokens 11 :output_tokens 7 :total_tokens 18}}
+               "anthropic" {:id "m1" :type "message" :role "assistant"
+                            :content [{:type "text" :text text}] :stop_reason "end_turn"
+                            :usage {:input_tokens 11 :output_tokens 7}}
+               "gemini" {:responseId "g1"
+                         :candidates [{:content {:role "model" :parts [{:text text}]}
+                                       :finishReason "STOP"}]
+                         :usageMetadata {:promptTokenCount 11 :candidatesTokenCount 7
+                                         :totalTokenCount 18}})]
+    {:status 200 :body (json/write-json body)}))
+
+(deftest nested-adapters-retain-supplied-harness-routing
+  (doseq [provider ["openai" "anthropic" "gemini"]]
+    (let [seen (atom [])
+          transport (fn [request]
+                      (swap! seen conj request)
+                      (if (= "invalid-key-for-matrix"
+                             (or (get-in request [:headers "x-api-key"])
+                                 (get-in request [:headers "x-goog-api-key"])))
+                        {:status 401 :body (json/write-json {:error {:message "bad key"}})}
+                        (text-reply provider "ready")))
+          target {:provider provider :model (case provider
+                                              "openai" "gpt-5-mini"
+                                              "anthropic" "claude-haiku-4-5"
+                                              "gemini" "gemini-3-flash-preview")
+                  :compat false}
+          adapter-options {:api_key "fixture" :base_url "https://fixture.invalid/native"
+                           :transport transport}
+          rows (into {} (journeys/journeys target adapter-options))]
+      ;; Global HTTP is a fail-closed guard: an escaped adapter never reaches a live endpoint.
+      (with-redefs [http/request (fn [request]
+                                  (throw (ex-info "escaped supplied transport"
+                                                  {:category :escaped-harness
+                                                   :url (:url request)})))]
+        (is (= :pass (:status (journeys/run-journey target [:provider-options (:provider-options rows)])))
+            provider))
+      (is (seq @seen))
+      (is (every? #(str/starts-with? (:url %) "https://fixture.invalid/native") @seen)))))
+
+(deftest missing-model-and-rate-limit-observe-one-native-attempt
+  (doseq [provider ["openai" "anthropic" "gemini"]
+          [scenario status] [[:missing-model 404] [:rate-limit 429]
+                             [:rate-limit 200]]]
+    (let [seen (atom [])
+          target {:provider provider :model (case provider
+                                              "openai" "gpt-5-mini"
+                                              "anthropic" "claude-haiku-4-5"
+                                              "gemini" "gemini-3-flash-preview")
+                  :compat false}
+          transport (fn [request]
+                      (swap! seen conj request)
+                      (if (= status 200)
+                        (text-reply provider "normal response")
+                        {:status status
+                         :body (json/write-json
+                                 {:error {:message (if (= status 404) "model not found" "rate limit")
+                                          :type (if (= status 404) "not_found_error" "rate_limit_error")
+                                          :status (if (= status 404) "NOT_FOUND" "RESOURCE_EXHAUSTED")}})}))
+          rows (into {} (journeys/journeys target
+                          {:api_key "fixture" :base_url "https://fixture.invalid/native"
+                           :transport transport}))
+          result (journeys/run-journey target [scenario (get rows scenario)])]
+      (is (= 1 (count @seen)) (str provider " " scenario " " status))
+      (is (= (if (and (= scenario :rate-limit) (= status 200)) :skipped :pass)
+             (:status result)) (pr-str result))
+      (when (= scenario :missing-model)
+        (is (str/includes? (pr-str (first @seen)) "attractor-nonexistent-model"))
+        (is (= 2 (get-in result [:detail :retry_allowance]))))
+      (when (and (= scenario :rate-limit) (= status 200))
+        (is (true? (:unproved result)))
+        (is (string? (:reason result)))))))
+
+(deftest model-selection-uses-native-catalog-and-preserves-overrides
+  (let [model-for (ns-resolve 'live.provider-matrix-journeys 'model-for)]
+    (is (some? model-for))
+    (when model-for
+      (doseq [[protocol provider] [[:openai-responses "openai"]
+                                   [:anthropic-messages "anthropic"]
+                                   [:gemini-generate-content "gemini"]]]
+        (let [expected (:id (llm/get-latest-model provider))]
+          (is (= expected (model-for provider protocol nil)))
+          (is (= expected (model-for (str provider "-proxy") protocol nil)))
+          (is (= "explicit-older" (model-for provider protocol "explicit-older")))))
+      (is (nil? (model-for "openai-compat" :openai-chat-completions nil)))
+      (is (= "local-model" (model-for "openai-compat" :openai-chat-completions "local-model"))))))
+
+(deftest applicable-unproved-row-makes-aggregate-incomplete
+  (let [aggregate (ns-resolve 'live.provider-matrix-journeys 'aggregate-status)]
+    (is (some? aggregate))
+    (when aggregate
+      (is (= :complete (aggregate [{:status :pass}])))
+      (is (= :complete (aggregate [{:status :pass}
+                                   {:status :skipped :reason "unsupported compatible-endpoint capability"}])))
+      (is (= :incomplete (aggregate [{:status :pass}
+                                     {:status :skipped :unproved true :reason "429 not observed"}])))
+      (is (= :fail (aggregate [{:status :fail}
+                               {:status :skipped :unproved true}])))
+      (is (= :empty (aggregate []))))))
+
+(deftest agent-loop-closes-session-and-removes-root-after-execution-failure
+  (let [root (atom nil)
+        closed (atom 0)
+        original-close agent/close-session!
+        target {:provider "gemini" :model "gemini-3-flash-preview" :compat false}
+        row (get (into {} (journeys/journeys target
+                            {:api_key "fixture" :base_url "https://fixture.invalid/native"}))
+                 :agent-loop)]
+    (try
+      (with-redefs [agent/process-input!
+                    (fn [session _]
+                      (let [dir ((:working_directory (:execution_env @session)))]
+                        (reset! root dir)
+                        (io/spit (str dir "/failure-marker") "created")
+                        (throw (ex-info "injected execution failure" {:category :injected-failure}))))
+                    agent/close-session!
+                    (fn [session] (swap! closed inc) (original-close session))]
+        (let [result (journeys/run-journey target [:agent-loop row])]
+          (is (= :fail (:status result)))
+          (is (= :injected-failure (:category result)))
+          (is (= 1 @closed))
+          (is (some? @root))
+          (is (not (io/file-exists? (str @root "/failure-marker"))))))
+      (finally
+        (when (and @root (io/file-exists? (str @root "/failure-marker")))
+          (os/sh "/bin/rm" "-rf" "--" @root))))))
+
+(deftest agent-loop-success-closes-real-session-and-removes-root
+  (doseq [[provider model] [["anthropic" "claude-haiku-4-5"]
+                            ["gemini" "gemini-3-flash-preview"]]]
+    (wire/with-wire-server
+      (fn [base]
+      (let [target {:provider provider :model model :compat false}
+            row (get (into {} (journeys/journeys target
+                                {:api_key "fixture"
+                                 :base_url (str base "/" provider "/provider-agent")}))
+                     :agent-loop)
+            created-root (atom nil)
+            closed (atom 0)
+            original-env execution/make-local-environment
+            original-close agent/close-session!]
+        (with-redefs [execution/make-local-environment
+                      (fn [opts]
+                        (reset! created-root (:working_dir opts))
+                        (original-env opts))
+                      agent/close-session!
+                      (fn [session]
+                        (swap! closed inc)
+                        (original-close session))]
+          (let [result (journeys/run-journey target [:agent-loop row])]
+            (is (= :pass (:status result)) (pr-str result))
+            (is (str/includes? (get-in result [:detail :output] "") "READY"))
+            (is (= 1 @closed))
+            (is (some? @created-root))
+            (is (not (io/file-exists? @created-root)))
+            (let [requests (filterv #(str/includes? (get % "path")
+                                                    (str "/" provider "/provider-agent/"))
+                                    (wire/recorded base))]
+              (is (= 2 (count requests)) provider)
+              (let [body (get-in (second requests) ["body"])]
+                (if (= provider "anthropic")
+                  (let [parts (get-in body ["messages" 1 "content"])]
+                    (is (= ["thinking" "redacted_thinking" "tool_use"]
+                           (mapv #(get % "type") parts)))
+                    (is (= "agent-thinking-signature" (get-in parts [0 "signature"])))
+                    (is (= "agent-redacted-data" (get-in parts [1 "data"])))
+                    (is (= "toolu-lookup" (get-in parts [2 "id"]))))
+                  (let [parts (get-in body ["contents" 1 "parts"])]
+                    (is (= ["agent-thought-signature" "agent-call-signature"]
+                           (mapv #(get % "thoughtSignature") parts)))
+                    (is (= true (get-in parts [0 "thought"])))
+                    (is (= "" (get-in parts [0 "text"])))
+                    (is (= "lookup" (get-in parts [1 "functionCall" "name"]))))))))))))))
+
+(deftest failed-journey-retains-bounded-agent-output-excerpt
+  (let [target {:provider "anthropic" :model "claude-haiku-4-5"}
+        output (str "agent diagnostic " (apply str (repeat 500 "x")))
+        result (journeys/run-journey target
+                 [:agent-loop (fn [] (throw (ex-info "agent output invalid"
+                                               {:category :agent-output-invalid :output output})))])]
+    (is (= :fail (:status result)))
+    (is (= :agent-output-invalid (:category result)))
+    (is (= 200 (count (get-in result [:detail :output_excerpt]))))
+    (is (str/starts-with? (get-in result [:detail :output_excerpt] "") "agent diagnostic "))))
+
+(deftest changed-journeys-run-through-all-native-recording-protocols
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[provider model] [["openai" "gpt-5-mini"]
+                                ["anthropic" "claude-haiku-4-5"]
+                                ["gemini" "gemini-3-flash-preview"]]
+              [scenario name] [["provider-text" :text]
+                               ["provider-stream" :stream]
+                               ["provider-structured" :structured]
+                               ["provider-parallel" :parallel-tools]
+                               ["provider-missing" :missing-model]
+                               ["provider-rate" :rate-limit]]]
+        (let [target {:provider provider :model model :compat false}
+              row (get (into {} (journeys/journeys target
+                                  {:api_key "fixture"
+                                   :base_url (str root "/" provider "/" scenario)})) name)
+              result (journeys/run-journey target [name row])]
+          (is (= :pass (:status result)) (str provider "/" scenario " " (pr-str result))))))))
+
+(defn- probe-client [root provider scenario]
+  (llm/make-client
+    {:default_provider provider
+     :providers {provider (llm/make-provider-adapter
+                            provider
+                            {:api_key "fixture"
+                             :base_url (str root "/" provider "/" scenario)})}}))
+
+(defn- probe-status [client model prompt & [options]]
+  (try
+    (llm/client-complete client
+      (merge {:model model :messages [{:role :user :content prompt}]} options))
+    :unexpected-success
+    (catch Object e (:status_code (ex-data e)))))
+
+(deftest native-agent-fixture-rejects-changed-signed-continuations
+  (wire/with-wire-server
+    (fn [base]
+      (doseq [[provider model] [["anthropic" "claude-haiku-4-5"]
+                                ["gemini" "gemini-3-flash-preview"]]]
+        (let [client (probe-client base provider "provider-agent")
+              prompt "Call the lookup tool with code X7 and report what it means in one sentence."
+              first-response (llm/client-complete client
+                               {:model model :messages [{:role :user :content prompt}]
+                                :tools [{:name "lookup" :description "Lookup a code"
+                                         :parameters {:type "object"
+                                                      :properties {"code" {:type "string"}}
+                                                      :required ["code"]}}]})
+              message (:message first-response)
+              call (first (:tool_calls first-response))
+              result {:role :tool
+                      :content [{:tool_call_id (:id call) :tool_name "lookup"
+                                 :content "code X7 means READY"}]}
+              status (fn [assistant tool-result]
+                       (probe-status client model prompt
+                         {:messages [{:role :user :content prompt} assistant tool-result]}))
+              altered-signature
+              (if (= provider "anthropic")
+                (assoc-in message [:parts 0 :thinking :signature] "changed-signature")
+                (assoc-in message [:parts 0 :provider_data "thoughtSignature"] "changed-signature"))
+              altered-call
+              (if (= provider "anthropic")
+                (assoc-in message [:parts 2 :tool_call :id] "wrong-tool-id")
+                (assoc-in message [:parts 1 :provider_data "functionCall" "name"] "wrong_tool"))
+              altered-result (if (= provider "anthropic")
+                               (assoc-in result [:content 0 :tool_call_id] "wrong-tool-id")
+                               result)]
+          (is (= :unexpected-success (status message result)) (str provider " valid continuation"))
+          (doseq [[fault assistant tool-result]
+                  [[:omitted (update message :parts #(vec (rest %))) result]
+                   [:moved (update message :parts #(vec (reverse %))) result]
+                   [:signature altered-signature result]
+                   [:tool-identity altered-call altered-result]]]
+            (is (= 400 (status assistant tool-result)) (str provider " " fault))))))))
+
+(deftest recording-fixture-rejects-changed-native-inputs
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[provider model] [["openai" "gpt-5-mini"]
+                                ["anthropic" "claude-haiku-4-5"]
+                                ["gemini" "gemini-3-flash-preview"]]]
+        (is (= 400 (probe-status (probe-client root provider "provider-text")
+                      model "Reply with exactly the word: banana")) provider)
+        (is (= 400 (probe-status (probe-client root provider "provider-text")
+                      "substituted-valid-model" "Reply with exactly the word: pong")) provider)
+        (is (= 400 (probe-status (probe-client root provider "provider-stream")
+                      model "Count from 1 to 3 separated by commas")) provider)
+        (is (= 400 (probe-status (probe-client root provider "provider-structured")
+                      model "Extract: Bob is 31 years old"
+                      {:response_format {:type "json_schema"
+                                         :json_schema {:type "object"
+                                                       :properties {"name" {:type "string"}
+                                                                    "age" {:type "integer"}}}}})) provider)
+        (is (= 400 (probe-status (probe-client root provider "provider-structured")
+                      model "Extract the person's name and integer age from: Alice is 30 years old. Respond with JSON only."
+                      {:response_format {:type "json_schema"
+                                         :json_schema {:type "object"
+                                                       :properties {"name" {:type "string"}
+                                                                    "age" {:type "string"}
+                                                                    "unrelated" {:type "integer"}}
+                                                       :required ["name" "age"]}}})) provider)
+        (is (= 400 (probe-status (probe-client root provider "provider-missing")
+                      model "Reply with one word: ready.")) provider)
+        (let [client (probe-client root provider "provider-parallel")
+              prompt "Call read_left and read_right together in the same response, in parallel. They are independent. Then report both complete returned values."
+              first-response (llm/client-complete client
+                               {:model model :messages [{:role :user :content prompt}]
+                                :tools [{:name "read_left" :description "left" :parameters {:type "object" :properties {}}}
+                                        {:name "read_right" :description "right" :parameters {:type "object" :properties {}}}]})
+              calls (:tool_calls first-response)
+              exchanged {:role :tool
+                         :content [{:tool_call_id (:id (first calls)) :tool_name "read_left" :content "right-opaque"}
+                                   {:tool_call_id (:id (second calls)) :tool_name "read_right" :content "left-opaque"}]}
+              unknown-id {:role :tool
+                          :content [{:tool_call_id "unknown-call" :tool_name "read_left" :content "left-opaque"}
+                                    {:tool_call_id (:id (second calls)) :tool_name "read_right" :content "right-opaque"}]}]
+          (is (= 2 (count (:tool_calls first-response))))
+          (is (= 400
+                 (probe-status client model prompt
+                   {:tools [{:name "other_left" :description "left" :parameters {:type "object" :properties {}}}
+                            {:name "other_right" :description "right" :parameters {:type "object" :properties {}}}]}))
+              (str provider " missing required tool declarations"))
+          (is (= 400
+                 (probe-status client model prompt
+                   {:messages [{:role :user :content prompt} (:message first-response)]}))
+              (str provider " continuation without tool results"))
+          (is (= 400
+                 (probe-status client model prompt
+                   {:messages [{:role :user :content prompt} (:message first-response) exchanged]}))
+              (str provider " exchanged result values"))
+          (when (not= provider "gemini")
+            (is (= 400
+                   (probe-status client model prompt
+                     {:messages [{:role :user :content prompt} (:message first-response) unknown-id]}))
+                (str provider " unknown result ID"))))))))
+
+(deftest gemini-recording-fixture-rejects-altered-parallel-signature
+  (wire/with-wire-server
+    (fn [root]
+      (let [client (probe-client root "gemini" "provider-parallel")
+            model "gemini-3-flash-preview"
+            prompt "Call read_left and read_right together in the same response, in parallel. They are independent. Then report both complete returned values."
+            first-response (llm/client-complete client
+                             {:model model :messages [{:role :user :content prompt}]
+                              :tools [{:name "read_left" :description "left" :parameters {:type "object" :properties {}}}
+                                      {:name "read_right" :description "right" :parameters {:type "object" :properties {}}}]})
+            altered (assoc-in (:message first-response)
+                             [:parts 1 :provider_data "thoughtSignature"] "altered-signature")
+            calls (:tool_calls first-response)
+            results {:role :tool
+                     :content [{:tool_call_id (:id (first calls)) :tool_name "read_left" :content "left-opaque"}
+                               {:tool_call_id (:id (second calls)) :tool_name "read_right" :content "right-opaque"}]}
+            status (probe-status client model prompt
+                     {:messages [{:role :user :content prompt} altered results]})]
+        (is (= 2 (count calls)))
+        (is (= 400 status))))))
+
+(deftest nested-and-representative-existing-rows-use-native-recording-server
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[provider model] [["openai" "gpt-5-mini"]
+                                ["anthropic" "claude-haiku-4-5"]
+                                ["gemini" "gemini-3-flash-preview"]]
+              [scenario name] [["provider-options" :provider-options]
+                               ["provider-image-base64" :image-base64]
+                               ["provider-image-url" :image-url]
+                               ["provider-invalid-key" :invalid-key]
+                               ["text" :usage-accounting]]]
+        (let [target {:provider provider :model model :compat false}
+              row (get (into {} (journeys/journeys target
+                                  {:api_key "fixture"
+                                   :base_url (str root "/" provider "/" scenario)})) name)
+              result (journeys/run-journey target [name row])]
+          (is (= :pass (:status result)) (str provider "/" scenario " " (pr-str result))))))))
+
+(deftest prompt-cache-completes-five-opaque-tool-turns-with-model-aware-choice
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[model expected-choice] [["claude-fable-5-1" "auto"]
+                                       ["claude-sonnet-4-5" "any"]]]
+        (let [target {:provider "anthropic" :model model :compat false}
+              row (get (into {} (journeys/journeys target
+                                  {:api_key "fixture"
+                                   :base_url (str root "/anthropic/provider-cache")}))
+                       :prompt-cache)
+              result (journeys/run-journey target [:prompt-cache row])
+              requests (filterv #(and (str/includes? (get % "path") "/anthropic/provider-cache/")
+                                      (= model (get-in % ["body" "model"])))
+                                (wire/recorded root))]
+          (is (= :pass (:status result)) (pr-str result))
+          (is (= 5 (count (get-in result [:detail :cache_turns]))))
+          (is (= 10 (count requests)))
+          (is (= expected-choice
+                 (get-in (first requests) ["body" "tool_choice" "type"]))))))))
+
+(deftest prompt-cache-auto-choice-rejects-an-omitted-tool-call
+  (wire/with-wire-server
+    (fn [base]
+      (let [target {:provider "anthropic" :model "claude-fable-5-1" :compat false}
+            row (get (into {} (journeys/journeys target
+                                {:api_key "fixture"
+                                 :base_url (str base "/anthropic/provider-cache-omit-tool")}))
+                     :prompt-cache)
+            result (journeys/run-journey target [:prompt-cache row])
+            requests (filterv #(str/includes? (get % "path")
+                                              "/anthropic/provider-cache-omit-tool/")
+                              (wire/recorded base))]
+        (is (= :fail (:status result)) (pr-str result))
+        (is (= :missing-tool-turn (:category result)))
+        (is (= 1 (count requests)))
+        (is (= "auto" (get-in (first requests) ["body" "tool_choice" "type"])))))))
+
+(deftest successful-rate-probe-is-explicitly-unproved-in-native-harness
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [[provider model] [["openai" "gpt-5-mini"]
+                                ["anthropic" "claude-haiku-4-5"]
+                                ["gemini" "gemini-3-flash-preview"]]]
+        (let [target {:provider provider :model model :compat false}
+              row (get (into {} (journeys/journeys target
+                                  {:api_key "fixture"
+                                   :base_url (str root "/" provider "/provider-rate-200")}))
+                       :rate-limit)
+              result (journeys/run-journey target [:rate-limit row])]
+          (is (= :skipped (:status result)) (pr-str result))
+          (is (true? (:unproved result)))
+          (is (= :incomplete (journeys/aggregate-status [result]))))))))
+
+(deftest billing-or-quota-error-cannot-prove-rate-limiting
+  (doseq [provider ["openai" "anthropic" "gemini"]]
+    (let [seen (atom 0)
+          target {:provider provider :model (case provider
+                                              "openai" "gpt-5-mini"
+                                              "anthropic" "claude-haiku-4-5"
+                                              "gemini" "gemini-3-flash-preview")
+                  :compat false}
+          transport (fn [_]
+                      (swap! seen inc)
+                      {:status 429
+                       :body (json/write-json
+                               {:error {:message "billing quota exceeded"
+                                        :type "insufficient_quota"
+                                        :status "RESOURCE_EXHAUSTED"}})})
+          row (get (into {} (journeys/journeys target
+                              {:api_key "fixture" :base_url "https://fixture.invalid/native"
+                               :transport transport})) :rate-limit)
+          result (journeys/run-journey target [:rate-limit row])]
+      (is (= :fail (:status result)))
+      (is (= :quota-exceeded (:category result)))
+      (is (= 1 @seen)))))

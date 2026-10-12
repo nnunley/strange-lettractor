@@ -1,0 +1,15 @@
+(ns probes.coding-loop-spec-audit
+  "Compatibility entry point for the original audit reproductions, now in the
+   regular regression suite. Run lgx audit-coding-loop for the complete audit."
+  (:require [attractor.coding-loop-audit-test]
+            [clojure.test :as test]
+            [harness.deadline :as deadline]
+            [os :as os]))
+
+(defn -main [& args]
+  (deadline/arm-from-args! args 30000 "coding-loop original-spec regressions")
+  (let [summary (test/run-tests 'attractor.coding-loop-audit-test)]
+    (prn summary)
+    (os/exit (if (zero? (+ (:fail summary) (:error summary))) 0 1))))
+
+(when *command-line-args* (apply -main *command-line-args*))

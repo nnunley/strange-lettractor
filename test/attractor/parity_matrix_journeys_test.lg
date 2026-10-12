@@ -1,0 +1,314 @@
+(ns attractor.parity-matrix-journeys-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [os :as os] [io :as io]
+            [attractor.providers :as providers]
+            [attractor.llm-contract-adapters-test :as wire]
+            [live.parity-matrix-journeys :as journeys]
+            [live.parity-matrix-checks :as checks]))
+
+(def providers {"openai" "gpt-5" "anthropic" "claude-sonnet-4-6"
+                "gemini" "gemini-3-pro"})
+
+(defn- row [name] (some #(when (= name (:row %)) %) journeys/rows))
+
+(defn- run [root provider scenario name & [options]]
+  (journeys/run-row (str provider "/" (get providers provider)) (row name)
+                    (merge {:adapter_options {:api_key (str "key-" provider)
+                                              :base_url (str root "/" provider "/" scenario)}}
+                           options)))
+
+(defn- displace-first-native-marker [context marker]
+  (let [requests (:requests context)
+        index (first (keep-indexed
+                       (fn [i body]
+                         (when (str/includes? (pr-str body) marker) i))
+                       requests))]
+    (when index
+      (assoc context :requests
+             (vec (concat (take index requests)
+                          [{"input" []}]
+                          (drop index requests)))))))
+
+(deftest runner-exposes-all-parity-journeys
+  (let [names (mapv :row journeys/rows)]
+    (is (= (count names) (count (set names))))
+    (is (every? (set names)
+                [:file-creation :read-then-edit :multi-file-edit :shell-execution
+                 :shell-timeout :grep-and-glob :multi-step :truncation
+                 :error-recovery :provider-edit-format :parallel-tools
+                 :steering :reasoning-change :subagent :loop-warning]))))
+
+(deftest existing-file-creation-uses-shared-runner-and-native-adapters
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)]
+        (testing provider
+          (let [result (run root provider "parity-create" :file-creation)]
+            (is (= :pass (:status result)) (pr-str result))
+            (is (some #{"write_file"} (:tools result)))))))))
+
+(deftest new-journeys-use-shared-runner-and-native-adapters
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)
+              [scenario name] [["parity-parallel" :parallel-tools]
+                               ["parity-steering" :steering]
+                               ["parity-reasoning" :reasoning-change]
+                               ["parity-subagent" :subagent]
+                               ["parity-loop" :loop-warning]]]
+        (testing (str provider "/" scenario)
+          (is (= :pass (:status (run root provider scenario name)))))))))
+
+(deftest equivalent-file-paths-use-shared-runner-and-native-adapters
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)
+              [scenario name] [["parity-parallel-dot" :parallel-tools]
+                               ["parity-parallel-absolute" :parallel-tools]
+                               ["parity-steering-dot" :steering]
+                               ["parity-steering-absolute" :steering]
+                               ["parity-subagent-dot" :subagent]
+                               ["parity-subagent-absolute" :subagent]]]
+        (testing (str provider "/" scenario)
+          (let [result (run root provider scenario name)]
+            (is (= :pass (:status result)) (pr-str result))))))))
+
+(deftest same-basename-in-another-directory-cannot-prove-file-work
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)
+              [scenario name seeded]
+              [["parity-parallel-wrong-dir" :parallel-tools
+                {"parallel-a.txt" "alpha" "parallel-b.txt" "beta"}]
+               ["parity-steering-wrong-dir" :steering
+                {"steering-first.txt" "before" "steering-correct.txt" "after"}]
+               ["parity-subagent-wrong-dir" :subagent
+                {"child-proof.txt" "child-done"}]]]
+        (testing (str provider "/" scenario)
+          (let [capture (atom nil)
+                seeded-row (assoc (row name) :setup
+                                  (fn [dir]
+                                    (doseq [[file content] seeded]
+                                      (io/spit (str dir "/" file) content))))
+                result (journeys/run-row
+                         (str provider "/" (get providers provider)) seeded-row
+                         {:adapter_options {:api_key (str "key-" provider)
+                                            :base_url (str root "/" provider "/" scenario)}
+                          :capture capture})]
+            (is (= seeded (select-keys (:files @capture) (keys seeded))))
+            (is (= :fail (:status result)) (pr-str result))))))))
+
+(deftest journey-controls-reject-unproved-outcomes
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)]
+        (testing (str provider ": serial calls cannot claim parallel overlap")
+          (let [capture (atom nil)
+                profile (assoc (checks/profile-for (providers/protocol-of provider)
+                                                   provider (get providers provider))
+                               :supports_parallel_tool_calls false)
+                result (run root provider "parity-parallel" :parallel-tools
+                            {:capture capture :session_options {:provider_profile profile}})]
+            (is (= :fail (:status result)))
+            (is (empty? (:active @(:barrier @capture))))
+            (is (empty? (:overlap-pairs @(:barrier @capture))))))
+        (testing (str provider ": missing delegated file effect rejects parallel proof")
+          (let [capture (atom nil)
+                result (run root provider "parity-parallel" :parallel-tools
+                            {:capture capture
+                             :environment_wrapper
+                             (fn [env]
+                               (assoc env :write_file
+                                      (fn [path content]
+                                        (when (not= path "parallel-b.txt")
+                                          ((:write_file env) path content)))) )})]
+            (is (= :fail (:status result)))
+            (is (seq (:overlap-pairs @(:barrier @capture))))
+            (is (nil? (get-in result [:failure_details :files "parallel-b.txt"])))))
+        (testing (str provider ": omitted or wrong steering rejects continuation")
+          (is (= :fail (:status (run root provider "parity-steering" :steering
+                                    {:boundary_action :none}))))
+          (let [result (run root provider "parity-steering" :steering
+                            {:steering_text "write a different file"})]
+            (is (= :fail (:status result)))
+            (is (= "after" (get-in result [:failure_details :files "steering-wrong.txt"])))))
+        (testing (str provider ": failed first write cannot claim steering success")
+          (let [capture (atom nil)
+                result (run root provider "parity-steering" :steering
+                            {:capture capture
+                             :environment_wrapper
+                             (fn [env]
+                               (assoc env :write_file
+                                      (fn [path content]
+                                        (if (= path "steering-first.txt")
+                                          (throw (ex-info "first write failed" {}))
+                                          ((:write_file env) path content)))))})]
+            (is (= :fail (:status result)))
+            (is (= "after" (get-in @capture [:files "steering-correct.txt"])))))
+        (testing (str provider ": unchanged native reasoning rejects proof")
+          (is (= :fail (:status (run root provider "parity-reasoning" :reasoning-change
+                                    {:boundary_action :none})))))
+        (testing (str provider ": wrong child ID rejects model-issued wait")
+          (is (= :fail (:status (run root provider "parity-subagent-mismatch" :subagent)))))
+        (testing (str provider ": successful wait without child file rejects proof")
+          (is (= :fail (:status (run root provider "parity-subagent-no-file" :subagent)))))
+        (testing (str provider ": parent-created expected file cannot impersonate child work")
+          (is (= :fail (:status (run root provider "parity-subagent-parent-forged" :subagent)))))
+        (testing (str provider ": disabled detection cannot claim a loop warning")
+          (let [capture (atom nil)
+                result (run root provider "parity-loop" :loop-warning
+                            {:capture capture
+                             :session_options {:enable_loop_detection false}})]
+            (is (= :fail (:status result)))
+            (is (empty? (filter #(= :loop_detection (:type %)) (:events @capture))))))))))
+
+(deftest alias-profile-keeps-native-reasoning-proof
+  (wire/with-wire-server
+    (fn [root]
+      (let [original providers/protocol-of]
+        (with-redefs [providers/protocol-of
+                      (fn [provider]
+                        (if (= provider "gemini-proxy") :gemini-generate-content
+                            (original provider)))]
+          (let [result (journeys/run-row
+                         "gemini-proxy/gemini-3-pro" (row :reasoning-change)
+                         {:adapter_options {:api_key "alias-test-key"
+                                            :base_url (str root "/gemini/parity-reasoning")}})]
+            (is (= :pass (:status result)) (pr-str result)))
+          (let [result (journeys/run-row
+                         "gemini-proxy/gemini-3-pro" (row :subagent)
+                         {:adapter_options {:api_key "alias-test-key"
+                                            :base_url (str root "/gemini/parity-subagent")}})]
+            (is (= :pass (:status result)) (pr-str result))))))))
+
+(deftest numeric-gemini-budget-proof-requires-policy-values
+  (let [dir (str (os/temp-dir) "/lettractor-budget-proof-" (rand-int 100000))
+        session (atom {:provider_profile {:id "gemini" :model "gemini-2.5-pro"}})
+        request (fn [budget]
+                  {"generationConfig" {"thinkingConfig" {"thinkingBudget" budget}}})
+        budget (fn [n] {"thinking" {"budget_tokens" n}})
+        adaptive (fn [effort] {"output_config" {"effort" effort}})]
+    (io/mkdir dir)
+    (try
+      (io/spit (str dir "/reasoning.txt") "changed")
+      (let [context {:dir dir :session session
+                     :history [{:type :assistant :tool_calls []}]
+                     :requests [(request 1024) (request 24576)]}]
+        (is (= [1024 24576]
+               (:native_efforts (checks/reasoning-evidence context))))
+        (is (nil? (checks/reasoning-evidence
+                    (assoc context :requests [(request 1024) (request 4096)]))))
+        (is (nil? (checks/reasoning-evidence
+                    (assoc context :requests [(request 1024) (request 1024)]))))
+        (reset! session {:provider_profile {:id "anthropic" :model "claude-sonnet-4-6"}})
+        (is (= [1024 3072]
+               (:native_efforts (checks/reasoning-evidence
+                                  (assoc context :requests [(budget 1024) (budget 3072)])))))
+        (is (nil? (checks/reasoning-evidence
+                    (assoc context :requests [(budget 1024) (budget 2048)]))))
+        (reset! session {:provider_profile {:id "anthropic" :model "claude-opus-5"}})
+        (is (= ["low" "high"]
+               (:native_efforts (checks/reasoning-evidence
+                                  (assoc context :requests [(adaptive "low") (adaptive "high")])))))
+        (is (nil? (checks/reasoning-evidence
+                    (assoc context :requests [(budget 1024) (budget 3072)])))))
+      (finally (os/sh "rm" "-rf" dir)))))
+
+(deftest gemini-25-reasoning-journey-observes-native-budget-change
+  (wire/with-wire-server
+    (fn [root]
+      (let [capture (atom nil)
+            result (journeys/run-row
+                     "gemini/gemini-2.5-pro" (row :reasoning-change)
+                     {:adapter_options {:api_key "budget-test-key"
+                                        :base_url (str root "/gemini/parity-reasoning")}
+                      :capture capture})
+            budgets (mapv #(get-in % ["generationConfig" "thinkingConfig" "thinkingBudget"])
+                          (:requests @capture))]
+        (is (= :pass (:status result)) (pr-str result))
+        (is (= [1024 24576] budgets))
+        (is (every? nil?
+                    (map #(get-in % ["generationConfig" "thinkingConfig" "thinkingLevel"])
+                         (:requests @capture))))))))
+
+(deftest captured-proof-rejects-corrupt-results-and-closes-after-check-errors
+  (wire/with-wire-server
+    (fn [root]
+      (let [capture (atom nil)
+            parallel (assoc (row :parallel-tools)
+                            :proof-check
+                            (fn [context]
+                              (let [changed (fn [f]
+                                              (update context :history
+                                                      (fn [history]
+                                                        (mapv (fn [turn]
+                                                                (if (= :tool_results (:type turn))
+                                                                  (update-in turn [:results 0] f)
+                                                                  turn)) history))))]
+                                (is (nil? (checks/parallel-evidence
+                                            (changed #(assoc % :tool_call_id "unmatched-call")))))
+                                (is (nil? (checks/parallel-evidence
+                                            (changed #(assoc % :is_error true)))))
+                                (checks/parallel-evidence context))))
+            result (journeys/run-row
+                     "openai/gpt-5" parallel
+                     {:adapter_options {:api_key "proof-test-key"
+                                        :base_url (str root "/openai/parity-parallel")}
+                      :capture capture})]
+        (is (= :pass (:status result)) (pr-str result))
+        (is (= :closed (:state @(:session @capture))))
+        (is (nil? (os/stat (:dir @capture)))))
+      (let [child (assoc (row :subagent)
+                         :proof-check
+                         (fn [context]
+                           (let [corrupt (update context :history
+                                                 (fn [history]
+                                                   (mapv (fn [turn]
+                                                           (if (= :tool_results (:type turn))
+                                                             (update turn :results
+                                                                     (fn [results]
+                                                                       (mapv (fn [result]
+                                                                               (if (= "wait" (:tool_name result))
+                                                                                 (assoc result :content "{:success false}")
+                                                                                 result)) results)))
+                                                             turn)) history)))]
+                             (is (nil? (checks/subagent-evidence corrupt)))
+                             (checks/subagent-evidence context))))
+            result (journeys/run-row
+                     "openai/gpt-5" child
+                     {:adapter_options {:api_key "proof-test-key"
+                                        :base_url (str root "/openai/parity-subagent")}})]
+        (is (= :pass (:status result)) (pr-str result)))
+      (let [capture (atom nil)
+            broken (assoc (row :file-creation)
+                          :proof-check (fn [_] (throw (ex-info "check failed" {}))))
+            result (journeys/run-row
+                     "openai/gpt-5" broken
+                     {:adapter_options {:api_key "proof-test-key"
+                                        :base_url (str root "/openai/parity-create")}
+                      :capture capture})]
+        (is (= :fail (:status result)))
+        (is (= :closed (:state @(:session @capture))))
+        (is (nil? (os/stat (:dir @capture))))))))
+
+(deftest steering-and-loop-require-the-immediate-native-request
+  (wire/with-wire-server
+    (fn [root]
+      (doseq [provider (keys providers)
+              [scenario name marker] [["parity-steering" :steering "STEER_TO_CORRECT"]
+                                      ["parity-loop" :loop-warning "Loop detected"]]]
+        (testing (str provider "/" name)
+          (let [original (:proof-check (row name))
+                strict-row (assoc (row name) :proof-check
+                                  (fn [context]
+                                    (let [displaced (displace-first-native-marker context marker)]
+                                      (is displaced)
+                                      (is (str/includes? (pr-str (last (:requests displaced))) marker))
+                                      (is (nil? (original displaced)))
+                                      (original context))))
+                result (journeys/run-row
+                         (str provider "/" (get providers provider)) strict-row
+                         {:adapter_options {:api_key (str "key-" provider)
+                                            :base_url (str root "/" provider "/" scenario)}})]
+            (is (= :pass (:status result)) (pr-str result))))))))

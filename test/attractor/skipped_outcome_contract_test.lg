@@ -1,0 +1,473 @@
+(ns attractor.skipped-outcome-contract-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.context :as context]
+            [attractor.engine :as engine]
+            [attractor.handlers :as handlers]
+            [attractor.interviewer :as interviewer]
+            [attractor.parser :as parser]
+            [attractor.pipeline :as pipeline]
+            [attractor.status :as status]
+            [io :as io]
+            [os :as os]))
+
+(defn- logs [label]
+  (str (os/temp-dir) "/attractor-skipped-" label "-" (System/nanoTime)))
+
+(defn- registry [type handler]
+  (let [reg (handlers/make-handler-registry)]
+    (handlers/register-handler! reg type handler)
+    reg))
+
+(defn- error-data [f]
+  (try (f) nil (catch Object error (ex-data error))))
+
+(deftest runtime-skip-normalization-and-file-precedence
+  (doseq [skip-status [:skipped "skipped"]]
+    (let [root (logs "normalize")
+          events (atom [])
+          counts (atom {"work" 2})
+          result (engine/execute-with-retry
+                   (fn [_ _ _ _]
+                     {:status skip-status :preferred_label "Next"
+                      :suggested_next_ids ["next"]
+                      :context_updates {"changed" true}
+                      :notes "intentionally skipped"})
+                   {:id "work" :auto_status true :max_retries 3}
+                   (context/make-context) {} root
+                   #(swap! events conj %)
+                   {:retry-counts counts
+                    :sleep-fn (fn [_] nil)})]
+      (is (= :skipped (:status result)))
+      (is (= "Next" (:preferred_label result)))
+      (is (= ["next"] (:suggested_next_ids result)))
+      (is (= 2 (get @counts "work")))
+      (is (not-any? #(= :stage.retrying (:type %)) @events))
+      (is (= ["work"] (mapv :node_id (filter #(= :stage.completed (:type %)) @events))))))
+  (let [root (logs "file-precedence")
+        result (engine/execute-with-retry
+                 (fn [_ _ _ stage-root]
+                   (os/sh "mkdir" "-p" (str stage-root "/work"))
+                   (io/spit (str stage-root "/work/status.json") "{\"outcome\":\"success\"}")
+                   {:status :skipped})
+                 {:id "work"} (context/make-context) {} root
+                 (fn [_] nil) {})]
+    (is (= :success (:status result))))
+  (let [root (logs "invalid-file")
+        result (engine/execute-with-retry
+                 (fn [_ _ _ stage-root]
+                   (os/sh "mkdir" "-p" (str stage-root "/work"))
+                   (io/spit (str stage-root "/work/status.json") "{\"outcome\":\"skipped\"}")
+                   {:status :skipped})
+                 {:id "work"} (context/make-context) {} root
+                 (fn [_] nil) {})]
+    (is (= :status_contract_error (:category result))))
+  (is (nil? (status/normalize-contract {:outcome "skipped"} :outcome)))
+  (is (= :status_contract_error
+         (:category (error-data #(status/outcome->status-json {:status :skipped})))))
+  (let [result (engine/execute-with-retry
+                 (fn [_ _ _ _] {:status :skipped :suggested_next_ids ["ok" 3]})
+                 {:id "invalid"} (context/make-context) {} (logs "invalid")
+                 (fn [_] nil) {})]
+    (is (= :status_contract_error (:category result)))))
+
+(deftest skipped-visit-routes-updates-and-leaves-no-record
+  (let [graph (parser/parse-dot
+                "digraph Skip { start [shape=Mdiamond]; work [type=skip.test, auto_status=true]; wrong [type=fail.test]; chosen [type=skip.test]; done [shape=Msquare]; start -> work; work -> wrong [weight=9]; work -> chosen [weight=1]; chosen -> done; }")
+        root (logs "main")
+        calls (atom []) events (atom [])
+        reg (registry "skip.test"
+              (fn [node _ _ _]
+                (swap! calls conj (:id node))
+                (if (= "work" (:id node))
+                  {:status :skipped :suggested_next_ids ["chosen"]
+                   :context_updates {"skip.value" 42}}
+                  {:status :skipped})))
+        _ (handlers/register-handler! reg "fail.test" (fn [_ _ _ _] {:status :fail}))
+        result (engine/run-pipeline graph {:registry reg :logs-root root
+                                           :on-event #(swap! events conj %)})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= ["start" "work" "chosen" "done"] (:completed_nodes result)))
+    (is (= ["work" "chosen"] @calls))
+    (is (not (contains? (:node_outcomes checkpoint) "work")))
+    (is (not (contains? (:node_outcomes checkpoint) "chosen")))
+    (is (not (io/file-exists? (str root "/work/status.json"))))
+    (is (not (io/file-exists? (str root "/chosen/status.json"))))
+    (is (= 42 (get-in result [:context "skip.value"])))
+    (is (= "skipped" (get-in result [:context "outcome"])))
+    (is (= [:skipped :skipped]
+           (mapv :status (filter #(and (= :stage.completed (:type %))
+                                       (#{"work" "chosen"} (:node_id %))) @events))))))
+
+(deftest skipped-revisit-retains-recorded-failure-and-goal-gate
+  (let [graph (parser/parse-dot
+                "digraph Revisit { start [shape=Mdiamond]; gate [type=gate.test, goal_gate=true]; again [type=again.test]; done [shape=Msquare]; start -> gate; gate -> again [condition=\"outcome=fail\"]; again -> gate; gate -> done [condition=\"outcome=skipped\"]; }")
+        visits (atom 0)
+        reg (registry "gate.test"
+              (fn [_ _ _ _]
+                (if (= 1 (swap! visits inc))
+                  {:status :fail :failure_reason "first failure"}
+                  {:status :skipped})))
+        _ (handlers/register-handler! reg "again.test" (fn [_ _ _ _] {:status :success}))
+        root (logs "revisit")
+        result (engine/run-pipeline graph {:registry reg :logs-root root :max-steps 5})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))]
+    (is (= :fail (:status result)))
+    (is (= 2 @visits))
+    (is (= :fail (get-in checkpoint [:node_outcomes "gate" :status])))
+    (is (= "skipped" (get-in checkpoint [:context_values "outcome"])))))
+
+(deftest skipped-revisit-retains-recorded-success-and-satisfied-goal-gate
+  (let [graph (parser/parse-dot
+                "digraph Revisit { start [shape=Mdiamond]; gate [type=gate.test, goal_gate=true]; again [type=again.test]; done [shape=Msquare]; start -> gate; gate -> again [condition=\"outcome=success\"]; again -> gate; gate -> done [condition=\"outcome=skipped\"]; }")
+        visits (atom 0)
+        reg (registry "gate.test"
+              (fn [_ _ _ _]
+                (if (= 1 (swap! visits inc))
+                  {:status :success}
+                  {:status :skipped})))
+        _ (handlers/register-handler! reg "again.test" (fn [_ _ _ _] {:status :success}))
+        root (logs "success-revisit")
+        result (engine/run-pipeline graph {:registry reg :logs-root root})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (= 2 @visits))
+    (is (= :success (get-in checkpoint [:node_outcomes "gate" :status])))
+    (is (not (io/file-exists? (str root "/gate/status.json"))))))
+
+(deftest only-skipped-goal-gate-has-no-recorded-outcome
+  (let [graph (parser/parse-dot
+                "digraph Gate { start [shape=Mdiamond]; gate [type=gate.test, goal_gate=true]; done [shape=Msquare]; start -> gate -> done; }")
+        root (logs "only-skipped-gate")
+        result (engine/run-pipeline graph
+                 {:registry (registry "gate.test" (fn [_ _ _ _] {:status :skipped}))
+                  :logs-root root})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))]
+    (is (= :success (:status result)))
+    (is (not (contains? (:node_outcomes checkpoint) "gate")))))
+
+(deftest skipped-checkpoint-resume-preserves-selected-edge-and-no-edge
+  (doseq [[label graph-source expected]
+          [["suggested"
+            "digraph S { start [shape=Mdiamond]; work [type=skip.test]; wrong [shape=Msquare]; right [type=right.test]; done [shape=Msquare]; start -> work; work -> wrong [weight=9]; work -> right [weight=1]; right -> done; }"
+            ["start" "work" "right" "done"]]
+           ["none"
+            "digraph N { start [shape=Mdiamond]; work [type=skip.test]; start -> work; }"
+            ["start" "work"]]]]
+    (let [graph (parser/parse-dot graph-source)
+          root (logs label)
+          calls (atom 0)
+          reg (registry "skip.test" (fn [_ _ _ _]
+                                        (swap! calls inc)
+                                        {:status :skipped :suggested_next_ids ["right"]}))
+          _ (handlers/register-handler! reg "right.test" (fn [_ _ _ _] {:status :success}))
+          stopped (engine/run-pipeline graph {:registry reg :logs-root root :max-steps 2})
+          checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))
+          resumed (engine/resume-pipeline-from-checkpoint
+                    checkpoint graph {:registry reg :logs-root root})]
+      (is (= (if (= label "none") :success :fail) (:status stopped)) label)
+      (is (= :success (:status resumed)) label)
+      (is (= expected (:completed_nodes resumed)) label)
+      (is (= 1 @calls) label)
+      (is (not (contains? (:node_outcomes checkpoint) "work")) label)
+      (is (map? (:selected_transition checkpoint)) label))))
+
+(deftest public-resume-validates-skipped-transition-before-events
+  (let [root (logs "public")
+        source "digraph S { start [shape=Mdiamond]; work [type=skip.test]; right [type=right.test]; done [shape=Msquare]; start -> work; work -> right; right -> done; }"
+        calls (atom 0) events (atom [])
+        reg (registry "skip.test" (fn [_ _ _ _] (swap! calls inc) {:status :skipped}))
+        _ (handlers/register-handler! reg "right.test" (fn [_ _ _ _] {:status :success}))
+        stopped (pipeline/run source {:logs-root root :registry reg :max-steps 2})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)
+        corrupt (assoc checkpoint :selected_transition
+                       {:kind :edge :from "work" :to "missing" :edge_index 99})]
+    (is (= :fail (:status stopped)))
+    (is (= 1 @calls))
+    (context/save-checkpoint corrupt path)
+    (let [error (error-data #(pipeline/resume path
+                              {:registry reg :on-event #(swap! events conj %)}))]
+      (is (= :workflow_snapshot_corrupt (:category error)))
+      (is (= [] @events))
+      (is (= 1 @calls)))))
+
+(deftest public-resume-rejects-forged-no-edge-when-a-route-is-eligible
+  (doseq [[label edge-attrs updates]
+          [["unconditional" "" {}]
+           ["matching-condition" "[condition=\"outcome=skipped\"]" {}]
+           ["context-key-containing-preferred-label"
+            "[condition=\"context.my_preferred_label=ready\"]"
+            {"my_preferred_label" "ready"}]
+           ["literal-containing-preferred-label"
+            "[condition=\"context.token=preferred_label\"]"
+            {"token" "preferred_label"}]]]
+    (let [root (logs (str "forged-none-" label))
+        source (str "digraph S { start [shape=Mdiamond]; work [type=skip.test]; right [type=right.test]; done [shape=Msquare]; start -> work; work -> right " edge-attrs "; right -> done; }")
+        calls (atom []) events (atom [])
+        reg (registry "skip.test" (fn [_ _ _ _]
+                                      (swap! calls conj "work")
+                                      {:status :skipped :context_updates updates}))
+        _ (handlers/register-handler! reg "right.test"
+            (fn [_ _ _ _] (swap! calls conj "right") {:status :success}))
+        stopped (pipeline/run source {:logs-root root :registry reg :max-steps 2})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)
+        forged {:kind :none :from "work" :to nil}
+        corrupt (-> checkpoint
+                    (assoc :selected_transition forged)
+                    (assoc-in [:transition_history (dec (count (:transition_history checkpoint)))]
+                              forged))]
+    (is (= :fail (:status stopped)))
+    (is (= ["work"] @calls))
+    (context/save-checkpoint corrupt path)
+    (is (= :workflow_snapshot_corrupt
+           (:category (error-data #(pipeline/resume path
+                                    {:registry reg
+                                     :on-event #(swap! events conj %)})))))
+    (is (= [] @events))
+    (is (= ["work"] @calls) label))))
+
+(deftest public-resume-allows-real-no-edge-when-transient-preferred-label-is-absent
+  (let [root (logs "real-none-preferred-label")
+        source "digraph S { start [shape=Mdiamond]; work [type=skip.test]; right [type=right.test]; done [shape=Msquare]; start -> work; work -> right [condition=\"preferred_label=ready\"]; right -> done; }"
+        calls (atom [])
+        reg (registry "skip.test"
+              (fn [_ _ _ _] (swap! calls conj "work") {:status :skipped}))
+        _ (handlers/register-handler! reg "right.test"
+            (fn [_ _ _ _] (swap! calls conj "right") {:status :success}))
+        initial (pipeline/run source {:logs-root root :registry reg})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)
+        resumed (pipeline/resume path {:registry reg})]
+    (is (= :success (:status initial)))
+    (is (= :none (get-in checkpoint [:selected_transition :kind])))
+    (is (= :success (:status resumed)))
+    (is (= ["work"] @calls))))
+
+(deftest direct-codergen-skipped-result-does-not-write-status-file
+  (doseq [skip-status [:skipped "skipped"]]
+    (let [root (logs "direct-codergen")
+          handler (handlers/make-codergen-handler
+                    (fn [_ _ _] {:status skip-status :notes "skip"}))
+          result (handler {:id "work" :prompt "Try work"}
+                          (context/make-context) {} root)]
+      (is (= skip-status (:status result)))
+      (is (not (io/file-exists? (str root "/work/status.json"))))))
+  (let [root (logs "direct-codergen-revisit")
+        status (atom :success)
+        handler (handlers/make-codergen-handler
+                  (fn [_ _ _] {:status @status :notes "visit"}))]
+    (is (= :success (:status (handler {:id "work"} (context/make-context) {} root))))
+    (is (io/file-exists? (str root "/work/status.json")))
+    (reset! status :skipped)
+    (is (= :skipped (:status (handler {:id "work"} (context/make-context) {} root))))
+    (is (not (io/file-exists? (str root "/work/status.json"))))))
+
+(deftest skipped-override-survives-a-later-checkpoint-and-public-validation
+  (let [root (logs "override")
+        source "digraph O { start [shape=Mdiamond]; work [type=skip.test]; middle [type=middle.test]; far [type=far.test]; finish [type=middle.test]; done [shape=Msquare]; start -> work; work -> middle; middle -> far; far -> finish; finish -> done; }"
+        calls (atom []) events (atom [])
+        reg (registry "skip.test" (fn [_ _ _ _]
+                                      (swap! calls conj "work")
+                                      {:status :skipped :next_node_id "far"
+                                       :context_updates {"once" 1}}))
+        _ (handlers/register-handler! reg "middle.test"
+            (fn [node _ _ _] (swap! calls conj (:id node)) {:status :success}))
+        _ (handlers/register-handler! reg "far.test"
+            (fn [_ _ _ _] (swap! calls conj "far") {:status :success}))
+        stopped (pipeline/run source {:logs-root root :registry reg :max-steps 3})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)]
+    (is (= :fail (:status stopped)))
+    (is (= ["start" "work" "far"] (:completed_nodes checkpoint)))
+    (is (= :override (get-in checkpoint [:transition_history 1 :kind])))
+    (is (not (contains? (:node_outcomes checkpoint) "work")))
+    (is (= :success (:status
+                      (pipeline/resume path {:registry reg
+                                             :on-event #(swap! events conj %)}))))
+    (is (= ["work" "far" "finish"] @calls))
+    (is (= 1 (get-in (context/load-checkpoint path) [:context_values "once"])))
+    (is (= [] (filter #(= "work" (:node_id %)) @events)))
+    (let [tamper-events (atom [])
+          corrupt (assoc-in checkpoint [:transition_history 1 :to] "middle")]
+      (context/save-checkpoint corrupt path)
+      (is (= :workflow_snapshot_corrupt
+             (:category (error-data #(pipeline/resume path
+                                      {:registry reg
+                                       :on-event #(swap! tamper-events conj %)})))))
+      (is (= [] @tamper-events))
+      (is (= ["work" "far" "finish"] @calls)))))
+
+(deftest skipped-branch-retains-last-real-result-and-neutral-branch-cannot-win
+  (let [graph (parser/parse-dot
+                "digraph B { first [type=branch.test]; trailing [type=branch.test]; join [shape=tripleoctagon]; first -> trailing; trailing -> join; }")
+        root (logs "branch")
+        reg (registry "branch.test"
+              (fn [node _ _ _]
+                (if (= "first" (:id node))
+                  {:status :success :artifacts ["kept"]}
+                  {:status :skipped :artifacts ["omitted"]})))
+        result (engine/execute-subgraph "first" (context/make-context)
+                 graph root reg (fn [_] nil) {})]
+    (is (= :success (:status result)))
+    (is (= ["kept"] (:artifacts result)))
+    (is (not (io/file-exists? (str root "/trailing/status.json")))))
+  (let [graph (parser/parse-dot
+                "digraph B { first [type=branch.test]; join [shape=tripleoctagon]; first -> join; }")
+        reg (registry "branch.test" (fn [_ _ _ _] {:status :skipped}))
+        branch (engine/execute-subgraph "first" (context/make-context)
+                 graph (logs "neutral") reg (fn [_] nil) {})
+        parallel ((handlers/make-parallel-handler
+                    (fn [_ _ _ _] branch))
+                  {:id "fork" :attrs {:join_policy "first_success"}}
+                  (context/make-context)
+                  {:edges [{:from "fork" :to "first"}]}
+                  (logs "first-success"))
+        fan-in (handlers/handle-fan-in
+                 {:id "join"} (context/make-context
+                                {"parallel.results" [branch]}) {} "unused")]
+    (is (= :skipped (:status branch)))
+    (is (= :fail (:status parallel)))
+    (is (= :fail (:status fan-in)))))
+
+(deftest skipped-branch-uses-transient-next-node-override
+  (let [graph (parser/parse-dot
+                "digraph B { first [type=branch.test]; wrong [type=branch.test]; right [type=branch.test]; join [shape=tripleoctagon]; first -> wrong; wrong -> join; right -> join; }")
+        visited (atom [])
+        reg (registry "branch.test"
+              (fn [node _ _ _]
+                (swap! visited conj (:id node))
+                (if (= "first" (:id node))
+                  {:status :skipped :next_node_id "right"}
+                  {:status :success})))
+        result (engine/execute-subgraph "first" (context/make-context)
+                 graph (logs "branch-override") reg (fn [_] nil) {})]
+    (is (= ["first" "right"] @visited))
+    (is (= :success (:status result)))))
+
+(deftest manager-child-telemetry-does-not-collect-skipped-outcome-or-artifacts
+  (let [child-path (str (logs "child-source") ".dot")
+        _ (io/spit child-path
+                   "digraph Child { start [shape=Mdiamond]; work [type=skip.test]; done [shape=Msquare]; start -> work -> done; }")
+        parent (parser/parse-dot
+                 (str "digraph Parent { graph [stack.child_dotfile=\"" child-path
+                      "\"]; start [shape=Mdiamond]; manager [shape=house, manager.poll_interval=\"1ms\", manager.max_cycles=100]; done [shape=Msquare]; start -> manager -> done; }"))
+        reg (registry "skip.test"
+              (fn [_ _ _ _] {:status :skipped :artifacts ["do-not-collect"]}))
+        root (logs "manager") events (atom [])
+        result (engine/run-pipeline parent {:registry reg :logs-root root
+                                            :on-event #(swap! events conj %)})
+        child-events (map :event (filter #(= :manager.child_event (:type %)) @events))]
+    (is (= :success (:status result)))
+    (is (some #(and (= :stage.completed (:type %))
+                    (= :skipped (:status %))) child-events))
+    (is (not (contains? (get-in result [:context "context.stack.child.node_outcomes"])
+                        "work")))
+    (is (= [] (get-in result [:context "context.stack.child.artifacts"])))
+    (is (not (io/file-exists? (str root "/manager/child/work/status.json"))))))
+
+(deftest resume-uses-exact-skipped-edge-for-fidelity-and-restart
+  (let [graph (parser/parse-dot
+                "digraph E { graph [default_fidelity=summary:low]; start [shape=Mdiamond]; work [type=skip.test]; wrong [type=probe.test]; right [type=probe.test]; done [shape=Msquare]; start -> work; work -> wrong [weight=9]; work -> right [weight=1, fidelity=compact]; right -> done; wrong -> done; }")
+        root (logs "edge-fidelity") seen (atom [])
+        reg (registry "skip.test"
+              (fn [_ _ _ _] {:status :skipped :suggested_next_ids ["right"]}))
+        _ (handlers/register-handler! reg "probe.test"
+            (fn [node _ _ _]
+              (swap! seen conj [(:id node) (:resolved_fidelity node)])
+              {:status :success}))
+        stopped (engine/run-pipeline graph {:registry reg :logs-root root :max-steps 2})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))
+        resumed (engine/resume-pipeline-from-checkpoint
+                  checkpoint graph {:registry reg :logs-root root})]
+    (is (= :fail (:status stopped)))
+    (is (= :edge (get-in checkpoint [:selected_transition :kind])))
+    (is (= :success (:status resumed)))
+    (is (= [["right" "compact"]] @seen)))
+  (let [graph (parser/parse-dot
+                "digraph R { start [shape=Mdiamond]; work [type=skip.test]; landing [type=probe.test]; done [shape=Msquare]; start -> work; work -> landing [loop_restart=true]; landing -> done; }")
+        root (logs "edge-restart") calls (atom 0)
+        reg (registry "skip.test" (fn [_ _ _ _]
+                                      (swap! calls inc) {:status :skipped}))
+        _ (handlers/register-handler! reg "probe.test"
+            (fn [_ _ _ _] {:status :success}))
+        stopped (engine/run-pipeline graph {:registry reg :logs-root root :max-steps 2})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))
+        resumed (engine/resume-pipeline-from-checkpoint
+                  checkpoint graph {:registry reg :logs-root root})]
+    (is (= :fail (:status stopped)))
+    (is (= :edge (get-in checkpoint [:selected_transition :kind])))
+    (is (= :success (:status resumed)))
+    (is (= ["landing" "done"] (:completed_nodes resumed)))
+    (is (= 1 @calls))))
+
+(deftest selected-no-edge-keeps-failed-result-distinct-from-skipped-result
+  (let [graph (parser/parse-dot
+                "digraph F { start [shape=Mdiamond]; work [type=fail.test]; start -> work; }")
+        root (logs "failed-no-edge") calls (atom 0)
+        reg (registry "fail.test" (fn [_ _ _ _]
+                                      (swap! calls inc)
+                                      {:status :fail :failure_reason "hard failure"}))
+        initial (engine/run-pipeline graph {:registry reg :logs-root root})
+        checkpoint (context/load-checkpoint (str root "/checkpoint.edn"))
+        resumed (engine/resume-pipeline-from-checkpoint
+                  checkpoint graph {:registry reg :logs-root root})]
+    (is (= :fail (:status initial)))
+    (is (= :fail (:status resumed)))
+    (is (= "hard failure" (:failure_reason resumed)))
+    (is (= 1 @calls))))
+
+(deftest skipped-human-answer-still-fails-the-gate
+  (let [handler (handlers/make-wait-human-handler
+                  (interviewer/make-queue-interviewer [{:value :skipped}]))
+        result (handler {:id "gate" :label "Choose"}
+                       (context/make-context)
+                       {:edges [{:from "gate" :to "done" :label "Continue"}]}
+                       (logs "human"))]
+    (is (= :fail (:status result)))
+    (is (= "human skipped interaction" (:failure_reason result)))))
+
+(deftest public-resume-validates-goal-gate-reroute-after-skipped-revisit
+  (let [source "digraph G { start [shape=Mdiamond]; gate [type=gate.test, goal_gate=true, retry_target=fix]; fix [type=fix.test]; done [shape=Msquare]; start -> gate; gate -> fix [condition=\"outcome=fail\"]; gate -> done [condition=\"outcome=skipped\"]; gate -> done [condition=\"outcome=success\"]; fix -> gate; }"
+        root (logs "gate-reroute") visits (atom 0)
+        reg (registry "gate.test"
+              (fn [_ _ _ _]
+                (case (swap! visits inc)
+                  1 {:status :fail}
+                  2 {:status :skipped}
+                  {:status :success})))
+        _ (handlers/register-handler! reg "fix.test"
+            (fn [_ _ _ _] {:status :success}))
+        stopped (pipeline/run source {:registry reg :logs-root root :max-steps 6})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)
+        resumed (pipeline/resume path {:registry reg})]
+    (is (= :fail (:status stopped)))
+    (is (= ["start" "gate" "fix" "gate" "fix"]
+           (:completed_nodes checkpoint)))
+    (is (= :goal_gate (get-in checkpoint [:transition_history 3 :kind])))
+    (is (= :fail (get-in checkpoint [:node_outcomes "gate" :status])))
+    (is (= :success (:status resumed)))
+    (is (= 3 @visits))
+    (is (= :success (:status (pipeline/resume path {:registry reg}))))
+    (is (= 3 @visits))))
+
+(deftest public-resume-accepts-historical-retry-after-later-success
+  (let [source "digraph R { start [shape=Mdiamond]; work [type=work.test, retry_target=fix]; fix [type=fix.test]; done [shape=Msquare]; start -> work; work -> fix [condition=\"outcome=retry\"]; fix -> work; work -> done; }"
+        root (logs "historic-retry") visits (atom 0)
+        reg (registry "work.test"
+              (fn [_ _ _ _]
+                (if (= 1 (swap! visits inc))
+                  {:status :fail}
+                  {:status :success})))
+        _ (handlers/register-handler! reg "fix.test"
+            (fn [_ _ _ _] {:status :success}))
+        initial (pipeline/run source {:registry reg :logs-root root})
+        path (str root "/checkpoint.edn")
+        checkpoint (context/load-checkpoint path)]
+    (is (= :success (:status initial)))
+    (is (= :retry (get-in checkpoint [:transition_history 1 :kind])))
+    (is (= :success (get-in checkpoint [:node_outcomes "work" :status])))
+    (is (= :success (:status (pipeline/resume path {:registry reg}))))
+    (is (= 2 @visits))))

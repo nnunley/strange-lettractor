@@ -1,0 +1,346 @@
+(ns attractor.interactive-harness-test
+  (:require [clojure.test :refer [deftest is]] [clojure.core :as core]
+            [attractor.hub :as hub] [attractor.agent :as agent]
+            [attractor.harness :as harness] [attractor.profiles :as profiles]
+            [attractor.execution :as execution] [attractor.console.session :as console]
+            [attractor.nrepl-hub :as wire] [clojure.edn :as edn] [io :as io] [os :as os]))
+(defn req [h op fields] (deref (hub/request! h (merge {:id "test" :op op} fields)) 3000 {}))
+(defn opts [complete]
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :execution_env (execution/make-environment {:file_exists (fn [_] false) :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :project_docs [] :complete_fn complete}})
+(defn answer [request] {:message {:role :assistant :content (:content (last (:messages request)))}})
+(defn wait-for [pred] (loop [n 0] (if (or (pred) (> n 3000)) (pred) (do (core/sleep 1) (recur (inc n))))))
+(defn sid [h] (get-in (req h :session/open {}) [:value :session_id]))
+(defn stop [h] (req h :hub/stop {}))
+
+(deftest queued-steering-and-followups-share-one-completion
+  (let [entered (promise) release (promise) requests (atom [])
+        h (hub/start! (opts (fn [r] (swap! requests conj r)
+                                    (when (= 1 (count @requests)) (deliver entered true) (deref release 3000 nil))
+                                    (answer r))))]
+    (try
+      (let [id (sid h) first (:value (req h :session/submit {:session_id id :text "one"}))]
+        (is (= true (deref entered 3000 false)))
+        (is (= :busy (get-in (req h :session/submit {:session_id id :text "reject"}) [:error :category])))
+        (doseq [[text behavior] [["steer" :steer] ["later" :followup]]]
+          (let [queued (:value (req h :session/submit {:session_id id :text text :queue true :behavior behavior}))]
+            (is (= true (:queued queued)))
+            (is (= (:turn_id first) (:turn_id queued)))
+            (is (identical? (:completion first) (:completion queued)))))
+        (deliver release true)
+        (is (= "later" (:value (deref (:completion first) 3000 {}))))
+        (is (= ["one" "steer" "later"]
+               (mapv :content (filter #(= :user (:role %)) (:history @(get-in @(:sessions h) [id :agent])))))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest input-between-agent-idle-and-hub-publication-is-not-lost
+  (let [finished (promise) release (promise) original agent/process-input! calls (atom [])
+        h (hub/start! (opts (fn [r] (swap! calls conj (:content (last (:messages r)))) (answer r))))]
+    (try
+      (with-redefs [agent/process-input! (fn [s text] (let [result (original s text)]
+                                                       (when (= "one" text) (deliver finished true) (deref release 3000 nil)) result))]
+        (let [id (sid h) first (:value (req h :session/submit {:session_id id :text "one"}))]
+          (is (= true (deref finished 3000 false)))
+          (is (= true (get-in (req h :session/submit {:session_id id :text "late" :queue true}) [:value :queued])))
+          (deliver release true)
+          (is (= "late" (:value (deref (:completion first) 3000 {}))))
+          (is (= ["one" "late"] @calls))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest explicit-ledger-is-exclusive-released-and-restored
+  (let [path (str "evidence/interactive-harness-2026-10-07/ledger-" (System/nanoTime) ".edn")
+        h (hub/start! (assoc (opts answer) :interactive_harness {:path path :auto_refine false}))]
+    (try
+      (let [id (sid h) a (get-in @(:sessions h) [id :agent])
+            status (:value (req h :session/harness {:session_id id}))]
+        (is (= true (:enabled status)))
+        (is (string? (:path status)))
+        (is (= :harness-in-use (get-in (req h :session/open {}) [:error :category])))
+        (when (:harness @a) (harness/apply-edit! (:harness @a) {:kind "memory" :id "kept" :content "remembered"}))
+        (deref (get-in (req h :session/cancel {:session_id id}) [:value :completion]) 3000 nil)
+        (let [next-id (sid h) next-session (get-in @(:sessions h) [next-id :agent])]
+          (is (string? next-id))
+          (is (= "remembered" (get-in @(or (:harness @next-session) (atom {})) [:entries :memory "kept" :content])))))
+      (finally (stop h)))))
+
+(deftest interactive-refinement-plans-while-conversation-progresses
+  (let [planning (promise) release (promise) calls (atom 0)
+        path (str "evidence/interactive-harness-2026-10-07/refine-" (System/nanoTime) ".edn")
+        h (hub/start! (-> (opts answer)
+                         (assoc :interactive_harness {:path path :auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn]
+                           (fn [_] (when (= 1 (swap! calls inc)) (deliver planning true) (deref release 3000 nil))
+                             {:message {:content "{\"summary\":\"done\",\"edits\":[]}"}}))))]
+    (try
+      (let [id (sid h) accepted (req h :session/refine {:session_id id :instructions "learn"})]
+        (is (= true (get-in accepted [:value :accepted])))
+        (is (= true (deref planning 3000 false)))
+        (is (= :refiner-busy (get-in (req h :session/refine {:session_id id}) [:error :category])))
+        (let [turn (:value (req h :session/submit {:session_id id :text "during planning"}))]
+          (is (= "during planning" (:value (deref (:completion turn) 3000 {})))))
+        (deliver release true)
+        (is (wait-for #(= 4 (:refinements (:value (req h :session/harness {:session_id id})))))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest console-and-wire-expose-host-owned-harness
+  (let [h (hub/start! (assoc (opts answer) :interactive_harness {:auto_refine false})) c (console/open! h)]
+    (try
+      (let [lines (:lines (console/handle! c {:type :line :text "/harness"})) id (:session @c)]
+        (is (some #(re-find #"Harness enabled" %) lines))
+        (is (string? id))
+        (let [reply (wire/handle-message h {"id" "status" "op" "attractor/request"
+                                           "payload" (pr-str {:op :session/harness :session_id id})})]
+          (is (= true (get-in (edn/read-string (get reply "value")) [:value :enabled]))))
+        (let [other (sid h)]
+          (is (not= (get-in (req h :session/harness {:session_id id}) [:value :path])
+                    (get-in (req h :session/harness {:session_id other}) [:value :path])))))
+      (finally (console/close! c) (stop h)))))
+
+(deftest stale-background-plan-preserves-intervening-edit
+  (let [entered (promise) release (promise)
+        h (hub/start! (-> (opts answer) (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn]
+                           (fn [_] (deliver entered true) (deref release 3000 nil)
+                             {:message {:content "{\"edits\":[]}"}}))))]
+    (try
+      (let [id (sid h) s (get-in @(:sessions h) [id :agent])]
+        (req h :session/refine {:session_id id})
+        (is (= true (deref entered 3000 false)))
+        (harness/apply-edit! (:harness @s) {:id "fresh" :kind "memory" :content "keep"})
+        (deliver release true)
+        (is (wait-for #(nil? @(:interactive_refinement @s))))
+        (is (= "keep" (get-in @(:harness @s) [:entries :memory "fresh" :content])))
+        (is (= 0 (count (:refinements @(:harness @s)))))
+        (is (some #(= :refiner-stale (:category %)) (agent/session-events s))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest nonexistent-ancestor-alias-is-normalized-before-ownership
+  (let [base (str "evidence/interactive-harness-2026-10-07/absent-" (System/nanoTime))
+        h (hub/start! (assoc (opts answer) :interactive_harness {:path (str base "/nested/../ledger.edn") :auto_refine false}))]
+    (try
+      (let [id (sid h) path (get-in (req h :session/harness {:session_id id}) [:value :path])]
+        (is (= (str (os/canonical-path ".") "/" base "/ledger.edn") path)))
+      (finally (stop h)))))
+
+(deftest cancellation-joins-planner-and-forbids-late-ledger-writes
+  (let [entered (promise) finalised (atom false)
+        h (hub/start! (-> (opts answer) (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn]
+                           (fn [_] (try (deliver entered true) (core/sleep 30000)
+                                        {:message {:content "{\"edits\":[]}"}}
+                                        (finally (reset! finalised true)))))))]
+    (try
+      (let [id (sid h) s (get-in @(:sessions h) [id :agent])]
+        (req h :session/refine {:session_id id})
+        (is (= true (deref entered 3000 false)))
+        (let [cancel (get-in (req h :session/cancel {:session_id id}) [:value :completion])]
+          (is (not= :timeout (deref cancel 3000 :timeout))))
+        (is @finalised)
+        (is (= 0 (count (:refinements @(:harness @s)))))
+        (is (= :session-closed (get-in (req h :session/refine {:session_id id}) [:error :category]))))
+      (finally (stop h)))))
+
+(deftest pending-refinement-applies-before-followup-provider-call
+  (let [plan-entered (promise) release-plan (promise) turn-entered (promise) release-turn (promise)
+        requests (atom 0) seen (atom nil) session (atom nil)
+        h (hub/start! (-> (opts (fn [r]
+                                 (if (= 1 (swap! requests inc))
+                                   (do (deliver turn-entered true) (deref release-turn 3000 nil))
+                                   (reset! seen (count (:refinements @(:harness @@session)))))
+                                 (answer r)))
+                         (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn]
+                           (fn [_] (deliver plan-entered true) (deref release-plan 3000 nil)
+                             {:message {:content "{\"edits\":[]}"}}))))]
+    (try
+      (let [id (sid h) s (get-in @(:sessions h) [id :agent])
+            first (:value (req h :session/submit {:session_id id :text "one"}))]
+        (reset! session s)
+        (is (= true (deref turn-entered 3000 false)))
+        (req h :session/refine {:session_id id})
+        (is (= true (deref plan-entered 3000 false)))
+        (req h :session/submit {:session_id id :text "follow" :queue true :behavior :followup})
+        (deliver release-plan true)
+        (is (wait-for #(some? (:pending_refinement @s))))
+        (is (= 0 (count (:refinements @(:harness @s)))))
+        (deliver release-turn true)
+        (is (= "follow" (:value (deref (:completion first) 3000 {}))))
+        (is (= 4 @seen)))
+      (finally (deliver release-plan true) (deliver release-turn true) (stop h)))))
+
+(deftest wire-queues-and-refines-the-same-host-session
+  (let [entered (promise) release (promise)
+        h (hub/start! (-> (opts (fn [r] (deliver entered true) (deref release 3000 nil) (answer r)))
+                         (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn] (fn [_] {:message {:content "{\"edits\":[]}"}}))))
+        rpc (fn [request] (edn/read-string (get (wire/handle-message h {"id" "wire" "op" "attractor/request" "payload" (pr-str request)}) "value")))]
+    (try
+      (let [id (get-in (rpc {:op :session/open :harness_path "untrusted.edn" :complete_fn "untrusted"}) [:value :session_id])
+            first (:value (rpc {:op :session/submit :session_id id :text "one"}))]
+        (is (= true (deref entered 3000 false)))
+        (let [queued (:value (rpc {:op :session/submit :session_id id :text "two" :queue true :behavior :followup}))]
+          (is (= true (:queued queued))) (is (= (:turn_id first) (:turn_id queued)))
+          (is (not (contains? queued :completion))))
+        (is (= true (get-in (rpc {:op :session/refine :session_id id}) [:value :accepted])))
+        (deliver release true)
+        (is (wait-for #(= :completed (get-in (rpc {:op :session/result :session_id id :turn_id (:turn_id first)}) [:value :state]))))
+        (is (= "two" (get-in (rpc {:op :session/result :session_id id :turn_id (:turn_id first)}) [:value :result :value]))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest failed-refinement-startup-does-not-wedge-singleflight
+  (let [h (hub/start! (-> (opts answer) (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn] (fn [_] {:message {:content "{\"edits\":[]}"}}))))]
+    (try
+      (let [id (sid h) s (get-in @(:sessions h) [id :agent])]
+        (with-redefs [core/future* (fn [_] (throw (ex-info "launch failed" {:category :launch-failed})))]
+          (is (= :launch-failed (try (agent/request-refinement! s :operator {}) nil (catch Object e (:category (ex-data e)))))))
+        (is (nil? @(:interactive_refinement @s)))
+        (is (= true (:accepted (agent/request-refinement! s :operator {}))))
+        (is (wait-for #(nil? @(:interactive_refinement @s)))))
+      (finally (stop h)))))
+
+(deftest automatic-refinement-coalesces-and-completion-callback-can-close
+  (let [entered (promise) release (promise) closed (promise) holder (atom nil)
+        s (agent/make-session (merge (:session_options (opts answer))
+                                   {:enable_continual_harness true :interactive_refinement true
+                                    :auto_refine true :auto_refine_interval 1
+                                    :refiner_complete_fn (fn [_] (deliver entered true) (deref release 3000 nil)
+                                                           {:message {:content "{\"edits\":[]}"}})
+                                    :on_event (fn [event] (when (= :refine_complete (:type event))
+                                                           (agent/close-session! @holder) (deliver closed true)))}))]
+    (reset! holder s)
+    (try
+      (is (= "one" (agent/process-input! s "one")))
+      (is (= true (deref entered 3000 false)))
+      (is (= "two" (agent/process-input! s "two")))
+      (is (not-any? #(= :refine_error (:type %)) (agent/session-events s)))
+      (deliver release true)
+      (is (= true (deref closed 3000 false)))
+      (is (= :closed (:state @s)))
+      (finally (deliver release true) (agent/close-session! s)))))
+
+(deftest failed-background-dispatch-releases-admitted-owner
+  (let [h (hub/start! (-> (opts answer) (assoc :interactive_harness {:auto_refine false})
+                         (assoc-in [:session_options :refiner_complete_fn] (fn [_] {:message {:content "{\"edits\":[]}"}}))))]
+    (try
+      (let [id (sid h) s (get-in @(:sessions h) [id :agent]) original core/future* calls (atom 0)]
+        (with-redefs [core/future* (fn [f] (if (= 2 (swap! calls inc))
+                                           (throw (ex-info "dispatch failed" {:category :dispatch-failed})) (original f)))]
+          (is (= :dispatch-failed (try (agent/request-refinement! s :operator {}) nil (catch Object e (:category (ex-data e)))))))
+        (is (nil? @(:refinement_owner @s)))
+        (is (nil? @(:interactive_refinement @s)))
+        (is (= true (:accepted (agent/request-refinement! s :operator {}))))
+        (is (wait-for #(nil? @(:interactive_refinement @s)))))
+      (finally (stop h)))))
+
+(deftest symlink-parent-navigation-opens-the-physical-ledger
+  (let [base (str "evidence/interactive-harness-2026-10-07/symlink-" (System/nanoTime))
+        _ (os/sh "mkdir" "-p" (str base "/project") (str base "/other/dir"))
+        absolute (os/canonical-path base)
+        _ (os/sh "ln" "-s" (str absolute "/other/dir") (str absolute "/project/link"))
+        expected (str absolute "/other/ledger.edn")
+        h (hub/start! (assoc (opts answer) :interactive_harness {:path (str absolute "/project/link/../ledger.edn") :auto_refine false}))]
+    (try
+      (let [id (sid h)]
+        (is (= expected (get-in (req h :session/harness {:session_id id}) [:value :path]))))
+      (finally (stop h)))))
+
+(deftest context-controls-and-late-input-survive-recoverable-error
+  (let [finished (promise) release (promise) original agent/process-input! calls (atom [])
+        h (hub/start! (opts (fn [r] (swap! calls conj (:content (last (:messages r)))) (answer r))))]
+    (try
+      (with-redefs [agent/process-input! (fn [s text]
+                                        (if (= text "overflow")
+                                          (do (deliver finished true) (deref release 3000 nil)
+                                              (throw (ex-info "too large" {:category :context-length})))
+                                          (original s text)))]
+        (let [id (sid h) first (:value (req h :session/submit {:session_id id :text "overflow"}))]
+          (is (= true (deref finished 3000 false)))
+          (is (= true (get-in (req h :session/submit {:session_id id :text "late" :queue true}) [:value :queued])))
+          (is (= 0 (get-in (req h :session/context {:session_id id}) [:value :history_turns])))
+          (deliver release true)
+          (is (= "late" (:value (deref (:completion first) 3000 {}))))
+          (is (= ["late"] @calls))
+          (is (= true (get-in (req h :session/compact {:session_id id}) [:value :accepted])))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest console-two-turns-share-executed-tool-state-and-durable-memory
+  (let [stored (atom nil) writes (atom 0) initialized (atom 0) cleaned (atom 0)
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool! registry
+              {:definition {:name "set_state" :description "Set environment state" :parameters {:type "object"}}
+               :executor (fn [_ env] ((:write_state env) "persistent-value") "stored")})
+        _ (profiles/register-tool! registry
+              {:definition {:name "get_state" :description "Read environment state" :parameters {:type "object"}}
+               :executor (fn [_ env] ((:read_state env)))})
+        requests (atom [])
+        h (hub/start! {:interactive_harness {:auto_refine false}
+                       :session_options
+                       {:project_docs []
+                        :provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false :tool_registry registry})
+                        :execution_env (execution/make-environment
+                                         {:initialize #(swap! initialized inc) :cleanup #(swap! cleaned inc)
+                                          :file_exists (fn [_] false)
+                                          :write_state (fn [value] (swap! writes inc) (reset! stored value))
+                                          :read_state #(deref stored)})
+                        :complete_fn (fn [r]
+                                       (swap! requests conj r)
+                                       (case (count @requests)
+                                         1 {:message {:role :assistant :content ""}
+                                            :tool_calls [{:id "write" :name "set_state" :arguments {}}
+                                                         {:id "memory" :name "remember" :arguments {"title" "chosen-port" "content" "Use port 8123"}}]}
+                                         2 {:message {:role :assistant :content "saved"}}
+                                         3 {:message {:role :assistant :content ""}
+                                            :tool_calls [{:id "read" :name "get_state" :arguments {}}]}
+                                         {:message {:role :assistant :content "read persistent state"}}))}})
+        c (console/open! h)]
+    (try
+      (console/handle! c {:type :line :text "Save state and remember port"})
+      (let [id (:session @c) first-turn (get-in @(:sessions h) [id :turn])]
+        (is (= "saved" (:value (deref (:completion first-turn) 3000 {}))))
+        (console/handle! c {:type :line :text "Read saved state"})
+        (let [second-turn (get-in @(:sessions h) [id :turn]) s (get-in @(:sessions h) [id :agent])]
+          (is (= "read persistent state" (:value (deref (:completion second-turn) 3000 {}))))
+          (is (= 1 @writes)) (is (= 1 @initialized)) (is (= 0 @cleaned))
+          (is (= "persistent-value" (get-in @s [:history 6 :results 0 :content])))
+          (is (clojure.string/includes? (pr-str (nth @requests 2)) "chosen-port"))
+          (is (= 1 (count (get-in @(:harness @s) [:entries :memory]))))
+          (is (some #(re-find #"Context:" %) (:lines (console/handle! c {:type :line :text "/context"}))))))
+      (finally (console/close! c) (stop h)))))
+
+(deftest native-queued-inputs-drain-before-overflow-aggregate-completes
+  (doseq [queued [[[:steer "steering"]]
+                  [[:followup "followup"]]
+                  [[:followup "followup"] [:steer "steering"]]]]
+    (let [entered (promise) release (promise) requests (atom [])
+          h (hub/start! (opts (fn [r]
+                               (swap! requests conj (:content (last (:messages r))))
+                               (if (= 1 (count @requests))
+                                 (do (deliver entered true) (deref release 3000 nil)
+                                     (throw (attractor.llm/provider-error
+                                              "llamacpp" {:status 400 :body {"error" {"code" 400
+                                                "type" "exceed_context_size_error" "n_ctx" 131072 "n_prompt_tokens" 134031}}})))
+                                 (answer r)))))]
+      (try
+        (let [id (sid h) submitted (:value (req h :session/submit {:session_id id :text "original"}))
+              s (get-in @(:sessions h) [id :agent])]
+          (is (= true (deref entered 3000 false)))
+          (doseq [[behavior text] queued]
+            (let [reply (:value (req h :session/submit {:session_id id :text text :behavior behavior :queue true}))]
+              (is (= true (:queued reply)))
+              (is (identical? (:completion submitted) (:completion reply)))))
+          (is (= (count queued) (+ (count (:steering-queue @s)) (count (:followup-queue @s)))))
+          (deliver release true)
+          (let [ordered (vec (concat (map second (filter #(= :steer (first %)) queued))
+                                     (map second (filter #(= :followup (first %)) queued))))
+                result (deref (:completion submitted) 3000 {})]
+            (is (= (last ordered) (:value result)))
+            (is (= (into ["original"] ordered) @requests))
+            (is (= (into ["original"] ordered) (mapv :content (filter #(= :user (:role %)) (:history @s))))))
+          (is (= (count (filter #(= :steer (first %)) queued))
+                 (count (filter #(= :steering (:type %)) (:history @s)))))
+          (is (empty? (:steering-queue @s)))
+          (is (empty? (:followup-queue @s)))
+          (is (= :idle (:state @s))))
+        (finally (deliver release true) (stop h))))))

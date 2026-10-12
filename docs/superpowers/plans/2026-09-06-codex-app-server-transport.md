@@ -29,7 +29,7 @@ Work in `.worktrees/codex-app-server`. Do not modify the user-owned let-go check
 Focused command (repeat after each task, require exit zero and no failed assertions):
 
 ```sh
-/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote attractor.codex-transport-test)) (clojure.test/run-tests) (os/exit (if clojure.test/*test-result* 0 1))'
+/Users/ndn/development/let-go/lg -source-paths src:test -e '(require (quote harness.tests) (quote attractor.codex-transport-test)) (harness.tests/run-and-exit! (quote attractor.codex-transport-test))'
 ```
 
 ### Task 2: Implement the smallest owned duplex transport

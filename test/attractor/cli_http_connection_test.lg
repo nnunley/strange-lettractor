@@ -1,5 +1,5 @@
 (ns attractor.cli-http-connection-test
-  (:require [clojure.test :refer [deftest is]] [json :as json] [http :as http]
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str] [json :as json] [http :as http]
             [attractor.cli :as cli] [attractor.hub :as hub]
             [attractor.server :as server] [attractor.nrepl-client :as remote]
             [attractor.nrepl-server :as nserver]))
@@ -65,3 +65,29 @@
                   server/start-server (fn [_] (throw (ex-info "Legacy startup" {:category :wrong-startup})))]
       (is (= :configuration_error
              (try (cli/cmd-serve args) nil (catch Object e (:category (ex-data e)))))))))
+
+(deftest serve-startup-displays-an-accessible-api-endpoint
+  (doseq [[address expected] [[nil "http://127.0.0.1:7070/pipelines"]
+                             ["127.0.0.1:7071" "http://127.0.0.1:7071/pipelines"]
+                             ["example.local:8080" "http://example.local:8080/pipelines"]
+                             ["0.0.0.0:8080" "http://localhost:8080/pipelines"]
+                             ["[::]:8080" "http://[::1]:8080/pipelines"]
+                             ["[::1]:8080" "http://[::1]:8080/pipelines"]
+                             [":0" "assigned HTTP port is unavailable"]]]
+    (let [requested (atom nil)
+          output (with-out-str
+                   (with-redefs [remote/connect! (fn [_] :remote)
+                                 remote/close! (fn [_] nil)
+                                 http/serve (fn [_ addr] (reset! requested addr))]
+                     (cli/cmd-serve (into ["--connect" "4555"]
+                                         (if address ["--port" address] [])))))]
+      (is (= (or address "127.0.0.1:7070") @requested))
+      (is (str/includes? output expected))
+      (is (str/includes? output "Starting Attractor HTTP adapter"))
+      (when (nil? address)
+        (is (str/includes? output "Conversation UI: http://127.0.0.1:7070/")))
+      (when (= address "example.local:8080")
+        (is (str/includes? output "Conversation UI requires a loopback listener or local tunnel.")))
+      (is (not (str/includes? output "listening")))
+      (when (= address ":0")
+        (is (not (str/includes? output "http://")))))))

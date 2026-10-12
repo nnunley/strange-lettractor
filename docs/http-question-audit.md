@@ -1,5 +1,10 @@
 # HTTP human-question audit — 2026-09-12
 
+Historical evidence for the legacy `server.lg` / `web_interviewer.lg` path.
+The current CLI serves the hub HTTP/nREPL implementation; see [hub usage](hub.md)
+and the [2026-10-07 audit](codebase-audit-2026-10-07.md). Both expose HTTP APIs,
+not a bundled browser frontend.
+
 The original-spec audit found that the HTTP interviewer ignored each question's
 timeout and imposed a hardcoded 30-second limit. Millisecond-based question IDs
 could also collide between parallel gates. `web_interviewer.lg` now uses unique
@@ -9,8 +14,9 @@ endpoint exposes stage, metadata, default and timeout alongside text and options
 
 The parallel answer regression also exposed a runtime JSON defect: string map
 keys were serialized with reader quotes. The configured runtime is fixed; the
-reproducible source patch and Go regression are in
-[`runtime-patches`](../runtime-patches/README.md).
+historical source-patch evidence is recorded in
+[runtime build audits](runtime-audits.md). The patch directory has since been removed;
+the current release pin is in `lgx.edn`.
 
 The native socket probe found that an empty lazy pipeline listing serialized as
 `[null]`. The endpoint now constructs a vector and returns `[]`; a public-handler

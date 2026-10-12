@@ -1,5 +1,6 @@
 (ns provider-wire-server
-  (:require [http :as http] [json :as json] [clojure.string :as str]))
+  (:require [http :as http] [json :as json] [clojure.string :as str]
+            [clojure.edn :as edn]))
 
 ;; Recording server for the native adapter wire contract (SCN-ULLM-ADAPTERS,
 ;; SCN-OPENAI-COMPAT). Requests arrive as
@@ -21,35 +22,43 @@
 
 (def default-call {:id "call-1" :tool-id "toolu-1" :name "get_weather" :args {:city "Oslo"}})
 
+(defn- calls-for [scenario call]
+  (let [selected (or call (when (= scenario "tools") default-call))]
+    (cond (nil? selected) [] (vector? selected) selected :else [selected])))
+
 (defn complete-body
   "The provider's success body. `call` (default get_weather/Oslo when the
    scenario is \"tools\") adds one tool call in the provider's shape."
   [provider scenario & [call]]
-  (let [call (or call (when (= scenario "tools") default-call))
-        tools? (some? call)
+  (let [calls (calls-for scenario call)
+        call (first calls)
+        tools? (seq calls)
         args-json (when call (json/write-json (:args call)))]
     (case provider
       "openai"
       {:id "resp-1" :status "completed" :model "gpt-test"
-       :output (cond-> [{:id "msg-1" :type "message" :role "assistant"
-                         :content [{:type "output_text" :text "Hello world"}]}]
-                 tools? (conj {:id "fc-1" :type "function_call" :call_id (:id call)
-                               :name (:name call) :arguments args-json}))
+       :output (into [{:id "msg-1" :type "message" :role "assistant"
+                       :content [{:type "output_text" :text "Hello world"}]}]
+                     (map-indexed (fn [i c]
+                                    {:id (str "fc-" (inc i)) :type "function_call"
+                                     :call_id (:id c) :name (:name c)
+                                     :arguments (json/write-json (:args c))}) calls))
        :usage usage-openai}
       "anthropic"
       {:id "msg-1" :type "message" :role "assistant" :model "claude-test"
-       :content (cond-> [{:type "text" :text "Hello world"}]
-                  tools? (conj {:type "tool_use" :id (:tool-id call) :name (:name call)
-                                :input (:args call)}))
+       :content (into [{:type "text" :text "Hello world"}]
+                      (map (fn [c] {:type "tool_use" :id (:tool-id c)
+                                    :name (:name c) :input (:args c)}) calls))
        :stop_reason (if tools? "tool_use" "end_turn")
        :usage {:input_tokens 11 :output_tokens 7
                :cache_read_input_tokens 3 :cache_creation_input_tokens 0}}
       "gemini"
       {:responseId "gem-1"
        :candidates [{:content {:role "model"
-                               :parts (cond-> [{:text "Hello world"}]
-                                        tools? (conj {:functionCall {:name (:name call)
-                                                                     :args (:args call)}}))}
+                               :parts (into [{:text "Hello world"}]
+                                            (map (fn [c] {:functionCall
+                                                          (cond-> {:name (:name c) :args (:args c)}
+                                                            (:gemini-id c) (assoc :id (:gemini-id c)))}) calls))}
                      :finishReason "STOP"}]
        :usageMetadata {:promptTokenCount 11 :candidatesTokenCount 7 :totalTokenCount 18}}
       "openai-compat"
@@ -57,9 +66,9 @@
        :choices [{:index 0
                   :message (cond-> {:role "assistant" :content "Hello world"}
                              tools? (assoc :tool_calls
-                                           [{:id (:id call) :type "function"
-                                             :function {:name (:name call)
-                                                        :arguments args-json}}]))
+                                           (mapv (fn [c] {:id (:id c) :type "function"
+                                                          :function {:name (:name c)
+                                                                     :arguments (json/write-json (:args c))}}) calls)))
                   :finish_reason (if tools? "tool_calls" "stop")}]
        :usage {:prompt_tokens 11 :completion_tokens 7 :total_tokens 18}}
       nil)))
@@ -72,9 +81,10 @@
                         frames))})
 
 (defn stream-body [provider scenario & [call]]
-  (let [call (or call (when (= scenario "tools") default-call))
-        final (complete-body provider scenario call)
-        tools? (some? call)
+  (let [calls (calls-for scenario call)
+        final (complete-body provider scenario calls)
+        tools? (seq calls)
+        call (first calls)
         args-json (when call (json/write-json (:args call)))]
     (case provider
       "openai"
@@ -83,12 +93,14 @@
                     :item {:id "msg-1" :type "message" :role "assistant" :content []}}]
               [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "Hello "}]
               [nil {:type "response.output_text.delta" :item_id "msg-1" :content_index 0 :delta "world"}]]
-             (when tools?
-               [[nil {:type "response.output_item.added"
-                      :item {:id "fc-1" :type "function_call" :call_id (:id call) :name (:name call) :arguments ""}}]
-                [nil {:type "response.function_call_arguments.delta" :item_id "fc-1" :delta args-json}]
-                [nil {:type "response.output_item.done"
-                      :item {:id "fc-1" :type "function_call" :call_id (:id call) :name (:name call) :arguments args-json}}]])
+             (mapcat (fn [i c]
+                       (let [item-id (str "fc-" (inc i)) encoded (json/write-json (:args c))]
+                         [[nil {:type "response.output_item.added"
+                                :item {:id item-id :type "function_call" :call_id (:id c) :name (:name c) :arguments ""}}]
+                          [nil {:type "response.function_call_arguments.delta" :item_id item-id :delta encoded}]
+                          [nil {:type "response.output_item.done"
+                                :item {:id item-id :type "function_call" :call_id (:id c) :name (:name c) :arguments encoded}}]]))
+                     (range (count calls)) calls)
              [[nil {:type "response.completed" :response final}]]))
       "anthropic"
       (sse (concat
@@ -102,21 +114,26 @@
             ["content_block_delta" {:type "content_block_delta" :index 0
                                     :delta {:type "text_delta" :text "world"}}]
             ["content_block_stop" {:type "content_block_stop" :index 0}]]
-           (when tools?
-             [["content_block_start" {:type "content_block_start" :index 1
-                                      :content_block {:type "tool_use" :id (:tool-id call) :name (:name call) :input {}}}]
-              ["content_block_delta" {:type "content_block_delta" :index 1
-                                      :delta {:type "input_json_delta" :partial_json args-json}}]
-              ["content_block_stop" {:type "content_block_stop" :index 1}]])
+           (mapcat (fn [i c]
+                     (let [index (inc i)]
+                       [["content_block_start" {:type "content_block_start" :index index
+                                                :content_block {:type "tool_use" :id (:tool-id c) :name (:name c) :input {}}}]
+                        ["content_block_delta" {:type "content_block_delta" :index index
+                                                :delta {:type "input_json_delta" :partial_json (json/write-json (:args c))}}]
+                        ["content_block_stop" {:type "content_block_stop" :index index}]]))
+                   (range (count calls)) calls)
            [["message_delta" {:type "message_delta" :delta {:stop_reason (if tools? "tool_use" "end_turn")}
                               :usage {:output_tokens 7}}]
             ["message_stop" {:type "message_stop"}]]))
       "gemini"
       (sse (concat
              [[nil {:candidates [{:content {:role "model" :parts [{:text "Hello "}]}}]}]]
-             (when tools?
-               [[nil {:candidates [{:content {:role "model"
-                                              :parts [{:functionCall {:name (:name call) :args (:args call)}}]}}]}]])
+             (map (fn [c]
+                    [nil {:candidates [{:content {:role "model"
+                                                 :parts [{:functionCall
+                                                          (cond-> {:name (:name c) :args (:args c)}
+                                                            (:gemini-id c) (assoc :id (:gemini-id c)))}]}}]}])
+                  calls)
              [[nil {:candidates [{:content {:role "model" :parts [{:text "world"}]} :finishReason "STOP"}]
                     :usageMetadata (:usageMetadata final)}]]))
       "openai-compat"
@@ -165,8 +182,438 @@
   (when-let [step (get (matrix-script provider) (dec attempt))]
     (assoc step :id (str "call-" attempt) :tool-id (str "toolu-" attempt))))
 
+(defn- native-results [provider body]
+  (case provider
+    "openai" (filter #(= "function_call_output" (get % "type")) (get body "input"))
+    "anthropic" (mapcat (fn [m] (filter #(= "tool_result" (get % "type")) (get m "content")))
+                        (get body "messages"))
+    "gemini" (mapcat (fn [m] (keep #(get % "functionResponse") (get m "parts")))
+                     (get body "contents"))
+    []))
+
+(defn- native-result-content [provider result]
+  (case provider
+    "openai" (get result "output")
+    "anthropic" (get result "content")
+    "gemini" (get-in result ["response" "result"])
+    nil))
+
+(defn- native-result-id [provider result]
+  (case provider
+    "openai" (get result "call_id")
+    "anthropic" (get result "tool_use_id")
+    "gemini" (get result "name")
+    nil))
+
+(defn- observed-spawn-id [provider body]
+  (some (fn [result]
+          (try
+            (let [value (edn/read-string (str (native-result-content provider result)))]
+              (or (:agent_id value) (get value "agent_id")))
+            (catch Object _ nil)))
+        (native-results provider body)))
+
+(defn- journey-working-dir [provider body]
+  (let [system (case provider
+                 "openai" (get body "instructions")
+                 "anthropic" (let [value (get body "system")]
+                               (if (string? value) value
+                                   (str/join "\n" (map #(get % "text") value))))
+                 "gemini" (str/join "\n" (map #(get % "text")
+                                                (get-in body ["systemInstruction" "parts"]))))]
+    (second (re-find #"(?m)^Working directory: ([^\r\n]+)" (str system)))))
+
+(defn- journey-calls [provider scenario body]
+  (let [count-results (count (native-results provider body))
+        text (json/write-json body)
+        path-form (cond
+                    (str/ends-with? scenario "-dot") :dot
+                    (str/ends-with? scenario "-absolute") :absolute
+                    (str/ends-with? scenario "-wrong-dir") :wrong-dir
+                    :else :bare)
+        base-scenario (str/replace scenario #"-(?:dot|absolute|wrong-dir)$" "")
+        file-path (fn [name]
+                    (case path-form
+                      :dot (str "./" name)
+                      :absolute (str (or (journey-working-dir provider body)
+                                         (throw (ex-info "Missing journey working directory" {})))
+                                     "/" name)
+                      :wrong-dir (str "wrong-dir/" name)
+                      name))
+        call (fn [suffix name args]
+               {:id (str scenario "-" suffix) :tool-id (str scenario "-toolu-" suffix)
+                :name name :args args})]
+    (case base-scenario
+      "parity-create"
+      (when (zero? count-results)
+        [(call "create" "write_file" {:file_path "hello.txt" :content "hello"})])
+      "parity-parallel"
+      (when (zero? count-results)
+        [(call "alpha" "write_file" {:file_path (file-path "parallel-a.txt") :content "alpha"})
+         (call "beta" "write_file" {:file_path (file-path "parallel-b.txt") :content "beta"})])
+      "parity-steering"
+      (cond (zero? count-results)
+            [(call "first" "write_file" {:file_path (file-path "steering-first.txt") :content "before"})]
+            (= 1 count-results)
+            [(call "second" "write_file"
+                   {:file_path (file-path (if (str/includes? text "STEER_TO_CORRECT")
+                                            "steering-correct.txt" "steering-wrong.txt"))
+                    :content "after"})])
+      "parity-reasoning"
+      (when (zero? count-results)
+        [(call "first" "write_file" {:file_path "reasoning.txt" :content "changed"})])
+      "parity-subagent"
+      (cond
+        (and (zero? count-results) (str/includes? text "PARENT_DELEGATE"))
+        [(call "spawn" "spawn_agent" {:task "CHILD_WRITE: create child-proof.txt containing child-done"})]
+        (and (= 1 count-results) (str/includes? text "PARENT_DELEGATE"))
+        (let [agent-id (observed-spawn-id provider body)]
+          (when agent-id [(call "wait" "wait" {:agent_id agent-id})]))
+        (and (zero? count-results) (str/includes? text "CHILD_WRITE"))
+        [(call "child" "write_file" {:file_path (file-path "child-proof.txt") :content "child-done"})])
+      "parity-subagent-mismatch"
+      (mapv (fn [step]
+              (if (= "wait" (:name step))
+                (assoc step :args {:agent_id "wrong-child-id"})
+                step))
+            (or (journey-calls provider "parity-subagent" body) []))
+      "parity-subagent-no-file"
+      (mapv (fn [step]
+              (if (and (= "write_file" (:name step))
+                       (= "child-proof.txt" (get-in step [:args :file_path])))
+                (assoc-in step [:args :file_path] "wrong-child.txt")
+                step))
+            (or (journey-calls provider "parity-subagent" body) []))
+      "parity-subagent-parent-forged"
+      (if (and (= 2 count-results) (str/includes? text "PARENT_DELEGATE"))
+        [(call "parent-file" "write_file"
+               {:file_path "child-proof.txt" :content "child-done"})]
+        (mapv (fn [step]
+                (if (and (= "write_file" (:name step))
+                         (= "child-proof.txt" (get-in step [:args :file_path])))
+                  (assoc-in step [:args :file_path] "unrelated-child.txt")
+                  step))
+              (or (journey-calls provider "parity-subagent" body) [])))
+      "parity-loop"
+      (when (< count-results 2)
+        [(call (str "repeat-" (inc count-results)) "read_file" {:file_path "loop-source.txt"})])
+      nil)))
+
 (defn json-response [body]
   {:status 200 :headers {"Content-Type" "application/json"} :body (json/write-json body)})
+
+(defn- provider-journey-text [provider text]
+  (let [base (complete-body provider "text")]
+    (case provider
+      "openai" (assoc-in base [:output 0 :content 0 :text] text)
+      "anthropic" (assoc-in base [:content 0 :text] text)
+      "gemini" (assoc-in base [:candidates 0 :content :parts 0 :text] text)
+      base)))
+
+(defn- provider-journey-error [status code message]
+  {:status status :headers {"Content-Type" "application/json"}
+   :body (json/write-json {:error {:message message :type code
+                                   :status (case status
+                                             404 "NOT_FOUND"
+                                             401 "UNAUTHENTICATED"
+                                             429 "RESOURCE_EXHAUSTED"
+                                             "INVALID_ARGUMENT")}})})
+
+(defn- provider-journey-invalid [reason]
+  {:status 400 :headers {"Content-Type" "application/json"}
+   :body (json/write-json {:error {:message reason :type "invalid_request_error"}})})
+
+(defn- provider-journey-model [provider path body]
+  (if (= provider "gemini") path (get body "model")))
+
+(defn- provider-journey-prior-calls? [provider body]
+  (case provider
+    "openai" (some #(= "function_call" (get % "type")) (get body "input"))
+    "anthropic" (some #(= "tool_use" (get % "type"))
+                      (mapcat #(get % "content") (get body "messages")))
+    "gemini" (some #(contains? % "functionCall")
+                    (mapcat #(get % "parts") (get body "contents")))
+    false))
+
+(defn- provider-journey-user-texts [provider body]
+  (case provider
+    "openai" (vec (keep #(get % "text")
+                        (mapcat #(get % "content")
+                                (filter #(= "user" (get % "role"))
+                                        (get body "input")))))
+    "anthropic" (vec (keep #(get % "text")
+                           (mapcat #(get % "content")
+                                   (filter #(= "user" (get % "role"))
+                                           (get body "messages")))))
+    "gemini" (vec (keep #(get % "text")
+                         (mapcat #(get % "parts")
+                                 (filter #(= "user" (get % "role"))
+                                         (get body "contents")))))
+    []))
+
+(defn- provider-journey-tool-names [provider body]
+  (case provider
+    "gemini" (mapv #(get % "name")
+                   (get-in body ["tools" 0 "functionDeclarations"]))
+    (mapv #(get % "name") (get body "tools"))))
+
+(def ^:private extraction-schema
+  {"type" "object"
+   "properties" {"name" {"type" "string"}
+                 "age" {"type" "integer"}}
+   "required" ["name" "age"]})
+
+(defn- provider-journey-schema [provider body]
+  (case provider
+    "openai" (get-in body ["text" "format" "schema"])
+    "gemini" (get-in body ["generationConfig" "responseSchema"])
+    "anthropic"
+    (let [system (get body "system")
+          text (if (string? system)
+                 system
+                 (str/join "\n\n" (keep #(get % "text") system)))
+          prefix "Return only valid JSON matching this JSON Schema: "
+          index (str/index-of text prefix)]
+      (when (some? index)
+        (try (json/read-json (subs text (+ index (count prefix))))
+             (catch Object _ nil))))
+    nil))
+
+(def ^:private provider-agent-call
+  {:id "call-lookup" :tool-id "toolu-lookup"
+   :name "lookup" :args {:code "X7"}})
+
+(def ^:private provider-agent-anthropic-parts
+  [{:type "thinking" :thinking "reason" :signature "agent-thinking-signature"}
+   {:type "redacted_thinking" :data "agent-redacted-data"}
+   {:type "tool_use" :id "toolu-lookup" :name "lookup" :input {:code "X7"}}])
+
+(def ^:private provider-agent-gemini-parts
+  [{:text "" :thought true :thoughtSignature "agent-thought-signature"}
+   {:functionCall {:name "lookup" :args {:code "X7"}}
+    :thoughtSignature "agent-call-signature"}])
+
+(defn- provider-agent-first-response [provider streaming?]
+  (case provider
+    "anthropic"
+    (if streaming?
+      (sse [["message_start" {:type "message_start"
+                              :message {:id "agent-first" :type "message" :role "assistant"
+                                        :model "claude-haiku-4-5"
+                                        :usage {:input_tokens 12 :output_tokens 0}}}]
+            ["content_block_start" {:type "content_block_start" :index 0
+                                    :content_block {:type "thinking" :thinking "reason" :signature ""}}]
+            ["content_block_delta" {:type "content_block_delta" :index 0
+                                    :delta {:type "signature_delta" :signature "agent-thinking-signature"}}]
+            ["content_block_stop" {:type "content_block_stop" :index 0}]
+            ["content_block_start" {:type "content_block_start" :index 1
+                                    :content_block {:type "redacted_thinking" :data "agent-redacted-data"}}]
+            ["content_block_stop" {:type "content_block_stop" :index 1}]
+            ["content_block_start" {:type "content_block_start" :index 2
+                                    :content_block {:type "tool_use" :id "toolu-lookup"
+                                                    :name "lookup" :input {}}}]
+            ["content_block_delta" {:type "content_block_delta" :index 2
+                                    :delta {:type "input_json_delta" :partial_json "{\"code\":\"X7\"}"}}]
+            ["content_block_stop" {:type "content_block_stop" :index 2}]
+            ["message_delta" {:type "message_delta" :delta {:stop_reason "tool_use"}
+                              :usage {:output_tokens 4}}]
+            ["message_stop" {:type "message_stop"}]])
+      (json-response (assoc (complete-body provider "tools" provider-agent-call)
+                            :content provider-agent-anthropic-parts)))
+    "gemini"
+    (let [body (assoc-in (complete-body provider "tools" provider-agent-call)
+                         [:candidates 0 :content :parts] provider-agent-gemini-parts)]
+      (if streaming? (sse [[nil body]]) (json-response body)))
+    (if streaming?
+      (stream-body provider "tools" provider-agent-call)
+      (json-response (complete-body provider "tools" provider-agent-call)))))
+
+(defn- provider-agent-prior-valid? [provider body]
+  (case provider
+    "anthropic"
+    (= [(json/read-json (json/write-json provider-agent-anthropic-parts))]
+       (mapv #(mapv (fn [part] (dissoc part "cache_control"))
+                    (get % "content"))
+             (filter #(= "assistant" (get % "role")) (get body "messages"))))
+    "gemini"
+    (= [(json/read-json (json/write-json provider-agent-gemini-parts))]
+       (mapv #(get % "parts")
+             (filter #(= "model" (get % "role")) (get body "contents"))))
+    (provider-journey-prior-calls? provider body)))
+
+(defn- provider-journey-reply [provider scenario path headers body streaming?]
+  (let [wire (pr-str body)
+        user-texts (provider-journey-user-texts provider body)
+        has-prompt? (fn [prompt] (some #(= prompt %) user-texts))
+        submitted-model (provider-journey-model provider path body)
+        expected-model (case provider
+                         "openai" "gpt-5-mini"
+                         "anthropic" "claude-haiku-4-5"
+                         "gemini" "gemini-3-flash-preview"
+                         nil)
+        valid-model? (and (string? submitted-model)
+                          (or (contains? #{"provider-missing" "provider-cache"
+                                           "provider-cache-omit-tool"} scenario)
+                              (if (= provider "gemini")
+                                (str/includes? submitted-model (str "/models/" expected-model ":"))
+                                (= expected-model submitted-model))))]
+    (cond
+      (not valid-model?) (provider-journey-invalid "native model missing")
+
+      (= scenario "provider-text")
+      (if (has-prompt? "Reply with exactly the word: pong")
+        (json-response (provider-journey-text provider "pong"))
+        (provider-journey-invalid "generation prompt changed"))
+
+      (= scenario "provider-stream")
+      (if (and streaming? (has-prompt? "Count from 1 to 3 separated by commas"))
+        (update (stream-body provider "text") :body
+                #(-> % (str/replace "Hello " "1,") (str/replace "world" "2,3")))
+        (provider-journey-invalid "stream mode or prompt changed"))
+
+      (= scenario "provider-structured")
+      (let [schema (provider-journey-schema provider body)]
+        (if (and (has-prompt? "Extract the person's name and integer age from: Alice is 30 years old. Respond with JSON only.")
+                 (= extraction-schema schema))
+          (json-response (provider-journey-text provider
+                           (json/write-json {:name "Alice" :age 30})))
+          (provider-journey-invalid "extraction input or schema changed")))
+
+      (= scenario "provider-parallel")
+      (if-let [results (seq (native-results provider body))]
+        (let [values (mapv #(str (native-result-content provider %)) results)
+              expected-prefixes (case provider
+                                  "openai" {"call-left" "left-" "call-right" "right-"}
+                                  "anthropic" {"toolu-left" "left-" "toolu-right" "right-"}
+                                  "gemini" {"read_left" "left-" "read_right" "right-"})
+              result-ids (mapv #(native-result-id provider %) results)
+              signed-parts (when (= provider "gemini")
+                             (filter #(contains? % "functionCall")
+                                     (mapcat #(get % "parts")
+                                             (filter #(= "model" (get % "role"))
+                                                     (get body "contents")))))]
+          (if (and (= 2 (count values))
+                   (= (set (keys expected-prefixes)) (set result-ids))
+                   (every? (fn [[id value]]
+                             (str/starts-with? value (get expected-prefixes id "<unknown>")))
+                           (map vector result-ids values))
+                   (or (not= provider "gemini")
+                       (= ["parallel-call-signature" nil]
+                          (mapv #(get % "thoughtSignature") signed-parts))))
+            (json-response (provider-journey-text provider (str/join " " values)))
+            (provider-journey-invalid "parallel results or signed call parts changed")))
+        (if (and (not (provider-journey-prior-calls? provider body))
+                 (has-prompt? "Call read_left and read_right together in the same response, in parallel. They are independent. Then report both complete returned values.")
+                 (= #{"read_left" "read_right"}
+                    (set (provider-journey-tool-names provider body))))
+          (let [calls [{:id "call-left" :tool-id "toolu-left"
+                        :name "read_left" :args {}}
+                       {:id "call-right" :tool-id "toolu-right"
+                        :name "read_right" :args {}}]
+                response (complete-body provider "tools" calls)
+                response (if (= provider "gemini")
+                           (assoc-in response [:candidates 0 :content :parts 1 :thoughtSignature]
+                                     "parallel-call-signature")
+                           response)]
+            (json-response response))
+          (provider-journey-invalid "parallel prompt or tools changed")))
+
+      (= scenario "provider-agent")
+      (if-let [results (seq (native-results provider body))]
+        (if (and (= 1 (count results))
+                 (provider-agent-prior-valid? provider body)
+                 (= (case provider
+                      "openai" "call-lookup"
+                      "anthropic" "toolu-lookup"
+                      "gemini" "lookup")
+                    (native-result-id provider (first results)))
+                 (= "code X7 means READY"
+                    (str (native-result-content provider (first results)))))
+          (if streaming?
+            (update (stream-body provider "text") :body
+                    #(-> % (str/replace "Hello " "code X7 means ")
+                         (str/replace "world" "READY")))
+            (json-response (provider-journey-text provider "code X7 means READY")))
+          (provider-journey-invalid "agent continuation omitted lookup result"))
+        (if (and (has-prompt? "Call the lookup tool with code X7 and report what it means in one sentence.")
+                 (some #{"lookup"} (provider-journey-tool-names provider body)))
+          (provider-agent-first-response provider streaming?)
+          (provider-journey-invalid "agent prompt or lookup tool changed")))
+
+      (= scenario "provider-missing")
+      (if (str/includes? (provider-journey-model provider path body)
+                         "attractor-nonexistent-model-")
+        (provider-journey-error 404 "not_found_error" "model not found")
+        (provider-journey-invalid "missing-model request used a valid model"))
+
+      (= scenario "provider-rate")
+      (if (has-prompt? "Reply with one word: ready.")
+        (provider-journey-error 429 "rate_limit_error" "rate limit")
+        (provider-journey-invalid "rate-limit prompt changed"))
+
+      (= scenario "provider-rate-200")
+      (if (has-prompt? "Reply with one word: ready.")
+        (json-response (provider-journey-text provider "ready"))
+        (provider-journey-invalid "rate-limit prompt changed"))
+
+      (= scenario "provider-options")
+      (if (has-prompt? "Reply with one word: ready.")
+        (json-response (provider-journey-text provider "ready"))
+        (provider-journey-invalid "provider-options prompt changed"))
+
+      (= scenario "provider-image-base64")
+      (if (has-prompt? "Name the two solid colors in this image from left to right. Reply with only the two lowercase color names separated by a comma.")
+        (json-response (provider-journey-text provider "red,blue"))
+        (provider-journey-invalid "base64 image prompt changed"))
+
+      (= scenario "provider-image-url")
+      (if (has-prompt? "Identify the animal and its predominant fur color in the image. Reply with only the lowercase animal name and color separated by a comma. Use a basic color name.")
+        (json-response (provider-journey-text provider "cat, orange"))
+        (provider-journey-invalid "image URL prompt changed"))
+
+      (= scenario "provider-invalid-key")
+      (if (str/includes? (pr-str headers) "invalid-key-for-matrix")
+        (provider-journey-error 401 "authentication_error" "invalid key")
+        (provider-journey-invalid "invalid-key row used another key"))
+
+      (= scenario "provider-cache")
+      (let [turn (some->> (re-seq #"Use cache_probe for turn ([1-5])" wire)
+                          last second parse-long)
+            results (seq (native-results provider body))
+            choice (get-in body ["tool_choice" "type"])
+            expected-choice (if (= "claude-fable-5-1" (get body "model"))
+                              "auto" "any")
+            usage {:input_tokens 40 :output_tokens 6
+                   :cache_read_input_tokens 80 :cache_creation_input_tokens 0}]
+        (cond
+          (not= provider "anthropic")
+          (provider-journey-invalid "cache fixture expects Anthropic")
+          (nil? turn)
+          (provider-journey-invalid "cache turn prompt missing")
+          results
+          (let [value (str (native-result-content provider (last results)))]
+            (if (and (= 1 (count results))
+                     (str/starts-with? value "cache-value-"))
+              (json-response (assoc (provider-journey-text provider value) :usage usage))
+              (provider-journey-invalid "opaque cache tool result missing")))
+          (= choice expected-choice)
+          (json-response (assoc (complete-body provider "tools"
+                                  {:id (str "call-cache-" turn)
+                                   :tool-id (str "toolu-cache-" turn)
+                                   :name "cache_probe" :args {:turn turn}})
+                                :usage usage))
+          :else
+          (provider-journey-invalid "forced cache tool choice conflicts with model capability")))
+
+      (= scenario "provider-cache-omit-tool")
+      (if (and (= provider "anthropic")
+               (= "claude-fable-5-1" (get body "model"))
+               (= "auto" (get-in body ["tool_choice" "type"]))
+               (has-prompt? "Use cache_probe for turn 1."))
+        (json-response (provider-journey-text provider "cache-value-plausible"))
+        (provider-journey-invalid "omitted-tool control request changed"))
+
+      :else nil)))
 
 (defn make-handler [token state]
   (fn [request]
@@ -196,14 +643,19 @@
                           (get-in (swap! state update-in [:attempts counter] (fnil inc 0)) [:attempts counter])
                           ;; Bodyless probes (context discovery) do not consume a turn.
                           0)
-                call (when (= scenario "matrix") (scripted-call provider attempt))
+                call (cond (= scenario "matrix") (scripted-call provider attempt)
+                           (str/starts-with? scenario "parity-") (journey-calls provider scenario body)
+                           :else nil)
                 scenario (cond (= scenario "loop") (if (= attempt 1) "tools" "text")
                                (= scenario "matrix") (if call "tools" "text")
+                               (str/starts-with? scenario "parity-") (if (seq call) "tools" "text")
                                ;; "loop-error": a tool call whose execution the test makes fail.
                                (= scenario "loop-error") (if (= attempt 1) "tools" "text")
                                (contains? #{"flaky429" "flaky503"} scenario) (if (= attempt 1) scenario "text")
                                :else scenario)]
           (cond
+            (str/starts-with? scenario "provider-")
+            (provider-journey-reply provider scenario path (:headers request) body streaming?)
             ;; "flaky429" / "flaky503": the first model call per provider fails
             ;; with a retryable status, later calls answer normally.
             (and (= scenario "flaky429") (= attempt 1))

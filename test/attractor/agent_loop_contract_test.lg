@@ -71,7 +71,7 @@
       (is (= "answer-3" (get-in @requests [3 :messages 8 :content])))
       (is (= "second" (get-in @requests [3 :messages 9 :content])))
       (is (= [:session_start :user_input :steering_injected
-              :assistant_text_start :assistant_text_end :tool_call_start :tool_call_end
+              :assistant_text_start :assistant_text_end :tool_call_start :tool_call_end :tool_results_recorded
               :steering_injected :assistant_text_start :assistant_text_end
               :user_input :assistant_text_start :assistant_text_end :processing_end
               :user_input :assistant_text_start :assistant_text_end :processing_end]
@@ -193,4 +193,25 @@
             _ (agent/wait-subagent! session agent-id)
             child (get-in @session [:subagents agent-id :session])]
         (is (= 7 (get-in @child [:config :max_total_tokens]))))
+      (finally (agent/close-session! session)))))
+
+;; §2.3's prose question state conflicts with §2.5's executable loop.
+;; Pin the chosen §2.5 behavior without classifying natural-language text.
+(deftest text-only-question-completes-and-answer-retains-history
+  (let [requests (atom [])
+        session (fixture
+                  (fn [request]
+                    (swap! requests conj request)
+                    (response (str (count @requests))
+                              (if (= 1 (count @requests))
+                                "Which file should I update?" "I will use main.lg.") []))
+                  (fn [_ _] (throw (ex-info "No tool should run" {}))) {})]
+    (try
+      (is (= "Which file should I update?" (agent/process-input! session "Update the entry point")))
+      (is (= :idle (:state @session)))
+      (is (= "I will use main.lg." (agent/process-input! session "Use main.lg")))
+      (is (= :idle (:state @session)))
+      (is (= ["Update the entry point" "Which file should I update?" "Use main.lg"]
+             (mapv :content (rest (:messages (second @requests))))))
+      (is (= [:user :assistant :user :assistant] (mapv :type (:history @session))))
       (finally (agent/close-session! session)))))

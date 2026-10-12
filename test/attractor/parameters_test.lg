@@ -1,0 +1,388 @@
+(ns attractor.parameters-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [attractor.parameters :as parameters]
+            [attractor.validation]
+            [attractor.transforms]
+            [attractor.parser :as parser]))
+
+(deftest parameter-names-are-lowercase-identifiers
+  (doseq [good ["editable" "run_cmd" "max_iterations" "a1"]]
+    (is (true? (parameters/valid-name? good)) good))
+  (doseq [bad ["Editable" "run-cmd" "1st" "_leading" ""]]
+    (is (false? (parameters/valid-name? bad)) bad)))
+
+(deftest declarations-parse-into-records-with-defaults
+  (let [res (parameters/parse-declarations
+              "[{:name :editable :type :string :default \"solve.lg\" :export true}
+                {:name :direction :type [:enum \"min\" \"max\"] :default \"min\" :delegable true}]")]
+    (is (= [] (:errors res)))
+    (is (= 2 (count (:declarations res))))
+    (let [d (first (:declarations res))]
+      (is (= "editable" (:name d)))
+      (is (= :string (:type d)))
+      (is (= "solve.lg" (:default d)))
+      (is (true? (:export d)))
+      (is (false? (:delegable d))))))
+
+(deftest absent-params-attribute-declares-nothing
+  (is (= {:declarations [] :errors []} (parameters/parse-declarations nil)))
+  (is (= {:declarations [] :errors []} (parameters/parse-declarations "  "))))
+
+(deftest duplicate-name-is-an-error
+  (let [res (parameters/parse-declarations
+              "[{:name :editable :type :string} {:name :editable :type :int}]")]
+    (is (some #(clojure.string/includes? % "duplicate") (:errors res)))))
+
+(deftest default-must-match-declared-type
+  (let [res (parameters/parse-declarations
+              "[{:name :max_iterations :type :int :default \"many\"}]")]
+    (is (some #(clojure.string/includes? % "max_iterations") (:errors res)))))
+
+(deftest unknown-type-is-an-error
+  (let [res (parameters/parse-declarations "[{:name :x :type :duration}]")]
+    (is (some #(clojure.string/includes? % "duration") (:errors res)))))
+
+(deftest legacy-comma-separated-form-names-the-declaration-form
+  (let [res (parameters/parse-declarations "task_file, target_dir, max_iterations")]
+    (is (some #(clojure.string/includes? % "comma-separated") (:errors res)))
+    (is (some #(clojure.string/includes? % ":name") (:errors res)))))
+
+(deftest validation-reports-declaration-errors
+  (let [graph {:nodes {} :edges [] :attrs {:params "[{:name :x :type :duration}]"}}
+        diags (filter #(= "parameter_declaration" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (= :error (:severity (first diags))))))
+
+(deftest substitution-replaces-references-and-leaves-shell-alone
+  (let [vals {"editable" "solve.lg"}]
+    (is (= "edit solve.lg" (:text (parameters/substitute-string "edit {{editable}}" vals))))
+    (is (= "solve.lgsolve.lg"
+           (:text (parameters/substitute-string "{{editable}}{{editable}}" vals))))
+    (is (= "\"${LG:-lg}\" bench.lg"
+           (:text (parameters/substitute-string "\"${LG:-lg}\" bench.lg" vals))))
+    (is (= "$goal" (:text (parameters/substitute-string "$goal" vals))))
+    (is (= "cost is {50}" (:text (parameters/substitute-string "cost is {50}" vals))))))
+
+(deftest doubled-open-brace-is-an-escape
+  (is (= "{{editable}}"
+         (:text (parameters/substitute-string "{{{{editable}}" {"editable" "solve.lg"})))))
+
+(deftest an-unsupplied-reference-is-left-in-place
+  (is (= "edit {{editable}}" (:text (parameters/substitute-string "edit {{editable}}" {})))))
+
+(deftest substitution-reports-which-names-it-used
+  (is (= #{"editable"}
+         (:used (parameters/substitute-string "a {{editable}} b" {"editable" "x"})))))
+
+(deftest unterminated-reference-left-in-place-and-does-not-loop
+  (let [vals {"editable" "solve.lg"}
+        result (parameters/substitute-string "edit {{editable" vals)]
+    (is (= "edit {{editable" (:text result)))
+    (is (= #{} (:used result)))))
+
+(deftest invalid-parameter-name-left-in-place
+  (let [vals {"valid_name" "value"}]
+    (is (= "{{Not-A-Name}}"
+           (:text (parameters/substitute-string "{{Not-A-Name}}" vals))))
+    (is (= #{}
+           (:used (parameters/substitute-string "{{Not-A-Name}}" vals))))
+    (is (= "{{1st}}"
+           (:text (parameters/substitute-string "{{1st}}" vals))))
+    (is (= #{}
+           (:used (parameters/substitute-string "{{1st}}" vals))))))
+
+(deftest substitution-transform-rewrites-graph-node-and-edge-attributes
+  (let [graph {:model_stylesheet ".r { llm_model: {{model}}; }"
+               :goal "make {{editable}} fast"
+               :attrs {:params "[{:name :model :type :string}]"
+                       :model_stylesheet ".r { llm_model: {{model}}; }"}
+               :nodes {"run" {:id "run" :timeout "{{budget}}"
+                              :tool_command "sh ar.sh {{editable}}"
+                              :attrs {:tool_command "sh ar.sh {{editable}}"}}}
+               :edges [{:from "run" :to "exit" :condition "param.direction = {{direction}}"
+                        :attrs {:condition "param.direction = {{direction}}"}}]}
+        out ((parameters/substitution-transform
+               {"model" "haiku" "editable" "solve.lg" "budget" "30s" "direction" "max"})
+             graph)]
+    (is (= ".r { llm_model: haiku; }" (:model_stylesheet out)))
+    (is (= "make solve.lg fast" (:goal out)))
+    (is (= "30s" (get-in out [:nodes "run" :timeout])))
+    (is (= "sh ar.sh solve.lg" (get-in out [:nodes "run" :tool_command])))
+    (is (= "sh ar.sh solve.lg" (get-in out [:nodes "run" :attrs :tool_command])))
+    (is (= "param.direction = max" (:condition (first (:edges out)))))))
+
+(deftest the-params-attribute-is-never-substituted-into
+  (let [graph {:attrs {:params "[{:name :x :type :string :default \"{{x}}\"}]"}
+               :nodes {} :edges []}
+        out ((parameters/substitution-transform {"x" "boom"}) graph)]
+    (is (= "[{:name :x :type :string :default \"{{x}}\"}]" (get-in out [:attrs :params])))))
+
+(deftest substitution-records-where-each-parameter-was-used
+  (let [graph {:attrs {} :nodes {"a" {:id "a" :tool_command "{{p}}" :attrs {:tool_command "{{p}}"}}}
+               :edges []}
+        out ((parameters/substitution-transform {"p" "v"}) graph)]
+    (is (contains? (set (:parameter_authored_references out))
+                   {:name "p" :attr :tool_command :node_id "a"}))))
+
+(deftest substitution-runs-before-the-stylesheet-transform
+  ;; The stylesheet transform resolves llm_model onto nodes. If substitution
+  ;; ran after it, the node would carry the literal reference instead.
+  (let [graph {:model_stylesheet ".r { llm_model: {{model}}; }"
+               :attrs {} :edges []
+               :nodes {"n" {:id "n" :class "r" :shape "box" :attrs {}}}}
+        out (attractor.transforms/apply-transforms graph [] {"model" "haiku"})]
+    (is (= "haiku" (get-in out [:nodes "n" :llm_model])))))
+
+(deftest undeclared-references-are-validation-errors
+  (let [graph {:attrs {:params "[{:name :editable :type :string}]"}
+               :nodes {"guard" {:id "guard" :tool_command "sh ar.sh {{editble}}"
+                                :attrs {:tool_command "sh ar.sh {{editble}}"}}}
+               :edges []}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "editble"))
+    (is (clojure.string/includes? (:message (first diags)) "guard"))))
+
+(deftest a-declared-but-unsupplied-reference-is-not-a-validation-error
+  (let [graph {:attrs {:params "[{:name :editable :type :string}]"}
+               :nodes {"guard" {:id "guard" :tool_command "sh ar.sh {{editable}}"
+                                :attrs {:tool_command "sh ar.sh {{editable}}"}}}
+               :edges []}]
+    (is (empty? (filter #(= "parameter_reference" (:rule %))
+                        (attractor.validation/validate graph))))))
+
+(deftest an-undeclared-reference-on-an-edge-names-the-edge
+  (let [graph {:attrs {}
+               :nodes {}
+               :edges [{:from "a" :to "b" :condition "{{missing}}"
+                        :attrs {:condition "{{missing}}"}}]}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (= [["a" "b"]] (mapv :edge diags)))
+    (is (clojure.string/includes? (:message (first diags)) "edge a -> b"))
+    (is (not (clojure.string/includes? (:message (first diags)) "graph attribute")))))
+
+(deftest a-promoted-node-field-referencing-an-undeclared-parameter-is-reported-once
+  (let [graph (parser/parse-dot
+                (str "digraph G { start [shape=Mdiamond]; "
+                     "guard [type=codergen, prompt=\"do the {{thing}}\"]; "
+                     "exit [shape=Msquare]; start -> guard -> exit; }"))
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "thing"))
+    (is (clojure.string/includes? (:message (first diags)) "guard"))))
+
+(deftest a-graph-level-undeclared-reference-reports-without-a-node-id
+  (let [graph {:attrs {:goal "solve {{issue}}"}
+               :nodes {}
+               :edges []}
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate graph))]
+    (is (= 1 (count diags)))
+    (is (nil? (:node_id (first diags))))
+    (is (nil? (:edge (first diags))))
+    (is (clojure.string/includes? (:message (first diags)) "issue"))
+    (is (clojure.string/includes? (:message (first diags)) "graph attribute"))))
+
+(deftest an-escaped-reference-survives-substitution-and-validation
+  ;; The escape exists so a prompt can carry a literal brace pair for a model
+  ;; to read. Validation used to run on the substituted graph, where the
+  ;; escape's own output "{{thing}}" read as an undeclared reference.
+  (let [graph (parser/parse-dot
+                (str "digraph G { start [shape=Mdiamond]; "
+                     "guard [type=codergen, prompt=\"emit {{{{thing}}\"]; "
+                     "exit [shape=Msquare]; start -> guard -> exit; }"))
+        prepared (attractor.transforms/apply-transforms graph [] {})
+        diags (filter #(= "parameter_reference" (:rule %))
+                      (attractor.validation/validate prepared))]
+    (is (= "emit {{thing}}" (get-in prepared [:nodes "guard" :prompt])))
+    (is (= [] diags))))
+
+(deftest a-reference-in-an-eagerly-coerced-attribute-is-rejected
+  ;; The parser collapses these to a boolean (or, for a weight, a number)
+  ;; before substitution can run, so the reference is destroyed and the
+  ;; attribute silently takes a fixed value -- a parameterized goal gate
+  ;; would simply always fire.
+  (doseq [[attr source]
+          [[:goal_gate (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                            "start [shape=Mdiamond]; "
+                            "guard [type=codergen, goal_gate=\"{{p}}\", retry_target=start]; "
+                            "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:auto_status (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                              "start [shape=Mdiamond]; "
+                              "guard [type=codergen, auto_status=\"{{p}}\"]; "
+                              "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:allow_partial (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                                "start [shape=Mdiamond]; "
+                                "guard [type=codergen, allow_partial=\"{{p}}\"]; "
+                                "exit [shape=Msquare]; start -> guard -> exit; }")]
+           [:loop_restart (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                               "start [shape=Mdiamond]; exit [shape=Msquare]; "
+                               "start -> exit [loop_restart=\"{{p}}\"]; }")]
+           [:weight (str "digraph G { graph [params=\"[{:name :p :type :string}]\"]; "
+                         "start [shape=Mdiamond]; exit [shape=Msquare]; "
+                         "start -> exit [weight=\"{{p}}\"]; }")]]]
+    (let [prepared (attractor.transforms/apply-transforms (parser/parse-dot source) [] {})
+          diags (filter #(= "parameter_reference_coerced" (:rule %))
+                        (attractor.validation/validate prepared))]
+      (is (= 1 (count diags)) (str attr))
+      (is (clojure.string/includes? (:message (first diags)) (name attr)) (str attr))
+      (is (clojure.string/includes? (:message (first diags)) "'p'") (str attr)))))
+
+(deftest an-integer-attribute-is-not-in-the-coerced-family
+  ;; typed-integer passes a non-numeric string through unchanged, so
+  ;; substitution still reaches max_retries.
+  (let [source (str "digraph G { graph [params=\"[{:name :p :type :int :default 3}]\"]; "
+                    "start [shape=Mdiamond]; "
+                    "guard [type=codergen, max_retries=\"{{p}}\"]; "
+                    "exit [shape=Msquare]; start -> guard -> exit; }")
+        prepared (attractor.transforms/apply-transforms
+                   (parser/parse-dot source) [] {"p" "3"})]
+    (is (= [] (filter #(= "parameter_reference_coerced" (:rule %))
+                      (attractor.validation/validate prepared))))
+    (is (= "3" (get-in prepared [:nodes "guard" :attrs :max_retries])))))
+
+(deftest the-delegable-check-is-static-and-does-not-need-a-value
+  ;; The rule reads an index built from the authored text, so it fires for a
+  ;; delegable parameter with no default and no supplied value -- exactly the
+  ;; parameter a delegated caller is meant to supply.
+  (let [source (str "digraph G { graph [params=\""
+                    "[{:name :p :type :string :delegable true}]\"]; "
+                    "start [shape=Mdiamond]; "
+                    "run [shape=parallelogram, tool_command=\"sh {{p}}\"]; "
+                    "exit [shape=Msquare]; start -> run -> exit; }")
+        prepared (attractor.transforms/apply-transforms (parser/parse-dot source) [] {})
+        diags (filter #(= "parameter_delegable_open" (:rule %))
+                      (attractor.validation/validate prepared))]
+    (is (= 1 (count diags)))
+    (is (clojure.string/includes? (:message (first diags)) "tool_command"))))
+
+(def ^:private decls
+  (:declarations
+    (parameters/parse-declarations
+      "[{:name :editable :type :string :default \"solve.lg\"}
+        {:name :run_cmd :type :string}
+        {:name :direction :type [:enum \"min\" \"max\"] :default \"min\"}
+        {:name :max_iterations :type :int :default 0}]")))
+
+(deftest a-flag-beats-the-file-which-beats-the-default
+  (let [res (parameters/resolve-values
+              decls {:file {"direction" "max" "max_iterations" 7}
+                     :flags {"direction" "min" "run_cmd" "sh bench.sh"}})]
+    (is (= [] (:errors res)))
+    (is (= "min" (get-in res [:values "direction"])))
+    (is (= :flag (get-in res [:sources "direction"])))
+    (is (= "7" (get-in res [:values "max_iterations"])))
+    (is (= :file (get-in res [:sources "max_iterations"])))
+    (is (= "solve.lg" (get-in res [:values "editable"])))
+    (is (= :default (get-in res [:sources "editable"])))))
+
+(deftest a-parameter-with-no-default-and-no-value-is-an-error
+  (let [res (parameters/resolve-values decls {:file {} :flags {}})]
+    (is (some #(and (= "parameter_missing" (:rule %))
+                    (clojure.string/includes? (:message %) "run_cmd"))
+              (:errors res)))))
+
+(deftest flag-text-is-coerced-to-the-declared-type
+  (let [ok (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" "-1"}})]
+    (is (= [] (:errors ok)))
+    (is (= -1 (get-in ok [:typed "max_iterations"])))
+    (is (= "-1" (get-in ok [:values "max_iterations"]))))
+  ;; A leading + is accepted by the :int pattern, and render normalizes it
+  ;; away, so the rendered value is what a substituted command sees.
+  (let [plus (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" "+7"}})]
+    (is (= [] (:errors plus)))
+    (is (= 7 (get-in plus [:typed "max_iterations"])))
+    (is (= "7" (get-in plus [:values "max_iterations"]))))
+  (doseq [bad ["7.5" "many" ""]]
+    (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "max_iterations" bad}})]
+      (is (some #(and (= "parameter_type" (:rule %))
+                      (clojure.string/includes? (:message %) "max_iterations"))
+                (:errors res)) bad))))
+
+(deftest an-enum-error-names-the-allowed-values
+  (doseq [bad ["Max" "middle"]]
+    (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "direction" bad}})
+          msg (:message (first (filter #(clojure.string/includes? (:message %) "direction")
+                                       (:errors res))))]
+      (is (some? msg) bad)
+      (is (clojure.string/includes? msg "min") bad)
+      (is (clojure.string/includes? msg "max") bad))))
+
+(deftest a-supplied-name-that-is-not-declared-is-an-error
+  ;; The brief's own version of this test checked
+  ;; `(clojure.string/includes? % "editble")` against `(:errors res)` directly,
+  ;; but resolve-values errors are maps ({:rule ... :message ...}), not
+  ;; strings, per this task's error-shape contract. Checking :message instead.
+  (let [res (parameters/resolve-values decls {:file {} :flags {"run_cmd" "x" "editble" "y"}})]
+    (is (some #(and (= "parameter_undeclared" (:rule %))
+                    (clojure.string/includes? (:message %) "editble"))
+              (:errors res))))
+  ;; The same holds for a name that only a --params-file supplies.
+  (let [res (parameters/resolve-values decls {:file {"editble" "y"} :flags {"run_cmd" "x"}})]
+    (is (some #(and (= "parameter_undeclared" (:rule %))
+                    (clojure.string/includes? (:message %) "editble"))
+              (:errors res)))))
+
+(deftest a-file-supplied-float-is-rejected-for-an-int-parameter
+  ;; Coverage gap deferred from Task 1: default-matches? (reused by
+  ;; check-typed) must reject a float for :int, exercised here through a
+  ;; file-supplied value rather than a declared default.
+  (let [res (parameters/resolve-values
+              decls {:file {"max_iterations" 7.5} :flags {"run_cmd" "x"}})]
+    (is (some #(and (= "parameter_type" (:rule %))
+                    (clojure.string/includes? (:message %) "max_iterations"))
+              (:errors res)))))
+
+(deftest a-file-supplied-value-outside-the-enum-is-rejected
+  ;; Coverage gap deferred from Task 1: default-matches? must reject a value
+  ;; outside an [:enum ...] list, exercised here through a file-supplied value.
+  (let [res (parameters/resolve-values
+              decls {:file {"direction" "sideways"} :flags {"run_cmd" "x"}})]
+    (is (some #(and (= "parameter_type" (:rule %))
+                    (clojure.string/includes? (:message %) "direction"))
+              (:errors res)))))
+
+(deftest trust-never-increases-along-a-chain
+  (is (= :trusted (parameters/effective-trust nil :trusted)))
+  (is (= :delegated (parameters/effective-trust :trusted :delegated)))
+  (is (= :delegated (parameters/effective-trust :delegated :delegated)))
+  (is (= :delegated (parameters/effective-trust :delegated :trusted))))
+
+(deftest a-delegated-launch-may-set-only-delegable-parameters
+  (let [ds (:declarations
+             (parameters/parse-declarations
+               "[{:name :run_cmd :type :string}
+                 {:name :direction :type [:enum \"min\" \"max\"] :delegable true}]"))]
+    (is (= [] (parameters/check-delegation ds {:flags {"run_cmd" "sh evil.sh"}} :trusted)))
+    (is (= [] (parameters/check-delegation ds {:flags {"direction" "max"}} :delegated)))
+    (let [errs (parameters/check-delegation ds {:flags {"run_cmd" "sh evil.sh"}} :delegated)]
+      (is (= 1 (count errs)))
+      (is (clojure.string/includes? (first errs) "run_cmd")))))
+
+(deftest a-delegable-string-may-not-reach-a-command-a-path-or-the-stylesheet
+  (doseq [attr [:tool_command :subpipeline.dotfile]]
+    (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"}
+                 :nodes {"n" {:id "n" :attrs {attr "{{p}}"}}} :edges []}
+          diags (filter #(= "parameter_delegable_open" (:rule %))
+                        (attractor.validation/validate graph))]
+      (is (= 1 (count diags)) (str attr))))
+  (let [graph {:attrs {:params "[{:name :p :type :string :delegable true}]"
+                       :model_stylesheet "{{p}}"}
+               :nodes {} :edges []}]
+    (is (= 1 (count (filter #(= "parameter_delegable_open" (:rule %))
+                            (attractor.validation/validate graph)))))))
+
+(deftest a-closed-type-or-a-non-delegable-parameter-may-reach-a-command
+  (doseq [decl ["[{:name :p :type :int :delegable true}]"
+                "[{:name :p :type [:enum \"a\" \"b\"] :delegable true}]"
+                "[{:name :p :type :string}]"]]
+    (let [graph {:attrs {:params decl}
+                 :nodes {"n" {:id "n" :attrs {:tool_command "{{p}}"}}} :edges []}]
+      (is (empty? (filter #(= "parameter_delegable_open" (:rule %))
+                          (attractor.validation/validate graph)))
+          decl))))

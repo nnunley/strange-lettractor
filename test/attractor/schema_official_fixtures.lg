@@ -1,0 +1,25 @@
+(ns attractor.schema-official-fixtures
+  "Shared pinned corpus and assertions; callers choose dialect and registry policy."
+  (:require [clojure.test :refer [is]]
+            [json :as json]
+            [attractor.llm :as llm]))
+
+(def fixture-root "test/fixtures/json-schema/")
+
+(defn fixture [path]
+  (json/read-json (slurp (str fixture-root path))))
+
+(defn corpus [filename]
+  (fixture (str "mandatory2020-12/tests/" filename)))
+
+(defn remote [uri]
+  (fixture (str "mandatory2020-12/remotes/"
+                (second (re-find #"/draft2020-12/(.+)$" uri)))))
+
+(defn check-group [filename group options]
+  (doseq [example (get group "tests")]
+    (let [result (llm/validate-json-schema (get example "data")
+                   (get group "schema") options)]
+      (is (= (get example "valid") (first result))
+          (str filename " / " (get group "description") " / "
+               (get example "description") " / " (pr-str result))))))

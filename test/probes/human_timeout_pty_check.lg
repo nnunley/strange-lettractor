@@ -3,7 +3,8 @@
    real pseudo-terminal. One run gets no input and must complete through
    human.default_choice at the deadline; one is answered by typing; one gets
    its answer only after the deadline, which must not leak into a later gate."
-  (:require [clojure.test :refer [deftest is]] [clojure.string :as str] [os :as os] [io :as io]))
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str] [os :as os] [io :as io]
+            [harness.tests :as tests]))
 
 (def ^:private gate-dot
   (str/join "\n" ["digraph G {" "start [shape=Mdiamond]"
@@ -66,8 +67,5 @@
     (is (not (str/includes? text "Stage 'a' started")))))
 
 (defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))

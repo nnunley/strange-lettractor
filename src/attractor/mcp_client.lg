@@ -369,10 +369,13 @@
           (and (= :legacy (:mode state)) (not (str/blank? (str (:session-id state)))))
           (try
             (let [transport (or (:transport state) http/request)]
-              (transport {:method :delete :url (:endpoint state)
-                          :headers (assoc (:headers state)
-                                          "mcp-session-id" (:session-id state))
-                          :body ""}))
+              ;; Cleanup gets its own budget; an already-aborted request must
+              ;; not skip the DELETE or make teardown unbounded.
+              (capacity/call!
+                #(transport {:method :delete :url (:endpoint state)
+                             :headers (assoc (:headers state) "mcp-session-id" (:session-id state))
+                             :body ""})
+                {:timeout_ms (min 60000 (or (:timeout-ms state) default-timeout-ms))}))
             (catch Object _ nil))))
 )
 

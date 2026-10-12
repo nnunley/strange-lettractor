@@ -1,0 +1,96 @@
+(ns attractor.thread-ui-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [attractor.hub-http :as http] [attractor.console.session :as console]))
+(deftest browser-routes-forward-only-typed-operations
+  (let [calls (atom []) handler (http/make-handler #(do (swap! calls conj %) {:value {:thread_id "child"}}))
+        headers {"Host" "localhost:7070" "Origin" "http://localhost:7070" "Content-Type" "application/json"}]
+    (doseq [[method path body op] [[:get "/threads" nil :thread/list]
+                                  [:get "/threads/child" nil :thread/read]
+                                  [:post "/threads" "{}" :session/open]
+                                  [:post "/threads/child/messages" "{\"text\":\"hello\",\"behavior\":\"followup\"}" :thread/submit]
+                                  [:post "/threads/child/cancel" "{}" :thread/cancel]
+                                  [:post "/threads/child/resume" "{}" :thread/resume]]]
+      (let [reply (handler {:path path :request-method method :headers headers :body body})]
+        (is (= 200 (:status reply)))
+        (is (nil? (get-in reply [:headers "Access-Control-Allow-Origin"])))
+        (is (= op (:op (last @calls))))))
+    (is (= 200 (:status (handler {:path "/threads/child/cancel" :request-method :post
+                                  :server-addr "localhost:7070" :scheme :http
+                                  :headers (dissoc headers "Host") :body "{}"}))))
+    (is (= :followup (:behavior (nth @calls 3))))
+    (is (= "child" (:thread_id (nth @calls 3))))
+    (let [before (count @calls)]
+      (doseq [bad [(assoc headers "Origin" "http://evil.test")
+                   (assoc headers "Origin" "null")
+                   (assoc headers "Content-Type" "text/plain")]]
+        (is (= 403 (:status (handler {:path "/threads/child/cancel" :request-method :post :headers bad :body "{}"})))))
+      (is (= before (count @calls))))
+    (let [page (handler {:path "/" :request-method :get :headers headers})]
+      (is (= 200 (:status page)))
+      (is (str/includes? (:body page) "textContent"))
+      (is (not (str/includes? (:body page) "innerHTML"))))))
+(deftest console-thread-selection-routes-text-followup-and-cancel
+  (let [calls (atom [])
+        c (console/open! nil {:request_fn #(do (swap! calls conj %)
+                                               {:value (case (:op %) :client/attach {:client_id "c" :cursor 0}
+                                                         :thread/list [{:thread_id "child" :root_id "root" :parent_id "root" :task "child work"}]
+                                                         :thread/read {:thread_id "child" :history [{:role :user :content "past"}]}
+                                                         :thread/resume {:session_id "new" :thread_id "new"}
+                                                         {})})
+                              :events_fn (fn [_ cursor] {:events [] :cursor cursor})})]
+    (is (some #(str/includes? % "past") (:lines (console/handle! c {:type :line :text "/thread child"}))))
+    (doseq [[text op] [["hello" :thread/submit] ["/followup later" :thread/submit] ["/cancel" :thread/cancel]]]
+      (console/handle! c {:type :line :text text})
+      (is (= op (:op (last @calls))))
+      (is (= "child" (:thread_id (last @calls)))))
+    (console/handle! c {:type :line :text "/resume child"})
+    (is (= {:kind :thread :id "new"} (console/focus c)))))
+
+(deftest selected-thread-drain-reads-snapshots-without-events
+  (let [history (atom [{:role :user :content "original"}])
+        c (console/open! nil {:request_fn (fn [r] {:value (case (:op r)
+                                                 :client/attach {:client_id "c" :cursor 0}
+                                                 :thread/list [{:thread_id "child"}]
+                                                 :thread/read {:thread_id "child" :history @history}
+                                                 {})})
+                              :events_fn (fn [_ cursor] {:events [] :cursor cursor})})]
+    (console/handle! c {:type :line :text "/thread child"})
+    (is (empty? (:lines (console/drain! c))))
+    (swap! history conj {:role :assistant :content "new reply" :tool_calls [{:id "call-42" :name "read_file" :arguments {:path "x"}}]})
+    (let [lines (:lines (console/drain! c))]
+      (is (some #(str/includes? % "new reply") lines))
+      (is (some #(str/includes? % "call-42") lines))
+      (is (not (some #(str/includes? % "original") lines))))
+    (is (empty? (:lines (console/drain! c))))))
+
+(deftest browser-rejects-dns-rebinding-and-nonloopback-peers
+  (let [calls (atom 0) handler (http/make-handler (fn [_] (swap! calls inc) {:value []}))]
+    (doseq [req [{:server-addr "evil.test:7070" :headers {"Origin" "http://evil.test:7070"}}
+                 {:server-addr "127.0.0.1.evil.test:7070"}
+                 {:server-addr "localhost:7070" :remote-addr "192.168.1.4:50123"}
+                 {:server-addr "localhost:7070" :remote-addr "[2001:db8::1]:50123"}
+                 {}]]
+      (is (= 403 (:status (handler (merge {:path "/threads" :request-method :get} req))))))
+    (is (= 0 @calls))
+    (doseq [[host peer] [["localhost:7070" "127.0.0.1:50123"]
+                         ["127.0.0.1" "127.0.0.1"]
+                         ["[::1]:7070" "[::1]:50123"]]]
+      (is (= 200 (:status (handler {:path "/threads" :request-method :get :server-addr host :remote-addr peer})))))))
+
+(deftest browser-submit-omits-native-completion-promises
+  (let [handler (http/make-handler (fn [_] {:value {:thread_id "child" :queued true :completion (promise)}}))
+        reply (handler {:path "/threads/child/messages" :request-method :post
+                        :server-addr "localhost:7070" :headers {"Content-Type" "application/json"}
+                        :body "{\"text\":\"hello\"}"})]
+    (is (= 200 (:status reply)))
+    (is (not (str/includes? (:body reply) "completion")))
+    (is (str/includes? (:body reply) "child"))))
+
+(deftest selected-thread-preserves-explicit-evaluation-output
+  (let [c (atom {:focus {:kind :thread :id "child"}})]
+    (is (= ["printed" "[eval] => 3"]
+           (console/render-envelope c
+             {:source :eval :event {:type :eval_result :status :ok :printed "printed" :value_repr "3"}})))
+    (is (= ["[eval] error: evaluation failed"]
+           (console/render-envelope c
+             {:source :eval :event {:type :eval_result :status :error :error {:message "evaluation failed"}}})))))

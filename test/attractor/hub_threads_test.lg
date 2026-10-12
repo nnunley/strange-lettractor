@@ -1,0 +1,135 @@
+(ns attractor.hub-threads-test
+  (:require [clojure.test :refer [deftest is]] [attractor.hub :as hub]
+            [attractor.agent :as agent] [attractor.profiles :as profiles]
+            [attractor.execution :as execution] [os :as os] [clojure.string :as str]
+            [clojure.edn :as edn] [io :as io]))
+
+(defn req [h op fields]
+  (deref (hub/request! h (merge {:id (str (random-uuid)) :op op} fields)) 5000 {}))
+(defn opts [calls]
+  {:session_options {:provider_profile (profiles/make-profile {:id "fixture" :model "fixture" :supports_streaming false})
+                     :project_docs []
+                     :execution_env (execution/make-environment {:file_exists (constantly false)
+                                       :inspect_command (fn [_] {:exit_code 1 :stdout ""})})
+                     :complete_fn (fn [r] (swap! calls conj r)
+                                    {:message {:role :assistant :content (:content (last (:messages r)))}})}})
+(defn stop [h] (req h :hub/stop {}))
+
+(deftest threads-expose-real-parent-child-history-and-target-child-input
+  (let [calls (atom []) h (hub/start! (opts calls))]
+    (try
+      (let [id (get-in (req h :session/open {}) [:value :session_id])
+            root (:agent (get @(:sessions h) id))
+            child-id (:agent_id (agent/spawn-subagent! root {"task" "inspect child"}))]
+        (agent/wait-subagent! root child-id)
+        (let [records (:value (req h :thread/list {}))
+              child (:value (req h :thread/read {:thread_id child-id}))]
+          (is (= #{id child-id} (set (map :thread_id records))))
+          (is (= id (:parent_id child)))
+          (is (= ["inspect child" "inspect child"] (mapv :content (:history child))))
+          (is (every? #(not (contains? % :history)) records)))
+        (is (nil? (:error (req h :thread/submit {:thread_id child-id :text "child followup" :behavior :followup}))))
+        (agent/wait-subagent! root child-id)
+        (is (= "child followup" (:content (last (:history (:value (req h :thread/read {:thread_id child-id})))))))
+        (is (empty? (:history @root)))
+        (is (= :unknown-thread (get-in (req h :thread/read {:thread_id "missing"}) [:error :category]))))
+      (finally (stop h)))))
+
+(deftest edn-archive-reconnect-and-explicit-resume-preserve-history
+  (let [dir (str/trim (:out (os/sh "mktemp" "-d"))) calls (atom [])
+        options (assoc (opts calls) :conversation_root dir)
+        h (hub/start! options) id (get-in (req h :session/open {}) [:value :session_id])]
+    (try
+      (let [turn (:value (req h :thread/submit {:thread_id id :text "remember this"}))]
+        (is (= "remember this" (:value (deref (:completion turn) 3000 {})))))
+      (stop h)
+      (let [restored (hub/start! options)]
+        (try
+          (is (= 1 (count @calls)))
+          (let [thread (:value (req restored :thread/read {:thread_id id}))]
+            (is (:archived thread))
+            (is (= ["remember this" "remember this"] (mapv :content (:history thread)))))
+          (is (= :thread-archived (get-in (req restored :thread/submit {:thread_id id :text "unsafe"}) [:error :category])))
+          (let [resumed (:value (req restored :thread/resume {:thread_id id}))
+                next-id (:thread_id resumed)
+                next-turn (:value (req restored :thread/submit {:thread_id next-id :text "continue"}))]
+            (is (not= id next-id))
+            (is (= id (:resumed_from resumed)))
+            (is (= "continue" (:value (deref (:completion next-turn) 3000 {}))))
+            (is (= ["remember this" "continue"]
+                   (mapv :content (filter #(= :user (:role %)) (:messages (last @calls)))))))
+          (finally (stop restored))))
+      (finally (stop h) (os/delete-tree dir)))))
+
+(deftest persistence-failure-settles-accepted-turn
+  (let [entered (promise) release (promise)
+        options (assoc-in (opts (atom [])) [:session_options :complete_fn]
+                  (fn [_] (deliver entered true) @release
+                    {:message {:role :assistant :content "done"}}))
+        h (hub/start! options)]
+    (try
+      (let [id (get-in (req h :session/open {}) [:value :session_id])
+            turn (:value (req h :thread/submit {:thread_id id :text "work"}))]
+        (is (= true (deref entered 3000 false)))
+        (reset! (:closed (:conversations h)) true)
+        (deliver release true)
+        (is (= :conversation-storage
+               (get-in (deref (:completion turn) 3000 {}) [:error :category]))))
+      (finally (deliver release true) (stop h)))))
+
+(deftest resume-rejects-reused-unfinished-tool-call
+  (let [h (hub/start! (opts (atom [])))
+        archive {:schema 1 :root_id "old" :threads
+                 [{:thread_id "old" :root_id "old" :parent_id nil :state :processing
+                   :history [{:type :assistant :tool_calls [{:id "same"}]}
+                             {:type :tool_results :results [{:tool_call_id "same"}]}
+                             {:type :assistant :tool_calls [{:id "same"}]}]}]}]
+    (try
+      (attractor.conversations/save! (:conversations h) archive)
+      (is (= :incomplete-tool-turn
+             (get-in (req h :thread/resume {:thread_id "old"}) [:error :category])))
+      (finally (stop h)))))
+
+(deftest completed-tool-results-persist-before-next-provider-response
+  (let [dir (str/trim (:out (os/sh "mktemp" "-d")))
+        entered (promise) release (promise) calls (atom 0) executed (atom 0)
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool! registry
+            {:definition {:name "record_effect" :description "Record one effect"
+                          :parameters {:type "object" :properties {}}}
+             :executor (fn [_ _] (swap! executed inc) "effect completed")})
+        options (-> (opts (atom []))
+                    (assoc :conversation_root dir)
+                    (assoc-in [:session_options :provider_profile]
+                      (profiles/make-profile {:id "fixture" :model "fixture"
+                                              :supports_streaming false :tool_registry registry}))
+                    (assoc-in [:session_options :complete_fn]
+                      (fn [_]
+                        (if (= 1 (swap! calls inc))
+                          {:message {:role :assistant :content ""}
+                           :tool_calls [{:id "effect-1" :name "record_effect" :arguments {}}]}
+                          (do (deliver entered true) @release
+                              {:message {:role :assistant :content "done"}})))))
+        h (hub/start! options)]
+    (try
+      (let [id (get-in (req h :session/open {}) [:value :session_id])
+            turn (:value (req h :thread/submit {:thread_id id :text "perform effect"}))]
+        (is (= true (deref entered 3000 false)))
+        (is (= 1 @executed))
+        ;; Read the actual file while inference is blocked: shutdown or the
+        ;; next assistant reply must not be what makes this result durable.
+        (let [path (get @(:paths (:conversations h)) id)
+              snapshot (edn/read-string (io/slurp path))
+              history (:history (first (:threads snapshot)))
+              results (:results (last history))]
+          (is (= :tool_results (:type (last history))))
+          (is (= ["effect-1"] (mapv :tool_call_id results)))
+          (is (= ["effect completed"] (mapv :content results))))
+        (deliver release true)
+        (is (= "done" (:value (deref (:completion turn) 3000 {})))))
+      (finally (deliver release true) (stop h) (os/delete-tree dir)))))
+
+(deftest archive-close-failure-still-settles-hub-stop
+  (let [h (hub/start! (opts (atom [])))]
+    (with-redefs [attractor.conversations/close! (fn [_] (throw (ex-info "lock release failed" {:category :conversation-lock})))]
+      (is (= :conversation-lock (get-in (stop h) [:error :category]))))))

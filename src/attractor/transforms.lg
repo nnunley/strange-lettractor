@@ -1,6 +1,7 @@
 (ns attractor.transforms
   (:require [clojure.string :as str]
-            [attractor.stylesheet :as stylesheet]))
+            [attractor.stylesheet :as stylesheet]
+            [attractor.parameters :as parameters]))
 
 ;; Variable expansion transform (Section 9.2)
 ;; Expands $goal in node prompt attributes to the graph goal attribute value
@@ -36,6 +37,12 @@
 ;; Apply transform pipeline to a parsed graph
 (defn apply-transforms
   ([graph] (apply-transforms graph []))
-  ([graph custom-transforms]
-   (let [all-transforms (concat default-transforms custom-transforms)]
+  ([graph custom-transforms] (apply-transforms graph custom-transforms nil))
+  ([graph custom-transforms parameter-values]
+   ;; Substitution runs first so every later transform, validation rule and
+   ;; handler reads an ordinary resolved graph.
+   (let [leading (if parameter-values
+                   [(parameters/substitution-transform parameter-values)]
+                   [])
+         all-transforms (concat leading default-transforms custom-transforms)]
      (reduce (fn [g t] (t g)) graph all-transforms))))

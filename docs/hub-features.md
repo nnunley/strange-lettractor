@@ -1,5 +1,10 @@
 # Hub Features — Consolidated
 
+Current usage is documented in [hub.md](hub.md). This collection preserves
+dated investigations: patched-runtime requirements and statements that HTTP
+owns a separate registry are historical. Stock let-go 1.13.0 supplies the
+listener; `hub`, `console --connect` and `serve --connect` share a hub today.
+
 ## Hub Listener Runtime Request
 
 # Runtime request: owned TCP listeners for a let-go RPC hub

@@ -256,7 +256,7 @@
           (is (= :pending (deref stopping 20 :pending)))
           (deliver release-cleanup true)
           (is (= {:id "drain" :value {:stopped true}} (deref stopping 3000 :timeout)))
-          (is (= :cancelled (get-in (deref (:completion a) 3000 {}) [:error :category])))
+          (is (= {:error {:category :cancelled :message "Turn cancelled"}} (deref (:completion a) 3000 :pending)))
           (is (= :cancelled (get-in (deref (:completion b) 3000 {}) [:error :category])))))
       (finally (deliver release-cleanup true) (async/close! blocked) (stop h)))))
 

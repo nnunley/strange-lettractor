@@ -1,0 +1,36 @@
+(ns attractor.schema-official-dialect-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [attractor.schema-official-fixtures :as fixtures]
+            [attractor.schema.trusted-metas :as trusted]))
+
+(def dialect "https://json-schema.org/draft/2020-12/schema")
+
+(defn- references-standard-meta? [document]
+  (cond
+    (map? document)
+    (or (some (fn [[key value]]
+                (and (contains? #{"$ref" "$dynamicRef"} key)
+                     (string? value)
+                     (str/starts-with? value "https://json-schema.org/draft/2020-12/")))
+              document)
+        (some references-standard-meta? (vals document)))
+    (vector? document) (some references-standard-meta? document)
+    :else false))
+
+(deftest all-mandatory-draft2020-12-cases
+  (let [manifest (fixtures/fixture "mandatory2020-12/registries.json")
+        count-cases (atom 0)]
+    (doseq [[filename registries] manifest]
+      (let [groups (fixtures/corpus filename)]
+        (is (= (count groups) (count registries)) filename)
+        (doseq [[index group] (map-indexed vector groups)]
+          (let [remotes (into {} (map (fn [uri] [uri (fixtures/remote uri)])
+                                      (get registries index)))
+                meta-needed? (or (references-standard-meta? (get group "schema"))
+                                 (some references-standard-meta? (vals remotes)))
+                registry (merge (if meta-needed? trusted/documents {}) remotes)]
+            (swap! count-cases + (count (get group "tests")))
+            (fixtures/check-group filename group
+              {:schema_default_dialect dialect :schema_registry registry})))))
+    (is (= 1301 @count-cases))))

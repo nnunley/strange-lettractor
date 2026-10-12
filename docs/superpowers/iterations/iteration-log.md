@@ -359,3 +359,278 @@ live smoke against llama.cpp 1/20/0; interviewer timeout 3/11 plus PTY 3/12;
 artifact discovery 3/22/0; composition acceptance 7/169/0; full suite
 840/7796/0; CLI build/help and PTY checks pass; runtime `425d8461` with
 pkg/compiler, pkg/rt, pkg/vm, pkg/api, jank suite and e2e passing.
+## ITER-0014 — Original-spec closure repairs — 2026-09-23
+
+**Completed:** 2026-09-23 (bounded repair checkpoint).
+
+**Stories delivered:** Repairs under ULLM-STRUCTURED-01, CAL-ENV-01 and CAL-TOOLS-01.
+
+**Tasks executed:**
+unevaluated object/array annotations across successful applicators; false/null
+structured-stream completion; native profile editing on standard execution
+environments; explicit raw/tool-reader boundaries; patch capability preflight.
+The overarching stories and original-spec objective are not declared complete.
+
+**Scenarios:** SCN-SCHEMA-UNEVALUATED and SCN-CAL-ENV-EDIT. Independent scope/code reviews
+identified and resolved a formatted-reader corruption path and mutation before
+raw-capability failure. Red/green evidence and residual limitations are in
+the dated LLM/runtime audits and `spec-closure.md`.
+
+**Summary:** User requested latest lgx: installed 0.3.2 and migrated `lgx suite` to its
+built-in `lgx test`. The initial sandbox baseline failed on denied listener and
+process operations; the final integrated run outside the sandbox passes 1417
+tests / 11275 assertions / zero failures. Focused root checks pass 44/299/0.
+Standalone CLI build and example validation pass. Remaining original-scope
+work includes schema resources/dynamic references/dialects, SKIPPED outcomes,
+missing parity rows and first-party evidence, and full requirement audit.
+
+## ITER-0015/0016 — References and runtime SKIPPED — 2026-09-23
+
+**Completed:** 2026-09-23 (bounded repair checkpoints).
+
+**Stories delivered:** ULLM-STRUCTURED-01 reference repair; ATTR-ENG-01,
+ATTR-CP-01 and ATTR-STATUS-01 runtime SKIPPED repair.
+
+**Scenarios:** SCN-SCHEMA-REFERENCES, SCN-SCHEMA-UNEVALUATED, SCN-SKIPPED-OUTCOME.
+
+**Tasks executed:** Implemented schema resource indexing, relative URI resolution, explicit
+registries, anchors/dynamic references, and resolution errors outside boolean
+validation logic. Focused root evidence: 61 tests / 716 assertions, including
+all 323 vendored official reference/unevaluated cases. Whole-dialect semantics
+and schema meta-validation remain partial. See `schema-reference-plan.md`.
+
+User-directed cheaper staffing: gpt-6-luna repaired the verifier timing fixture;
+gpt-6-sol implemented the multi-file runtime SKIPPED behavior. Runtime/file
+normalizers are separate; skipped visits retain prior outcomes and retry counts,
+apply updates and route from their transient result. Checkpoint transition
+metadata preserves selected edges and override history through public resume.
+Entirely skipped branches are neutral; manager collection omits their outcomes
+and artifacts. Human skipped answers retain their separate failure semantics.
+
+Paired spec review exposed historical retry/gate validation, direct codergen
+status serialization, and forged no-edge transitions. All were repaired with
+observable regression tests, including exact condition-key parsing. Paired
+quality review approved the resulting implementation. Focused SKIPPED corpus:
+19 tests / 138 assertions. Fresh root impacted run: 208 / 1506 / zero failures.
+
+**Summary:** Final `lgx suite` on 0.3.2 passes **1453 tests / 11844 assertions / zero failures**,
+exit 0, including the verifier readiness repair. Log:
+`/tmp/attractor-runtime-integrated-20260923.log`. Fresh standalone and project
+CLI builds validate `examples/hello.dot` (5 nodes, 4 edges, no diagnostics).
+`git diff --check` passes. No commit or publication was made.
+
+Native Gemini discovery succeeds but generation returns HTTP 402 with depleted
+prepaid credits; successful native evidence remains absent. Next local work is
+the gpt-6-luna preparation-contract batch, then dialect/meta-validation and
+missing parity rows. This is a completed repair checkpoint, not a claim that
+the full original-spec goal is complete.
+
+## ITER-0017 — Preparation contracts — 2026-09-23
+
+**Completed:** 2026-09-23.
+
+**Stories delivered:** ATTR-DOT-01 and ATTR-VAL-01 preparation repairs.
+
+**Tasks executed:** Implemented by gpt-6-luna under the user's cheaper-subagent policy. DOT BareValue
+now accepts model-name and trailing/repeated hyphens while preserving duration
+tokens, negative numbers, adjacent arrows, strict identifiers/attribute keys,
+qualified attribute names and quoted custom properties. Invalid stylesheet
+reasoning values reject the entire stylesheet. Named lint objects run alongside
+function and Var rules, aggregate diagnostics in order, and gate public execution
+before handlers, lifecycle callbacks, events or log creation.
+
+**Scenarios:** SCN-PREPARATION-CONTRACTS adds seven tests and fifty assertions through public
+APIs. Root and independent review exposed and repaired duration, trailing-hyphen,
+Var-callability and key-grammar regressions with permanent coverage. Both spec
+reviewers and both quality reviewers approve. Fresh root impacted proof is
+**40 tests / 327 assertions / zero failures**; log
+`/tmp/attractor-preparation-reviewed-20260923.log`.
+
+**Summary:** Final `lgx suite` on 0.3.2 passes **1460 tests / 11894 assertions / zero failures**,
+exit 0, `/tmp/attractor-preparation-integrated-20260923.log`. A fresh standalone
+CLI validates `examples/hello.dot` (5 nodes, 4 edges, zero diagnostics); build
+log `/tmp/attractor-preparation-build-20260923.log`. Whitespace checks pass.
+No commit or publication was made. Schema dialect/meta-validation, runner/smoke
+completion, native-provider evidence and the full original-spec audit remain.
+
+## ITER-0018 — Schema dialect and meta-validation — 2026-09-23
+
+**Completed:** 2026-09-23.
+
+**Stories delivered:** ULLM-STRUCTURED-01 dialect/meta-validation repair.
+
+**Tasks executed:** Implemented by gpt-6-sol under the user's cheaper-subagent policy. Explicit
+2020-12 and registered custom dialects now control active vocabularies per
+resource. Local default-dialect options flow through both structured APIs
+without altering provider schemas. Schema preflight rejects malformed unused
+branches before instance evaluation; bundled trusted meta-schemas work in
+standalone binaries without test fixtures or network access. Undeclared
+compatibility preserves valid legacy tuple/dependency forms.
+
+**Scenarios:** SCN-SCHEMA-DIALECTS adds 20 contract tests / 88 assertions and runs all 1301
+mandatory official cases from 46 pinned files. Paired spec review found and
+verified repairs to registry bases, embedded custom-meta discovery, inactive
+annotation isolation, unused reference syntax, explicit null handling and
+trusted meta precedence. Paired quality review approves. The documented custom
+registration boundary, historical-draft rejection and optional-feature limits
+remain explicit in `docs/schema-validation.md`.
+
+The first full integration passed all new dialect/official cases but failed
+12 older fixture assertions: raw arrays directly in `$defs` are invalid schemas,
+and malformed percent escapes now fail URI preflight. A bounded gpt-6-luna task
+aligned those fixtures without changing production validation. It preserves
+array-index and escape discrimination and adds an explicit invalid-schema case.
+Paired spec and quality reviews approve; fresh root focused verification passes
+**108 tests / 616 assertions / zero failures**.
+
+**Summary:** Final `lgx test` on 0.3.2 passes **1481 tests / 13376 assertions / zero failures**,
+exit 0, `/tmp/attractor-schema-dialect-integrated-20260923.log`. Initial failure
+log: `/tmp/attractor-schema-dialect-initial-failures-20260923.log`. Six fresh
+compiled public-validation probes pass from `/tmp`, including trusted-meta
+override rejection; a fresh CLI validates the example (5 nodes / 4 edges,
+zero diagnostics). Root verified upstream corpus bytes and bundled meta-schema
+contents. No commit or publication was made.
+
+Nonblocking maintenance observation: duplicated schema-location keyword lists
+must be updated together for future vocabularies. Remaining original-scope work
+is catalog freshness, complete parity/smoke journeys, native-provider evidence
+and final requirement audit. The overall specification goal remains active.
+
+## ITER-0019 — Current model catalog — 2026-09-23
+
+**Completed:** 2026-09-23.
+
+**Stories delivered:** ULLM-CORE-01, ULLM-QUIRKS-01 and CAL-SYSTEM-01 catalog/capability repairs.
+
+**Tasks executed:** Implemented by gpt-6-luna. Added sourced Opus 5.5, GPT-6 Sol and GPT-6 Luna
+metadata, corrected Opus 4.6's context window, and recorded Sonnet 4.5's reliable
+cutoff. Existing aliases and Fable/Astra default selection remain unchanged.
+The new Anthropic entry uses existing capability metadata; no adapter branch
+or new production abstraction was introduced.
+
+**Scenarios:** SCN-CATALOG-REFRESH observes actual completion/stream requests and rejection
+before transport for unsupported Opus 5.5 forced choice/disabled thinking,
+plus two-turn generated prompts carrying the current vendor cutoffs. Existing
+default routing and unknown-model controls remain. Root and both spec reviewers
+pass the six-namespace impacted run: **137 tests / 822 assertions / zero
+failures/errors**. Both quality reviewers independently pass the three changed
+namespaces: 16 tests / 169 assertions. All four reviewers approve.
+
+**Summary:** Final `lgx test` on 0.3.2 passes **1485 tests / 13406 assertions / zero failures**,
+exit 0; log `/tmp/attractor-catalog-integrated-20260923.log`. Fresh compiled CLI
+`/tmp/attractor-catalog-cli-20260923` validates the example with five nodes,
+four edges and no diagnostics. No commit, publication or live model call was
+made. Dated primary-source evidence is in `docs/provider-model-audits.md`.
+
+The separately updateable offline catalog data artifact recommended by §2.9
+remains a pre-existing final-audit obligation. The next implementation batches
+are the shared agent parity journeys, provider journeys and shared-session
+integration smoke in `parity-evidence-plan.md`, using gpt-6-sol for integration.
+Unavailable native-provider credentials/credit still leave live cells unproved.
+The overall original-spec goal remains active.
+
+## ITER-0020 — Shared native agent journeys — 2026-09-24
+
+**Completed:** 2026-09-24 as a bounded runner and serializer repair.
+
+**Stories delivered:** Deterministic journey proof supporting CAL-PARITY-01,
+CAL-LOOP-01, CAL-REASON-01, CAL-STEER-01 and CAL-SUBAGENT-01; Gemini 2.5
+portable-budget repair under ULLM-QUIRKS-01. Full live parity is not declared done.
+
+**Tasks executed:** gpt-6-sol extracted the ordinary shared runner, preserved
+the ten earlier rows and added parallel, steering, reasoning-change, subagent
+and loop-warning journeys. The native fixture uses actual submitted history,
+opaque identities and real local operations. Review repairs added immediate
+continuation checks, exact model-specific reasoning expectations, successful
+initial steering effects, child provenance and equivalent-path handling.
+Gemini 2.5 complete/stream serialization now maps portable effort to numeric
+budgets while preserving explicit native overrides and Gemini 3 behavior.
+
+**Scenarios:** SCN-CAL-PARITY-JOURNEYS exercises the same entry point as the
+live CLI through all three native adapters. Focused proof passes 11 tests /
+156 assertions, including 18 valid dot/absolute path journeys and nine
+preseeded wrong-directory controls. Path repair RED had 18 failures before
+the fix. Earlier controls reject serial work, missing/failed results and file
+effects, delayed steering/warnings, unchanged or wrong reasoning, forged child
+work and mismatched identity. Gemini budgets pass 2/23/0; impacted adapter wire
+7/131/0 and older parity predicates 2/17/0. Paired specification, quality and
+progress audits approve; the final full-suite result satisfies the auditors'
+integration condition.
+
+**Summary:** Final `lgx test` on 0.3.2 passes **1498 tests / 13585 assertions /
+zero failures**, exit 0. Log: `/tmp/attractor-parity-integrated-20260924.log`.
+Fresh parity binary `/tmp/attractor-parity-final-20260924-2044` exits 3 with no
+configured model and 1 on an unknown row, listing fifteen rows before dispatch.
+Fresh main binary `/tmp/attractor-main-final-20260924-2044` validates the example
+with five nodes, four edges and zero diagnostics. No TODO for this iteration
+remains. No commit or publication was made.
+
+The user funded Gemini and Anthropic; one bounded native basic request to each
+now returns HTTP 200. This restores access without proving live tool parity.
+ITER-0021 addresses provider journeys and independently confirmed Gemini
+thought-signature/history loss. The approved offline catalog extraction follows
+that batch, before shared-session smoke, per the user's priority update.
+
+## ITER-0021 — Shared provider journeys and signed history — 2026-09-24
+
+**Completed:** 2026-09-24 as a bounded runner and signed-history repair.
+
+**Stories delivered:** Component evidence supporting ULLM-CORE-01,
+ULLM-ADAPTER-01, ULLM-COMPLETE-01, ULLM-TOOLS-01, ULLM-ERROR-01,
+ULLM-QUIRKS-01 and ULLM-RELEASE-01; signed content and agent-history behavior
+also support ULLM-CONTENT-01 and CAL-LOOP-01. Full release/native parity remains
+partial; no whole-spec completion claim is made.
+
+**Tasks executed:** gpt-6-sol extracted the ordinary provider journey namespace,
+preserved fifteen existing rows and added missing-model404/rate-limit429 rows.
+Generation, stream, extraction and parallel evidence now checks the actual
+result and native inputs; parallel results bind tool names, IDs and opaque
+values while executors overlap. Catalog defaults respect aliases/overrides,
+cache turns respect forced-choice capabilities, and agent sessions/temporary
+roots close on success and failure. Reports retain bounded agent failure output
+and distinguish incomplete evidence from intentionally unsupported capabilities.
+The confirmed production dependency preserves original Gemini signed parts
+through completion, streamed accumulation and agent history, with provenance
+preventing raw metadata from leaking to other adapters. Agent history also
+retains Anthropic thinking/redacted blocks. Strict shared fixtures reject
+changed ordered signed continuations and derive final answers from tool results.
+
+**Scenarios:** SCN-PROVIDER-JOURNEYS and SCN-GEMINI-SIGNATURES have reusable
+public-interface commands in the behavior corpus. Root final focused/impacted
+verification passes62tests673assertions0fail. Shared provider journeys18/210,
+predicates18/111, Gemini signatures5/36, Anthropic history1/6, adapters7/131,
+earlier agent journeys11/156 and Gemini2.5 budgets2/23 are covered. Behavioral
+REDs demonstrated lost signatures/thinking, metadata leakage, swapped/unknown
+tool results, altered native inputs/schema/tools, omitted cache tools, missing
+cleanup evidence and discarded failure output. Strict agent fixture repair
+had15 failing controls before correction. Paired fresh specification and quality
+reviews approve. Both progress auditors found tiers1/2 clean; the final full
+suite satisfies their sole remaining sentinel/integration condition.
+
+**Summary:** Final `lgx test` on0.3.2 passes **1526 tests / 13863 assertions /
+zero failures**, exit0. Logs: `/tmp/attractor-provider-focused-20260924.log` and
+`/tmp/attractor-provider-integrated-20260924.log`. Fresh binaries
+`/tmp/attractor-provider-integrated-cli-20260924-2314` and
+`/tmp/attractor-main-integrated-cli-20260924-2314` pass the five provider CLI
+selection/error/aggregate checks and example validation (5nodes4edges,
+zero diagnostics). Final CLI proof:
+`/var/folders/vk/rkcd0mjn591_03z0856412gh0000gn/T/tmp.6rZXI9g6Cu/checks.edn`.
+Review files: `/tmp/iter0021-spec-r3-{a,b}.txt`,
+`/tmp/iter0021-quality-{a,b}.txt`, `/tmp/iter0021-progress-{a,b}.txt`.
+Collaboration's thread limit required fresh read-only Codex CLI reviewers.
+
+Native evidence is bounded: eight selected rows pass on Gemini3.1FlashLite and
+Haiku4.5; each rate-limit probe returned200, so429 is skipped/unproved and the
+aggregate incomplete. Gemini3.8Flash and Fable5.1 catalog defaults each pass
+text, parallel tools and agent loop. A separate Fable high-reasoning session
+successfully replays a signed thinking block. See `docs/provider-model-audits.md`
+and ignored `evidence/native-provider-journeys-20260924-*.edn`.
+
+Nonblocking quality followups: richer bounded failed-probe diagnostic fields;
+a controlled signed Gemini stream split across multiple SSE frames. Neither
+reviewer identified an unmet acceptance condition from these suggestions.
+OpenAI credentials, native429, unselected matrix rows, the shared-session smoke
+and final original-spec audit remain open. The approved offline catalog EDN
+extraction is next in the user-directed priority order. Provider OIDC token
+acquisition/refresh remains unimplemented; no auth/billing settings, commit or
+publication were changed by this iteration.

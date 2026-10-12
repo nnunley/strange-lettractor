@@ -1,6 +1,7 @@
 (ns attractor.parity-matrix-evidence-test
   (:require [clojure.test :refer [deftest is]]
             [attractor.profiles :as profiles]
+            [io :as io] [os :as os]
             [live.parity-matrix-checks :as checks]))
 
 (deftest protocol-profiles-keep-native-tools-and-alias-routing
@@ -25,3 +26,48 @@
                      [(round [failed]) (round [(assoc success :is_error true)])]
                      [(round [failed]) (round [(assoc success :content "wrong file")])]]]
       (is (nil? (checks/recovery-evidence history "recovered-token"))))))
+
+(defn- child-proof-context [root]
+  (let [done (promise)
+        child (atom {:state :closed
+                     :execution_env {:working_directory (fn [] root)}
+                     :history [{:type :assistant
+                                :tool_calls [{:id "child-write" :name "write_file"
+                                              :arguments {"file_path" "child-proof.txt" "content" "child-done"}}]}
+                               {:type :tool_results :results [{:tool_call_id "child-write" :is_error false :content "written"}]}]})]
+    (deliver done true)
+    {:dir root
+     :history [{:type :assistant :tool_calls [{:id "spawn-ok" :name "spawn_agent" :arguments {}}]}
+               {:type :tool_results :results [{:tool_call_id "spawn-ok" :is_error false :content "{:agent_id \"child\"}"}]}
+               {:type :assistant :tool_calls [{:id "wait-ok" :name "wait" :arguments {"agent_id" "child"}}]}
+               {:type :tool_results :results [{:tool_call_id "wait-ok" :is_error false :content "{:success true}"}]}]
+     :events [{:type :subagent_event :agent_id "child"
+               :event {:type :tool_call_start :tool_name "write_file" :call_id "child-write"}}
+              {:type :subagent_event :agent_id "child"
+               :event {:type :tool_call_end :tool_name "write_file" :call_id "child-write" :output "written"}}]
+     :session (atom {:subagents {"child" {:session child :future done :status :closed}}})}))
+
+(deftest subagent-evidence-correlates-a-successful-chain-after-failed-attempts
+  (let [root (str (os/temp-dir) "/parity-subagent-evidence-" (random-uuid))]
+    (io/mkdir root)
+    (io/spit (str root "/child-proof.txt") "child-done")
+    (try
+      (let [context (child-proof-context root)
+            failed [{:type :assistant :tool_calls [{:id "spawn-failed" :name "spawn_agent" :arguments {"skills" ["invented"]}}]}
+                    {:type :tool_results :results [{:tool_call_id "spawn-failed" :is_error true :content "skill-not-found"}]}
+                    {:type :assistant :tool_calls [{:id "wait-failed" :name "wait" :arguments {"agent_id" "missing"}}]}
+                    {:type :tool_results :results [{:tool_call_id "wait-failed" :is_error true :content "unknown child"}]}]
+            recovered (update context :history #(vec (concat failed %)))]
+        (is (= {:agent_id "child" :child_file_verified true :joined_and_closed true}
+               (checks/subagent-evidence recovered)))
+        (is (nil? (checks/subagent-evidence
+                    (assoc-in recovered [:history 6 :tool_calls 0 :arguments "agent_id"] "wrong-child"))))
+        (is (nil? (checks/subagent-evidence
+                    (assoc-in recovered [:events 1 :agent_id] "wrong-child"))))
+        (is (nil? (checks/subagent-evidence
+                    (assoc-in recovered [:events 1 :event :call_id] "different-call"))))
+        (is (nil? (checks/subagent-evidence
+                    (assoc-in recovered [:history 7 :results 0 :is_error] true)))))
+      (finally
+        (io/delete-file (str root "/child-proof.txt"))
+        (io/delete-file root)))))

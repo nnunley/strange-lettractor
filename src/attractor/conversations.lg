@@ -1,0 +1,162 @@
+(ns attractor.conversations
+  "EDN conversation archives. Restoring these records never executes an agent."
+  (:refer-clojure :exclude [close!])
+  (:require [clojure.core :as core] [clojure.edn :as edn]
+            [clojure.string :as str] [attractor.ids :as ids]
+            [io :as io] [os :as os] [syscall :as syscall]))
+
+(defn- fail! [message category] (throw (ex-info message {:category category})))
+(defn- read-snapshot [text]
+  (let [forms (edn/read-string (str "[" text "\n]"))]
+    (when-not (= 1 (count forms))
+      (fail! "Expected exactly one conversation snapshot" :conversation-corrupt))
+    (first forms)))
+(defn- serializable! [value]
+  ;; EDN reading rejects opaque runtime values, preserving collections and keys
+  ;; exactly instead of silently coercing them through JSON.
+  (try
+    (when-not (= value (edn/read-string (pr-str value)))
+      (fail! "Conversation contains non-EDN data" :conversation-corrupt))
+    value
+    (catch Object _ (fail! "Conversation contains non-EDN data" :conversation-corrupt))))
+
+(defn snapshot [root-agent]
+  (let [root-id (:id @root-agent) seen (atom #{})]
+    (letfn [(walk [agent parent-id handle-pending]
+              (let [s @agent id (:id s)]
+                (when (contains? @seen id)
+                  (fail! "Conversation contains duplicate or cyclic threads" :conversation-corrupt))
+                (swap! seen conj id)
+                (into [{:thread_id id :root_id root-id :parent_id parent-id
+                        :task (if parent-id (get-in s [:config :delegation_task])
+                                (:content (first (filter #(contains? #{:user "user"} (:role %)) (:history s)))))
+                        :model (if-let [provider (get-in s [:provider_profile :id])]
+                                 (str provider "/" (get-in s [:provider_profile :model])) (:model s))
+                        :resumed_from (:resumed_from s)
+                        :user_instructions (let [v (get-in s [:config :user_instructions])] (when (string? v) v))
+                        :pending (vec (concat (map #(hash-map :text % :behavior :steer) (:steering-queue s))
+                                              (map #(hash-map :text % :behavior :followup) (:followup-queue s))
+                                              (map #(hash-map :text (:input %) :behavior :followup) handle-pending)))
+                        :state (:state s) :history (vec (:history s))
+                        :context_projection (:context_projection s)
+                        :harness_steps (or (:harness_steps s) 0)}]
+                      (mapcat (fn [[_ handle]] (walk (:session handle) id (:pending handle)))
+                              (sort-by first (:subagents s))))))]
+      (serializable! {:schema 1 :root_id root-id :threads (walk root-agent nil [])}))))
+
+(defn- valid-id? [id] (and (string? id) (not (str/blank? id))))
+(defn- validate! [snapshot]
+  (let [root (:root_id snapshot) records (:threads snapshot) index (into {} (map (juxt :thread_id identity) records))]
+    (when-not (and (map? snapshot) (= 1 (:schema snapshot)) (valid-id? root)
+                   (vector? records) (seq records) (= (count records) (count index))
+                   (contains? index root) (nil? (:parent_id (get index root)))
+                   (every? (fn [r] (and (map? r) (valid-id? (:thread_id r)) (= root (:root_id r))
+                                       (contains? r :parent_id) (keyword? (:state r))
+                                       (vector? (:history r)) (every? map? (:history r))
+                                       (or (= root (:thread_id r)) (contains? index (:parent_id r))))) records))
+      (fail! "Malformed conversation snapshot" :conversation-corrupt))
+    (doseq [r records]
+      (loop [id (:thread_id r) seen #{}]
+        (when id
+          (when (contains? seen id) (fail! "Cyclic conversation ancestry" :conversation-corrupt))
+          (recur (:parent_id (get index id)) (conj seen id)))))
+    (serializable! snapshot)))
+
+(defn- locked [store f]
+  (loop [] (when-not (compare-and-set! (:lock store) false true) (core/sleep 1) (recur)))
+  (try (f) (finally (reset! (:lock store) false))))
+
+(defn- unique-threads! [store snapshot]
+  (let [others (dissoc @(:snapshots store) (:root_id snapshot))
+        ids (set (map :thread_id (mapcat :threads (vals others))))]
+    (when (some #(contains? ids (:thread_id %)) (:threads snapshot))
+      (fail! "Thread identity appears in multiple conversation roots" :conversation-corrupt))))
+
+(defn- owner-metadata [lock-path]
+  (try (read-snapshot (io/slurp (str lock-path "/owner.edn")))
+       (catch Object _ nil)))
+
+(defn- release-owner! [store]
+  (let [path (:lock_path store)]
+    (when-not (= (:owner store) (owner-metadata path))
+      (fail! (str "Conversation owner changed or metadata is missing; leaving lock untouched: " path)
+             :conversation-lock))
+    (io/delete-file (str path "/owner.edn"))
+    (let [result (os/sh "rmdir" path)]
+      (when-not (= 0 (:exit result))
+        (fail! (str "Cannot release conversation owner: " (:err result)) :conversation-lock)))))
+
+(defn open-store [root]
+  (let [lock-path (when root (str root "/owner.lock"))
+        store {:root root :lock_path lock-path :lock (atom false) :closed (atom false)
+               :snapshots (atom {}) :paths (atom {})
+               :owner (when root {:pid (syscall/getpid) :host (os/hostname)
+                                  :acquired_at_ms (System/currentTimeMillis) :token (ids/uuid-text)})}]
+    (when root
+      (io/mkdir root)
+      (let [result (os/sh "mkdir" lock-path)]
+        (when-not (= 0 (:exit result))
+          (if (io/file-exists? lock-path)
+            (let [owner (owner-metadata lock-path)]
+              (throw (ex-info
+                (str "Conversation store is locked: " lock-path ". "
+                     (if (and (map? owner) (:pid owner) (:host owner))
+                       (str "Owner PID " (:pid owner) " on " (:host owner) ". ")
+                       "Owner metadata is unavailable. ")
+                     "Confirm that the owning host has stopped before manually removing owner.edn and the lock directory; no automatic takeover is performed.")
+                {:category :conversation-in-use :lock_path lock-path :owner owner})))
+            (fail! (str "Cannot create conversation owner lock: " lock-path ": " (:err result))
+                   :conversation-lock))))
+      (try (io/spit (str lock-path "/owner.edn") (pr-str (:owner store)))
+           (catch Object e
+             (when (io/file-exists? (str lock-path "/owner.edn"))
+               (io/delete-file (str lock-path "/owner.edn")))
+             (os/sh "rmdir" lock-path)
+             (throw e))))
+    (try
+      (when root
+        (doseq [entry (os/ls root)]
+          (let [name (if (map? entry) (:name entry) (str entry))]
+            (when (str/ends-with? name ".edn")
+              (let [path (str root "/" name)
+                    s (try (validate! (read-snapshot (io/slurp path)))
+                           (catch Object _ (fail! (str "Corrupt conversation archive: " path) :conversation-corrupt)))
+                    id (:root_id s)]
+                (when (contains? @(:snapshots store) id)
+                  (fail! "Duplicate conversation root archives" :conversation-corrupt))
+                (unique-threads! store s)
+                (swap! (:snapshots store) assoc id s)
+                (swap! (:paths store) assoc id path))))))
+      store
+      (catch Object e (when root (release-owner! store)) (throw e)))))
+
+(defn save! [store snapshot]
+  (locked store
+    (fn []
+      (when @(:closed store) (fail! "Conversation store closed" :conversation-closed))
+      (validate! snapshot)
+      (unique-threads! store snapshot)
+      (let [id (:root_id snapshot)]
+        (when (:root store)
+          ;; Generated names never interpret a session id as a filesystem path.
+          (let [path (or (get @(:paths store) id) (str (:root store) "/" (ids/uuid-text) ".edn"))
+                temp (str path ".tmp-" (ids/uuid-text))]
+            (try
+              (io/spit temp (pr-str snapshot))
+              (os/rename temp path)
+              (swap! (:paths store) assoc id path)
+              (finally (when (io/file-exists? temp) (io/delete-file temp))))))
+        (swap! (:snapshots store) assoc id snapshot)
+        snapshot))))
+
+(defn threads [store]
+  (vec (map (fn [r] (assoc r :archived true :state (if (= :processing (:state r)) :interrupted :archived)))
+            (mapcat :threads (sort-by :root_id (vals @(:snapshots store)))))))
+(defn read-thread [store id] (first (filter #(= id (:thread_id %)) (threads store))))
+(defn close! [store]
+  (when store
+    (locked store (fn []
+      (when-not @(:closed store)
+        (when (:lock_path store)
+          (release-owner! store))
+        (reset! (:closed store) true))))))

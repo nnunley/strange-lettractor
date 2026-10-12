@@ -4,7 +4,9 @@
             [io :as io]
             [os :as os]
             [attractor.execution :as execution]
+            [attractor.co-learning :as co-learning]
             [attractor.context :as context]
+            [attractor.parameters :as parameters]
             [attractor.composition :as composition]
             [attractor.conditions :as conditions]
             [attractor.parser :as parser]
@@ -60,26 +62,26 @@
                     :retryable false}))))))
 
 (defn- tool-environment-options [timeout-ms]
-  {:working_dir (os/cwd)
-   :default_command_timeout_ms timeout-ms
-   :max_command_timeout_ms timeout-ms})
+  (if timeout-ms
+    {:working_dir (os/cwd)
+     :default_command_timeout_ms timeout-ms
+     :max_command_timeout_ms timeout-ms}
+    {:working_dir (os/cwd) :unbounded_command_timeout true}))
 
 (defn- tool-context-updates [stdout stderr]
   {"tool.output" (or stdout "")
    "tool.error" (or stderr "")})
 
-(defn- handle-unbounded-tool [cmd]
-  (let [res (os/sh "/bin/bash" "--noprofile" "--norc" "-c" cmd)]
-    (if (zero? (:exit res))
-      {:status :success
-       :context_updates {"tool.output" (:out res)}
-       :notes (str "Tool completed: " cmd)}
-      {:status :fail
-       :failure_reason (str "Tool exited with code " (:exit res) ": " (:err res))
-       :context_updates {"tool.output" (:out res)
-                         "tool.error" (:err res)}})))
+(defn- exported-environment [graph ctx]
+  (let [decls (:declarations (parameters/parse-declarations (get-in graph [:attrs :params])))]
+    (into {} (keep (fn [d]
+                     (when (:export d)
+                       (let [v (context/ctx-get-string ctx (str "param." (:name d)) nil)]
+                         (when (some? v)
+                           [(str "ATTRACTOR_PARAM_" (str/upper-case (:name d))) v]))))
+                   decls))))
 
-(defn- handle-timed-tool [node cmd timeout-ms]
+(defn- handle-owned-tool [node cmd timeout-ms env-vars]
   (let [environment (*tool-environment-factory*
                       (tool-environment-options timeout-ms))
         cancelled? (:cancelled? node)
@@ -97,7 +99,7 @@
                         (core/sleep 2)
                         (recur)))))]
     (try
-      (let [res ((:exec_command environment) cmd timeout-ms (os/cwd) nil)
+      (let [res ((:exec_command environment) cmd timeout-ms (os/cwd) env-vars)
             context-updates (tool-context-updates (:stdout res) (:stderr res))]
         (cond
           (or (and cancelled? (cancelled?)) (:cancelled res))
@@ -131,15 +133,13 @@
           ((:cleanup environment))
           (catch Object _ nil))))))
 
-(defn handle-tool [node _context _graph _logs-root]
+(defn handle-tool [node context graph _logs-root]
   (try
     (let [cmd (or (:tool_command (:attrs node)) (:tool_command node) "")
           timeout-ms (parsed-tool-timeout-ms node)]
       (if (str/blank? cmd)
         {:status :fail :failure_reason "No tool_command specified"}
-        (if timeout-ms
-          (handle-timed-tool node cmd timeout-ms)
-          (handle-unbounded-tool cmd))))
+        (handle-owned-tool node cmd timeout-ms (exported-environment graph context))))
     (catch Object e
       (merge {:status :fail
               :failure_reason (str "Tool execution exception: " e)}
@@ -184,10 +184,13 @@
              ;; Backend returned an Outcome directly
              (if (= :cancelled (:status backend-result))
                backend-result
-               (do
+               (let [skipped? (#{:skipped "skipped"} (:status backend-result))]
                  (when-not (os/stat (str stage-dir "/response.md"))
                    (io/spit (str stage-dir "/response.md") (or (:notes backend-result) (str backend-result))))
-                 (when-not engine-managed-status?
+                 (when (and skipped? (not engine-managed-status?)
+                            (io/file-exists? (str stage-dir "/status.json")))
+                   (io/delete-file (str stage-dir "/status.json")))
+                 (when-not (or engine-managed-status? skipped?)
                    (io/spit (str stage-dir "/status.json")
                             (status/outcome->status-json backend-result)))
                  backend-result))
@@ -367,6 +370,16 @@
                                    :duration_ms (- (System/currentTimeMillis) branch-started)
                                    :success (contains? #{:success :partial_success} (:status result))})
                             {:index index :result (assoc result :id target-id :node_id target-id)})
+                          (catch Cancelled e
+                            ;; A local winner/parent cancellation is an indexed
+                            ;; branch outcome, not an exception that can erase the
+                            ;; coordinator's future result at a runtime boundary.
+                            (if (branch-cancelled?)
+                              (do (emit {:type :parallel.branch_completed :branch target-id :index index
+                                         :duration_ms (- (System/currentTimeMillis) branch-started)
+                                         :success false :cancelled true})
+                                  {:index index :result {:status :cancelled :id target-id :node_id target-id}})
+                              {:index index :error e}))
                           (catch Object e
                             (emit {:type :parallel.branch_completed :branch target-id :index index
                                    :duration_ms (- (System/currentTimeMillis) branch-started)
@@ -615,6 +628,7 @@
             "wait.human" (make-wait-human-handler interviewer)
             "conditional" handle-conditional
             "tool" handle-tool
+            "co_learning" (co-learning/make-handler)
             "parallel" parallel-handler
             "parallel.fan_in" fan-in-handler
             "stack.manager_loop" manager-handler

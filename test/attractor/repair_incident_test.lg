@@ -1,0 +1,50 @@
+(ns attractor.repair-incident-test
+  (:require [clojure.test :refer [deftest is]] [attractor.agent :as agent]
+            [attractor.execution :as execution] [clojure.string :as str] [io :as io] [os :as os]))
+
+(deftest delegated-missing-path-preserves-incident-context
+  (let [events (atom []) calls (atom 0)
+        root (str (os/cwd) "/attractor_runs/repair-capture-" (random-uuid))
+        _ (io/mkdir (str root "/src/attractor"))
+        _ (io/spit (str root "/src/attractor/engine.lg") "real source")
+        env (execution/make-local-environment {:working_dir root})
+        parent (agent/make-session
+                 {:model "mock/default" :project_docs [] :execution_env env
+                  :on_event #(swap! events conj %)
+                  :complete_fn (fn [_]
+                    (if (= 1 (swap! calls inc))
+                      {:message {:content "" :tool_calls [{:id "missing" :name "read_file" :arguments {"file_path" "engine.lg"}}]}}
+                      {:message {:content "done"}}))})]
+    (try
+      (let [paths ((:glob env) "engine.lg" "src/attractor")
+            child (agent/spawn-subagent! parent {"task" (str "Read " (first paths))})
+            _ (agent/wait-subagent! parent (:agent_id child))
+            event (first (filter #(and (= :subagent_event (:type %)) (= :tool_call_end (get-in % [:event :type]))) @events))
+            incident (get-in event [:event :incident])]
+        (is (= ["src/attractor/engine.lg"] paths))
+        (is (= root (:cwd incident)))
+        (is (= ["file_path"] (:argument_names incident)))
+        (is (nil? (:arguments incident)))
+        (is (nil? (:delegation_task incident)))
+        (is (= (:id @parent) (:parent_session_id incident)))
+        (is (= :missing-path (get-in incident [:exception :kind])))
+        (is (seq (:history incident)))
+        (is (= "1 | real source" ((:read_file env) (first paths) nil nil))))
+      (finally (agent/close-session! parent)))))
+
+(deftest incident-is-private-before-event-forwarding
+  (let [secret "private-tool-and-history-fixture" calls (atom 0) events (atom [])
+        env (assoc (execution/make-local-environment {:working_dir (os/cwd)})
+                   :read_file (fn [& _] (throw (ex-info secret {:password secret}))))
+        session (agent/make-session {:model "mock/default" :project_docs [] :execution_env env
+                   :on_event #(swap! events conj %)
+                   :complete_fn (fn [_] (if (= 1 (swap! calls inc))
+                     {:message {:content "" :tool_calls [{:id "read" :name "read_file" :arguments {"file_path" secret}}]}}
+                     {:message {:content "done"}}))})]
+    (try
+      (agent/process-input! session secret)
+      (let [incident (:incident (first (filter :incident @events)))]
+        (is (map? incident))
+        (is (not (str/includes? (pr-str incident) secret)))
+        (is (= "read_file" (:tool_name incident))))
+      (finally (agent/close-session! session)))))

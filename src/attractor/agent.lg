@@ -1,14 +1,21 @@
 (ns attractor.agent
-  (:require [attractor.tools :as tools] [attractor.ids :as ids] [attractor.mcp :as mcp] [attractor.skills :as skills] [clojure.string :as str]
+  (:require [attractor.tools :as tools] [attractor.text :as text] [attractor.ids :as ids] [attractor.mcp :as mcp] [attractor.skills :as skills] [clojure.string :as str]
             [os :as os]
             [io :as io]
             [json :as json]
             [attractor.llm :as llm]
+            [attractor.reasoning :as reasoning]
+            [attractor.repair :as repair]
             [attractor.context-discovery :as capacity]
+            [attractor.context-management :as cm]
             [attractor.execution :as execution]
             [attractor.tool-hooks :as tool-hooks]
             [attractor.tool-images :as tool-images]
-            [attractor.profiles :as profiles]))
+            [attractor.profiles :as profiles]
+            [attractor.harness :as harness]
+            [attractor.refiner :as refiner]
+            [attractor.operation-owner :as operation-owner]
+            [attractor.evaluator :as evaluator]))
 
 ;; Provider-profile tool output limits (raw events keep everything; the
 ;; model sees bounded head/tail content).
@@ -150,16 +157,6 @@
     "gemini" ["AGENTS.md" "GEMINI.md"]
     ["AGENTS.md"]))
 
-(defn- utf8-prefix [text max-bytes]
-  ;; Binary-search character boundaries rather than slicing encoded bytes.
-  ;; A rune can consume more than one byte; the resulting prefix stays valid UTF-8.
-  (loop [low 0 high (min (count text) (max 0 max-bytes))]
-    (if (= low high)
-      (subs text 0 low)
-      (let [middle (quot (+ low high 1) 2)]
-        (if (<= (count (bytes (subs text 0 middle))) max-bytes)
-          (recur middle high)
-          (recur low (dec middle)))))))
 
 (defn discover-project-docs [environment provider]
   (let [working-dir ((:working_directory environment))
@@ -191,7 +188,7 @@
                     ;; Keep labels, separators and marker inside the same budget.
                     ;; A single truncated fragment renders identically in prompts
                     ;; and can reclaim space from an exactly-full earlier entry.
-                    [(str (utf8-prefix rendered (- 32768 (count (bytes marker))))
+                    [(str (text/utf8-prefix rendered (- 32768 (count (bytes marker))))
                           marker)]))))))))))
 
 (defn- valid-metadata-string [value]
@@ -232,42 +229,48 @@
      :model_display_name model_display_name
      :knowledge_cutoff knowledge_cutoff}))
 
-(defn- assemble-system-prompt [profile environment snapshot project-docs user-instructions skills-block]
-  (let [base (profiles/build-system-prompt profile environment [])
-        tool-text
-        (str/join "\n"
-                  (map (fn [tool]
-                         (str (:name tool) ": " (:description tool)))
-                       (profiles/profile-tools profile)))
-        environment-text
-        (str "<environment>\n"
-             "Working directory: " (:working_directory snapshot) "\n"
-             "Is git repository: " (:is_git_repository snapshot) "\n"
-             "Git branch: " (:git_branch snapshot) "\n"
-             "Git changed files: " (:git_status_count snapshot) "\n"
-             (when-not (str/blank? (:recent_commits snapshot))
-               (str "Recent commits:\n" (:recent_commits snapshot) "\n"))
-             "Platform: " (:platform snapshot) "\n"
-             "OS version: " (:os_version snapshot) "\n"
-             "Today's date: " (:date snapshot) "\n"
-             "Model: " (:model_display_name snapshot) "\n"
-             "Knowledge cutoff: " (:knowledge_cutoff snapshot) "\n"
-             "</environment>")]
-    (str base
-         "\n\n" environment-text
-         "\n\n<tools>\n" tool-text "\n</tools>"
-         (when (seq project-docs)
-           (str "\n\n<project_instructions>\n"
-                (str/join "\n\n" project-docs)
-                "\n</project_instructions>"))
-         (when-not (str/blank? skills-block)
-           (str "\n\n" skills-block))
-         (when-not (str/blank? user-instructions)
-           (str "\n\n" user-instructions)))))
+(defn- assemble-system-prompt
+  ([profile environment snapshot project-docs user-instructions skills-block]
+   (assemble-system-prompt profile environment snapshot project-docs user-instructions skills-block nil))
+  ([profile environment snapshot project-docs user-instructions skills-block harness-block]
+   (let [base (profiles/build-system-prompt profile environment [])
+         tool-text
+         (str/join "\n"
+                   (map (fn [tool]
+                          (str (:name tool) ": " (:description tool)))
+                        (profiles/profile-tools profile)))
+         environment-text
+         (str "<environment>\n"
+              "Working directory: " (:working_directory snapshot) "\n"
+              "Is git repository: " (:is_git_repository snapshot) "\n"
+              "Git branch: " (:git_branch snapshot) "\n"
+              "Git changed files: " (:git_status_count snapshot) "\n"
+              (when-not (str/blank? (:recent_commits snapshot))
+                (str "Recent commits:\n" (:recent_commits snapshot) "\n"))
+              "Platform: " (:platform snapshot) "\n"
+              "OS version: " (:os_version snapshot) "\n"
+              "Today's date: " (:date snapshot) "\n"
+              "Model: " (:model_display_name snapshot) "\n"
+              "Knowledge cutoff: " (:knowledge_cutoff snapshot) "\n"
+              "</environment>")]
+     (str base
+          "\n\n" environment-text
+          "\n\n<tools>\n" tool-text "\n</tools>"
+          (when (seq project-docs)
+            (str "\n\n<project_instructions>\n"
+                 (str/join "\n\n" project-docs)
+                 "\n</project_instructions>"))
+          (when-not (str/blank? skills-block)
+            (str "\n\n" skills-block))
+          (when-not (str/blank? harness-block)
+            (str "\n\n" harness-block))
+          (when-not (str/blank? user-instructions)
+            (str "\n\n" user-instructions))))))
 
-(declare register-subagent-tools! close-subagent!)
+(declare register-subagent-tools! register-harness-tools! close-subagent!)
 
 (def subagent-tool-names #{"spawn_agent" "send_input" "wait" "close_agent"})
+(def harness-tool-names #{"refine_harness" "remember" "recall" "define_subagent"})
 
 ;; Tool Dispatcher
 (defn execute-tool [tool-name args]
@@ -279,19 +282,23 @@
     "directory_list" (tools/tool-directory-list (get args "path"))
     (str "Unknown tool: " tool-name)))
 
-;; Create an Agent Session
-(defn- validated-reasoning-effort [value]
-  (when (some? value)
-    (let [normalized (str/lower-case
-                       (if (keyword? value) (name value) (str value)))]
-      (when-not (contains? #{"low" "medium" "high"} normalized)
-        (throw
-          (ex-info (str "Invalid reasoning_effort: " value)
-                   {:category :invalid-reasoning-effort
-                    :reasoning_effort value
-                    :valid_values ["low" "medium" "high"]})))
-      normalized)))
+(defn- run-dynamic-tool! [session run]
+  (let [check! (fn [] (when (or (= :closed (:state @session)) (:abort_signaled @session))
+                        (throw (ex-info "Dynamic tool cancelled" {:category :cancelled}))))
+        operation (operation-owner/start! {:check! check! :cleanup! (fn [] nil)})
+        id (ids/prefixed "dynamic-tool")
+        owners (:dynamic_tool_owners @session)]
+    (try
+      (with-session-lock session
+        (fn [] (check!) (swap! owners assoc id operation)))
+      (let [result (operation-owner/invoke! operation run)]
+        (operation-owner/finish! operation)
+        result)
+      (finally
+        (try (operation-owner/close! operation) (catch Object _ nil))
+        (swap! owners dissoc id)))))
 
+;; Create an Agent Session
 (defn make-session [& [opts]]
   (let [options (or opts {})
         _capacity-config
@@ -302,7 +309,12 @@
                                  (<= 1 (:context_discovery_timeout_ms options) 60000)))))
           (throw (ex-info "Invalid context capacity or discovery time budget"
                           {:category :configuration})))
-        reasoning-effort (validated-reasoning-effort
+        _context-config
+        (doseq [key [:max_output_tokens :context_reserve_tokens :context_max_summary_calls]]
+          (when (and (contains? options key)
+                     (not (and (integer? (get options key)) (<= 1 (get options key) 1000000))))
+            (throw (ex-info "Invalid context management setting" {:category :configuration :setting key}))))
+        reasoning-effort (reasoning/normalize-effort
                            (:reasoning_effort options))
         parsed-model (llm/parse-model-spec (or (:model options) "mock/default"))
         base-profile (or (:provider_profile options)
@@ -378,12 +390,38 @@
           skill-roster-render (skills/render-roster skill-roster)
           skills-block (skills/render-skills-block
                          {:roster skill-roster :loaded (vec (:loaded skill-result))})
+          harness-initial (or (:harness options)
+                              (when (and (:harness_path options) (io/file-exists? (:harness_path options)))
+                                (:harness_path options))
+                              (:harness_bootstrap options) (:harness_path options))
+          harness-atom (cond
+                         (nil? harness-initial) (when (or (:enable_continual_harness options)
+                                                          (:auto_refine options))
+                                                  (harness/make-harness))
+                         (= "let-go.lang.Atom" (str (type harness-initial))) harness-initial
+                         :else (harness/make-harness harness-initial))
+          _harness-config (when harness-atom
+                            (harness/configure! harness-atom
+                              (cond-> {} (:harness_path options) (assoc :path (:harness_path options))
+                                         (:frozen_harness options) (assoc :frozen true))))
+          _task-prompt (when (and harness-atom (:adaptive_task_prompt options)
+                                 (empty? (get-in @harness-atom [:entries :prompt])))
+                         (harness/apply-edit! harness-atom {:kind "prompt" :id "task" :action "create"
+                                                           :content (:adaptive_task_prompt options)}))
           session
           (atom {:id (or (:id options) (ids/prefixed "agent"))
                  :model (:model profile)
                  :provider_profile profile
                  :context_capacity_fallback (:context_window_fallback profile)
                  :execution_env environment
+                 :harness harness-atom
+                 :turns_since_refine 0
+                 :harness_steps 0
+                 :context_owner (atom nil)
+                 :context_aux_tokens 0
+                 :refinement_owner (atom nil)
+                 :interactive_refinement (atom nil)
+                 :dynamic_tool_owners (atom {})
                  :tool_hook_context (or (:tool_hook_context options) (atom (or (:tool_hooks options) {})))
                  :llm_client (:llm_client options)
                  :event_fn (:on_event options)
@@ -426,12 +464,17 @@
                                    :reasoning_effort nil
                                    :enable_loop_detection true
                                    :loop_detection_window 10
+                                   :auto_refine false
+                                   :auto_refine_interval 0
+                                   :auto_refine_warmup 0
                                    :max_subagent_depth 1}
                                   options)
                            :reasoning_effort reasoning-effort)})]
       (when (< (:subagent_depth @session)
                (or (get-in @session [:config :max_subagent_depth]) 1))
         (register-subagent-tools! session))
+      (when (:harness @session)
+        (register-harness-tools! session))
       (when (seq selected-skills)
         (emit-event! session {:type :skills_loaded
                               :skills (:skill_evidence @session)
@@ -445,6 +488,7 @@
                                  :file-exists (:file-exists skill-access)
                                  :list-dir (:list-dir skill-access)
                                  :approvals mcp-approvals
+                                 :write-approvals (:mcp_write_approvals options)
                                  :token-reader (fn [name] (os/getenv name))
                                  :oauth-authorizer (:mcp_oauth_authorizer options)
                                  :credential-store (:mcp_credential_store options)))]
@@ -454,8 +498,28 @@
       (emit-event! session {:type :session_start})
       session)))
 
+(defn set-model!
+  "Activate a model on an idle session without resetting history, environment or harness.
+   The provider must remain compatible with the session's tools and transport."
+  [session model]
+  (let [parsed (llm/parse-model-spec model)]
+    (with-session-lock session
+      (fn []
+        (when-not (= :idle (:state @session))
+          (throw (ex-info "Model activation requires an idle session" {:category :session-busy})))
+        (when-not (= (:provider parsed) (get-in @session [:provider_profile :id]))
+          (throw (ex-info "Model activation cannot change provider" {:category :configuration})))
+        (swap! session (fn [state] (-> state (assoc :model (:model parsed))
+                                           (assoc-in [:provider_profile :model] (:model parsed))
+                                           (assoc-in [:config :model] model)
+                                           (update :environment_snapshot merge
+                                             (resolve-model-metadata (-> (:provider_profile state)
+                                                                         (assoc :model (:model parsed))
+                                                                         (dissoc :display_name :knowledge_cutoff)))))))))
+    session))
+
 (defn set-reasoning-effort! [session value]
-  (let [effort (validated-reasoning-effort value)]
+  (let [effort (reasoning/normalize-effort value)]
     (with-session-lock
       session
       (fn []
@@ -483,6 +547,28 @@
                       {:category :session-closed
                        :session_id (:id @session)})))))
 
+(defn queue-input-if-processing!
+  "Atomically admit input only while the active aggregate turn can drain it."
+  [session text behavior]
+  (with-session-lock session
+    (fn []
+      (when (and (= :processing (:state @session)) (not (:abort_signaled @session)))
+        (swap! session update (if (= :followup behavior) :followup-queue :steering-queue) conj text)
+        true))))
+
+(defn take-idle-queued-inputs!
+  "Transfer accepted native input to the hub after a recoverable turn failure.
+   The hub holds its admission lock; this lock makes detaching both queues
+   atomic with native admission and cancellation. Steering keeps priority."
+  [session]
+  (with-session-lock session
+    (fn []
+      (when (and (= :idle (:state @session)) (not (:abort_signaled @session)))
+        (let [inputs (vec (concat (map #(hash-map :text % :behavior :steer) (:steering-queue @session))
+                                  (map #(hash-map :text % :behavior :followup) (:followup-queue @session))))]
+          (swap! session assoc :steering-queue [] :followup-queue [])
+          inputs)))))
+
 (defn steer-session! [session msg]
   (enqueue-session-message! session :steering-queue msg))
 
@@ -493,6 +579,16 @@
   (if (compare-and-set! (:cleanup_started @session) false true)
     (let [errors (atom [])]
       (try
+        (when-let [operation (some-> (:context_owner @session) deref)]
+          (try (operation-owner/close! operation)
+               (catch Object e
+                 (when-not (contains? #{:cancelled :operation-cancelled} (:category (ex-data e)))
+                   (swap! errors conj e)))))
+        (when-let [operation (some-> (:refinement_owner @session) deref)]
+          (try (operation-owner/close! operation)
+               (catch Object e
+                 (when-not (contains? #{:cancelled :operation-cancelled} (:category (ex-data e)))
+                   (swap! errors conj e)))))
         (when-let [close-stream (:active_stream_close @session)]
           (try
             (close-stream)
@@ -502,9 +598,21 @@
           (try
             (cleanup)
             (catch Object e (swap! errors conj e))))
+        ;; Environment cleanup first cancels any native command a tool owns;
+        ;; then joined operation scopes stop authored computation before return.
+        (doseq [operation (vals @(:dynamic_tool_owners @session))]
+          (try (operation-owner/close! operation)
+               (catch Object e
+                 (when-not (contains? #{:cancelled :operation-cancelled} (:category (ex-data e)))
+                   (swap! errors conj e)))))
         (doseq [[agent-id _] (:subagents @session)]
           (try
             (close-subagent! session agent-id)
+            (catch Object e (swap! errors conj e))))
+        (when-let [h (:harness @session)]
+          (try
+            (harness/persist! h)
+            (harness/detach! h (get-in @session [:provider_profile :tool_registry]))
             (catch Object e (swap! errors conj e))))
         (doseq [close-mcp (:mcp_close_fns @session)]
           (try
@@ -596,14 +704,19 @@
         true))))
 
 (defn- drain-steering! [session event-fn]
-  (let [queued (:steering-queue @session)]
+  ;; Detach this batch before invoking callbacks. A listener may enqueue more
+  ;; steering; that new batch belongs to the next safe drain, not this clear.
+  (let [queued (with-session-lock session
+                 (fn []
+                   (let [queued (:steering-queue @session)]
+                     (swap! session assoc :steering-queue [])
+                     queued)))]
     (doseq [msg queued]
       (when (append-history-if-open!
               session
               {:type :steering :role :user :content msg
                :timestamp (System/currentTimeMillis)})
-        (event-fn {:type :steering_injected :content msg})))
-    (swap! session assoc :steering-queue [])))
+        (event-fn {:type :steering_injected :content msg})))))
 
 (defn- history-to-messages [history]
   (mapv
@@ -611,6 +724,7 @@
       (case (:type turn)
         :tool_results {:role :tool :content (:results turn)}
         :assistant (cond-> {:role :assistant :content (:content turn)}
+                     (seq (:parts turn)) (assoc :parts (:parts turn))
                      (seq (:tool_calls turn)) (assoc :tool_calls (:tool_calls turn)))
         {:role :user :content (:content turn)}))
     history))
@@ -751,6 +865,19 @@
       (catch Object _ arguments))
     arguments))
 
+(defn- incident-text [value limit]
+  (let [text (if (string? value) value (pr-str value))]
+    (if (> (count text) limit) (str (subs text 0 limit) " …[truncated]") text)))
+
+(defn- exception-incident [session error fields]
+  ;; Sanitize at capture, before forwarding to hub events or repair storage.
+  (repair/sanitize-incident
+    (merge {:session_id (:id @session)
+            :parent_session_id (get-in @session [:config :parent_session_id])
+            :cwd ((:working_directory (:execution_env @session)))
+            :exception {:message (ex-message error) :category (:category (ex-data error))}
+            :history (mapv #(select-keys % [:role]) (take-last 6 (:history @session)))} fields)))
+
 (defn- execute-single-tool [session tool-call event-fn]
   (let [tool-name (or (:name tool-call) (get tool-call "name") "")
         call-id (or (:id tool-call) (get tool-call "id") "")
@@ -787,8 +914,15 @@
                   (throw (ex-info reason {:category :invalid-tool-arguments})))
                     raw-output (tool-images/normalize-output
                                  ((:executor registered) args (:execution_env @session)))]
-                {:result raw-output :is_error false :skipped false})
+                {:result raw-output
+                 :is_error (boolean (when-let [error? (:result_is_error registered)]
+                                      (error? raw-output)))
+                 :skipped false})
               (catch Object error {:result (str "Tool error (" tool-name "): " error)
+                                   :incident (exception-incident session error
+                                               {:tool_name tool-name :call_id call-id
+                                                :arguments (if (<= (count (pr-str raw-args)) 8000)
+                                                             raw-args (incident-text raw-args 8000))})
                                    :is_error true :skipped (= :invalid-tool-arguments (:category (ex-data error)))})))
           raw-output (:result outcome)
           attachment? (tool-images/attachment-output? raw-output)
@@ -798,7 +932,7 @@
       (let [post (tool-hooks/run! hooks :post identity raw-args outcome (:execution_env @session) stopped? event-fn)]
         (when (:cancelled post) (abort-session! session)))
       (event-fn (merge {:type :tool_call_end :call_id call-id :tool_name tool-name}
-                       (if (:is_error outcome) {:error raw-text} {:output raw-text}) attachments
+                       (if (:is_error outcome) {:error raw-text :incident (:incident outcome)} {:output raw-text}) attachments
                        (when attachment? {:result raw-output})))
       (merge {:tool_call_id call-id :tool_name tool-name
        :content (tools/truncate-tool-output raw-text tool-name (:config @session))
@@ -823,6 +957,7 @@
         (fn []
           (when (compare-and-set! text-started false true)
             (event-fn {:type :assistant_text_start})))
+        _ (swap! session assoc :context_stream_partial false)
         stream-request
         (assoc request
                :register_stream_close
@@ -837,6 +972,7 @@
             :text_start (ensure-text-start!)
             :text_delta
             (do
+              (when (seq (:delta event)) (swap! session assoc :context_stream_partial true))
               (ensure-text-start!)
               (event-fn {:type :assistant_text_delta
                          :delta (:delta event)
@@ -912,18 +1048,112 @@
               true)))
     (event-fn {:type :processing_end})))
 
-;; Tokens the session has spent so far. A provider that reports no total is
-;; counted as input plus output; one that reports no usage counts as zero.
-(defn- sum-usage-tokens [history]
-  (reduce (fn [total turn]
-            (let [usage (:usage turn)
-                  reported (or (:total_tokens usage) 0)]
-              (+ total
-                 (if (> reported 0)
-                   reported
-                   (+ (or (:input_tokens usage) 0) (or (:output_tokens usage) 0))))))
-          0
-          (filter #(= :assistant (:type %)) history)))
+(defn context-status [session]
+  (merge {:history_turns (count (:history @session))
+          :context_turns (count (cm/projected-history @session))
+          :compacted (boolean (:context_projection @session))
+          :auxiliary_tokens (:context_aux_tokens @session)}
+         (:context_measurement @session)))
+
+(defn request-compaction! [session]
+  (with-session-lock session
+    #(do (when (session-stopped? session)
+           (throw (ex-info "Session is closed" {:category :session-closed})))
+         (swap! session assoc :context_compaction_requested true)
+         {:accepted true :at :next-model-request})))
+
+(defn- context-callbacks [session owner event-fn reason]
+  {:reason reason :event! event-fn
+   :check! (fn [] (when (or (session-stopped? session)
+                            (not (identical? owner (:current_turn_owner @session))))
+                   (throw (ex-info "Context work cancelled" {:category :cancelled}))))
+   :publish! (fn [snapshot projection]
+               (with-session-lock session
+                 #(do (when (or (session-stopped? session)
+                                 (not (identical? owner (:current_turn_owner @session)))
+                                 (not= (:history snapshot) (:history @session))
+                                 (not= (:context_projection snapshot) (:context_projection @session)))
+                        (throw (ex-info "Context changed during compaction" {:category :cancelled})))
+                      (swap! session assoc :context_projection projection :context_compaction_requested false))))})
+
+(defn- generate-with-context! [session owner base stream-fn complete-fn event-fn]
+  (let [advisory? (true? (get-in @session [:config :context_advisory_only]))
+        generate (fn [request]
+                   (when-not (session-stopped? session)
+                     (if stream-fn (stream-response! session stream-fn request event-fn)
+                         (do (event-fn {:type :assistant_text_start}) (complete-fn request)))))]
+    (if advisory? (generate base)
+      (loop [attempt 0 window (let [configured (get-in @session [:provider_profile :context_window_size])
+                                    observed (:context_observed_limit @session)]
+                                (if (identical? owner (:owner observed))
+                                  (if (and (integer? configured) (pos? configured))
+                                    (min configured (:window observed)) (:window observed)) configured)) force? false]
+        (let [limits (cm/settings session window)
+              projected (cm/request session base history-to-messages)
+              measured (cm/measure projected limits)
+              manual? (with-session-lock session
+                        (fn []
+                          (when (and (identical? owner (:current_turn_owner @session))
+                                     (not (session-stopped? session))
+                                     (:context_compaction_requested @session))
+                            (if (cm/reducible? session)
+                              true
+                              ;; An empty checkpoint request is consumed here;
+                              ;; mandatory capacity checks below still apply.
+                              (do (swap! session assoc :context_compaction_requested false)
+                                  false)))))
+              ;; An optional checkpoint starts only when there is older material;
+              ;; hard overflow always attempts compaction, then fails recoverably.
+              threshold? (and (integer? window) (pos? window) (cm/reducible? session)
+                              (> (*' (:input measured) 5) (*' (- window (:output limits) (:reserve limits)) 4)))
+              prepare? (or force? manual? threshold? (not (cm/fits? measured)))
+              prepared (if prepare?
+                         (cm/compact! session base limits history-to-messages
+                                      (context-callbacks session owner event-fn
+                                                         (if force? :overflow (if manual? :manual :capacity))))
+                         projected)
+              _ (cm/check-spend! session)
+              _ (swap! session assoc :context_measurement (cm/measure prepared limits))
+              outcome (try {:response (generate (assoc prepared :max_tokens (:output limits)))}
+                           (catch Object e {:error e}))]
+          (if-let [e (:error outcome)]
+            (let [data (ex-data e)]
+              (if (and (= :context-length (:category data)) (zero? attempt)
+                       (not (and stream-fn (:context_stream_partial @session))) (not (session-stopped? session)))
+                (let [reported (:context_window data)
+                      next-window (if (and (integer? reported) (pos? reported))
+                                    (if (and (integer? window) (pos? window)) (min window reported) reported)
+                                    window)]
+                  (if (and (integer? next-window) (pos? next-window))
+                    (do (swap! session assoc :context_observed_limit {:owner owner :window next-window})
+                        (recur 1 next-window true)) (throw e)))
+                (throw e)))
+            (:response outcome)))))))
+
+(defn request-refinement! [session trigger options]
+  (refiner/request-interactive! session trigger options #(emit-event! session %)))
+
+(defn- refine-session! [session trigger options]
+  (if (get-in @session [:config :interactive_refinement])
+    (try (request-refinement! session trigger options)
+         (catch Object e
+           (if (and (= :refiner-busy (:category (ex-data e)))
+                    (contains? #{:step-interval :loop-detected} trigger))
+             {:coalesced true}
+             (throw e))))
+    (refiner/execute-refinement! session trigger options)))
+
+(defn- refine-after-step! [session event-fn]
+  (let [step (:harness_steps (swap! session update :harness_steps (fnil inc 0)))
+        config (:config @session) interval (or (:auto_refine_interval config) 0)
+        warmup (or (:auto_refine_warmup config) 0)]
+    (when (and (:harness @session) (:auto_refine config) (not (:frozen_harness config))
+               (pos? interval) (> step warmup) (zero? (mod (- step warmup) interval))
+               (not (session-stopped? session)))
+      (try (refine-session! session :step-interval nil)
+           (catch Object e
+             (when-not (session-stopped? session)
+               (event-fn {:type :refine_error :error (str e)})))))))
 
 ;; Process one user input through LLM -> tools -> LLM until natural completion.
 (defn- process-input-cycle! [session prompt on-event followup? & [invocation]]
@@ -954,16 +1184,20 @@
           (or (= "mock" (:id profile))
               (not (:supports_streaming profile))) nil
           client (fn [request] (with-retry #(llm/client-stream client request)))
-          :else (fn [request] (llm/stream request)))
+          :else (fn [request] (with-retry #(llm/stream request))))
         complete-fn
         (when-not stream-fn
           (or (:complete_fn config)
               (when client
                 (fn [request] (with-retry #(llm/client-complete client request))))
-              (fn [request] (llm/complete request))))
+              (fn [request] (with-retry #(llm/complete request)))))
         round-limit (or (:max_tool_rounds_per_input config) 0)
         turn-limit (or (:max_turns config) 0)
         token-limit (or (:max_total_tokens config) 0)]
+    (when-let [event (with-session-lock session
+                       #(when (contains? #{:idle :awaiting_input} (:state @session))
+                          (refiner/apply-pending-locked! session)))]
+      (event-fn event))
     (when-not
       (with-session-lock
         session
@@ -983,7 +1217,7 @@
                      (-> state
                          (assoc :state :processing)
                          (update :history conj
-                                 {:type :user :role :user :content prompt
+                                 {:type (or (:input_type invocation) :user) :role :user :content prompt
                                   :timestamp (System/currentTimeMillis)}))))
             true)))
       (let [closed? (session-stopped? session)]
@@ -1001,7 +1235,7 @@
                  last-text ""]
             (let [assistant-count (count (filter (fn [turn] (= :assistant (:type turn)))
                                                  (:history @session)))
-                  total-tokens (sum-usage-tokens (:history @session))]
+                  total-tokens (cm/spent session)]
               (cond
                 (session-stopped? session) last-text
 
@@ -1021,13 +1255,17 @@
                   last-text)
 
                 :else
-                (let [system-prompt
+                (let [harness-atom (:harness @session)
+                      harness-block (when harness-atom
+                                      (harness/format-harness-overview @harness-atom))
+                      system-prompt
                       (assemble-system-prompt
                         profile environment
                         (:environment_snapshot @session)
                         (:project_docs @session)
                         (:user_instructions config)
-                        (:skills_block @session))
+                        (:skills_block @session)
+                        harness-block)
                       request {:model (:model profile)
                                :provider (:id profile)
                                :messages
@@ -1045,11 +1283,7 @@
                         (refresh-context-capacity! session owner request event-fn)
                         (check-context-usage! session event-fn)
                         (when-not (session-stopped? session)
-                          (if stream-fn
-                            (stream-response! session stream-fn request event-fn)
-                            (do
-                              (event-fn {:type :assistant_text_start})
-                              (complete-fn request))))
+                          (generate-with-context! session owner request stream-fn complete-fn event-fn))
                         (catch Object e
                           (if (session-stopped? session)
                             nil
@@ -1058,7 +1292,8 @@
                                 (recover-context-overflow! session e event-fn)
                                 (do
                                   (event-fn {:type :error :error (str e)
-                                             :category (:category (ex-data e))})
+                                             :category (:category (ex-data e))
+                                             :incident (exception-incident session e {:phase :generation})})
                                   (close-session-after-error! session e on-event)))
                               (throw e)))))]
                   (if (session-stopped? session)
@@ -1069,6 +1304,13 @@
                                           :role :assistant
                                           :content text
                                           :tool_calls tool-calls
+                                          :parts (let [parts (get-in response [:message :parts])]
+                                                   (when (or (and (= "gemini" (:provider response))
+                                                                  (some #(contains? (:provider_data %) "thoughtSignature") parts))
+                                                             (and (= "anthropic" (:provider response))
+                                                                  (some #(contains? #{:thinking :redacted_thinking}
+                                                                                    (:kind %)) parts)))
+                                                     parts))
                                           :reasoning (:reasoning response)
                                           :usage (:usage response)
                                           :response_id (:id response)
@@ -1080,7 +1322,7 @@
                           (event-fn {:type :assistant_text_end :text text
                                      :reasoning (:reasoning response)})
                           (if (empty? tool-calls)
-                            text
+                            (do (refine-after-step! session event-fn) text)
                             (if (session-stopped? session)
                               text
                               (let [execute-call
@@ -1100,8 +1342,10 @@
                                 (if-not recorded?
                                   text
                                   (do
+                                    (event-fn {:type :tool_results_recorded})
                                     (drain-steering! session event-fn)
                                     (check-context-usage! session event-fn)
+                                    (refine-after-step! session event-fn)
                                     (when (and (:enable_loop_detection config)
                                                (detect-loop
                                                  (:history @session)
@@ -1109,6 +1353,11 @@
                                       (let [warning
                                             (str "Loop detected: recent tool calls repeat. "
                                                  "Try a different approach.")]
+                                        (when (and (:harness @session) (:auto_refine config)
+                                                   (not (:frozen_harness config)))
+                                          (try
+                                            (refine-session! session :loop-detected {:instructions warning})
+                                            (catch Object _ nil)))
                                         (when (append-history-if-open!
                                                 session
                                                 {:type :steering :role :user
@@ -1122,22 +1371,25 @@
             (with-session-lock
               session
               (fn []
-                (cond
+                (let [refinement-event (refiner/apply-pending-locked! session)]
+                  (assoc (cond
                   (= :closed (:state @session)) {:kind :stopped}
-                  (seq (:followup-queue @session))
-                  (let [next-input (first (:followup-queue @session))]
-                    (swap! session update :followup-queue
+                  (or (seq (:steering-queue @session)) (seq (:followup-queue @session)))
+                  (let [queue (if (seq (:steering-queue @session)) :steering-queue :followup-queue)
+                        next-input (first (get @session queue))]
+                    (swap! session update queue
                            (fn [queued] (vec (rest queued))))
-                    {:kind :followup :input next-input})
+                    {:kind :followup :input next-input :input_type (if (= queue :steering-queue) :steering :user)})
                   :else
                   (do
                     (swap! session assoc :state :idle)
-                    {:kind :idle}))))]
+                    {:kind :idle})) :refinement_event refinement-event))))]
+        (when-let [event (:refinement_event decision)] (event-fn event))
         (case (:kind decision)
           :stopped result
           :followup
           (try
-            (process-input-cycle! session (:input decision) on-event true {:owner owner})
+            (process-input-cycle! session (:input decision) on-event true {:owner owner :input_type (:input_type decision)})
             (catch Object e
               (if (and (session-stopped? session)
                        (= :session-closed (:category (ex-data e))))
@@ -1149,6 +1401,13 @@
 
 (defn process-input! [session prompt & [on-event]]
   (process-input-cycle! session prompt on-event false))
+
+(defn process-queued-input!
+  "Resume accepted aggregate input after an idle boundary without turning
+   steering into a replacement user objective in the context ledger."
+  [session prompt behavior]
+  (process-input-cycle! session prompt nil false
+                        {:input_type (if (= :followup behavior) :user :steering)}))
 
 ;; Compatibility name used by the Attractor codergen backend.
 (defn run-agent-turn! [session prompt & [on-event]]
@@ -1279,13 +1538,23 @@
           parent-environment (:execution_env @parent)
           scoped-environment
           (if (and (not (str/blank? requested-dir))
-                   (:with_working_directory parent-environment))
-            ((:with_working_directory parent-environment) requested-dir)
+                   (or (:with_working_directory_from parent-environment)
+                       (:with_working_directory parent-environment)))
+            (if-let [view-from (:with_working_directory_from parent-environment)]
+              (view-from parent-environment requested-dir)
+              ((:with_working_directory parent-environment) requested-dir))
             parent-environment)
-          ;; The parent owns shared-environment lifecycle cleanup.
-          child-environment (assoc scoped-environment
-                              :initialize (fn [] nil)
-                              :cleanup (fn [] nil))
+          ;; Share files, not command cancellation. Local environments fork an
+          ;; owned command scope; custom backends may provide the same hook.
+          ;; Without it, preserve borrowed callbacks and leave lifecycle cleanup
+          ;; to the parent (that backend cannot promise per-child cancellation).
+          child-environment (assoc (cond
+                                    (:fork_scope_from scoped-environment)
+                                    ((:fork_scope_from scoped-environment) scoped-environment)
+                                    (:fork_scope scoped-environment)
+                                    ((:fork_scope scoped-environment))
+                                    :else (assoc scoped-environment :cleanup (fn [] nil)))
+                                   :initialize (fn [] nil))
           parent-profile (:provider_profile @parent)
           requested-model (subagent-arg arguments "model")
           child-profile (if (str/blank? requested-model)
@@ -1293,10 +1562,22 @@
                           (profiles/create-profile (:id parent-profile)
                                                    requested-model))
           child-id (ids/prefixed "agent")
+          role-id (subagent-arg arguments "role")
+          harness-atom (:harness @parent)
+          role-spec (when (and harness-atom (not (str/blank? role-id)))
+                      (get-in @harness-atom [:entries :subagent role-id]))
+          role-instructions (when role-spec (:content role-spec))
+          explicit-instructions (subagent-arg arguments "instructions")
+          user-instructions (or explicit-instructions role-instructions)
           child
           (make-session
             (merge
              {:id child-id
+              :parent_session_id (:id @parent)
+              :delegation_task (subagent-arg arguments "task")
+              :user_instructions user-instructions
+              :harness harness-atom
+              :frozen_harness (get-in @parent [:config :frozen_harness])
               :tool_hook_context (:tool_hook_context @parent)
              :provider_profile child-profile
              :execution_env child-environment
@@ -1306,6 +1587,10 @@
              :max_total_tokens (or (subagent-arg arguments "max_total_tokens") 0)
              :max_tool_rounds_per_input
              (get-in @parent [:config :max_tool_rounds_per_input])
+             :default_command_timeout_ms
+             (get-in @parent [:config :default_command_timeout_ms])
+             :max_command_timeout_ms
+             (get-in @parent [:config :max_command_timeout_ms])
              :max_subagent_depth max-depth
              :subagent_depth (inc depth)
              :on_event
@@ -1364,10 +1649,11 @@
   (let [registry (get-in @session [:provider_profile :tool_registry])
         tools
         [(subagent-tool
-           "spawn_agent" "Spawn a scoped coding subagent with optional skill selection"
+           "spawn_agent" "Spawn a scoped coding subagent with optional skill or role selection"
            {:task {:type "string"} :working_dir {:type "string"}
             :model {:type "string"} :max_turns {:type "integer"}
             :max_total_tokens {:type "integer"}
+            :role {:type "string"} :instructions {:type "string"}
             :skills {:type "array" :items {:type "string"}}}
            ["task"]
            (fn [arguments _] (spawn-subagent! session arguments)))
@@ -1390,6 +1676,91 @@
            (fn [arguments _]
              (close-subagent! session (subagent-arg arguments "agent_id"))))]]
     (doseq [tool tools] (profiles/register-tool! registry tool))
+    session))
+
+(defn register-harness-tools! [session]
+  (let [registry (get-in @session [:provider_profile :tool_registry])
+        harness-atom (:harness @session)
+        tools
+        [(subagent-tool
+           "refine_harness"
+           "Propose online continual harness updates to prompt notes, memory, skills, or subagents"
+           {:instructions {:type "string"}}
+           []
+           (fn [arguments _]
+             (let [instructions (or (get arguments "instructions") (get arguments :instructions))
+                   res (refine-session! session :agent-requested {:instructions instructions})]
+               (cond (:accepted res) "Harness refinement planning started."
+                     res (str "Harness refined: " (:summary res) " (" (count (:applied_edits res)) " edits applied)")
+                     :else "Harness refinement skipped or failed."))))
+         (subagent-tool
+           "remember"
+           "Save a durable fact, lesson, milestone, or heuristic to Continual Harness long-term memory"
+           {:title {:type "string"} :content {:type "string"}}
+           ["title" "content"]
+           (fn [arguments _]
+             (let [title (or (get arguments "title") (get arguments :title))
+                   content (or (get arguments "content") (get arguments :content))
+                   res (harness/apply-edit! harness-atom {:action "create" :kind "memory" :title title :content content})]
+               (str "Remembered [" (:id res) "]: " title))))
+         (subagent-tool
+           "recall"
+           "Search or inspect entries from Continual Harness long-term memory"
+           {:query {:type "string"}}
+           []
+           (fn [arguments _]
+             (let [query (str/lower-case (or (get arguments "query") (get arguments :query) ""))
+                   memories (vals (get-in @harness-atom [:entries :memory] {}))
+                   matched (if (str/blank? query)
+                             memories
+                             (filter (fn [m]
+                                       (or (str/includes? (str/lower-case (or (:title m) "")) query)
+                                           (str/includes? (str/lower-case (or (:content m) "")) query)))
+                                     memories))]
+               (if (seq matched)
+                 (str/join "\n"
+                   (map (fn [m] (str "- [" (:id m) "] " (:title m) ": " (:content m))) matched))
+                 "No matching memories found in harness."))))
+         (subagent-tool
+           "define_subagent"
+           "Define a specialized subagent specification in the Continual Harness"
+           {:id {:type "string"} :title {:type "string"} :instructions {:type "string"}}
+           ["id" "instructions"]
+           (fn [arguments _]
+             (let [id (or (get arguments "id") (get arguments :id))
+                   title (or (get arguments "title") (get arguments :title) id)
+                   instructions (or (get arguments "instructions") (get arguments :instructions))
+                   res (harness/apply-edit! harness-atom {:action "create" :kind "subagent" :id id :title title :content instructions})]
+               (str "Defined subagent spec [" (:id res) "]: " title))))
+         (subagent-tool
+           "edit_harness"
+           "Read, create, update or delete an adaptive prompt, memory, skill, subagent or dynamic tool through the validated ledger."
+           {:action {:type "string" :enum ["read" "create" "update" "delete"]}
+            :kind {:type "string" :enum ["prompt" "memory" "skill" "subagent" "tool"]}
+            :id {:type "string"} :title {:type "string"} :content {:type "string"}
+            :arguments {:type "object" :description "For tools: description and parameters JSON schema"}}
+           ["action" "kind"]
+           (fn [arguments _]
+             (let [action (subagent-arg arguments "action")
+                   kind (keyword (subagent-arg arguments "kind"))
+                   id (subagent-arg arguments "id")]
+               (pr-str (if (= "read" action)
+                         (if id (get-in @harness-atom [:entries kind id])
+                           (get-in @harness-atom [:entries kind]))
+                         (harness/apply-edit! harness-atom arguments))))))
+         (evaluator/eval-letgo-tool)
+         (evaluator/define-tool-tool registry harness-atom)]]
+    (doseq [tool tools]
+      (when-not (and (get-in @session [:config :frozen_harness])
+                     (contains? #{"refine_harness" "remember" "define_subagent" "define_tool" "eval_letgo" "edit_harness"}
+                                (get-in tool [:definition :name])))
+        (profiles/register-tool! registry
+          (if (= "eval_letgo" (get-in tool [:definition :name]))
+            (assoc tool :executor (fn [args env]
+                                    (run-dynamic-tool! session #((:executor tool) args env))))
+            tool))))
+    (alter-meta! registry assoc :run_dynamic_tool (fn [run] (run-dynamic-tool! session run)))
+    (evaluator/load-harness-tools! registry harness-atom)
     session))
 
 ;; CodergenBackend implementation backed by the Coding Agent Loop
@@ -1441,12 +1812,34 @@
             dynamic-options (if options-fn (or (options-fn node) {}) {})
             static-options (dissoc base-options :session_options_fn)
             node-model (:llm_model node)
+            node-attrs (or (:attrs node) {})
+            merged-options (merge static-options dynamic-options)
+            node-option (fn [key fallback]
+                          (cond (contains? node-attrs key) (get node-attrs key)
+                                (contains? node-attrs (keyword key)) (get node-attrs (keyword key))
+                                :else fallback))
+            bool-option (fn [key fallback] (= "true" (str (node-option key fallback))))
+            int-option (fn [key fallback]
+                         (let [value (node-option key fallback)
+                               n (if (integer? value) value
+                                   (try (Integer/parseInt (str value)) (catch Object _ -1)))]
+                           (when (neg? n) (throw (ex-info "Invalid harness cadence" {:category :configuration :attribute key})))
+                           n))
+            harness-bootstrap (node-option "harness.bootstrap" (:harness_bootstrap merged-options))
+            harness-path (node-option "harness.path" (:harness_path merged-options))
             session-options
-            (assoc (merge static-options dynamic-options)
+            (assoc merged-options
                    :model (or (:model dynamic-options)
                               (when-not (str/blank? node-model) node-model)
-                              (:model static-options)
-                              "default"))
+                              (:model static-options) "default")
+                   :enable_continual_harness
+                   (bool-option "harness.enabled" (or (:enable_continual_harness merged-options)
+                                                       (some? harness-bootstrap) (some? harness-path)))
+                   :auto_refine (bool-option "harness.auto_refine" (:auto_refine merged-options))
+                   :frozen_harness (bool-option "harness.frozen" (:frozen_harness merged-options))
+                   :auto_refine_interval (int-option "harness.interval" (or (:auto_refine_interval merged-options) 0))
+                   :auto_refine_warmup (int-option "harness.warmup" (or (:auto_refine_warmup merged-options) 0))
+                   :harness_bootstrap harness-bootstrap :harness_path harness-path)
             full? (= "full" (:resolved_fidelity node))
             thread-key (:resolved_thread_id node)
             threads (:fidelity_threads node)

@@ -99,7 +99,8 @@
             turn (get-in (value submitted) [:value :turn_id])]
         (is (= "request-7" (get opened "id")))
         (is (= "request-7" (:id (value opened))))
-        (is (= #{:session_id :turn_id} (set (keys (:value (value submitted))))))
+        (is (= #{:session_id :turn_id :queued} (set (keys (:value (value submitted))))))
+        (is (false? (get-in (value submitted) [:value :queued])))
         (is (string? turn))
         (let [done (deref (get-in @(:sessions h) [id :turn :completion]) 3000 {})
               result (value (call h {:op :session/result :session_id id :turn_id turn}))]
