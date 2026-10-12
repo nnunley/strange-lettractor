@@ -1,9 +1,10 @@
 (ns main
   "Native terminal evidence for the console frontends. script(1) allocates a
    pseudo-terminal and relays a paced stdin pipe, so the built CLI runs under a
-   real tty with the mock model. Run from the console worktree after lgx build."
+   real tty with the mock model. Run after lgx rebuild with lg -source-paths test."
   (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
-            [os :as os] [io :as io]))
+            [harness.deadline :as deadline]
+            [os :as os] [io :as io] [harness.tests :as tests]))
 
 (defn- temp-file [] (str/trim (:out (os/sh "/usr/bin/mktemp"))))
 (defn- drive [typescript args script]
@@ -28,17 +29,16 @@
 
 (deftest line-console-under-a-pty-quits-on-eof
   (let [typescript (temp-file)
-        result (drive typescript "--mock" "sleep 1; printf 'hello line\\n'; sleep 2.5; printf ': (+ 1 1)\\n'; sleep 1.5")
+        result (drive typescript "--mock" "sleep 1; printf 'hello line\\r'; sleep 2.5; printf ': (+ 1 1)\\r'; sleep 1.5; printf '\\004'; sleep 1")
         text (io/slurp typescript)]
     (is (= 0 (:exit result)) (str (:err result)))
     (is (has? text "Response to: hello line"))
     (is (has? text "[eval] => 2"))
-    (is (has? text "bye") "EOF quits cleanly")
+    (is (has? text "Ready") "inline activity row rendered")
+    (is (not (has? text (str (char 27) "[?1049h"))) "inline console preserves terminal scrollback")
     (os/sh "/bin/rm" "-f" "--" typescript)))
 
 (defn -main [& _]
-  (let [output (with-out-str (clojure.test/run-tests))]
-    (prn clojure.test/*report-counters*)
-    (when-not clojure.test/*test-result* (println output))
-    (os/exit (if clojure.test/*test-result* 0 1))))
+  (deadline/start! {:timeout-ms 45000 :describe (fn [] "compiled console PTY checks")})
+  (tests/run-and-exit! 'main))
 (when *command-line-args* (apply -main *command-line-args*))

@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [clojure.core :as core]
             [json :as json]
-            [attractor.llm :as llm]))
+            [attractor.llm :as llm]
+            [attractor.providers :as providers]))
 
 (deftest test-model-catalog-supports-provider-capability-and-alias-lookups
   (is (= "claude-opus-4-6" (:id (llm/get-model-info "opus"))))
@@ -682,7 +683,7 @@
            (get-in gemini-parts [2 "inlineData"])))))
 
 (deftest test-local-image-path-is-inlined-and-mime-type-is-inferred
-  (let [path (str "/tmp/strange-lettractor-image-" (random-uuid) ".png")
+  (let [path (str "/tmp/strange-lettractor-image-" (random-uuid) ".jpg")
         captured (atom nil)]
     (spit path (byte-array [0 255]))
     (try
@@ -699,7 +700,7 @@
       (let [inline-data
             (get-in (json/read-json (:body @captured))
                     ["contents" 0 "parts" 0 "inlineData"])]
-        (is (= "image/png" (get inline-data "mimeType")))
+        (is (= "image/jpeg" (get inline-data "mimeType")))
         (is (= "AP8=" (get inline-data "data"))))
       (finally
         (delete-file path)))))
@@ -1180,7 +1181,7 @@
         gemini-body (json/read-json (:body @gemini-captured))]
     (is (= "function" (get-in openai-body ["tool_choice" "type"])))
     (is (= "lookup"
-           (get-in openai-body ["tool_choice" "function" "name"])))
+           (get-in openai-body ["tool_choice" "name"])))
     (is (= "any" (get-in anthropic-body ["tool_choice" "type"])))
     (is (nil? (get anthropic-none-body "tools")))
     (is (nil? (get anthropic-none-body "tool_choice")))
@@ -1812,27 +1813,36 @@
         "explicit scopes override the defaults, the rest keep them")))
 
 (deftest test-stream-closes-late-registration-after-timeout
-  (let [closed (atom false)
+  (let [registration (promise) finalized (promise) closes (atom 0)
         adapter
         (llm/make-adapter
           "mock" (fn [_] nil)
           (fn [request]
-            (core/sleep 30)
-            ((:register_stream_close request)
-             (fn [] (reset! closed true)))
-            [{:type :stream_start}]))
+            ;; Model a native handle acquired before cancellation whose close
+            ;; registration arrives after the connecting worker has joined.
+            ;; The test owns that delayed publication explicitly: cancelled
+            ;; sleep need not resume ordinary adapter code on this runtime.
+            (deliver registration {:register (:register_stream_close request)
+                                   :close (fn [] (swap! closes inc))})
+            (try
+              (core/sleep 10000)
+              [{:type :stream_start}]
+              (finally (deliver finalized true)))))
         client (llm/make-client {:providers {"mock" adapter}
-                                 :default_provider "mock"})]
-    (is (= :request-timeout
-           (try
-             (do (doall (:events
-                          (llm/stream "mock/model" "go"
-                                      {:client client
-                                       :timeout {:per_step 0.005}})))
-                 nil)
-             (catch Object error (:category (ex-data error))))))
-    (core/sleep 40)
-    (is (true? @closed))))
+                                 :default_provider "mock"})
+        result (core/future
+                 (try
+                   (doall (:events (llm/stream "mock/model" "go"
+                                      {:client client :timeout {:per_step 0.1}})))
+                   :unexpected-success
+                   (catch Object error (:category (ex-data error)))))
+        handle (deref registration 2000 nil)]
+    (is (fn? (:register handle)) "the adapter acquired a handle before timing out")
+    (is (= :request-timeout (deref result 2000 :pending)))
+    (is (= true (deref finalized 0 false)) "timeout acknowledgement joins the adapter")
+    (is (= 0 @closes) "an unregistered handle has not yet been closed")
+    (when handle ((:register handle) (:close handle)))
+    (is (= 1 @closes) "late registration closes the acquired handle immediately, once")))
 
 (deftest test-stream-closes-failed-attempt-before-retry
   (let [attempts (atom 0)
@@ -1951,9 +1961,9 @@
           (first
             (llm/validate-json-schema
               3
-              {:$ref "#/$defs/choices/1"
-               :$defs {:choices [{:type "string"}
-                                  {:type "integer" :minimum 2}]}}))))
+              {:$ref "#/$defs/choices/anyOf/1"
+               :$defs {:choices {:anyOf [{:type "string"}
+                                          {:type "integer" :minimum 2}]}}}))))
     (doseq [invalid
             [(assoc valid "enabled" "false")
              (assoc valid "name" nil)
@@ -1980,13 +1990,49 @@
     (is (= [:initialize :close] @events))))
 
 (deftest test-client-from-env-registers-only-configured-providers
-  (let [client (llm/client-from-env
-                 {"OPENAI_API_KEY" "openai-key"
-                  "GOOGLE_API_KEY" "google-key"})]
+  (let [client (with-redefs [providers/definitions (fn [] (providers/load-registry {:paths []}))]
+                 (llm/client-from-env {"OPENAI_API_KEY" "openai-key" "GOOGLE_API_KEY" "google-key"}))]
     (is (= #{"openai" "gemini"} (set (keys (:providers client)))))
     (is (= "openai" (:default_provider client)))
     (is (= "google-key"
            (get-in client [:providers "gemini" :options :api_key])))))
+
+(deftest test-high-level-request-preparation-preserves-api-option-boundaries
+  ;; Retry options historically reach completion adapters, but streaming owns
+  ;; them itself. Consolidating input preparation must preserve this boundary.
+  (doseq [stream? [false true]]
+    (let [captured (atom nil)
+          response {:message {:role :assistant :content "Done"}
+                    :tool_calls [] :usage {} :finish_reason :stop}
+          adapter (llm/make-adapter
+                    "mock"
+                    (fn [request] (reset! captured request) response)
+                    (fn [request]
+                      (reset! captured request)
+                      [{:type :finish :finish_reason :stop
+                        :usage {} :response response}]))
+          client (llm/make-client {:providers {"mock" adapter}
+                                  :default_provider "mock"})
+          options {:client client :prompt "From options" :system "Be precise"
+                   :temperature 0.25 :max_tool_rounds 2
+                   :stop_when (fn [_] false)
+                   :repair_tool_call (fn [_] nil)
+                   :retry_policy {:base_delay 0.0} :max_retries 0}]
+      (if stream?
+        (doall (:events (llm/stream "native-model" nil options)))
+        (llm/generate "native-model" nil options))
+      (is (= "native-model" (:model @captured)))
+      (is (= [{:role :system :content "Be precise"}
+              {:role :user :content "From options"}]
+             (:messages @captured)))
+      (is (= 0.25 (:temperature @captured)))
+      (doseq [key [:client :prompt :system :max_tool_rounds :stop_when :repair_tool_call]]
+        (is (not (contains? @captured key))))
+      (if stream?
+        (do (is (not (contains? @captured :retry_policy)))
+            (is (not (contains? @captured :max_retries))))
+        (do (is (= {:base_delay 0.0} (:retry_policy @captured)))
+            (is (= 0 (:max_retries @captured))))))))
 
 (deftest test-high-level-generate-standardizes-input-and-result
   (let [captured (atom nil)
@@ -2818,3 +2864,19 @@
     (is (= "read_file" (get-in response [:tool_calls 0 :name])))
     (is (= 8 (get-in response [:usage :input_tokens])))
     (is (= :tool_calls (:finish_reason response)))))
+
+(deftest compatible-provider-translates-json-format-and-length-finish
+  (doseq [[format expected] [[{:type "json"} {"type" "json_object"}]
+                             [{:type "json_schema" :name "example" :strict true
+                               :json_schema {:type "object"}}
+                              {"type" "json_schema" :json_schema
+                               {"name" "example" "strict" true "schema" {"type" "object"}}}]]]
+    (let [captured (atom nil)
+          response (llm/openai-compatible-complete
+                     {:model "fixture" :api_key "fixture" :messages [] :response_format format
+                      :transport (fn [request]
+                                   (reset! captured (json/read-json (:body request)))
+                                   {:status 200 :body (json/write-json
+                                     {:choices [{:message {:content "{}"} :finish_reason "length"}]})})})]
+      (is (= (json/read-json (json/write-json expected)) (get @captured "response_format")))
+      (is (= :length (:finish_reason response))))))

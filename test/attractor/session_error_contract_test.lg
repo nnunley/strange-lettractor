@@ -21,7 +21,7 @@
         session
         (agent/make-session
           (merge
-            {:project_docs []
+            {:context_advisory_only true :project_docs []
              :execution_env (execution/make-environment
                               {:cleanup #(swap! cleanups inc)})}
             (if (= mode :complete)
@@ -147,7 +147,7 @@
 (deftest recoverable-overflow-keeps-owned-child-and-existing-history
   (let [{:keys [session error cleanups]} (fixture :context-length :complete false)
         child (agent/make-session
-                {:project_docs []
+                {:context_advisory_only true :project_docs []
                  :complete_fn (fn [_]
                                 {:message {:role :assistant :content "child works"}
                                  :tool_calls []})})
@@ -171,7 +171,7 @@
 (deftest untyped-stream-errors-retain-compatibility-wrapper
   (let [raw {"code" "legacy_error"}
         session (agent/make-session
-                  {:project_docs []
+                  {:context_advisory_only true :project_docs []
                    :stream_fn (fn [_] [{:type :error :error raw}])})
         error (caught #(agent/process-input! session "input"))]
     (is (= :provider-stream (:category (ex-data error))))

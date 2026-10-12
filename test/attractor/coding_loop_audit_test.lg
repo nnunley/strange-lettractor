@@ -1,0 +1,282 @@
+(ns attractor.coding-loop-audit-test
+  "Regression contracts from the original-spec audit of 2026-09-27."
+  (:require [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.profiles :as profiles]
+            [clojure.core :as core]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is] :as test]
+            [harness.deadline :as deadline]
+            [io :as io]
+            [os :as os]))
+
+(defn- scripted-session [environment arguments options]
+  (let [calls (atom 0)]
+    (agent/make-session
+      (merge {:provider_profile (profiles/create-openai-profile "audit")
+              :execution_env environment :project_docs [] :max_subagent_depth 0
+              :complete_fn
+              (fn [_]
+                (if (= 1 (swap! calls inc))
+                  {:text "" :tool_calls [{:id "shell-1" :name "shell"
+                                          :arguments arguments}]}
+                  {:text "done" :tool_calls []}))}
+             options))))
+
+(defn- shell-result [session]
+  (first (:results (first (filter #(= :tool_results (:type %))
+                                 (:history @session))))))
+
+(deftest steering-accepted-during-drain-is-retained
+  (let [holder (atom nil)
+        requests (atom [])
+        session (agent/make-session
+                  {:project_docs [] :max_subagent_depth 0
+                   :execution_env (execution/make-environment
+                                    {:file_exists (fn [_] false)})
+                   :complete_fn (fn [request]
+                                  (swap! requests conj request)
+                                  {:text "done" :tool_calls []})
+                   :on_event
+                   (fn [event]
+                     (when (and (= :steering_injected (:type event))
+                                (= "first" (:content event)))
+                       (agent/steer-session! @holder "second")))})]
+    (reset! holder session)
+    (try
+      (agent/steer-session! session "first")
+      (agent/process-input! session "work")
+      (agent/process-input! session "next")
+      (is (= ["first" "second"]
+             (mapv :content (filter #(= :steering (:type %)) (:history @session))))
+          "§2.6: an accepted steering message must survive queue draining")
+      (is (= 1 (count (filter #(= "second" (:content %))
+                             (:messages (last @requests)))))
+          "accepted steering reaches the next model request exactly once")
+      (finally (agent/close-session! session)))))
+
+(deftest shell-failure-results-are-errors
+  (doseq [[command timeout expected-exit]
+          [["printf partial; exit 7" 1000 7]
+           ["printf partial; sleep 1" 10 124]]]
+    (let [environment (execution/make-local-environment {:working_dir (os/temp-dir)})
+          session (scripted-session environment
+                                    {:command command :timeout_ms timeout} {})]
+      (try
+        (agent/process-input! session "run")
+        (let [result (shell-result session)
+              exec-result (edn/read-string (:content result))
+              event (first (filter #(= :tool_call_end (:type %))
+                                   (agent/session-events session)))]
+          (is (= expected-exit (:exit_code exec-result)) "control: command really failed")
+          (is (true? (:is_error result)) "Appendix B: shell exit/timeout is an error result")
+          (is (= exec-result (when (:error event) (edn/read-string (:error event))))
+              "error events retain the complete command result")
+          (is (= "partial" (:stdout exec-result))))
+        (finally (agent/close-session! session))))))
+
+(deftest shell-errors-keep-full-events-and-truncate-only-model-output
+  (let [payload (apply str (repeat 1000 "x"))
+        environment (execution/make-environment
+                      {:file_exists (fn [_] false)
+                       :exec_command (fn [& _]
+                                       {:stdout payload :stderr "failed" :exit_code 7})})
+        session (scripted-session environment {:command "fail"}
+                                  {:tool_output_limits {"shell" 40}})]
+    (try
+      (agent/process-input! session "run")
+      (let [result (shell-result session)
+            event (first (filter #(= :tool_call_end (:type %))
+                                 (agent/session-events session)))]
+        (is (true? (:is_error result)))
+        (is (str/includes? (:content result) "Tool output was truncated"))
+        (is (= payload (:stdout (when (:error event) (edn/read-string (:error event)))))))
+      (finally (agent/close-session! session)))))
+
+(deftest command-result-classification-does-not-leak-into-custom-tools
+  (let [profile (profiles/create-openai-profile "audit")
+        definition (:definition (profiles/registry-get (:tool_registry profile) "shell"))
+        _ (profiles/register-tool! (:tool_registry profile)
+            {:definition definition :executor (fn [& _] {:exit_code 7 :meaning "domain data"})})
+        session (scripted-session
+                  (execution/make-environment {:file_exists (fn [_] false)})
+                  {:command "domain data"} {:provider_profile profile})]
+    (try
+      (agent/process-input! session "run")
+      (is (false? (:is_error (shell-result session)))
+          "a custom replacement owns its result semantics")
+      (finally (agent/close-session! session)))))
+
+(deftest profile-defaults-and-per-call-timeouts-are-capped
+  (doseq [[profile default-timeout]
+          [[(profiles/create-openai-profile "audit") 5000]
+           [(profiles/create-anthropic-profile "audit") 120000]
+           [(profiles/create-gemini-profile "audit") 5000]]]
+    (doseq [[requested maximum expected]
+            [[nil 600000 default-timeout] [nil 200 200] [50 200 50] [1000 200 200]]]
+      (let [observed (atom nil)
+            environment (execution/make-environment
+                          {:file_exists (fn [_] false)
+                           :exec_command (fn [command timeout _ _]
+                                           (when (= command "requested-shell") (reset! observed timeout))
+                                           {:stdout "" :stderr "" :exit_code 0})})
+            session (scripted-session environment
+                                      (cond-> {:command "requested-shell"}
+                                        requested (assoc :timeout_ms requested))
+                                      {:provider_profile profile
+                                       :default_command_timeout_ms 5000
+                                       :max_command_timeout_ms maximum})]
+        (try
+          (agent/process-input! session "run")
+          (is (= expected @observed) (str (:id profile) " timeout " requested "/" maximum))
+          (is (false? (:is_error (shell-result session))) "successful shell stays successful")
+          (finally (agent/close-session! session)))))))
+
+(deftest session-timeout-cap-reaches-supplied-environments
+  (let [observed (atom nil)
+        environment (execution/make-environment
+                      {:file_exists (fn [_] false)
+                       :exec_command (fn [command timeout _ _]
+                                       (when (= command "requested-shell")
+                                         (reset! observed timeout))
+                                       {:stdout "" :stderr "" :exit_code 0
+                                        :timed_out false :duration_ms 1})})
+        session (scripted-session environment
+                                  {:command "requested-shell" :timeout_ms 900000}
+                                  {:max_command_timeout_ms 200})]
+    (try
+      (agent/process-input! session "run")
+      (is (= 200 @observed) "§5.4: session maximum caps a custom environment call")
+      (finally (agent/close-session! session))))
+  (let [environment (execution/make-local-environment {:working_dir (os/temp-dir)})
+        session (scripted-session environment
+                                  {:command "sleep 0.15; echo completed" :timeout_ms 500}
+                                  {:max_command_timeout_ms 10})]
+    (try
+      (agent/process-input! session "run")
+      (is (true? (:timed_out (edn/read-string (:content (shell-result session)))))
+          "§5.4: supplied local environment must obey the session cap")
+      (finally (agent/close-session! session)))))
+
+(deftest closing-a-child-cancels-its-shell-before-later-writes
+  (let [root (str (os/temp-dir) "/attractor-child-close-audit-" (System/nanoTime))
+        _ (io/mkdir root)
+        environment (execution/make-local-environment {:working_dir root})
+        session (agent/make-session
+                  {:provider_profile (profiles/create-anthropic-profile "audit")
+                   :execution_env environment :project_docs []
+                   :complete_fn
+                   (fn [_]
+                     {:text "" :tool_calls
+                      [{:id "child-shell" :name "shell"
+                        :arguments
+                        {:command (str "touch started; i=0; "
+                                       "while [ ! -e release ] && [ \"$i\" -lt 100 ]; do "
+                                       "sleep 0.02; i=$((i+1)); done; "
+                                       "if [ -e release ]; then touch after-close; "
+                                       "else touch release-expired; fi")
+                         :timeout_ms 4000}}]})})]
+    (try
+      (let [child-id (:agent_id (agent/spawn-subagent! session {:task "work" :max_turns 1}))
+            started (deadline/wait-until #((:file_exists environment) "started") 3000)]
+        (is (true? started) "control: child command started")
+        (when started
+          (is (= :closed (:status (agent/close-subagent! session child-id))))
+          (io/spit (str root "/release") "go")
+          (let [result (deref (core/future (agent/wait-subagent! session child-id)) 5000 ::timeout)]
+            (is (not= ::timeout result) "control: child settled")
+            (is (false? (:success result)) "control: child reports cancellation"))
+          (is (not ((:file_exists environment) "release-expired"))
+              "control: release-wait expiration cannot explain an absent write")
+          (is (not ((:file_exists environment) "after-close"))
+              "§7.2: closing a child must stop its command, not only mark it closed")))
+      (finally
+        (agent/close-session! session)
+        (os/sh "rm" "-rf" root)))))
+
+(deftest child-scope-preserves-composed-file-operations
+  (let [root (str (os/temp-dir) "/attractor-wrapped-files-" (System/nanoTime))
+        _ (io/mkdir root)
+        denied (atom 0)
+        env (assoc (execution/make-local-environment {:working_dir root})
+                   :write_file (fn [& _] (swap! denied inc)
+                                 (throw (ex-info "writes denied" {:category :policy}))))
+        session (agent/make-session
+                  {:execution_env env :project_docs []
+                   :provider_profile (profiles/create-openai-profile "audit")
+                   :complete_fn (fn [_] {:text "" :tool_calls
+                                         [{:id "write" :name "write_file"
+                                           :arguments {:file_path "bypass" :content "written"}}]})})]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! session {:task "write" :max_turns 1}))]
+        (is (not= ::timeout (deref (core/future (agent/wait-subagent! session id)) 3000 ::timeout)))
+        (is (= 1 @denied))
+        (is (not ((:file_exists env) "bypass"))))
+      (finally (agent/close-session! session) (os/sh "rm" "-rf" root)))))
+
+(deftest composed-command-scopes-are-rejected-before-child-admission
+  (doseq [cwd [nil "."] callback [:exec_command :exec_command_stdin]]
+    (let [native (execution/make-local-environment {:working_dir (os/temp-dir)})
+          env (assoc native callback (fn [& _] {:exit_code 0 :stdout "wrapped"}))
+          session (agent/make-session {:execution_env env :project_docs []
+                                       :complete_fn (fn [_] {:text "done" :tool_calls []})})]
+      (try
+        (is (= :unsupported-environment-composition
+               (try (agent/spawn-subagent! session (cond-> {:task "work"} cwd (assoc :working_dir cwd)))
+                    nil (catch Object error (:category (ex-data error))))))
+        (is (empty? (:subagents @session)))
+        (finally (agent/close-session! session))))))
+
+(deftest composed-file-working-directory-view-is-explicitly-rejected
+  (let [env (assoc (execution/make-local-environment {:working_dir (os/temp-dir)})
+                   :write_file (fn [& _] (throw (ex-info "denied" {}))))
+        session (agent/make-session {:execution_env env :project_docs []
+                                     :complete_fn (fn [_] {:text "done" :tool_calls []})})]
+    (try
+      (is (= :unsupported-environment-composition
+             (try (agent/spawn-subagent! session {:task "work" :working_dir "."}) nil
+                  (catch Object error (:category (ex-data error))))))
+      (finally (agent/close-session! session)))))
+
+(deftest host-owned-scope-hooks-preserve-wrapped-command-compatibility
+  (doseq [hook [:fork_scope :fork_scope_from]]
+    (let [native (execution/make-local-environment {:working_dir (os/temp-dir)})
+          invoked (atom 0) cleaned (atom 0)
+          wrapped-command (fn [& _] {:stdout "wrapped" :exit_code 0})
+          child-env (execution/make-environment
+                      {:file_exists (fn [_] false) :exec_command wrapped-command
+                       :cleanup #(swap! cleaned inc)})
+          custom-hook (if (= hook :fork_scope)
+                        (fn [] (swap! invoked inc) child-env)
+                        (fn [source]
+                          (is (= wrapped-command (:exec_command source)))
+                          (swap! invoked inc) child-env))
+          env (assoc native :exec_command wrapped-command hook custom-hook)
+          session (agent/make-session {:execution_env env :project_docs []
+                                       :complete_fn (fn [_] {:text "done" :tool_calls []})})]
+      (try
+        (let [id (:agent_id (agent/spawn-subagent! session {:task "work"}))]
+          (is (= "done" (:output (deref (core/future (agent/wait-subagent! session id)) 3000 {}))))
+          (is (= 1 @invoked))
+          (agent/close-subagent! session id)
+          (is (= 1 @cleaned)))
+        (finally (agent/close-session! session))))))
+
+(deftest source-aware-working-directory-hook-needs-no-legacy-hook
+  (let [seen (atom nil)
+        env (execution/make-environment
+              {:file_exists (fn [_] false)
+               :working_directory (fn [] "/parent")
+               :with_working_directory_from
+               (fn [source directory]
+                 (reset! seen directory)
+                 (assoc source :working_directory (fn [] "/parent/child")))})
+        session (agent/make-session {:execution_env env :project_docs []
+                                     :complete_fn (fn [_] {:text "done" :tool_calls []})})]
+    (try
+      (let [id (:agent_id (agent/spawn-subagent! session {:task "work" :working_dir "child"}))]
+        (is (= "done" (:output (deref (core/future (agent/wait-subagent! session id)) 3000 {}))))
+        (is (= "child" @seen))
+        (is (= "/parent/child" ((:working_directory (:execution_env @(get-in @session [:subagents id :session])))))))
+      (finally (agent/close-session! session)))))

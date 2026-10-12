@@ -1,0 +1,15 @@
+(ns attractor.reasoning
+  "Portable reasoning-effort validation shared by sessions and provider adapters."
+  (:require [clojure.string :as str]))
+
+(defn normalize-effort [value]
+  (when (some? value)
+    (let [normalized (str/lower-case
+                       (if (keyword? value) (name value) (str value)))]
+      (when-not (contains? #{"low" "medium" "high"} normalized)
+        (throw
+          (ex-info (str "Invalid reasoning_effort: " value)
+                   {:category :invalid-reasoning-effort
+                    :reasoning_effort value
+                    :valid_values ["low" "medium" "high"]})))
+      normalized)))

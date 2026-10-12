@@ -1,0 +1,78 @@
+(ns attractor.anthropic-thinking-history-test
+  (:require [clojure.test :refer [deftest is]]
+            [json :as json]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.execution :as execution]
+            [attractor.llm :as llm]
+            [attractor.profiles :as profiles]))
+
+(defn- event [body]
+  (str "data: " (json/write-json body) "\n\n"))
+
+(defn- first-stream []
+  (apply str
+    (map event
+         [{:type "message_start" :message {:id "m1" :model "claude-haiku-4-5"
+                                            :usage {:input_tokens 12 :output_tokens 4}}}
+          {:type "content_block_start" :index 0
+           :content_block {:type "thinking" :thinking "reason" :signature ""}}
+          {:type "content_block_delta" :index 0
+           :delta {:type "signature_delta" :signature "signed-opaque"}}
+          {:type "content_block_stop" :index 0}
+          {:type "content_block_start" :index 1
+           :content_block {:type "redacted_thinking" :data "redacted-opaque"}}
+          {:type "content_block_stop" :index 1}
+          {:type "content_block_start" :index 2
+           :content_block {:type "tool_use" :id "toolu-1" :name "lookup" :input {}}}
+          {:type "content_block_stop" :index 2}
+          {:type "message_delta" :delta {:stop_reason "tool_use"}
+           :usage {:output_tokens 4}}
+          {:type "message_stop"}])))
+
+(defn- final-stream []
+  (apply str
+    (map event
+         [{:type "message_start" :message {:id "m2" :model "claude-haiku-4-5"
+                                            :usage {:input_tokens 15 :output_tokens 3}}}
+          {:type "content_block_start" :index 0
+           :content_block {:type "text" :text "lookup-ready"}}
+          {:type "content_block_stop" :index 0}
+          {:type "message_delta" :delta {:stop_reason "end_turn"}
+           :usage {:output_tokens 3}}
+          {:type "message_stop"}])))
+
+(deftest agent-tool-continuation-replays-anthropic-thinking-blocks
+  (let [requests (atom [])
+        adapter (llm/make-provider-adapter
+                  "anthropic"
+                  {:api_key "fixture" :base_url "https://fixture.invalid/v1"
+                   :transport (fn [request]
+                                (if (nil? (:body request))
+                                  {:status 404 :body "unavailable"}
+                                  (let [n (count (swap! requests conj (json/read-json (:body request))))]
+                                    {:status 200 :body (if (= n 1) (first-stream) (final-stream))})))})
+        client (llm/make-client {:default_provider "anthropic"
+                                 :providers {"anthropic" adapter}})
+        registry (profiles/make-tool-registry)
+        _ (profiles/register-tool!
+            registry
+            {:definition {:name "lookup" :description "Lookup a code"
+                          :parameters {:type "object" :properties {}}}
+             :executor (fn [_ _] "lookup-ready")})
+        profile (assoc (profiles/create-profile "anthropic" "claude-haiku-4-5")
+                       :tool_registry registry)
+        session (agent/make-session
+                  {:provider_profile profile :llm_client client :project_docs []
+                   :max_subagent_depth 0
+                   :execution_env (execution/make-local-environment {:working_dir (os/cwd)})})]
+    (try
+      (is (= "lookup-ready" (agent/process-input! session "Call lookup")))
+      (is (= 2 (count @requests)))
+      (let [parts (get-in (second @requests) ["messages" 1 "content"])]
+        (is (= ["thinking" "redacted_thinking" "tool_use"]
+               (mapv #(get % "type") parts)))
+        (is (= "signed-opaque" (get-in parts [0 "signature"])))
+        (is (= "redacted-opaque" (get-in parts [1 "data"])))
+        (is (= "toolu-1" (get-in parts [2 "id"]))))
+      (finally (agent/close-session! session)))))

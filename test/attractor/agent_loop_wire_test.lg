@@ -151,7 +151,7 @@
                        (get-in (first (filter #(= :tool_results (:type %)) (:history @session)))
                                [:results 0 :content])))
                 (is (= [:session_start :user_input :assistant_text_start :assistant_text_end
-                        :tool_call_start :tool_call_end :steering_injected
+                        :tool_call_start :tool_call_end :tool_results_recorded :steering_injected
                         :assistant_text_start :assistant_text_end :processing_end]
                        (mapv :type (remove #(= :assistant_text_delta (:type %)) @events))))
                 (is (pos? (count (filter #(= :assistant_text_delta (:type %)) @events)))

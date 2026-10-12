@@ -1,0 +1,9 @@
+(ns main
+  (:require [harness.deadline :as deadline]
+            [live.coding-conformance-suite :as suite] [os :as os]))
+
+(defn -main [& args]
+  (deadline/arm-from-args! args 3600000 "native coding conformance")
+  (os/exit (suite/run-suite!)))
+
+(when *command-line-args* (apply -main *command-line-args*))

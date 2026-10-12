@@ -1,0 +1,282 @@
+(ns attractor.parameters
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn]))
+
+(def ^:private name-pattern #"[a-z][a-z0-9_]*")
+
+(defn valid-name? [s]
+  (boolean (and (string? s) (re-matches name-pattern s))))
+
+(defn- enum-type? [t]
+  (and (vector? t) (= :enum (first t)) (seq (rest t))
+       (every? string? (rest t))))
+
+(defn- known-type? [t]
+  (or (= :string t) (= :int t) (enum-type? t)))
+
+(defn- default-matches? [t v]
+  (cond
+    (= :string t) (string? v)
+    (= :int t) (integer? v)
+    (enum-type? t) (contains? (set (rest t)) v)
+    :else false))
+
+(defn- legacy-form? [text]
+  ;; Upstream spells params as a bare comma-separated name list.
+  (boolean (re-matches #"\s*[a-z][a-z0-9_]*(\s*,\s*[a-z][a-z0-9_]*)*\s*" text)))
+
+(defn- read-one [raw]
+  (let [nm (:name raw)
+        nm (cond (keyword? nm) (name nm) (string? nm) nm :else nil)
+        t (:type raw)]
+    (cond
+      (not (valid-name? nm))
+      {:error (str "invalid parameter name: " (pr-str (:name raw)))}
+
+      (not (known-type? t))
+      {:error (str "parameter '" nm "' has unknown type " (pr-str t))}
+
+      (and (contains? raw :default) (not (default-matches? t (:default raw))))
+      {:error (str "parameter '" nm "' default " (pr-str (:default raw))
+                   " is not a " (pr-str t))}
+
+      :else
+      {:declaration {:name nm :type t
+                     :default (get raw :default)
+                     :has_default (contains? raw :default)
+                     :doc (or (:doc raw) "")
+                     :export (true? (:export raw))
+                     :delegable (true? (:delegable raw))}})))
+
+(defn parse-declarations [attr-value]
+  (let [text (str (or attr-value ""))]
+    (if (str/blank? text)
+      {:declarations [] :errors []}
+      (if (legacy-form? text)
+        {:declarations []
+         :errors [(str "'params' is a comma-separated name list; this runtime "
+                       "expects a vector of declarations, e.g. "
+                       "[{:name :task_file :type :string}]")]}
+        (let [parsed (try (edn/read-string text) (catch Object e {::bad (str e)}))]
+          (cond
+            (and (map? parsed) (contains? parsed ::bad))
+            {:declarations [] :errors [(str "'params' is not readable EDN: " (::bad parsed))]}
+
+            (not (vector? parsed))
+            {:declarations [] :errors ["'params' must be a vector of declarations"]}
+
+            :else
+            (let [results (mapv read-one parsed)
+                  decls (vec (keep :declaration results))
+                  errs (vec (keep :error results))
+                  dup (->> (map :name decls)
+                           frequencies
+                           (filter (fn [[_ n]] (> n 1)))
+                           (map first)
+                           sort)]
+              {:declarations decls
+               :errors (vec (concat errs
+                                    (map #(str "duplicate parameter name '" % "'") dup)))})))))))
+
+;; Scan once, left to right. "{{{{" emits a literal "{{" and consumes four
+;; characters, so an escape can never be re-read as a reference.
+(defn substitute-string [text values]
+  (if-not (string? text)
+    {:text text :used #{}}
+    (loop [i 0 out [] used #{}]
+      (cond
+        (>= i (count text))
+        {:text (apply str out) :used used}
+
+        (and (<= (+ i 4) (count text)) (= "{{{{" (subs text i (+ i 4))))
+        (recur (+ i 4) (conj out "{{") used)
+
+        (and (<= (+ i 2) (count text)) (= "{{" (subs text i (+ i 2))))
+        (let [close (str/index-of text "}}" (+ i 2))
+              nm (when close (subs text (+ i 2) close))]
+          (if (and close (valid-name? nm) (contains? values nm))
+            (recur (+ close 2) (conj out (get values nm)) (conj used nm))
+            (recur (+ i 2) (conj out "{{") used)))
+
+        :else
+        (recur (inc i) (conj out (subs text i (inc i))) used)))))
+
+(defn- rewrite-map [m values skip]
+  (reduce (fn [acc [k v]]
+            (if (or (contains? skip k) (not (string? v)))
+              (assoc acc k v)
+              (assoc acc k (:text (substitute-string v values)))))
+          {}
+          m))
+
+(declare find-references)
+
+(defn reference-index
+  "Fold a reference vector from find-references into
+   parameter name -> the set of attribute keys that name is written in.
+   Its input is scanned from the AUTHORED graph, so the index is the same
+   whether or not a value was supplied for the name. It is derived on demand
+   rather than carried on the graph: plan-fingerprint hashes the whole graph,
+   so a second derived view of the same scan would inflate every plan digest."
+  [references]
+  (reduce (fn [acc r] (update acc (:name r) (fnil conj #{}) (:attr r)))
+          {}
+          references))
+
+(defn substitution-transform [values]
+  (fn [graph]
+    ;; The reference scan runs on the authored graph, before substitution. Two
+    ;; things depend on that: an escaped "{{{{name}}" becomes a literal
+    ;; "{{name}}" that a post-substitution scan would misread as a reference,
+    ;; and a name with no supplied value is substituted nowhere yet is still
+    ;; statically referenced.
+    (let [skip #{:params}
+          authored (find-references graph)
+          top (rewrite-map (dissoc graph :nodes :edges :attrs) values #{})
+          attrs (rewrite-map (or (:attrs graph) {}) values skip)
+          nodes (reduce (fn [acc [nid node]]
+                          (assoc acc nid
+                                 (assoc (rewrite-map (dissoc node :attrs) values #{})
+                                        :attrs (rewrite-map (or (:attrs node) {}) values skip))))
+                        {}
+                        (or (:nodes graph) {}))
+          edges (reduce (fn [acc edge]
+                          (conj acc (assoc (rewrite-map (dissoc edge :attrs) values #{})
+                                           :attrs (rewrite-map (or (:attrs edge) {}) values skip))))
+                        []
+                        (or (:edges graph) []))]
+      (assoc top :attrs attrs :nodes nodes :edges (vec edges)
+                 :parameter_authored_references authored))))
+
+(defn- refs-in [text]
+  (if-not (string? text)
+    []
+    (loop [i 0 found []]
+      (let [open (str/index-of text "{{" i)]
+        (if (nil? open)
+          found
+          (if (and (<= (+ open 4) (count text)) (= "{{{{" (subs text open (+ open 4))))
+            (recur (+ open 4) found)
+            (let [close (str/index-of text "}}" (+ open 2))
+                  nm (when close (subs text (+ open 2) close))]
+              (if (and close (valid-name? nm))
+                (recur (+ close 2) (conj found nm))
+                (recur (+ open 2) found)))))))))
+
+(defn render [v]
+  (if (integer? v) (str v) (str v)))
+
+(defn- allowed-values [t] (vec (rest t)))
+
+(defn- coerce-text [t text nm]
+  (cond
+    (= :string t) {:value text}
+    (= :int t) (if (re-matches #"[-+]?[0-9]+" text)
+                 {:value (edn/read-string text)}
+                 {:error {:rule "parameter_type"
+                          :message (str "parameter '" nm "' expects an :int, got "
+                                        (pr-str text))}})
+    (enum-type? t) (if (contains? (set (allowed-values t)) text)
+                     {:value text}
+                     {:error {:rule "parameter_type"
+                              :message (str "parameter '" nm "' expects one of "
+                                            (str/join ", " (allowed-values t))
+                                            ", got " (pr-str text))}})
+    :else {:error {:rule "parameter_type"
+                   :message (str "parameter '" nm "' has unknown type")}}))
+
+(defn- check-typed [t v nm]
+  (if (default-matches? t v)
+    {:value v}
+    {:error {:rule "parameter_type"
+             :message (str "parameter '" nm "' value " (pr-str v)
+                           " is not a " (pr-str t))}}))
+
+(defn resolve-values [declarations supplied]
+  (let [flags (or (:flags supplied) {})
+        file (or (:file supplied) {})
+        by-name (into {} (map (fn [d] [(:name d) d]) declarations))
+        unknown (sort (remove #(contains? by-name %)
+                              (distinct (concat (keys flags) (keys file)))))
+        base {:values {} :typed {} :sources {}
+              :errors (mapv (fn [u] {:rule "parameter_undeclared"
+                                     :message (str "'" u "' names no declared parameter")})
+                            unknown)}]
+    (reduce
+      (fn [acc d]
+        (let [nm (:name d) t (:type d)
+              r (cond
+                  (contains? flags nm) (assoc (coerce-text t (str (get flags nm)) nm) :source :flag)
+                  (contains? file nm) (assoc (check-typed t (get file nm) nm) :source :file)
+                  (:has_default d) {:value (:default d) :source :default}
+                  :else {:error {:rule "parameter_missing"
+                                 :message (str "'" nm "' is required and was not supplied")}})]
+          (if (:error r)
+            (update acc :errors conj (:error r))
+            (-> acc
+                (assoc-in [:values nm] (render (:value r)))
+                (assoc-in [:typed nm] (:value r))
+                (assoc-in [:sources nm] (:source r))))))
+      base
+      declarations)))
+
+(defn find-references [graph]
+  ;; :attrs is scanned exclusively (never the promoted top-level copies): it is
+  ;; a superset of every promoted field, so scanning both would double-report
+  ;; every promoted string field. :attrs is also the only place some references
+  ;; survive at all: the boolean-coerced family (:goal_gate, :auto_status,
+  ;; :allow_partial, edge :loop_restart) is collapsed to true/false by the
+  ;; parser before substitution runs, which destroys the reference. That is what
+  ;; coerced-attr? and the parameter_reference_coerced rule are for;
+  ;; typed-integer fields such as :max_retries are NOT in that family, because
+  ;; typed-integer passes a non-numeric string through unchanged.
+  (let [scan (fn [m where]
+               (mapcat (fn [[k v]]
+                         (map (fn [nm] (merge {:name nm :attr k} where)) (refs-in v)))
+                       m))]
+    (vec (concat
+           (scan (dissoc (or (:attrs graph) {}) :params) {})
+           (mapcat (fn [[nid node]]
+                     (scan (or (:attrs node) {}) {:node_id nid}))
+                   (or (:nodes graph) {}))
+           (mapcat (fn [edge]
+                     (scan (or (:attrs edge) {}) {:edge [(:from edge) (:to edge)]}))
+                   (or (:edges graph) []))))))
+
+(def ^:private sensitive-attrs
+  #{:tool_command :subpipeline.dotfile :model_stylesheet})
+
+(defn sensitive-attr? [k] (contains? sensitive-attrs k))
+
+;; Attributes the parser coerces eagerly, before substitution can run, so a
+;; {{name}} reference in one of them is destroyed instead of substituted: the
+;; booleans collapse any non-empty string to true, and an edge's :weight
+;; collapses any non-number to 0. An author would be silently misled -- a
+;; parameterized goal gate would simply always fire -- so the reference is
+;; rejected instead. typed-integer fields (:max_retries and friends) are not
+;; in this family: typed-integer passes a non-numeric string through unchanged,
+;; so substitution still reaches them.
+(def ^:private coerced-attrs
+  #{:goal_gate :auto_status :allow_partial :loop_restart :weight})
+
+(defn coerced-attr? [k] (contains? coerced-attrs k))
+
+(defn closed-type? [t]
+  (or (= :int t) (enum-type? t)))
+
+;; A launch may lower its own trust and never raise it.
+(defn effective-trust [parent requested]
+  (let [req (or requested :trusted)]
+    (if (= :delegated parent) :delegated req)))
+
+(defn check-delegation [declarations supplied trust]
+  (if (not= :delegated trust)
+    []
+    (let [by-name (into {} (map (fn [d] [(:name d) d]) declarations))
+          names (distinct (concat (keys (or (:flags supplied) {}))
+                                  (keys (or (:file supplied) {}))))]
+      (vec (keep (fn [nm]
+                   (when-let [d (get by-name nm)]
+                     (when-not (:delegable d)
+                       (str "'" nm "' may not be supplied by a delegated launch"))))
+                 (sort names))))))

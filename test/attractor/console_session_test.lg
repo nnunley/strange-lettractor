@@ -75,9 +75,11 @@
         h (hub/start! opts) c (console/open! h)]
     (try
       (is (has (line c "hello") "→ agent"))
-      (let [rejected (line c "again")]
-        (is (has rejected "submit failed: busy") (pr-str rejected))
-        (is (not (has rejected "busy busy")) (pr-str rejected)))
+      (is (has (line c "again") "queued steering"))
+      (line c "/cancel")
+      (let [rejected (line c "after cancellation")]
+        (is (has rejected "submit failed: session-closed") (pr-str rejected))
+        (is (not (has rejected "session-closed session-closed")) (pr-str rejected)))
       (finally (deliver release true) (console/close! c) (stop h)))))
 
 (deftest eval-routes-render-values-errors-and-bind-focus

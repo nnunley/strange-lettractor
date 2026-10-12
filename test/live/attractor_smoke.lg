@@ -5,7 +5,7 @@
    the run exits 3 and prints a skip record; a skip is never a pass.
    Stage artifacts and result.edn persist under evidence/runtime-smoke-evidence;
    only the model's temporary working directory is removed."
-  (:require [harness.deadline :as deadline]
+  (:require [harness.deadline :as deadline] [harness.tests :as tests]
             [clojure.test :refer [deftest is]] [clojure.string :as str]
             [os :as os] [io :as io] [json :as json]
             [attractor.pipeline :as pipeline] [attractor.handlers :as handlers]
@@ -68,16 +68,14 @@
   (if (str/blank? model)
     (do (prn {:scenario "SCN-ATTR-SMOKE-LIVE" :status :skipped :reason "ATTRACTOR_LIVE_MODEL not set"})
         (os/exit 3))
-    (let [output (with-out-str (clojure.test/run-tests))]
+    (let [result (tests/run 'main)]
       (io/mkdir evidence-root)
       (io/spit (str evidence-root "/result.edn")
                (pr-str {:scenario "SCN-ATTR-SMOKE-LIVE" :model model
-                        :status (if clojure.test/*test-result* :pass :fail)
-                        :counts clojure.test/*report-counters*
+                        :status (if (:passed result) :pass :fail)
+                        :counts (:summary result)
                         :recorded_at (str (System/currentTimeMillis))
                         :logs_root (str evidence-root "/logs")}))
-      (prn clojure.test/*report-counters*)
       (println (str "Retained evidence: " evidence-root))
-      (when-not clojure.test/*test-result* (println output))
-      (os/exit (if clojure.test/*test-result* 0 1)))))
+      (tests/exit! result))))
 (when *command-line-args* (apply -main *command-line-args*))

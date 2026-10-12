@@ -153,7 +153,13 @@
             ;; Word / Identifier / Number / Duration / BareValue
             :else
             (let [rest-s (subs src i)
-                  m (re-find #"^-?[A-Za-z0-9_.:]+" rest-s)]
+                  m (re-find #"^(?:-?[0-9]+(?:ms|s|m|h|d)|-?(?:[0-9]*\.[0-9]+|[0-9]+)|[A-Za-z_][A-Za-z0-9_.:-]*)" rest-s)
+                  m (if (and m
+                             (str/ends-with? m "-")
+                             (< (+ i (count m)) n)
+                             (= ">" (subs src (+ i (count m)) (inc (+ i (count m))))))
+                        (subs m 0 (dec (count m)))
+                        m)]
               (if m
                 (let [val-len (count m)]
                   (recur (+ i val-len) (conj tokens {:type :word :val m})))
@@ -179,6 +185,10 @@
 (defn- typed-boolean [v]
   (cond (= v "true") true (= v "false") false :else v))
 
+(defn- valid-attribute-key? [value]
+  (and (string? value)
+       (some? (re-matches #"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*" value))))
+
 ;; Parse an attribute block starting at token idx: [ key=val, key2=val2 ... ]
 ;; Returns [attrs next-idx]
 (defn- parse-attr-block-tokens [tokens start-idx]
@@ -203,10 +213,14 @@
             ;; Custom CSS properties need quoted DOT names: unquoted -- is
             ;; reserved for unsupported undirected edges.
             (or (= (:type t) :word)
-                (and (= (:type t) :string)
+            (and (= (:type t) :string)
                      (re-matches #"--[a-z][a-z0-9-]*" (:val t))))
             (let [k-name (:val t)
                   next-t (get tokens (inc i))]
+              (when (and (= (:type t) :word)
+                         (not (valid-attribute-key? k-name)))
+                (throw (ex-info (str "Invalid attribute key: " k-name)
+                                {:attribute k-name :token-index i})))
               (when-not (and next-t (= (:val next-t) "="))
                 (throw (ex-info "Attribute requires '=' and a value"
                                 {:attribute k-name :token-index i})))
@@ -261,6 +275,39 @@
         (require-identifier! target-id "node")
         (recur (+ curr-idx 2) (conj chain target-id)))
       [chain curr-idx])))
+
+;; Every node receives the same attribute promotion, including edge-only nodes.
+(defn- make-node [id attrs existing-node explicit-class subgraph-classes sub-class]
+  (let [combined-class (reduce add-class-once explicit-class subgraph-classes)]
+    {:id id
+     :label (or (:label attrs) (:label existing-node) id)
+     :shape (or (:shape attrs) (:shape existing-node) "box")
+     :type (or (:type attrs) (:type existing-node) "")
+     :prompt (or (:prompt attrs) (:prompt existing-node) "")
+     :max_retries (typed-integer (or (:max_retries attrs) (:max_retries existing-node)))
+     :goal_gate (boolean (typed-boolean (or (:goal_gate attrs) false)))
+     :retry_target (or (:retry_target attrs) "")
+     :fallback_retry_target (or (:fallback_retry_target attrs) "")
+     :fidelity (:fidelity attrs)
+     :thread_id (:thread_id attrs)
+     :class combined-class
+     :explicit-class explicit-class
+     :subgraph-classes subgraph-classes
+     :subgraph_class sub-class
+     :timeout (:timeout attrs)
+     :llm_model (:llm_model attrs)
+     :llm_provider (:llm_provider attrs)
+     ;; Keep unset distinct from the system default so a
+     ;; stylesheet can supply this property.
+     :reasoning_effort (:reasoning_effort attrs)
+     :auto_status (boolean
+                    (if (contains? attrs :auto_status)
+                      (:auto_status attrs)
+                      false))
+     :allow_partial (boolean (or (:allow_partial attrs) false))
+     :attrs (assoc attrs
+                   :class combined-class
+                   :subgraph_class sub-class)}))
 
 ;; Step function for parser state
 (defn- step-parse [tokens n state]
@@ -348,6 +395,7 @@
       (and (< (+ idx 2) n)
            (= (get-in tokens [(inc idx) :val]) "="))
       (let [k-name val
+            _ (require-identifier! k-name "graph attribute")
             v-tok (nth tokens (+ idx 2))
             v (convert-val v-tok)
             next-i (+ idx 3)]
@@ -383,13 +431,16 @@
                 [attrs next-idx] (parse-attr-block-tokens tokens curr-idx)
                 defaults (or (get-in state [:current-subgraph :scoped-edge-defaults]) (:edge-defaults state))
                 merged-edge-attrs (merge defaults attrs)
-                merged-edge-attrs (update merged-edge-attrs :weight (fn [w] (if (number? w) w 0)))
+                ;; The promoted :weight is coerced, but :attrs keeps what the
+                ;; author wrote, so a "{{name}}" reference there is still
+                ;; visible to the reference scan (see parameters/coerced-attr?).
+                edge-weight (let [w (:weight merged-edge-attrs)] (if (number? w) w 0))
                 new-edges (map (fn [[from to]]
                                  {:from from
                                   :to to
                                   :label (or (:label merged-edge-attrs) "")
                                   :condition (or (:condition merged-edge-attrs) "")
-                                  :weight (or (:weight merged-edge-attrs) 0)
+                                  :weight edge-weight
                                   :fidelity (:fidelity merged-edge-attrs)
                                   :thread_id (:thread_id merged-edge-attrs)
                                   :loop_restart (boolean (:loop_restart merged-edge-attrs))
@@ -402,24 +453,8 @@
                             (:derived-class (:current-subgraph state)) "")
                 registered-nodes (reduce (fn [acc-nodes nid]
                                            (let [node (or (get acc-nodes nid)
-                                                          {:id nid
-                                                           :label nid
-                                                           :shape (or (:shape defaults) "box")
-                                                           :type (or (:type defaults) "")
-                                                           :prompt ""
-                                                           :max_retries (typed-integer (:max_retries defaults))
-                                                           :goal_gate false
-                                                           :retry_target ""
-                                                           :fallback_retry_target ""
-                                                           :fidelity (:fidelity defaults)
-                                                          :thread_id (:thread_id defaults)
-                                                          :class (or (:class defaults) "")
-                                                           :explicit-class (or (:class defaults) "")
-                                                           :subgraph-classes []
-                                                          :subgraph_class sub-class
-                                                           :attrs (assoc defaults
-                                                                     :class (or (:class defaults) "")
-                                                                     :subgraph_class sub-class)})]
+                                                          (make-node nid defaults nil
+                                                                     (or (:class defaults) "") [] sub-class))]
                                              (assoc acc-nodes nid
                                                     (apply-active-subgraph-classes node state))))
                                          (:nodes state)
@@ -453,39 +488,11 @@
                                              (conj classes derived-class)))
                                          (or (:subgraph-classes existing-node) [])
                                          (active-subgraph-classes state))
-                combined-class (reduce add-class-once explicit-class subgraph-classes)
                 sub-class (if (:current-subgraph state)
                             (:derived-class (:current-subgraph state))
                             (or (:subgraph_class existing-node) ""))
-                node-rec {:id first-id
-                          :label (or (:label merged-attrs) (:label existing-node) first-id)
-                          :shape (or (:shape merged-attrs) (:shape existing-node) "box")
-                          :type (or (:type merged-attrs) (:type existing-node) "")
-                          :prompt (or (:prompt merged-attrs) (:prompt existing-node) "")
-                          :max_retries (typed-integer (or (:max_retries merged-attrs) (:max_retries existing-node)))
-                          :goal_gate (boolean (typed-boolean (or (:goal_gate merged-attrs) false)))
-                          :retry_target (or (:retry_target merged-attrs) "")
-                          :fallback_retry_target (or (:fallback_retry_target merged-attrs) "")
-                          :fidelity (:fidelity merged-attrs)
-                          :thread_id (:thread_id merged-attrs)
-                          :class combined-class
-                          :explicit-class explicit-class
-                          :subgraph-classes subgraph-classes
-                          :subgraph_class sub-class
-                          :timeout (:timeout merged-attrs)
-                          :llm_model (:llm_model merged-attrs)
-                          :llm_provider (:llm_provider merged-attrs)
-                          ;; Keep unset distinct from the system default so a
-                          ;; stylesheet can supply this property.
-                          :reasoning_effort (:reasoning_effort merged-attrs)
-                          :auto_status (boolean
-                                         (if (contains? merged-attrs :auto_status)
-                                           (:auto_status merged-attrs)
-                                           false))
-                          :allow_partial (boolean (or (:allow_partial merged-attrs) false))
-                          :attrs (assoc merged-attrs
-                                        :class combined-class
-                                        :subgraph_class sub-class)}]
+                node-rec (make-node first-id merged-attrs existing-node
+                                    explicit-class subgraph-classes sub-class)]
             (-> state
                 (assoc :idx next-idx)
                 (assoc-in [:nodes first-id] node-rec)

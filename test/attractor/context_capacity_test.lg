@@ -23,7 +23,7 @@
         profile (profiles/make-profile {:id "custom" :model "fixture"
                                          :supports_streaming false :context_window_size 1000000})
         session (agent/make-session
-                  (merge {:provider_profile profile :project_docs [] :max_subagent_depth 0
+                  (merge {:context_advisory_only true :provider_profile profile :project_docs [] :max_subagent_depth 0
                           :execution_env (execution/make-environment {:working_directory (fn [] "/fixture")})
                           :llm_client (llm/make-client {:providers {"custom" adapter}})} options))]
     (reset! holder session)
@@ -145,7 +145,7 @@
                                             {:status :available :model "fixture" :context_window_size 8}
                                             (finally (deliver cleaned true))))})
         session (agent/make-session
-                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
+                  {:context_advisory_only true :provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
                    :llm_client (llm/make-client {:providers {"custom" adapter}})
                    :project_docs [] :max_subagent_depth 0
                    :execution_env (execution/make-environment {})})
@@ -164,7 +164,7 @@
         adapter (llm/make-adapter "custom" #(swap! calls inc) nil
                                   {:discover_context (fn [_] {:status :unsupported})})
         session (agent/make-session
-                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
+                  {:context_advisory_only true :provider_profile (profiles/make-profile {:id "custom" :model "fixture" :supports_streaming false})
                    :llm_client (llm/make-client {:providers {"custom" adapter}})
                    :require_context_discovery true :project_docs [] :max_subagent_depth 0
                    :execution_env (execution/make-environment {})})]
@@ -180,7 +180,7 @@
   (let [started (promise) release (promise) predecessor (atom :owned) successor (atom :owned)
         events (atom []) calls (atom 0)
         session (agent/make-session
-                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture"})
+                  {:context_advisory_only true :provider_profile (profiles/make-profile {:id "custom" :model "fixture"})
                    :llm_client {} :project_docs [] :max_subagent_depth 0
                    :execution_env (execution/make-environment {})})
         refresh @#'attractor.agent/refresh-context-capacity!
@@ -228,7 +228,7 @@
                                        {:status :available :model "fixture"
                                         :context_window_size (if (zero? @calls) 1000 16)})})
         session (agent/make-session
-                  {:provider_profile (profiles/make-profile {:id "custom" :model "fixture"
+                  {:context_advisory_only true :provider_profile (profiles/make-profile {:id "custom" :model "fixture"
                                                               :tool_registry registry :supports_streaming false})
                    :llm_client (llm/make-client {:providers {"custom" adapter}})
                    :project_docs [] :max_subagent_depth 0

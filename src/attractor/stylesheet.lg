@@ -55,7 +55,11 @@
           property (keyword (str/trim property))]
       (when-not (or (#{:llm_model :llm_provider :reasoning_effort} property) (custom-property? property))
         (syntax-error! "Expected a model declaration or --custom-property"))
-      (let [properties (assoc properties property (property-value (str/trim value) (custom-property? property)))
+      (let [parsed-value (property-value (str/trim value) (custom-property? property))
+            _ (when (and (= property :reasoning_effort)
+                         (not (contains? #{"low" "medium" "high"} parsed-value)))
+                (syntax-error! "reasoning_effort must be low, medium, or high"))
+            properties (assoc properties property parsed-value)
             tail (str/trim (subs remaining (inc end)))]
         (cond
           (= delimiter "}") [properties tail]

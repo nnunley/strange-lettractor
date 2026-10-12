@@ -1,0 +1,133 @@
+(ns attractor.repair-worker-test
+  (:require [clojure.test :refer [deftest is]] [clojure.string :as str]
+            [io :as io] [os :as os] [attractor.repair-worker :as worker]))
+
+(defn git [root & args]
+  (let [r (apply os/sh (concat ["git" "-c" "core.fsmonitor=false" "-C" root] args))]
+    (when-not (= 0 (:exit r)) (throw (ex-info "fixture git failed" r)))
+    (str/trim (:out r))))
+
+(defn fixture [f]
+  (let [root (str (os/cwd) "/attractor_runs/repair-fixture-" (System/currentTimeMillis) "-" (rand-int 100000))]
+    (io/mkdir root)
+    (git root "init")
+    (git root "config" "user.name" "Repair test")
+    (git root "config" "user.email" "repair@example.invalid")
+    (io/spit (str root "/.gitignore") "attractor_runs/\n")
+    (io/spit (str root "/value") "broken\n")
+    (git root "add" ".") (git root "commit" "-m" "baseline")
+    (try (f root (git root "rev-parse" "HEAD"))
+         (finally (os/sh "/bin/rm" "-rf" "--" root)))))
+
+(defn config [root]
+  {:repository root :triage_model "mock/reviewer" :coding_model "mock/coder"
+   :test_command "if test -f test/regression; then test \"$(cat value)\" = fixed; fi"
+   :build_command "test -f value" :timeout_ms 30000 :max_turns 5})
+
+(defn scripted [requests & [bad-phase]]
+  (let [n (atom 0)]
+    (fn [request]
+      (swap! requests conj request)
+      (let [i (swap! n inc)]
+        (case i
+          1 {:message {:role :assistant :content ""}
+             :tool_calls [{:id "repro" :name "write_file" :arguments
+                           {:file_path (if (= bad-phase :production) "value" "test/regression") :content "regression\n"}}]}
+          3 {:message {:role :assistant :content ""}
+             :tool_calls [{:id "fix" :name "write_file" :arguments {:file_path "value" :content "fixed\n"}}]}
+          5 {:message {:role :assistant :content (if (= bad-phase :review) "{\"approve\":false}" "{\"approve\":true,\"summary\":\"regression proves fix\"}")}}
+          {:message {:role :assistant :content "Done"} :tool_calls []})))))
+
+(deftest prepares-tested-commit-without-mutating-checkout
+  (fixture (fn [root base]
+    (let [requests (atom [])
+          result (worker/run! (config root) {:id "repair-one" :revision base :exception {:message "bug"}}
+                    {:classification "framework" :reproduction "value should be fixed"}
+                    (scripted requests) (fn [_]) (constantly false))]
+      (is (= :ready (:status result)) (pr-str result))
+      (is (= base (git root "rev-parse" "HEAD")))
+      (is (= "broken\n" (io/slurp (str root "/value"))))
+      (is (= "" (git root "status" "--porcelain")))
+      (is (= "mock/reviewer" (:model (last @requests))))
+      (is (= :activated (:status (worker/activate! (config root) result (constantly false)))))
+      (is (= "fixed\n" (io/slurp (str root "/value"))))))))
+
+(deftest refuses-production-edits-in-reproduction
+  (fixture (fn [root base]
+    (let [result (worker/run! (config root) {:id "bad-repro" :revision base} {:classification "framework"}
+                   (scripted (atom []) :production) (fn [_]) (constantly false))]
+      (is (= :failed (:status result)))
+      (is (= base (git root "rev-parse" "HEAD")))))))
+
+(deftest failed-baseline-and-review-never-produce-ready-commit
+  (doseq [mode [:baseline :review :build]]
+    (fixture (fn [root base]
+      (let [cfg (cond-> (config root)
+                  (= mode :baseline) (assoc :test_command "exit 1")
+                  (= mode :build) (assoc :build_command "exit 1"))
+            requests (atom [])
+            result (worker/run! cfg {:id "rejected" :revision base} {:classification "framework"}
+                     (scripted requests mode) (fn [_]) (constantly false))]
+        (is (= :failed (:status result)) (str mode " " result))
+        (is (nil? (:commit result)))
+        (is (= base (git root "rev-parse" "HEAD")))
+        (when (= mode :baseline) (is (empty? @requests))))))))
+
+(deftest activation-refuses-dirty-or-stale-checkout-and-changed-repair-branch
+  (doseq [mode [:dirty :stale :branch]]
+    (fixture (fn [root base]
+      (let [result (worker/run! (config root) {:id "activation" :revision base} {:classification "framework"}
+                     (scripted (atom [])) (fn [_]) (constantly false))]
+        (is (= :ready (:status result)))
+        (case mode
+          :dirty (io/spit (str root "/untracked") "keep me")
+          :stale (git root "commit" "--allow-empty" "-m" "new user work")
+          :branch (git root "-C" (:worktree result) "commit" "--allow-empty" "-m" "tamper"))
+        (let [before (git root "rev-parse" "HEAD")
+              activated (worker/activate! (config root) result (constantly false))]
+          (is (= :activation-failed (:status activated)))
+          (is (= before (git root "rev-parse" "HEAD")))
+          (is (= "broken\n" (io/slurp (str root "/value"))))))))))
+
+(deftest fix-cannot-weaken-the-regression
+  (fixture (fn [root base]
+    (let [calls (atom 0) ordinary (scripted (atom []))
+          result (worker/run! (config root) {:id "weaken" :revision base} {:classification "framework"}
+                   (fn [request]
+                     (let [response (ordinary request)]
+                       (if (= 3 (swap! calls inc))
+                         (assoc response :tool_calls [{:id "weaken" :name "write_file" :arguments {:file_path "test/regression" :content "weakened"}}])
+                         response))) (fn [_]) (constantly false))]
+      (is (= :failed (:status result)))
+      (is (= :regression-modified (get-in result [:error_data :category])))))))
+
+(deftest host-verification-must-not-change-the-reviewed-source
+  (fixture (fn [root base]
+    (let [result (worker/run! (assoc (config root) :build_command "printf changed-by-build > value")
+                   {:id "mutating-build" :revision base} {:classification "framework"}
+                   (scripted (atom [])) (fn [_]) (constantly false))]
+      (is (= :failed (:status result)))
+      (is (= :verification-mutated-source (get-in result [:error_data :category])))
+      (is (= base (git root "rev-parse" "HEAD")))))))
+
+(deftest cancellation-stops-the-host-command
+  (fixture (fn [root base]
+    (let [started (System/currentTimeMillis)
+          requests (atom [])
+          result (worker/run! (assoc (config root) :test_command "sleep 10")
+                   {:id "cancelled" :revision base} {:classification "framework"}
+                   (scripted requests) (fn [_]) #(> (- (System/currentTimeMillis) started) 350))]
+      (is (= :failed (:status result)))
+      (is (= :cancelled (get-in result [:error_data :category])))
+      (is (< (- (System/currentTimeMillis) started) 3000))
+      (is (empty? @requests))))))
+
+(deftest inference-budget-is-shared-across-both-coding-phases-and-review
+  (fixture (fn [root base]
+    (let [requests (atom [])
+          result (worker/run! (assoc (config root) :max_turns 3) {:id "budget" :revision base}
+                   {:classification "framework"} (scripted requests) (fn [_]) (constantly false))]
+      (is (= :failed (:status result)))
+      (is (= :inference-budget (get-in result [:error_data :category])))
+      (is (= 3 (count @requests)))
+      (is (= base (git root "rev-parse" "HEAD")))))))

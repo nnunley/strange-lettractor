@@ -2,6 +2,14 @@
 
 **Status:** Proposed NLSpec
 
+**2026-10-07 scope clarification:** This remains a proposed evaluation extension.
+It is not the acceptance specification for the current Continual Harness, whose
+target is arXiv:2605.09998. See [current harness usage](../examples/continual-harness/README.md)
+and the [convergence audit](codebase-audit-2026-10-07.md). In particular, current
+dynamic tools retain session environment capabilities; this proposal's pure-module
+constraints must not be mistaken for implemented isolation guarantees. Model
+training is optional and separate from ordinary harness operation.
+
 **Purpose:** Extend Attractor from a workflow executor into an observable,
 independently evaluable harness. A run must produce enough bounded, structured
 evidence to compare task outcomes, harness configurations, and later harness
@@ -439,6 +447,11 @@ silently add tools to an active session. Tool names MUST be namespaced and
 collision checked.
 
 ### 8.2 MCP trust boundaries
+
+Implemented admission policy: [MCP tool admission](mcp.md). The initial
+read-only slice now also admits write tools through explicit host grants tied
+to exact tool names and manifest digests. Human approval, where required by the
+host, precedes supplying that grant.
 
 Each MCP invocation MUST have:
 

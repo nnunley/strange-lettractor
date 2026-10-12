@@ -60,3 +60,13 @@
          (:error_code (ex-data (llm/provider-error "fixture"
                                 {:status 400 :body {"error" {"type" "generic_type"
                                                               "code" "specific_code"}}}))))))
+
+(deftest llama-context-type-is-not-masked-by-numeric-code
+  (let [body {"error" {"code" 400 "type" "exceed_context_size_error"
+                        "message" "request (134031 tokens) exceeds the available context size (131072 tokens), try increasing it"
+                        "n_prompt_tokens" 134031 "n_ctx" 131072}}
+        data (ex-data (llm/provider-error "llamacpp" {:status 400 :body body}))]
+    (is (= :context-length (:category data)))
+    (is (= 131072 (:context_window data)))
+    (is (= 134031 (:input_tokens data)))
+    (is (= :server (:category (ex-data (llm/provider-error "llamacpp" {:status 503 :body body})))))))

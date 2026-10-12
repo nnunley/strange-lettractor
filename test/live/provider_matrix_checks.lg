@@ -14,6 +14,40 @@
       (vec entries)
       (vec (filter (fn [[name _]] (contains? selected name)) entries)))))
 
+(defn basic-generation-evidence [response]
+  (let [text (:text response)
+        usage (:usage response)]
+    (when-not (and (not (str/blank? text))
+                   (str/includes? (str/lower-case text) "pong")
+                   (integer? (:input_tokens usage)) (pos? (:input_tokens usage))
+                   (integer? (:output_tokens usage)) (pos? (:output_tokens usage))
+                   (= :stop (:finish_reason response)))
+      (throw (ex-info "Basic generation lacks text, positive usage, or stop completion"
+                      {:category :incomplete-basic-generation
+                       :response_text text :reported_usage usage
+                       :finish_reason (:finish_reason response)})))
+    {:response_text text :usage usage :finish (:finish_reason response)}))
+
+(defn basic-stream-evidence [events text]
+  (let [deltas (vec (map :delta (filter #(= :text_delta (:type %)) events)))]
+    (when-not (and (seq deltas) (not (str/blank? text))
+                   (= text (apply str deltas)) (str/includes? text "3"))
+      (throw (ex-info "Stream deltas differ from the requested final answer"
+                      {:category :stream-text-mismatch :response_text text
+                       :text_deltas deltas})))
+    {:response_text text :text_deltas deltas :events (count events)}))
+
+(defn alice-extraction-evidence [output]
+  (when-not (= {"name" "Alice" "age" 30} output)
+    (throw (ex-info "Structured extraction differed from Alice, age 30"
+                    {:category :incorrect-extraction :output output})))
+  {:output output})
+
+(defn cache-tool-choice [model-info after-tool?]
+  {:mode (cond after-tool? "none"
+               (= false (:forced_tool_choice model-info)) "auto"
+               :else "required")})
+
 (defn url-image-wire-evidence [protocol body url]
   (let [[images expected]
         (case protocol
@@ -146,10 +180,27 @@
 
 (defn parallel-evidence [response expected-results]
   (let [first-step (first (:steps response))
-        actual (mapv :content (filter #(not (:is_error %)) (:tool_results first-step)))]
-    (when-not (and (= 2 (count (:tool_calls first-step)))
-                   (= 2 (count actual)) (= (set expected-results) (set actual))
-                   (every? #(str/includes? (or (:text response) "") %) expected-results))
+        calls (:tool_calls first-step)
+        ids (mapv :id calls)
+        results (:tool_results first-step)
+        actual (mapv :content (filter #(not (:is_error %)) results))
+        expected-by-id (into {} (map (fn [call]
+                                       [(:id call) (get expected-results (:name call))])
+                                     calls))
+        actual-by-id (into {} (map (fn [result]
+                                     [(:tool_call_id result) (:content result)])
+                                   results))]
+    (when-not (and (>= (count (:steps response)) 2)
+                   (= :stop (:finish_reason (last (:steps response))))
+                   (= 2 (count calls))
+                   (= 2 (count results))
+                   (= 2 (count (set ids)))
+                   (every? #(and (string? %) (not (str/blank? %))) ids)
+                   (= (set (keys expected-results)) (set (map :name calls)))
+                   (= (set ids) (set (map :tool_call_id results)))
+                   (= expected-by-id actual-by-id)
+                   (= 2 (count actual))
+                   (every? #(str/includes? (or (:text response) "") %) (vals expected-results)))
       (throw (ex-info "Parallel tools did not return both results together for the final answer"
                       {:category :missing-parallel-results
                        :tool_results (mapv :tool_results (:steps response))

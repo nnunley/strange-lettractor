@@ -1,0 +1,35 @@
+(ns harness.tests
+  "Run-and-exit for the entry points that run their own tests instead of
+   going through test/runner.lg: the probes, the live smoke, and the
+   edit-format bench. Prints the summary, prints the captured report only
+   when the run did not pass, and exits 0 or 1."
+  (:require [clojure.test :as t]
+            [os :as os]))
+
+(defn passed?
+  "successful? alone is true for {:test 0}, so a namespace whose deftests
+   moved elsewhere would exit 0 having checked nothing."
+  [summary]
+  (and (t/successful? summary) (pos? (:test summary 0))))
+
+(defn run
+  "Run the tests in namespaces with the report captured.
+   Returns {:summary :output :passed}."
+  [& namespaces]
+  (let [summary (atom nil)
+        ;; clojure.test binds *test-out* to the real stdout at load, so
+        ;; with-out-str alone captures nothing.
+        output (with-out-str
+                 (binding [t/*test-out* *out*]
+                   (reset! summary (apply t/run-tests namespaces))))]
+    {:summary @summary :output output :passed (passed? @summary)}))
+
+(defn exit!
+  "Print a run's summary, and its report when it did not pass, then exit."
+  [result]
+  (prn (:summary result))
+  (when-not (:passed result) (println (:output result)))
+  (os/exit (if (:passed result) 0 1)))
+
+(defn run-and-exit! [& namespaces]
+  (exit! (apply run namespaces)))

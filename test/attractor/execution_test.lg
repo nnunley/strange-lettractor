@@ -84,7 +84,11 @@
                           (str "PATH=" root ":/usr/bin:/bin")
                           "/bin/bash" "--noprofile" "--norc" "-p" "-c"
                           execution/command-wrapper "command-wrapper"
-                          root "0.05" "/bin/sleep 0.1; printf late > late"
+                          ;; Wait for the watchdog to start before measuring its
+                          ;; effect: a loaded runner may schedule the command
+                          ;; more than 50ms before it schedules the watchdog.
+                          root "0.05"
+                          "for i in {1..200}; do [ ! -e timeout ] || break; /bin/sleep 0.01; done; /bin/sleep 0.1; printf late > late"
                           timeout-marker cancel-marker "all")]
         (is (= 124 (:exit result)))
         (is (some? (os/stat timeout-marker)))
@@ -548,3 +552,14 @@
       (is (= 130 (:exit_code result)))
       (is (true? (:cancelled result)))
       (is (false? (some? (os/stat survived)))))))
+
+(deftest unbounded-default-is-opt-in-and-explicit-timeouts-still-apply
+  (let [env (execution/make-local-environment
+              {:unbounded_command_timeout true :default_command_timeout_ms 20 :max_command_timeout_ms 20})]
+    (try
+      (let [result ((:exec_command env) "sleep 0.1; printf done" nil nil nil)]
+        (is (= 0 (:exit_code result)))
+        (is (= "done" (:stdout result)))
+        (is (false? (:timed_out result))))
+      (is (true? (:timed_out ((:exec_command env) "sleep 0.1" 20 nil nil))))
+      (finally ((:cleanup env))))))

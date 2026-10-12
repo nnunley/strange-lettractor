@@ -1,0 +1,456 @@
+(ns attractor.continual-harness-test
+  "Comprehensive tests for Continual Harness
+   integration in Attractor coding agent loop."
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [os :as os]
+            [attractor.agent :as agent]
+            [attractor.harness :as harness]
+            [attractor.refiner :as refiner]
+            [attractor.profiles :as profiles]
+            [attractor.execution :as execution]))
+
+(deftest continual-harness-session-init-and-prompt-test
+  (let [h (harness/make-harness)
+        _ (harness/apply-edit! h {:action "create"
+                                  :kind "memory"
+                                  :id "mem-test"
+                                  :title "Test Memory"
+                                  :content "Do not divide by zero"})
+        _ (harness/apply-edit! h {:action "create"
+                                  :kind "prompt"
+                                  :id "rule-test"
+                                  :title "Safety rule"
+                                  :content "Always sanitize inputs"})
+        requests (atom [])
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)
+                   :complete_fn (fn [req]
+                                  (swap! requests conj req)
+                                  {:message {:role :assistant :content "Processed turn"}
+                                   :tool_calls []})})]
+    (try
+      (is (some? (:harness @session)))
+      (is (= h (:harness @session)))
+
+      ;; Run turn and inspect the system prompt
+      (agent/process-input! session "Run task")
+      (let [sent-prompt (get-in (first @requests) [:messages 0 :content])]
+        (is (str/includes? sent-prompt "# Continual Harness State"))
+        (is (str/includes? sent-prompt "Safety rule"))
+        (is (str/includes? sent-prompt "Do not divide by zero")))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest harness-meta-tools-test
+  (let [h (harness/make-harness)
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)})]
+    (try
+      (let [tools (profiles/profile-tools (:provider_profile @session))
+            tool-names (set (map :name tools))]
+        (is (contains? tool-names "remember"))
+        (is (contains? tool-names "recall"))
+        (is (contains? tool-names "define_subagent"))
+        (is (contains? tool-names "refine_harness"))
+        (is (contains? tool-names "eval_letgo"))
+        (is (contains? tool-names "define_tool")))
+
+      ;; Test executing 'eval_letgo'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            eval-tool (profiles/registry-get reg "eval_letgo")
+            res ((:executor eval-tool) {"code" "(str \"Platform is: \" ((:platform env)))"} env)]
+        (is (str/includes? res "Platform is: test-platform")))
+
+      ;; Test executing 'define_tool'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            define-tool-exec (profiles/registry-get reg "define_tool")
+            res ((:executor define-tool-exec)
+                  {"name" "double_it"
+                   "description" "Double an input number"
+                   "parameters" {:properties {:val {:type "number"}}}
+                   "code" "(fn [args env] (* 2 (get args \"val\")))"}
+                  env)
+            new-tool (profiles/registry-get reg "double_it")]
+        (is (str/includes? res "Defined and registered dynamic tool: double_it"))
+        (is (some? new-tool))
+        (is (= 50 ((:executor new-tool) {"val" 25} env)))
+        (is (some? (get-in @h [:entries :tool "double_it"]))))
+
+      ;; Test executing 'remember'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            remember-tool (profiles/registry-get reg "remember")
+            res ((:executor remember-tool) {"title" "Map boundary" "content" "North exit is blocked"} env)]
+        (is (str/includes? res "Remembered"))
+        (is (= "Map boundary" (get-in @h [:entries :memory (first (keys (get-in @h [:entries :memory]))) :title]))))
+
+      ;; Test executing 'recall'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            recall-tool (profiles/registry-get reg "recall")
+            res ((:executor recall-tool) {"query" "boundary"} env)]
+        (is (str/includes? res "Map boundary"))
+        (is (str/includes? res "North exit is blocked")))
+
+      ;; Test executing 'define_subagent'
+      (let [reg (get-in @session [:provider_profile :tool_registry])
+            define-tool (profiles/registry-get reg "define_subagent")
+            res ((:executor define-tool) {"id" "sql-expert" "title" "SQL Expert" "instructions" "Analyze SQL queries"} env)]
+        (is (str/includes? res "Defined subagent spec"))
+        (is (= "Analyze SQL queries" (get-in @h [:entries :subagent "sql-expert" :content]))))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest loop-detection-triggers-refinement-test
+  (let [h (harness/make-harness)
+        refine-calls (atom [])
+        mock-refine-response
+        {:message
+         {:role :assistant
+          :content "```json
+{
+  \"summary\": \"Loop detected: switch to alternate tool\",
+  \"rationale\": \"Tool calls repeating in a cycle\",
+  \"expected_outcome\": \"Break repeat cycle\",
+  \"edits\": [
+    {
+      \"action\": \"create\",
+      \"kind\": \"prompt\",
+      \"id\": \"anti-loop-rule\",
+      \"title\": \"Loop avoidance\",
+      \"content\": \"Stop repeating command X\"
+    }
+  ]
+}
+```"}}
+        mock-refine-complete
+        (fn [req]
+          (swap! refine-calls conj req)
+          mock-refine-response)
+        turn-count (atom 0)
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session (agent/make-session
+                  {:execution_env env
+                   :harness h
+                   :enable_loop_detection true
+                   :auto_refine true
+                   :loop_detection_window 2
+                   :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                            :supports_streaming false)
+                   :refiner_complete_fn mock-refine-complete
+                   :complete_fn (fn [_req]
+                                  (swap! turn-count inc)
+                                  ;; Return identical tool calls each turn to trigger detect-loop
+                                  (if (< @turn-count 4)
+                                    {:message {:role :assistant :content "Looping"}
+                                     :tool_calls [{:name "directory_list" :arguments {:path "/"}}]}
+                                    {:message {:role :assistant :content "Finished"}
+                                     :tool_calls []}))})]
+    (try
+      (agent/process-input! session "Start looping task")
+      ;; Loop detection should have fired and executed refinement!
+      (is (pos? (count @refine-calls)))
+      (is (= "Loop avoidance" (get-in @h [:entries :prompt "anti-loop-rule" :title])))
+      (finally
+        (agent/close-session! session)))))
+
+(deftest bootstrap-transfer-test
+  (let [tmp-harness "/tmp/test-bootstrap-transfer.edn"
+        h1 (harness/make-harness)
+        _ (harness/apply-edit! h1 {:action "create"
+                                   :kind "skill"
+                                   :id "fast-pathfinder"
+                                   :title "Fast Pathfinder"
+                                   :content "A* search routine"})
+        _ (harness/apply-edit! h1 {:action "create"
+                                   :kind "tool"
+                                   :id "square"
+                                   :title "square"
+                                   :content "(fn [args env] (let [x (get args \"x\")] (* x x)))"
+                                   :arguments {:description "Square a number"
+                                               :parameters {:properties {:x {:type "number"}}}}})
+        _ (harness/save-harness! @h1 tmp-harness)
+        ;; Create second session bootstrapping from tmp-harness
+        env (execution/make-environment
+              {:working_directory (fn [] "/tmp")
+               :platform (fn [] "test-platform")
+               :os_version (fn [] "test-os")
+               :inspect_command (fn [_] {:exit_code 0 :stdout ""})})
+        session2 (agent/make-session
+                   {:execution_env env
+                    :harness_bootstrap tmp-harness
+                    :provider_profile (assoc (profiles/create-openai-profile "mock/default")
+                                             :supports_streaming false)})]
+    (try
+      (is (some? (:harness @session2)))
+      (is (= "Fast Pathfinder" (get-in @(:harness @session2) [:entries :skill "fast-pathfinder" :title])))
+      (let [tools (profiles/profile-tools (:provider_profile @session2))
+            tool-names (set (map :name tools))]
+        (is (contains? tool-names "square"))
+        (let [square-tool (profiles/registry-get (get-in @session2 [:provider_profile :tool_registry]) "square")]
+          (is (some? square-tool))
+          (is (= 49 ((:executor square-tool) {"x" 7} env)))))
+      (finally
+        (agent/close-session! session2)
+        (os/sh "rm" "-f" tmp-harness)))))
+
+(defn- test-env []
+  (execution/make-environment {:working_directory (fn [] ".")
+                              :inspect_command (fn [_] {:exit_code 0 :stdout ""})}))
+(defn- test-session [opts]
+  (agent/make-session
+    (merge {:execution_env (test-env) :project_docs [] :max_subagent_depth 0
+            :provider_profile (assoc (profiles/create-openai-profile "fixture") :supports_streaming false)
+            :complete_fn (fn [_] {:message {:content "done"} :tool_calls []})} opts)))
+
+(deftest session-path-persists-edits-and-tool-rollback
+  (let [path (str (os/temp-dir) "/continual-session-" (System/currentTimeMillis) ".json")
+        session (test-session {:harness_path path :enable_continual_harness true})
+        h (:harness @session) reg (get-in @session [:provider_profile :tool_registry])]
+    (try
+      (let [r (harness/apply-proposal! h {:edits [{:kind "tool" :action "create" :id "answer"
+                                                 :content "(fn [args env] 42)"}]})
+            tool (profiles/registry-get reg "answer")]
+        (is (some? tool))
+        (when tool (is (= 42 ((:executor tool) {} {}))))
+        (is (some? (harness/load-harness path)))
+        (harness/rollback! h (:id r))
+        (is (nil? (profiles/registry-get reg "answer"))))
+      (harness/apply-edit! h {:kind "memory" :action "create" :id "learned" :content "persisted"})
+      (agent/close-session! session)
+      (let [reopened (test-session {:harness_path path :enable_continual_harness true})]
+        (try (is (= "persisted" (get-in @(:harness @reopened) [:entries :memory "learned" :content])))
+             (finally (agent/close-session! reopened))))
+      (finally (agent/close-session! session) (os/sh "rm" "-f" path)))))
+
+(deftest automatic-refinement-counts-agent-steps-and-callback-can-close
+  (let [calls (atom 0) passes (atom []) session-ref (atom nil)
+        session (test-session
+                  {:enable_continual_harness true :auto_refine true
+                   :auto_refine_interval 2 :auto_refine_warmup 1
+                   :complete_fn (fn [_] (let [n (swap! calls inc)]
+                                         (if (< n 5)
+                                           {:message {:content "step"} :tool_calls [{:id (str n) :name "directory_list" :arguments {:path "."}}]}
+                                           {:message {:content "done"} :tool_calls []})))
+                   :refiner_complete_fn (fn [request] (swap! passes conj request)
+                                          {:message {:content "{\"edits\":[]}"}})
+                   :on_event (fn [event] (when (= :refine_complete (:type event))
+                                          (agent/close-session! @session-ref)))})]
+    (reset! session-ref session)
+    (let [task (future (agent/process-input! session "go"))]
+      (is (not= :blocked (deref task 1500 :blocked)))
+      (is (= 3 @calls))
+      (is (= 4 (count @passes)))
+      (is (= :closed (:state @session))))))
+
+(deftest frozen-bootstrap-disables-mutation-tools
+  (let [session (test-session {:enable_continual_harness true :frozen_harness true})
+        names (set (profiles/registry-names (get-in @session [:provider_profile :tool_registry])))]
+    (try
+      (doseq [name ["remember" "define_tool" "define_subagent" "refine_harness"]]
+        (is (not (contains? names name))))
+      (finally (agent/close-session! session)))))
+
+(deftest model-swap-is-idle-and-provider-compatible
+  (let [session (test-session {})]
+    (try
+      (let [set-model (resolve 'attractor.agent/set-model!)]
+        (is (some? set-model))
+        (when set-model
+          (set-model session "openai/new-model")
+          (is (= "new-model" (:model @session)))
+          (is (= "new-model" (get-in @session [:provider_profile :model])))
+          (is (some? (try (set-model session "anthropic/other") nil (catch Object e e))))))
+      (finally (agent/close-session! session)))))
+
+(deftest backend-parses-harness-cadence-and-keeps-dynamic-options
+  (let [threads (atom {})
+        backend (agent/make-agent-codergen-backend
+                  {:session_options_fn (fn [_]
+                     {:execution_env (test-env) :project_docs [] :max_subagent_depth 0
+                      :provider_profile (assoc (profiles/create-openai-profile "fixture") :supports_streaming false)
+                      :enable_continual_harness true :auto_refine true
+                      :complete_fn (fn [_] {:message {:content "done"} :tool_calls []})})})]
+    (try
+      (backend {:attrs {"harness.interval" "8" "harness.warmup" "3"}
+                :resolved_fidelity "full" :resolved_thread_id "one" :fidelity_threads threads} "go" {})
+      (let [s (get-in @threads ["one" :session])]
+        (is (some? (:harness @s)))
+        (is (true? (get-in @s [:config :auto_refine])))
+        (is (= 8 (get-in @s [:config :auto_refine_interval])))
+        (is (= 3 (get-in @s [:config :auto_refine_warmup]))))
+      (finally (doseq [[_ entry] @threads] ((:close entry)))))))
+
+(deftest disabled-automatic-refinement-stays-disabled-on-loops
+  (let [calls (atom 0) refinements (atom 0)
+        session (test-session
+                  {:enable_continual_harness true :auto_refine false :auto_refine_interval 1
+                   :loop_detection_window 2
+                   :refiner_complete_fn (fn [_] (swap! refinements inc) {:message {:content "{\"edits\":[]}"}})
+                   :complete_fn (fn [_] (if (< (swap! calls inc) 4)
+                                        {:message {:content "loop"} :tool_calls [{:name "directory_list" :arguments {:path "."}}]}
+                                        {:message {:content "done"} :tool_calls []}))})]
+    (try (agent/process-input! session "go")
+         (is (= 0 @refinements))
+         (is (empty? (:refinements @(:harness @session))))
+         (finally (agent/close-session! session)))))
+
+(deftest failure-refinement-next-dispatch-and-reload-journey
+  (let [path (str (os/temp-dir) "/harness-journey-" (System/currentTimeMillis) ".edn")
+        h (harness/make-harness)
+        _ (harness/apply-edit! h {:kind "tool" :id "route" :action "create"
+                                  :content "(fn [args env] (throw (ex-info \"EXIT BLOCKED\" {})))"})
+        _ (harness/apply-edit! h {:kind "prompt" :id "task" :action "create" :content "OLD STRATEGY"})
+        calls (atom []) refiner-requests (atom [])
+        session (test-session
+                  {:harness h :harness_path path :auto_refine true :auto_refine_interval 1
+                   :refiner_complete_fn
+                   (fn [request]
+                     (swap! refiner-requests conj request)
+                     {:message {:content "{\"edits\":[{\"kind\":\"tool\",\"action\":\"update\",\"id\":\"route\",\"content\":\"(fn [args env] 42)\"},{\"kind\":\"prompt\",\"action\":\"update\",\"id\":\"task\",\"content\":\"NEW STRATEGY\"}]}"}})
+                   :complete_fn
+                   (fn [request]
+                     (swap! calls conj request)
+                     (if (<= (count @calls) 2)
+                       {:message {:content "act"} :tool_calls [{:id (str (count @calls)) :name "route" :arguments {}}]}
+                       {:message {:content "finished"} :tool_calls []}))})]
+    (try
+      (is (= "finished" (agent/process-input! session "find route")))
+      (let [results (mapcat :results (filter #(= :tool_results (:type %)) (:history @session)))]
+        (is (true? (:is_error (first results))))
+        (is (= "42" (:content (second results))))
+        (is (= 6 (count (:history @session)))))
+      (is (some #(str/includes? (get-in % [:messages 1 :content]) "EXIT BLOCKED") @refiner-requests))
+      (is (str/includes? (get-in (second @calls) [:messages 0 :content]) "NEW STRATEGY"))
+      (is (not (str/includes? (get-in (second @calls) [:messages 0 :content]) "OLD STRATEGY")))
+      (agent/close-session! session)
+      (let [reopened (test-session {:harness_path path})
+            route (profiles/registry-get (get-in @reopened [:provider_profile :tool_registry]) "route")]
+        (try (is (= 42 ((:executor route) {} (:execution_env @reopened))))
+             (is (str/includes? (get-in @(:harness @reopened) [:entries :memory "trajectory-failures" :content]) "EXIT BLOCKED"))
+             (finally (agent/close-session! reopened))))
+      (finally (agent/close-session! session) (os/sh "rm" "-f" path)))))
+
+(deftest invalid-tool-proposal-leaves-ledger-and-registry-unchanged
+  (let [session (test-session {:enable_continual_harness true}) h (:harness @session)
+        registry (get-in @session [:provider_profile :tool_registry])
+        before @h tools @registry]
+    (try
+      (is (some? (try (harness/apply-proposal! h {:edits [{:kind "memory" :id "valid" :action "create"}
+                                                        {:kind "tool" :id "invalid" :action "create" :content "(do 1)"}]})
+                      nil (catch Object e e))))
+      (is (= before @h))
+      (is (= tools @registry))
+      (finally (agent/close-session! session)))))
+
+(deftest closing-session-cancels-and-joins-pending-refiner
+  (let [entered (promise) finished (atom false)
+        session (test-session
+                  {:enable_continual_harness true :auto_refine true :auto_refine_interval 1
+                   :refiner_complete_fn (fn [_]
+                                          (deliver entered true)
+                                          (try (core/sleep 10000)
+                                               {:message {:content "{\"edits\":[{\"kind\":\"memory\",\"id\":\"late\",\"action\":\"create\"}]}"}}
+                                               (finally (reset! finished true))))})
+        task (future (agent/process-input! session "go"))]
+    (is (= true (deref entered 1000 :missing)))
+    (agent/close-session! session)
+    (is (true? @finished))
+    (is (not= :blocked (deref task 1000 :blocked)))
+    (is (nil? (get-in @(:harness @session) [:entries :memory "late"])))))
+
+(deftest new-output-path-uses-bootstrap
+  (let [base (str (os/temp-dir) "/bootstrap-source-" (System/currentTimeMillis) ".edn")
+        target (str base ".new.edn") h (harness/make-harness)]
+    (try
+      (harness/apply-edit! h {:kind "memory" :action "create" :id "seed" :content "bootstrap"})
+      (harness/save-harness! @h base)
+      (let [s (test-session {:harness_bootstrap base :harness_path target})]
+        (try (is (= "bootstrap" (get-in @(:harness @s) [:entries :memory "seed" :content])))
+             (finally (agent/close-session! s))))
+      (finally (os/sh "rm" "-f" base target)))))
+
+(deftest generic-harness-tool-supports-agent-crud
+  (let [s (test-session {:enable_continual_harness true})
+        tool (profiles/registry-get (get-in @s [:provider_profile :tool_registry]) "edit_harness")]
+    (try
+      (is (some? tool))
+      (when tool
+        (let [exec (:executor tool)]
+          (exec {"kind" "prompt" "action" "create" "id" "task" "content" "old"} {})
+          (exec {"kind" "prompt" "action" "update" "id" "task" "content" "new"} {})
+          (is (str/includes? (exec {"kind" "prompt" "action" "read" "id" "task"} {}) "new"))
+          (exec {"kind" "prompt" "action" "delete" "id" "task"} {})
+          (is (nil? (get-in @(:harness @s) [:entries :prompt "task"])))))
+      (finally (agent/close-session! s)))))
+
+(deftest child-profile-retains-shared-dynamic-tools
+  (let [parent (test-session {:enable_continual_harness true}) h (:harness @parent)]
+    (try
+      (harness/apply-edit! h {:kind "tool" :action "create" :id "shared" :content "(fn [args env] 7)"})
+      (let [child (test-session {:harness h :provider_profile (:provider_profile @parent)})
+            tool (profiles/registry-get (get-in @child [:provider_profile :tool_registry]) "shared")]
+        (try (is (= 7 ((:executor tool) {} {})))
+             (harness/apply-edit! h {:kind "tool" :action "update" :id "shared" :content "(fn [args env] 8)"})
+             (is (= 8 ((:executor (profiles/registry-get (get-in @child [:provider_profile :tool_registry]) "shared")) {} {})))
+             (finally (agent/close-session! child))))
+      (finally (agent/close-session! parent)))))
+
+(deftest abort-joins-authored-dynamic-tool-loop
+  (let [calls (atom 0) started (promise)
+        session (test-session
+                  {:enable_continual_harness true
+                   :execution_env (execution/make-environment {:calls calls :started started})
+                   :complete_fn (fn [_] {:message {:content "act"}
+                                        :tool_calls [{:id "spin" :name "spin" :arguments {}}]})})
+        h (:harness @session)]
+    (harness/apply-edit! h {:kind "tool" :action "create" :id "spin"
+                            :content "(fn [args env] (deliver (:started env) true) (loop [] (swap! (:calls env) inc) (recur)))"})
+    (let [scope (core/scope-open)
+          task (future (try (agent/process-input! session "go") (catch Object _ :stopped)))]
+      (try
+        (is (= true (deref started 1000 false)))
+        (agent/abort-session! session)
+        (let [at-abort @calls]
+          (core/sleep 25)
+          (is (= at-abort @calls))
+          (is (not= :running (deref task 25 :running))))
+        (finally (core/scope-close! scope 1000) (agent/close-session! session))))))
+
+(deftest abort-joins-interactive-evaluation
+  (let [calls (atom 0) started (promise)
+        session (test-session
+                  {:enable_continual_harness true
+                   :execution_env (execution/make-environment {:calls calls :started started})
+                   :complete_fn (fn [_] {:message {:content "act"}
+                                        :tool_calls [{:id "eval" :name "eval_letgo"
+                                                      :arguments {"timeout_ms" 10000 "code" "(deliver (:started env) true) (loop [] (swap! (:calls env) inc) (recur))"}}]})})
+        scope (core/scope-open)
+        task (future (try (agent/process-input! session "go") (catch Object _ :stopped)))]
+    (try
+      (is (= true (deref started 1000 false)))
+      (agent/abort-session! session)
+      (let [at-abort @calls]
+        (core/sleep 25)
+        (is (= at-abort @calls))
+        (is (not= :running (deref task 25 :running))))
+      (finally (core/scope-close! scope 1000) (agent/close-session! session)))))

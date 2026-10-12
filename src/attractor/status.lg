@@ -27,12 +27,12 @@
     (get outcome field)
     (get outcome (name field))))
 
-(defn- normalize-status-value [value]
+(defn- normalize-status-value [value allowed]
   (let [normalized (cond
                      (keyword? value) value
                      (string? value) (keyword value)
                      :else nil)]
-    (when (contains? allowed-statuses normalized)
+    (when (contains? allowed normalized)
       normalized)))
 
 (defn- valid-optionals? [value]
@@ -47,10 +47,10 @@
     (or (not (field-present? value :notes))
         (string? (field-value value :notes)))))
 
-(defn normalize-contract [value status-field]
+(defn- normalize-with-statuses [value status-field allowed]
   (let [normalized-status
         (when (and (map? value) (field-present? value status-field))
-          (normalize-status-value (field-value value status-field)))]
+          (normalize-status-value (field-value value status-field) allowed))]
     (when (and normalized-status (valid-optionals? value))
       (cond-> {:status normalized-status}
         (field-present? value :preferred_label)
@@ -65,6 +65,12 @@
 
         (field-present? value :notes)
         (assoc :notes (field-value value :notes))))))
+
+(defn normalize-contract [value status-field]
+  (normalize-with-statuses value status-field allowed-statuses))
+
+(defn normalize-runtime-outcome [value]
+  (normalize-with-statuses value :status (conj allowed-statuses :skipped)))
 
 (defn outcome->status-map [outcome]
   (if-let [normalized (normalize-contract outcome :status)]

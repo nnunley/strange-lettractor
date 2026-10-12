@@ -3,12 +3,16 @@
 
    Servers are declared data-only in mcp.edn files under project and user
    roots. Admission is explicit per session (:mcp [ids], same shape as
-   :skills): manifests are digest-verified, restricted to read-only
-   classes, and registered as namespaced tools after collision checks.
+   :skills): manifests are digest-verified and registered as namespaced
+   tools after collision checks. Writes additionally require host approvals
+   pinned to the resolved manifest digest and each declared write tool.
    Credentials travel by reference (env names) and live in memory only;
    evidence carries digests and redaction flags, never secret values.
    Every failure is fail-closed with an :mcp-* category."
   (:require [attractor.auth :as auth]
+            [attractor.url :as url]
+            [attractor.manifests :as manifests]
+            [attractor.text :as text]
              [attractor.context-discovery :as capacity]
             [attractor.ids :as ids]
             [attractor.mcp-client :as mcp-client]
@@ -25,8 +29,8 @@
 
 (def manifest-file "mcp.edn")
 (def approvals-file-name "mcp-approvals.edn")
-(def allowed-tool-classes #{:pure-tool :idempotent-tool :read-only-resource})
-(def allowed-side-effects #{:none :read})
+(def allowed-tool-classes #{:pure-tool :idempotent-tool :read-only-resource :write-tool})
+(def allowed-side-effects #{:none :read :write})
 (def resource-tool-suffix "read_resource")
 (def result-truncation-marker "[MCP result truncated at byte budget]")
 
@@ -108,6 +112,12 @@
                  (contains? allowed-tool-classes (:class entry))
                  (contains? allowed-side-effects (:side-effects entry)))
     (fail! :mcp-manifest-invalid {:server_id id :reason :invalid-tool-entry
+                                 :tool (:name entry)}))
+  (when (or (and (= :write-tool (:class entry))
+                 (not= :write (:side-effects entry)))
+            (and (= :write (:side-effects entry))
+                 (not (contains? #{:write-tool :idempotent-tool} (:class entry)))))
+    (fail! :mcp-manifest-invalid {:server_id id :reason :contradictory-tool-effects
                                  :tool (:name entry)}))
   (when (some? (:schema entry))
     (when-not (map? (:schema entry))
@@ -293,49 +303,21 @@
 ;; Resolution with sticky approvals.
 ;; ---------------------------------------------------------------------------
 
-(defn- approval-matches? [approval project-info user-info]
-  (and (map? approval)
-       (contains? #{"project" "user"} (:winning-root approval))
-       (= (:project-digest approval) (:manifest-digest project-info))
-       (= (:user-digest approval) (:manifest-digest user-info))))
-
 (defn- resolve-one [id roots read-text file-exists approvals]
   (let [project-info (manifest-info (:project-root roots) id read-text file-exists)
-        user-info (manifest-info (:user-root roots) id read-text file-exists)]
-    (cond (and (nil? project-info) (nil? user-info))
-          (fail! :mcp-not-found {:server_id id})
-
-          (nil? user-info)
-          {:manifest (:manifest project-info)
-           :manifest-digest (:manifest-digest project-info)
-           :root "project" :cross-root :sole-project :approval nil}
-
-          (nil? project-info)
-          {:manifest (:manifest user-info)
-           :manifest-digest (:manifest-digest user-info)
-           :root "user" :cross-root :sole-user :approval nil}
-
-          (= (:manifest-digest project-info) (:manifest-digest user-info))
-          {:manifest (:manifest project-info)
-           :manifest-digest (:manifest-digest project-info)
-           :root "project" :cross-root :agree :approval nil}
-
-          :else
-          (let [approval (get approvals id)]
-            (if (approval-matches? approval project-info user-info)
-              (let [winner (if (= "user" (:winning-root approval)) user-info project-info)
-                    loser (if (= "user" (:winning-root approval)) project-info user-info)]
-                {:manifest (:manifest winner)
-                 :manifest-digest (:manifest-digest winner)
-                 :root (:winning-root approval)
-                 :cross-root :approved
-                 :loser-digest (:manifest-digest loser)
-                 :approval {id approval}})
-              (fail! :mcp-cross-root-conflict
-                     {:server_id id
-                      :project-digest (:manifest-digest project-info)
-                      :user-digest (:manifest-digest user-info)
-                      :hint "Record a sticky approval naming winning-root plus both digests."}))))))
+        user-info (manifest-info (:user-root roots) id read-text file-exists)
+        {:keys [status winner root cross-root loser-digest approval]}
+        (manifests/select-root project-info user-info (get approvals id))]
+    (case status
+      :missing (fail! :mcp-not-found {:server_id id})
+      :conflict (fail! :mcp-cross-root-conflict
+                      {:server_id id
+                       :project-digest (:manifest-digest project-info)
+                       :user-digest (:manifest-digest user-info)
+                       :hint "Record a sticky approval naming winning-root plus both digests."})
+      (cond-> (assoc winner :root root :cross-root cross-root
+                     :approval (when approval {id approval}))
+        approval (assoc :loser-digest loser-digest)))))
 
 (defn propose-approval
   "Build the sticky approval entry for a cross-root-divergent server id
@@ -357,7 +339,7 @@
             (fail! :mcp-not-found {:server_id id})
 
             (or (nil? project-info) (nil? user-info)
-                (= (:manifest-digest project-info) (:manifest-digest user-info)))
+                (manifests/same-digest? project-info user-info))
             (fail! :mcp-approval-unneeded {:server_id id})
 
             :else
@@ -368,38 +350,12 @@
 (defn discover
   "Best-effort roster of declared servers across both roots for operators."
   [opts]
-  (let [{:keys [project-root user-root read-text list-dir]} opts]
-    (if (nil? list-dir)
-      []
-      (let [entries-for
-            (fn [root root-name]
-              (if (or (nil? root) (str/blank? root))
-                []
-                (mapv (fn [id] {:id id :root root :root-name root-name})
-                      (sort (filter valid-id? (or (list-dir root) []))))))
-            describe
-            (fn [{:keys [id root root-name]}]
-              (try
-                (let [text (read-or-nil read-text (str root "/" id "/" manifest-file))]
-                  (when (some? text)
-                    (let [manifest (edn/read-string text)]
-                      (when (and (map? manifest)
-                                 (= id (:id manifest))
-                                 (non-blank-string? (:description manifest)))
-                        {:id id
-                         :revision (str (:revision manifest))
-                         :description (:description manifest)
-                         :endpoint (when (:endpoint manifest) (str (:endpoint manifest)))
-                         :command (:command manifest)
-                         :stdio (contains? #{:stdio "stdio"} (:transport manifest))
-                         :manifest-digest (hash/sha256 text)
-                         :root root-name}))))
-                (catch Object _ nil)))
-            project-described (vec (keep describe (entries-for project-root "project")))
-            project-ids (into #{} (map :id project-described))
-            user-described (vec (keep describe (entries-for user-root "user")))]
-        (vec (concat project-described
-                     (remove #(contains? project-ids (:id %)) user-described)))))))
+  (mapv #(dissoc % :cross-root)
+        (manifests/discover opts manifest-file valid-id?
+          (fn [manifest]
+            {:endpoint (when (:endpoint manifest) (str (:endpoint manifest)))
+             :command (:command manifest)
+             :stdio (contains? #{:stdio "stdio"} (:transport manifest))}))))
 
 (defn find-manifest
   "Locate and validate one server manifest across both roots. Returns
@@ -412,7 +368,7 @@
     (cond (and (nil? project-info) (nil? user-info)) nil
           (nil? user-info) (assoc project-info :root "project")
           (nil? project-info) (assoc user-info :root "user")
-          (= (:manifest-digest project-info) (:manifest-digest user-info))
+          (manifests/same-digest? project-info user-info)
           (assoc project-info :root "project" :cross-root :agree)
           :else (assoc project-info :root "project" :cross-root :divergent))))
 
@@ -461,24 +417,8 @@
 ;; Token refresh and dynamic registration (memory only, never persisted).
 ;; ---------------------------------------------------------------------------
 
-(defn- url-encode [text]
-  (-> (str text)
-      (str/replace "%" "%25")
-      (str/replace "&" "%26")
-      (str/replace "=" "%3D")
-      (str/replace "+" "%2B")
-      (str/replace " " "%20")
-      (str/replace "/" "%2F")
-      (str/replace ":" "%3A")
-      (str/replace "?" "%3F")
-      (str/replace "#" "%23")
-      (str/replace "@" "%40")
-      (str/replace "[" "%5B")
-      (str/replace "]" "%5D")
-      (str/replace "\"" "%22")))
-
 (defn- form-body [pairs]
-  (str/join "&" (map (fn [[key value]] (str (url-encode key) "=" (url-encode value)))
+  (str/join "&" (map (fn [[key value]] (str (url/encode-component key) "=" (url/encode-component value)))
                      pairs)))
 
 (defn refresh-access-token
@@ -520,30 +460,18 @@
                         (get body "refresh_token"))})))
 
 (defn perform-registration
-  "Perform dynamic client registration against a public-client endpoint.
-   Returns {:client-id}. Fails closed with :auth-registration-conflict
-   when the server issues a secret against auth method none: the value
-   is NEVER returned or stored by the harness."
+  "Register caller-supplied public-client metadata using the bounded auth
+   transport (15s default), preserving MCP failure categories."
   [transport registration-endpoint client-metadata]
-  (let [response (try
-                   (transport {:method :post :url registration-endpoint
-                               :headers {"content-type" "application/json"
-                                         "accept" "application/json"}
-                               :body (json/write-json client-metadata)})
-                   (catch Object _
-                     (fail! :mcp-protocol-error {:reason :registration-transport-failed})))]
-    (when-not (contains? #{200 201} (:status response))
-      (fail! :mcp-protocol-error {:reason :registration-rejected
-                                 :status (:status response)}))
-    (let [body (try (json/read-json (str (:body response)))
-                    (catch Object _
-                      (fail! :mcp-protocol-error {:reason :registration-malformed})))]
-      (when-not (non-blank-string? (get body "client_id"))
-        (fail! :mcp-protocol-error {:reason :registration-without-client-id}))
-      (when (non-blank-string? (get body "client_secret"))
-        (fail! :auth-registration-conflict
-               {:reason :server-issued-secret-for-public-client}))
-      {:client-id (get body "client_id")})))
+  (try
+    (auth/register-public-client transport registration-endpoint client-metadata)
+    (catch Object error
+      (let [data (ex-data error)]
+        (case (:category data)
+          :auth-registration-conflict (throw error)
+          :auth-registration-failed
+          (fail! :mcp-protocol-error (select-keys data [:reason :status]))
+          (fail! :mcp-protocol-error {:reason :registration-transport-failed}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Result text, labels, and audit.
@@ -580,14 +508,6 @@
        "\" provenance=\"externally-supplied\">\n"
        (escape-label-text text) "\n</mcp>"))
 
-(defn- utf8-prefix [text max-bytes]
-  (loop [low 0 high (min (count text) (max 0 max-bytes))]
-    (if (= low high)
-      (subs text 0 low)
-      (let [middle (quot (+ low high 1) 2)]
-        (if (<= (count (bytes (subs text 0 middle))) max-bytes)
-          (recur middle high)
-          (recur low (dec middle)))))))
 
 (defn- truncate-output [text max-bytes]
   (let [size (count (bytes (str text)))]
@@ -595,7 +515,7 @@
       {:text (str text) :truncated false}
       (let [marker (str "\n" result-truncation-marker)
             room (max 0 (- max-bytes (count (bytes marker))))]
-        {:text (str (utf8-prefix (str text) room) marker)
+        {:text (str (text/utf8-prefix (str text) room) marker)
          :truncated true}))))
 
 (defn- audit-entry [base]
@@ -909,7 +829,7 @@
          (catch Object error
            (fail! :auth-store-failed {:server_id server-id :reason :keychain-unavailable})))))
 
-(defn- admit-one-server [session resolved token-reader transport oauth-authorizer credential-store]
+(defn- admit-one-server [session resolved token-reader transport oauth-authorizer credential-store & [staged-registry]]
   (let [manifest (:manifest resolved)
         server-id (:id manifest)
         stdio? (stdio-transport? manifest)
@@ -940,7 +860,7 @@
                  (not refresh-available?)
                  (or (:registration-endpoint manifest) (:authorization-url manifest)))
         (println (str "[mcp] " server-id ": no token configured, OAuth will trigger on first 401."))))
-    (let [registry (get-in @session [:provider_profile :tool_registry])
+    (let [registry (or staged-registry (get-in @session [:provider_profile :tool_registry]))
           _ (when (nil? registry)
               (fail! :mcp-configuration {:server_id server-id
                                         :reason :no-tool-registry}))
@@ -970,8 +890,9 @@
                         :aborted? aborted?
                          :headers (if (str/blank? (str token))
                                      {}
-                                     (auth-headers token))}))
-            server-ctx {:manifest manifest
+                                     (auth-headers token))}))]
+        (try
+          (let [server-ctx {:manifest manifest
                         :manifest-digest (:manifest-digest resolved)
                         :token-state (atom {:token token :expires-at-ms nil :origin origin})
                         :refresh-lock (atom false)
@@ -1037,10 +958,31 @@
                     :transport (if stdio? :stdio :streamable-http)
                     :server-pid (:server-pid server-ctx)
                     :tools (mapv :name tool-entries)
+                    :write-tools (mapv #(str server-id "__" %) (:admitted-write-tools resolved))
                     :resources (mapv :uri (:resources manifest))
                     :token-source (:token-env manifest)
                     :redacted true
-                    :approvals-used (:approval resolved)}}))))
+                    :approvals-used (:approval resolved)}})
+          (catch Object error
+            (try (mcp-client/close-session! handle) (catch Object _ nil))
+            (throw error)))))))
+
+(defn- require-write-approval! [resolved approvals]
+  (let [manifest (:manifest resolved)
+        server-id (:id manifest)
+        writes (mapv :name (filter #(= :write (:side-effects %)) (:tools manifest)))
+        grant (get approvals server-id)]
+    (when (seq writes)
+      (when-not (and (map? grant)
+                     (= (:manifest-digest resolved) (:manifest-digest grant))
+                     (set? (:tools grant))
+                     (every? #(contains? (:tools grant) %) writes))
+        (fail! :mcp-write-approval-required
+               {:server_id server-id
+                :manifest-digest (:manifest-digest resolved)
+                :tools writes
+                :hint "Host write-approvals must pin this manifest digest and explicitly name every write tool."})))
+    (assoc resolved :admitted-write-tools writes)))
 
 (defn mcp-config-digest [admitted]
   (hash/sha256
@@ -1052,11 +994,14 @@
   "Admit explicitly selected MCP servers into a live session. Resolves
    manifests across project/user roots with sticky approvals, verifies
    digests, requires handoff tokens, registers namespaced tools after
-   collision checks, and records per-server evidence. Returns
+   collision checks, and records per-server evidence. Write tools additionally
+   require :write-approvals {server-id {:manifest-digest digest :tools #{names}}}
+   from the host; manifest fields and cross-root approvals grant no write access.
+   Every selected server is checked before any is opened. Returns
    {:servers [...] :config-digest ...}. Every failure is fail-closed."
   [session selected-ids opts]
   (let [{:keys [project-root user-root read-text file-exists approvals
-                transport token-reader oauth-authorizer credential-store]} (or opts {})]
+                transport token-reader oauth-authorizer credential-store write-approvals]} (or opts {})]
     (when-not (and (vector? selected-ids) (seq selected-ids)
                    (every? non-blank-string? selected-ids))
       (fail! :mcp-selection-invalid {:reason :ids-must-be-non-empty-strings}))
@@ -1074,19 +1019,39 @@
     (let [resolved (mapv #(resolve-one % {:project-root project-root :user-root user-root}
                                        read-text file-exists (or approvals {}))
                          selected-ids)
-          admitted (mapv #(admit-one-server session % token-reader transport oauth-authorizer credential-store) resolved)
-          config-digest (mcp-config-digest (map :evidence admitted))]
-      (swap! session assoc :mcp_servers (mapv :evidence admitted))
-      (swap! session assoc :mcp_config_digest config-digest)
-      (swap! session update :mcp_close_fns
-             (fn [existing]
-               (vec (concat (or existing [])
-                            (map (fn [entry]
-                                   (let [handle (:handle (:server-ctx entry))]
-                                     (fn [] (mcp-client/close-session! handle))))
-                                 admitted)))))
-      {:servers (mapv :evidence admitted)
-       :config-digest config-digest})))
+          ;; Preflight the whole selection before credentials, transports, or
+          ;; registry mutation: an unapproved later server opens none of them.
+          authorized (mapv #(require-write-approval! % write-approvals) resolved)
+          registry (get-in @session [:provider_profile :tool_registry])
+          original (when registry @registry) staged (when registry (atom original)) acquired (atom [])]
+      (try
+        (doseq [server authorized]
+          (swap! acquired conj (admit-one-server session server token-reader transport oauth-authorizer credential-store staged)))
+        (let [admitted @acquired config-digest (mcp-config-digest (map :evidence admitted))
+              lock (:lifecycle_lock @session)]
+          (when lock
+            (loop [] (when-not (compare-and-set! lock false true) (core/sleep 1) (recur))))
+          (try
+            (when (or (= :closed (:state @session)) (:abort_signaled @session))
+              (fail! :mcp-cancelled {:reason :session-closed-during-admission}))
+            (when-not (compare-and-set! registry original @staged)
+              (fail! :mcp-tool-collision {:reason :registry-changed-during-admission}))
+            (swap! session
+              (fn [state]
+                (-> state
+                    (assoc :mcp_servers (mapv :evidence admitted) :mcp_config_digest config-digest)
+                    (update :mcp_close_fns
+                      (fn [existing]
+                        (vec (concat (or existing [])
+                          (map (fn [entry]
+                                 (let [handle (:handle (:server-ctx entry))]
+                                   (fn [] (mcp-client/close-session! handle)))) admitted))))))))
+            (finally (when lock (reset! lock false))))
+          {:servers (mapv :evidence admitted) :config-digest config-digest})
+        (catch Object error
+          (doseq [entry @acquired]
+            (try (mcp-client/close-session! (:handle (:server-ctx entry))) (catch Object _ nil)))
+          (throw error))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Programmatic access.
@@ -1117,7 +1082,8 @@
                        :mcp_evidence (atom [])})
         resolved (resolve-one server-id options (:read-text options)
                               (:file-exists options) approvals)
-        admitted (admit-one-server session resolved (:token-reader options)
+        authorized (require-write-approval! resolved (:write-approvals options))
+        admitted (admit-one-server session authorized (:token-reader options)
                                    (:transport options) (:oauth-authorizer options)
                                    (:credential-store options))
         server-ctx (:server-ctx admitted)

@@ -34,6 +34,48 @@
                     {:type :finish :finish_reason :stop
                      :response {:message {:text "{\"name\":\"Grace\"}"}}})))))
 
+(deftest falsy-final-json-values-match-nonstreaming-output
+  (doseq [[text schema expected] [["false" {:type "boolean"} false]
+                                 ["null" {:type "null"} nil]]
+          explicit-response? [false true]]
+    (let [response {:message {:role :assistant :content text}
+                    :tool_calls [] :usage {} :finish_reason :stop}
+          finish (cond-> {:type :finish :finish_reason :stop}
+                   explicit-response? (assoc :response response))
+          adapter (llm/make-adapter "fixture" (fn [_] response)
+                    (fn [_] [{:type :stream_start}
+                             {:type :text_delta :delta text}
+                             finish]))
+          client (llm/make-client {:providers {"fixture" adapter}})
+          generated (llm/generate-object "fixture/model" "json" schema {:client client})
+          streamed (llm/stream-object "fixture/model" "json" schema {:client client})
+          outcome (fn [] (try {:output ((:object streamed))}
+                             (catch Object e {:category (:category (ex-data e))})))]
+      (is (= {:output expected} (select-keys generated [:output])))
+      (is (= {:output expected} (outcome)))
+      ;; Re-reading a completed value must retain its successful state.
+      (is (= {:output expected} (outcome))))))
+
+(deftest falsy-stream-values-still-require-successful-finalization
+  (doseq [[text finish schema category]
+          [["false" nil {:type "boolean"} :provider]
+           ["null" nil {:type "null"} :provider]
+           ["false" {:type :finish :finish_reason :tool_calls}
+            {:type "boolean"} :no-object-generated]
+           ["null" {:type :finish :finish_reason :stop}
+            {:type "boolean"} :no-object-generated]
+           ["false" {:type :error :error (ex-info "connection lost" {:category :network})}
+            {:type "boolean"} :network]]]
+    (let [adapter (llm/make-adapter "fixture" (fn [_] nil)
+                    (fn [_] (cond-> [{:type :stream_start}
+                                      {:type :text_delta :delta text}]
+                              finish (conj finish))))
+          result (llm/stream-object "fixture/model" "json" schema
+                   {:client (llm/make-client {:providers {"fixture" adapter}})})]
+      (is (= category
+             (try ((:object result)) :unexpected-success
+                  (catch Object e (:category (ex-data e)))))))))
+
 (deftest cancellation-closes-structured-stream-and-prevents-final-object
   (let [controller (llm/make-abort-controller)
         closed (promise)

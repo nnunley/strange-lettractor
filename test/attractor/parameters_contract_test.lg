@@ -1,0 +1,252 @@
+(ns attractor.parameters-contract-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
+            [io :as io]
+            [os :as os]
+            [attractor.pipeline :as pipeline]
+            [attractor.context :as context]
+            [attractor.cli :as cli]))
+
+(def ^:private source
+  "digraph P {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     echo [shape=parallelogram, tool_command=\"printf {{direction}}\"]
+     exit [shape=Msquare]
+     start -> echo
+     echo -> exit
+   }")
+
+(deftest prepare-substitutes-a-flag-value-into-a-tool-command
+  (let [res (pipeline/prepare source {:parameters {:flags {"direction" "max"}}})]
+    (is (= [] (filter #(= :error (:severity %)) (:diagnostics res))))
+    (is (= "printf max" (get-in res [:graph :nodes "echo" :attrs :tool_command])))
+    (is (= "max" (get-in res [:parameters :values "direction"])))))
+
+(deftest prepare-uses-the-declared-default-when-nothing-is-supplied
+  (let [res (pipeline/prepare source {})]
+    (is (= "printf min" (get-in res [:graph :nodes "echo" :attrs :tool_command])))))
+
+(deftest a-missing-required-value-is-an-error-diagnostic
+  (let [src (str/replace source ":default \\\"min\\\"" "")
+        res (pipeline/prepare src {})]
+    (is (some #(= "parameter_missing" (:rule %)) (:diagnostics res)))))
+
+(deftest resolved-parameters-are-seeded-into-the-run-context
+  (let [ctx (context/make-context)
+        _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
+                                :context ctx
+                                :logs-root (str (os/temp-dir) "/attractor-param-ctx-" (random-uuid))})]
+    (is (= "max" (context/ctx-get-string ctx "param.direction")))))
+
+;; Proves the R-context-mirror ruling: a caller that does NOT supply :context
+;; must still get an engine-created context seeded with param.<name>, so an
+;; edge condition can read it. We prove this by routing on the parameter
+;; through an edge condition rather than inspecting engine internals.
+(def ^:private branching-source
+  "digraph B {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     go_min [shape=box, tool_command=\"printf took-min\"]
+     go_max [shape=box, tool_command=\"printf took-max\"]
+     exit [shape=Msquare]
+     start -> go_min [condition=\"context.param.direction=min\"]
+     start -> go_max [condition=\"context.param.direction=max\"]
+     go_min -> exit
+     go_max -> exit
+   }")
+
+(deftest no-explicit-context-still-seeds-parameters-for-edge-conditions
+  (let [outcome (pipeline/run branching-source
+                  {:parameters {:flags {"direction" "max"}}
+                   :logs-root (str (os/temp-dir) "/attractor-param-no-ctx-" (random-uuid))})]
+    (is (= [] (filter #(= :error (:severity %)) (:diagnostics outcome))))
+    (is (contains? (set (:completed_nodes outcome)) "go_max"))
+    (is (not (contains? (set (:completed_nodes outcome)) "go_min")))))
+
+(def ^:private export-source
+  "digraph P {
+     graph [params=\"[{:name :editable :type :string :export true}
+                      {:name :secret_note :type :string}]\"]
+     start [shape=Mdiamond]
+     probe [shape=parallelogram, timeout=\"30s\",
+            tool_command=\"env | grep '^ATTRACTOR_PARAM_' | sort\"]
+     exit [shape=Msquare]
+     start -> probe
+     probe -> exit
+   }")
+
+(deftest only-exported-parameters-reach-a-tool-node
+  (doseq [source [export-source
+                  (str/replace export-source "timeout=\"30s\"," "")
+                  (-> export-source
+                      (str/replace "timeout=\"30s\"," "")
+                      (str/replace "probe [shape" "node [timeout=\"30s\"]; probe [shape"))]]
+   (let [ctx (context/make-context)
+        _ (pipeline/run source
+                        {:parameters {:flags {"editable" "solve.lg" "secret_note" "hidden"}}
+                         :context ctx
+                         :logs-root (str (os/temp-dir) "/attractor-param-env-" (random-uuid))})
+        out (context/ctx-get-string ctx "tool.output")]
+    (is (str/includes? out "ATTRACTOR_PARAM_EDITABLE=solve.lg"))
+    (is (not (str/includes? out "SECRET_NOTE"))))))
+
+;; A parent's --param belongs to the parent alone. Implicit inheritance is out
+;; of scope and input_map is the sanctioned path into a child, so a child
+;; sub-pipeline must neither receive the parent's supplied values nor be judged
+;; against them: neither the parent's names nor the child's own required
+;; parameters may turn the parent's launch into an error.
+(def ^:private parent-source
+  "digraph Parent {
+     graph [params=\"[{:name :direction :type [:enum \\\"min\\\" \\\"max\\\"] :default \\\"min\\\"}]\"]
+     start [shape=Mdiamond]
+     echo [shape=parallelogram, tool_command=\"printf {{direction}}\"]
+     child [type=subpipeline, subpipeline.dotfile=\"child.dot\",
+            input_map=\"{\\\"payload\\\" \\\"payload\\\"}\"]
+     exit [shape=Msquare]
+     start -> echo
+     echo -> child
+     child -> exit
+   }")
+
+(def ^:private child-source
+  "digraph Child {
+     graph [params=\"[{:name :child_only :type :string}]\"]
+     begin [shape=Mdiamond]
+     work [shape=parallelogram, tool_command=\"printf {{child_only}}\"]
+     finish [shape=Msquare]
+     begin -> work
+     work -> finish
+   }")
+
+(deftest a-parents-parameters-are-not-resolved-against-a-child-sub-pipeline
+  (let [dir (str (os/temp-dir) "/attractor-param-child-" (random-uuid))
+        _ (io/mkdir dir)
+        _ (io/spit (str dir "/parent.dot") parent-source)
+        _ (io/spit (str dir "/child.dot") child-source)
+        res (pipeline/prepare parent-source
+              {:source-path (str dir "/parent.dot")
+               :parameters {:flags {"direction" "max"}}})
+        errors (filter #(= :error (:severity %)) (:diagnostics res))]
+    ;; The parent's own flag still lands, and nothing about the child objects.
+    (is (= [] errors))
+    (is (= "printf max" (get-in res [:graph :nodes "echo" :attrs :tool_command])))
+    (is (= {"direction" "max"} (:values (:parameters res))))
+    (is (not (some #(= "parameter_undeclared" (:rule %)) (:diagnostics res))))
+    (is (not (some #(= "parameter_missing" (:rule %)) (:diagnostics res))))
+    ;; Nothing the child declares is demanded of the parent's launch.
+    (is (not (some #(str/includes? (str (:message %)) "child_only")
+                   (:diagnostics res))))))
+
+;; The child is shielded from the PARENT's supplied values, not from its own
+;; declarations: a default the child declares must still be substituted into the
+;; child's plan. Skipping resolve-values entirely shipped the literal
+;; "{{child_opt}}" into the executed plan with no diagnostic, because the name
+;; IS declared and so the undeclared-reference rule stayed silent.
+(def ^:private defaulting-child-source
+  "digraph Child {
+     graph [params=\"[{:name :child_opt :type :string :default \\\"fallback\\\"}]\"]
+     begin [shape=Mdiamond]
+     work [shape=parallelogram, tool_command=\"printf {{child_opt}}\"]
+     finish [shape=Msquare]
+     begin -> work
+     work -> finish
+   }")
+
+(deftest a-childs-own-declared-default-is-substituted-into-the-childs-plan
+  (let [dir (str (os/temp-dir) "/attractor-param-child-default-" (random-uuid))
+        _ (io/mkdir dir)
+        _ (io/spit (str dir "/parent.dot") parent-source)
+        _ (io/spit (str dir "/child.dot") defaulting-child-source)
+        res (pipeline/prepare parent-source
+              {:source-path (str dir "/parent.dot")
+               :parameters {:flags {"direction" "max"}}})
+        child-plan (first (keep (fn [[id plan]]
+                                  (when (str/includes? (str id) "child") plan))
+                                (:plans (:workflow res))))]
+    (is (some? child-plan))
+    (is (= "printf fallback"
+           (get-in child-plan [:graph :nodes "work" :attrs :tool_command])))
+    ;; The parent's own names must still not be judged against the child.
+    (is (not (some #(= "parameter_undeclared" (:rule %)) (:diagnostics res))))))
+
+(deftest parameter-flags-parse-with-repetition-and-a-file
+  (io/spit "/tmp/attractor-params.edn" "{:direction \"max\" :max_iterations 7}")
+  (let [res (cli/parse-parameter-args
+              ["run" "wf.dot" "--params-file" "/tmp/attractor-params.edn"
+               "--param" "direction=min" "--param" "run_cmd=sh bench.sh"
+               "--trust" "delegated"])]
+    (is (= [] (:errors res)))
+    (is (= {"direction" "min" "run_cmd" "sh bench.sh"} (:flags res)))
+    (is (= "max" (get-in res [:file "direction"])))
+    (is (= 7 (get-in res [:file "max_iterations"])))
+    (is (= :delegated (:trust res)))))
+
+(deftest a-param-value-containing-an-equals-sign-survives-intact
+  ;; The split is on the FIRST '=' precisely so a value may carry its own.
+  (let [res (cli/parse-parameter-args
+              ["run" "wf.dot" "--param" "run_cmd=sh a.sh --flag=1"])]
+    (is (= [] (:errors res)))
+    (is (= {"run_cmd" "sh a.sh --flag=1"} (:flags res)))))
+
+(deftest a-malformed-param-flag-is-rejected
+  (let [res (cli/parse-parameter-args ["run" "wf.dot" "--param" "novalue"])]
+    (is (some #(clojure.string/includes? % "novalue") (:errors res)))))
+
+(deftest an-unknown-trust-level-is-rejected
+  (let [res (cli/parse-parameter-args ["run" "wf.dot" "--trust" "root"])]
+    (is (some #(clojure.string/includes? % "root") (:errors res)))))
+
+(deftest a-checkpoint-records-the-resolved-parameters
+  (let [cp {:timestamp 1 :current_node "echo" :completed_nodes [] :node_retries {}
+            :node_outcomes {} :context_values {} :logs []
+            :parameters {"direction" "max"}}
+        path "/tmp/attractor-param-cp.edn"]
+    (context/save-checkpoint cp path)
+    (is (= {"direction" "max"} (:parameters (context/load-checkpoint path))))))
+
+(deftest resume-refuses-parameters
+  (let [path "/tmp/attractor-param-cp.edn"
+        thrown (try (pipeline/resume path {:parameters {:flags {"direction" "min"}}})
+                    nil
+                    (catch Object e (ex-data e)))]
+    (is (= :workflow_configuration_error (:category thrown)))
+    (is (= :--param (:option thrown)))))
+
+(deftest resume-refuses-trust
+  (let [path "/tmp/attractor-param-cp.edn"
+        thrown (try (pipeline/resume path {:trust :delegated})
+                    nil
+                    (catch Object e (ex-data e)))]
+    (is (= :workflow_configuration_error (:category thrown)))
+    (is (= :--trust (:option thrown)))))
+
+;; The library guard is only honest if the CLI reaches it. cmd-resume never
+;; parsed the parameter flags and the hub builds resume options from a fixed
+;; set, so `attractor resume --checkpoint ... --param x=y` used to discard the
+;; flag silently.
+(deftest the-cli-resume-path-refuses-launch-scoped-parameter-flags
+  (let [cp "/tmp/attractor-param-cli-resume-cp.edn"
+        pf "/tmp/attractor-param-cli-resume.edn"]
+    (io/spit cp (pr-str {:timestamp 1 :current_node "echo" :completed_nodes []
+                         :node_retries {} :node_outcomes {} :context_values {}
+                         :logs [] :parameters {"direction" "max"}}))
+    (io/spit pf "{:direction \"min\"}")
+    (doseq [[flag argv] [["--param" ["--checkpoint" cp "--param" "direction=max"]]
+                         ["--params-file" ["--checkpoint" cp "--params-file" pf]]
+                         ["--trust" ["--checkpoint" cp "--trust" "delegated"]]]]
+      (let [exits (atom [])
+            printed (with-redefs [os/exit (fn [code] (swap! exits conj code))]
+                      (with-out-str (cli/cmd-resume argv)))]
+        (is (= [1] @exits) flag)
+        (is (str/includes? printed
+                           (str "workflow_configuration_error: option " flag
+                                " is not permitted on resume"))
+            flag)))))
+
+(deftest a-live-run-checkpoint-records-resolved-parameters
+  (let [logs-root (str (os/temp-dir) "/attractor-param-live-cp-" (random-uuid))
+        _ (pipeline/run source {:parameters {:flags {"direction" "max"}}
+                                :logs-root logs-root})
+        cp (context/load-checkpoint (str logs-root "/checkpoint.edn"))]
+    (is (= "max" (get (:parameters cp) "direction")))))

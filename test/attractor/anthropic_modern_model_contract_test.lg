@@ -37,6 +37,32 @@
       (is (= :unsupported-tool-choice (:category (ex-data error))))
       (is (false? (:retryable (ex-data error)))))))
 
+(deftest opus-5-5-captures-adaptive-completion-and-stream-requests
+  (doseq [invoke [llm/anthropic-complete llm/anthropic-stream]]
+    (let [payload (captured-request invoke {:model "claude-opus-5-5"
+                                            :reasoning_effort "high" :max_tokens 512})]
+      (is (= {"type" "adaptive"} (get payload "thinking")))
+      (is (= "high" (get-in payload ["output_config" "effort"]))))))
+
+(deftest opus-5-5-rejects-forced-choice-and-disabled-thinking-before-transport
+  (doseq [invoke [llm/anthropic-complete llm/anthropic-stream]]
+    (let [choice-error
+          (try (invoke {:model "claude-opus-5-5" :api_key "fixture-only" :messages []
+                        :tool_choice {:mode "required"}
+                        :transport (fn [_] (throw (ex-info "transport reached"
+                                                           {:category :transport-reached})))})
+               nil (catch Object e e))
+          thinking-error
+          (try (invoke {:model "claude-opus-5-5" :api_key "fixture-only" :messages []
+                        :provider_options {:anthropic {:thinking {:type "disabled"}}}
+                        :transport (fn [_] (throw (ex-info "transport reached"
+                                                           {:category :transport-reached})))})
+               nil (catch Object e e))]
+      (is (= :unsupported-tool-choice (:category (ex-data choice-error))))
+      (is (false? (:retryable (ex-data choice-error))))
+      (is (= :invalid-request (:category (ex-data thinking-error))))
+      (is (false? (:retryable (ex-data thinking-error)))))))
+
 (deftest explicit-native-options-retain-their-fields-and-effort
   (let [payload (captured-request llm/anthropic-complete
                   {:reasoning_effort "high"

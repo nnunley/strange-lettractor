@@ -1,0 +1,38 @@
+(ns attractor.schema-uri-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.schema.uri :refer [resolve-uri]]))
+
+(deftest resolves-rfc3986-normal-and-abnormal-examples
+  (let [base "http://a/b/c/d;p?q"]
+    (doseq [[reference expected]
+            [["g:h" "g:h"] ["g" "http://a/b/c/g"] ["./g" "http://a/b/c/g"]
+             ["g/" "http://a/b/c/g/"] ["/g" "http://a/g"] ["//g" "http://g"]
+             ["?y" "http://a/b/c/d;p?y"] ["g?y" "http://a/b/c/g?y"]
+             ["#s" "http://a/b/c/d;p?q#s"] ["g#s" "http://a/b/c/g#s"]
+             ["g?y#s" "http://a/b/c/g?y#s"] [";x" "http://a/b/c/;x"]
+             ["g;x" "http://a/b/c/g;x"] ["g;x?y#s" "http://a/b/c/g;x?y#s"]
+             ["" "http://a/b/c/d;p?q"] ["." "http://a/b/c/"] ["./" "http://a/b/c/"]
+             [".." "http://a/b/"] ["../" "http://a/b/"] ["../g" "http://a/b/g"]
+             ["../.." "http://a/"] ["../../" "http://a/"] ["../../g" "http://a/g"]
+             ["../../../g" "http://a/g"] ["../../../../g" "http://a/g"]
+             ["/./g" "http://a/g"] ["/../g" "http://a/g"]
+             ["g." "http://a/b/c/g."] [".g" "http://a/b/c/.g"]
+             ["g.." "http://a/b/c/g.."] ["..g" "http://a/b/c/..g"]
+             ["./../g" "http://a/b/g"] ["./g/." "http://a/b/c/g/"]
+             ["g/./h" "http://a/b/c/g/h"] ["g/../h" "http://a/b/c/h"]
+             ["g;x=1/./y" "http://a/b/c/g;x=1/y"]
+             ["g;x=1/../y" "http://a/b/c/y"]
+             ["g?y/./x" "http://a/b/c/g?y/./x"] ["g?y/../x" "http://a/b/c/g?y/../x"]
+             ["g#s/./x" "http://a/b/c/g#s/./x"] ["g#s/../x" "http://a/b/c/g#s/../x"]
+             ["http:g" "http:g"] ["?" "http://a/b/c/d;p?"]
+             ["#" "http://a/b/c/d;p?q#"] ["%2e%2e/g" "http://a/b/c/%2e%2e/g"]]]
+      (is (= expected (resolve-uri base reference)) reference))
+    (is (= "https://example.org/child" (resolve-uri "https://example.org" "child")))
+    (is (= "urn:example:schema#node" (resolve-uri "urn:example:schema" "#node")))
+    (is (= "file:///tmp/child" (resolve-uri "file:///tmp/root" "child")))))
+
+(deftest malformed-uri-references-do-not-resolve
+  (doseq [reference ["1:a" "a#b#c" "%" "%A" "%xz" "a b" "a\\b"]]
+    (is (nil? (resolve-uri "https://example.org/base" reference)) reference))
+  (is (= "https://example.org/1%3Aa" (resolve-uri "https://example.org/base" "1%3Aa")))
+  (is (= "https://example.org/a#b%23c" (resolve-uri "https://example.org/base" "a#b%23c"))))

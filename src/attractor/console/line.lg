@@ -3,12 +3,13 @@
    owns stdin; the loop interleaves submitted lines with drained hub events.
    Works on any stream, so transcript tests drive it with scripted input."
   (:require [clojure.string :as str] [clojure.core :as core] [async :as async] [io :as io]
+            [term :as term] [attractor.console.tui :as tui]
             [attractor.console.session :as session]))
 
 (defn- emit! [out lines]
   (doseq [line lines] (out line)))
 
-(defn run!
+(defn- run-plain!
   "Drive a console until it quits. Options:
      :read-line  fn returning the next line or nil at EOF (default core/read-line)
      :out        fn receiving one rendered line (default println)
@@ -47,3 +48,11 @@
     (emit! out (:lines (session/drain! console)))
     (deref reader 100 nil)
     nil))
+
+(defn run!
+  "Interactive terminals use a tiny-tui inline activity/editor; pipes and
+   injected line readers retain the plain transcript protocol."
+  [console & [opts]]
+  (if (and (term/tty? *in*) (term/tty? *out*) (term/size) (not-any? #(contains? opts %) [:read-line :out :show-prompt :prompt]))
+    (tui/run! console (assoc opts :inline? true))
+    (run-plain! console opts)))

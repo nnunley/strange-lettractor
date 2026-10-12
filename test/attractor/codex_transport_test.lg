@@ -1,7 +1,8 @@
 (ns attractor.codex-transport-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.core :as core]
-            [os :as os]))
+            [os :as os] [io :as io]
+            [attractor.codex.transport :as transport]))
 
 (defn fixture-command [mode]
   [(let [configured (os/getenv "LG_EXECUTABLE")]
@@ -123,3 +124,42 @@
       (is (< (- (System/currentTimeMillis) started) 3000) "bounded shutdown")
       (is (not (process-alive? pid)) "exact child PID is gone")
       (is (= result (close! t)) "close is idempotent"))))
+
+(deftest invalid-framing-options-are-rejected-before-resources-are-acquired
+  (let [calls (atom [])]
+    (with-redefs [os/sh (fn [& args] (swap! calls conj args) {:exit 0 :out "/fake"})
+                  io/open (fn [& _] {})]
+      (is (= :invalid-limit
+             (try (transport/open! {:command ["/bin/cat"] :max-frame-bytes 0}) nil
+                  (catch Object e (:kind (ex-data e)))))))
+    (is (empty? @calls))))
+
+(deftest failed-fifo-acquisition-removes-files-and-joins-the-child
+  (let [acquired-path (atom nil) child-pid (atom nil) real-open io/open]
+    (with-redefs [io/open (fn [path mode]
+                           (if (and (= mode :write) (clojure.string/ends-with? path "/in"))
+                             (do
+                               (reset! acquired-path path)
+                               ;; Observe the real spawned child before forcing
+                               ;; acquisition to fail while its FIFO waits.
+                               (let [pid-path (str (subs path 0 (- (count path) 2)) "pid")]
+                                 (loop [remaining 100]
+                                   (when (and (not (io/file-exists? pid-path)) (pos? remaining))
+                                     (core/sleep 5) (recur (dec remaining))))
+                                 (when (io/file-exists? pid-path)
+                                   (reset! child-pid (parse-long (clojure.string/trim (io/slurp pid-path))))))
+                               (throw (ex-info "fixture FIFO open failure" {:category :fixture-open})))
+                             (real-open path mode)))]
+      (is (= :fixture-open
+             (try (transport/open! {:command ["/bin/cat"]}) nil
+                  (catch Object e (:category (ex-data e)))))))
+    (try
+      (is (some? @child-pid))
+      (is (not (process-alive? @child-pid)))
+      (is (not (io/file-exists? @acquired-path)))
+      (finally
+        ;; Keep the regression safe even if acquisition cleanup regresses.
+        (when (and @child-pid (process-alive? @child-pid))
+          (os/sh "/bin/kill" "-KILL" (str @child-pid)))
+        (when @acquired-path
+          (os/sh "/bin/rm" "-rf" "--" (subs @acquired-path 0 (- (count @acquired-path) 3))))))))

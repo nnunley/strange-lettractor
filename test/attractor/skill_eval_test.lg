@@ -443,7 +443,8 @@
                                             {})]
     (is (= :skipped (:status (first (filter #(= :irrelevant (:selection-kind %)) (:runs matrix))))))
     (is (= :hold (:verdict report)))
-    (is (= :no-irrelevant-coverage (:reason (first (:reasons report)))))))
+    (is (= :no-irrelevant-coverage (:reason (first (:reasons report)))))
+    (is (= report (skill-eval/validate-report! report)))))
 
 (deftest forged-reports-fail-validation-despite-matching-digest
   (let [{:keys [roots corpus workers]} (matrix-fixture)

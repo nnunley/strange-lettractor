@@ -1,0 +1,138 @@
+(ns attractor.execution-scope-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core :as core] [clojure.string :as str]
+            [attractor.execution :as execution] [io :as io] [os :as os]))
+
+(defn await-start [root name]
+  (loop [remaining 300]
+    (if (os/stat (str root "/" name ".started")) true
+      (when (> remaining 0) (core/sleep 10) (recur (dec remaining))))))
+
+(defn start-command [env name]
+  (core/future
+    ((:exec_command env)
+     (str "trap '' TERM; printf started > " name ".started; "
+          "while [ ! -e release ]; do /bin/sleep 0.02; done; "
+          "printf survived > " name ".survived")
+     15000 nil nil)))
+
+(defn fixture [f]
+  (let [root (str/trim (:out (os/sh "/usr/bin/mktemp" "-d")))
+        parent (execution/make-local-environment {:working_dir root})]
+    (try
+      (is (fn? (:fork_scope parent)) "Local environments expose independent cancellation scopes")
+      (when (:fork_scope parent) (f parent root))
+      (finally
+        (io/spit (str root "/release") "")
+        ((:cleanup parent))
+        (doseq [entry (os/ls root)] (io/delete-file (str root "/" entry)))
+        (io/delete-file root)))))
+
+(deftest test-closing-child-joins-descendants-and-preserves-parent-and-sibling
+  (fixture
+    (fn [parent root]
+      (let [child ((:fork_scope parent)) sibling ((:fork_scope parent))
+            descendant ((:fork_scope child))
+            view ((:with_working_directory child) ".")
+            child-task (start-command view "child")
+            nested-task (start-command descendant "nested")
+            parent-task (start-command parent "parent")
+            sibling-task (start-command sibling "sibling")]
+        (doseq [name ["child" "nested" "parent" "sibling"]] (is (true? (await-start root name))))
+        ((:cleanup child))
+        (doseq [task [child-task nested-task]]
+          (let [result (deref task 500 :unfinished)]
+            (is (= 130 (:exit_code result))) (is (true? (:cancelled result)))))
+        (is (= :running (deref parent-task 10 :running)))
+        (is (= :running (deref sibling-task 10 :running)))
+        (io/spit (str root "/release") "")
+        (doseq [task [parent-task sibling-task]] (is (= 0 (:exit_code (deref task 3000 :unfinished)))))
+        (doseq [name ["child" "nested"]] (is (nil? (os/stat (str root "/" name ".survived")))))
+        (doseq [name ["parent" "sibling"]] (is (some? (os/stat (str root "/" name ".survived")))))))))
+
+(deftest test-parent-cleanup-closes-nested-scopes-and-rejects-late-forks
+  (fixture
+    (fn [parent root]
+      (let [child ((:fork_scope parent)) nested ((:fork_scope child))
+            task (start-command nested "nested")]
+        (is (true? (await-start root "nested")))
+        ((:cleanup parent))
+        (is (= 130 (:exit_code (deref task 500 :unfinished))))
+        (doseq [env [parent child nested]]
+          (is (= :execution-environment-closed
+                 (try ((:fork_scope env)) nil
+                      (catch Object error (:category (ex-data error))))))
+          (is (true? (:cancelled ((:exec_command env) "printf late > late" 1000 nil nil)))))
+        (is (nil? (os/stat (str root "/late"))))))))
+
+(deftest test-fork-racing-parent-cleanup-never-creates-a-live-orphan
+  (fixture
+    (fn [parent root]
+      (let [gate (promise)
+            forks (mapv (fn [_]
+                          (core/future
+                            @gate
+                            (try ((:fork_scope parent))
+                                 (catch Object error (:category (ex-data error))))))
+                        (range 24))
+            closing (core/future @gate ((:cleanup parent)))]
+        (deliver gate true)
+        (is (not= :unfinished (deref closing 3000 :unfinished)))
+        (doseq [task forks]
+          (let [child (deref task 3000 :unfinished)]
+            (if (= :execution-environment-closed child)
+              (is true)
+              (do
+                (is (map? child))
+                (is (true? (:cancelled ((:exec_command child) "printf late > late" 1000 nil nil))))))))
+        (is (nil? (os/stat (str root "/late"))))))))
+
+(deftest test-forks-preserve-filesystem-and-local-execution-options
+  (fixture
+    (fn [_ root]
+      (let [parent (execution/make-local-environment
+                     {:working_dir root :env_policy :none
+                      :default_command_timeout_ms 50 :max_command_timeout_ms 80
+                      :rg_command "/usr/bin/false"})
+            child ((:fork_scope parent))]
+        (try
+          (is (= root ((:working_directory child))))
+          ((:write_file child) "shared" "shared content")
+          (is (= "shared content" ((:read_text parent) "shared")))
+          (is (= "" (:stdout ((:exec_command child) "printf '%s' \"$PATH\"" 1000 nil nil))))
+          (doseq [[requested expected] [[nil "50ms"] [1000 "80ms"]]]
+            (let [result ((:exec_command child) "/bin/sleep 1" requested nil nil)]
+              (is (true? (:timed_out result)))
+              (is (str/includes? (:stderr result) expected))))
+          ;; false returns no matches; default rg would find the file content.
+          (is (= "" ((:grep child) "shared" "." {})))
+          (finally ((:cleanup parent))))))))
+
+(deftest test-parent-cleanup-fences-a-child-command-admitted-before-shell-start
+  (fixture
+    (fn [parent root]
+      (let [child ((:fork_scope parent))
+            admitted (promise) release (promise) original-sh os/sh]
+        (with-redefs [os/sh (fn [& args]
+                             (when (and (= "/bin/bash" (first args))
+                                        (= execution/command-wrapper (nth args 5 nil)))
+                               (deliver admitted true)
+                               @release)
+                             (apply original-sh args))]
+          (let [task (core/future ((:exec_command child) "printf late > late" 10000 nil nil))]
+            (try
+              (is (= true (deref admitted 3000 :unfinished)))
+              (let [closing (core/future ((:cleanup parent)))
+                    closed? (loop [attempts 300]
+                              (let [closed? (try ((:fork_scope child)) false
+                                                 (catch Object error
+                                                   (= :execution-environment-closed (:category (ex-data error)))))]
+                                (cond closed? true
+                                      (= 0 attempts) false
+                                      :else (do (core/sleep 1) (recur (dec attempts))))))]
+                (is (true? closed?))
+                (deliver release true)
+                (is (not= :unfinished (deref closing 4000 :unfinished)))
+                (is (= 130 (:exit_code (deref task 1000 :unfinished))))
+                (is (nil? (os/stat (str root "/late")))))
+              (finally (deliver release true)))))))))

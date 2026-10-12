@@ -1,0 +1,9 @@
+// Opt-in training: configure co-learning.edn before running this workflow.
+// Ordinary harness sessions do not need this workflow or any trainer.
+digraph ContinualHarnessCoLearning {
+    graph [goal="Run bounded native-agent rollouts and configured model training"]
+    start [shape=Mdiamond]
+    learn [type="co_learning", co_learning.config="examples/continual-harness/co-learning.edn", goal_gate=true]
+    exit [shape=Msquare]
+    start -> learn -> exit
+}

@@ -1,0 +1,25 @@
+(ns attractor.schema-official-reference-test
+  (:require [clojure.test :refer [deftest]]
+            [attractor.schema-official-fixtures :as fixtures]))
+
+(defn- registry []
+  (into (into {} (map (fn [name]
+                       (let [uri (str "http://localhost:1234/draft2020-12/" name ".json")]
+                         [uri (fixtures/remote uri)]))
+                     ["detached-dynamicref" "tree" "extendible-dynamic-ref"]))
+        (map (fn [name]
+               (let [schema (fixtures/fixture (str "meta/" name ".json"))]
+                 [(get schema "$id") schema]))
+             ["schema" "core" "applicator" "unevaluated" "validation"
+              "meta-data" "format-annotation" "content"])))
+
+(defn- check-corpus [name]
+  (let [resources (registry)]
+    ;; Omitting a default dialect deliberately exercises compatibility mode.
+    (doseq [group (fixtures/corpus (str name ".json"))]
+      (fixtures/check-group name group {:schema_registry resources}))))
+
+(deftest official-static-references (check-corpus "ref"))
+(deftest official-dynamic-references (check-corpus "dynamicRef"))
+(deftest official-unevaluated-properties (check-corpus "unevaluatedProperties"))
+(deftest official-unevaluated-items (check-corpus "unevaluatedItems"))

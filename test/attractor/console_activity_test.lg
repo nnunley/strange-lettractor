@@ -1,0 +1,83 @@
+(ns attractor.console-activity-test
+  (:require [clojure.test :refer [deftest is]]
+            [attractor.console.session :as session]))
+
+(defn console [] (atom {:focus {:kind :session :id "s"} :session "s" :text_buffers {} :presentation true}))
+(defn ev [type fields] {:source :session :session_id "s" :event (assoc fields :type type)})
+(deftest activity-tracks-identities-without-transcript-noise
+  (let [c (console)]
+    (is (= [] (session/render-envelope c (ev :tool_call_start {:call_id "a" :tool_name "read_file"}))))
+    (session/render-envelope c (ev :tool_call_start {:call_id "b" :tool_name "read_file"}))
+    (is (= 2 (count (get-in @c [:activity :active]))))
+    (session/render-envelope c (ev :tool_call_end {:call_id "a" :tool_name "read_file"}))
+    (session/render-envelope c (ev :tool_call_end {:call_id "a" :tool_name "read_file"}))
+    (is (= 1 (get-in @c [:activity :done])))
+    (is (= ["tool read_file failed"] (session/render-envelope c (ev :tool_call_end {:call_id "b" :tool_name "read_file" :error "bad"}))))
+    (session/render-envelope c (ev :processing_end {}))
+    (is (empty? (get-in @c [:activity :active])))))
+(deftest other-focus-does-not-contaminate-activity
+  (let [c (console)]
+    (session/render-envelope c (assoc (ev :tool_call_start {:call_id "a" :tool_name "shell"}) :session_id "other"))
+    (is (empty? (get-in @c [:activity :active])))))
+
+(deftest child-identities-and-wait-polls-stay-bounded
+  (let [c (console)]
+    (doseq [id ["a" "b"]]
+      (session/render-envelope c (ev :subagent_event {:agent_id id :event {:type :tool_call_start :tool_name "shell" :call_id "same"}})))
+    (is (= 2 (count (get-in @c [:activity :active]))))
+    (doseq [n (range 100)]
+      (is (= [] (session/render-envelope c (ev :tool_call_start {:call_id (str n) :tool_name "wait"}))))
+      (session/render-envelope c (ev :tool_call_end {:call_id (str n) :tool_name "wait"})))
+    (is (= 2 (count (get-in @c [:activity :active]))))
+    (is (= 100 (get-in @c [:activity :done])))
+    (is (= ["hello"] (session/render-envelope c (ev :assistant_text_end {:text "hello"}))))
+    (session/render-envelope c (ev :error {:error "failed"}))
+    (is (empty? (get-in @c [:activity :active])))))
+
+(deftest child-terminal-events-retire-only-that-childs-active-calls
+  (doseq [terminal [:session_end :error :processing_end]]
+    (let [c (console)]
+      (session/render-envelope c (ev :tool_call_start {:call_id "parent" :tool_name "wait"}))
+      (doseq [child ["child" "sibling"]]
+        (session/render-envelope c
+          (ev :subagent_event {:agent_id child :event {:type :tool_call_start :call_id "same" :tool_name "shell"}})))
+      (session/render-envelope c (ev :subagent_event {:agent_id "child" :event {:type terminal}}))
+      (is (= #{[nil "parent"] ["sibling" "same"]}
+             (set (keys (get-in @c [:activity :active])))))
+      (is (= 0 (get-in @c [:activity :done]))))))
+
+(deftest thread-drain-tracks-selected-subtree-with-snapshot-transcripts
+  (let [events (atom [])
+        c (session/open! nil {:request_fn (fn [r] {:value (case (:op r)
+                                            :client/attach {:client_id "c" :cursor 0}
+                                            :thread/list [{:thread_id "child"} {:thread_id "s"} {:thread_id "grandchild"}]
+                                            :thread/read {:thread_id (:thread_id r) :history []}
+                                            {})})
+                             :events_fn (fn [_ cursor] (let [batch @events] (reset! events []) {:events batch :cursor (inc cursor)}))})
+        child (fn [id event] (ev :subagent_event {:agent_id id :event event}))
+        start {:type :tool_call_start :tool_name "read_file" :call_id "same"}
+        end {:type :tool_call_end :tool_name "read_file" :call_id "same"}]
+    (session/handle! c {:type :line :text "/thread child"})
+    (reset! events [(child "sibling" start) (child "child" start)
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event start})])
+    (is (empty? (:lines (session/drain! c))))
+    (is (= #{[nil "same"] ["grandchild" "same"]} (set (keys (get-in @c [:activity :active])))))
+    (reset! events [(child "sibling" end) (child "child" end)])
+    (session/drain! c)
+    (is (= 1 (get-in @c [:activity :done])))
+    (is (= #{["grandchild" "same"]} (set (keys (get-in @c [:activity :active])))))
+    (reset! events [(child "sibling" {:type :error :error "irrelevant"})
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event {:type :error :error "relevant"}})])
+    (let [lines (:lines (session/drain! c))]
+      (is (= 1 (count lines)))
+      (is (= "[thread grandchild] error: relevant" (first lines))))
+    (is (empty? (get-in @c [:activity :active])))
+    (session/handle! c {:type :line :text "/thread grandchild"})
+    (reset! events [(child "child" start)
+                    (child "child" {:type :subagent_event :agent_id "grandchild" :event start})])
+    (session/drain! c)
+    (is (= #{[nil "same"]} (set (keys (get-in @c [:activity :active])))))
+    (session/handle! c {:type :line :text "/thread s"})
+    (reset! events [(ev :tool_call_start {:tool_name "wait" :call_id "root"}) (child "child" start) (child "sibling" start)])
+    (session/drain! c)
+    (is (= 3 (count (get-in @c [:activity :active]))))))

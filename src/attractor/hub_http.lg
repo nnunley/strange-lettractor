@@ -1,7 +1,7 @@
 (ns attractor.hub-http
   "HTTP controls over a supplied hub request function; no execution registry."
   (:require [attractor.ids :as ids] [clojure.string :as str] [json :as json]
-            [attractor.graphviz :as graphviz]))
+            [attractor.graphviz :as graphviz] [attractor.thread-ui :as thread-ui]))
 
 (defn- response [value & [status]]
   {:status (or status 200)
@@ -92,7 +92,7 @@
                           (select-keys (ex-data e) [:request_id :outcome_unknown])))
                  "\n\n"))))))
 
-(defn make-handler [request!]
+(defn- pipeline-handler [request!]
   (fn [req]
     (try
       (let [path (or (:path req) "") raw-method (or (:request-method req) :get)
@@ -151,3 +151,69 @@
                     :unknown-run 404 :unknown-question 404 :invalid-request 400 :invalid-cursor 400
                     :request-timeout 503 :stopped 503 :connection-closed 503 :transport-error 503
                     :protocol-error 502 500))))))
+
+;; Browser controls are isolated from the legacy pipeline CORS contract.
+(defn- header [req key]
+  (some (fn [[k v]] (when (= key (str/lower-case (name k))) v)) (:headers req)))
+(defn- browser-response [value status]
+  {:status status :headers {"Content-Type" "application/json" "Cache-Control" "no-store"
+                             "X-Content-Type-Options" "nosniff"} :body (json/write-json value)})
+(defn- browser-request! [req method]
+  (let [origin (header req "origin") host (or (:server-addr req) (header req "host"))
+        scheme (name (or (:scheme req) :http))]
+    ;; Match literal loopback authorities, never a suffix or DNS resolution.
+    ;; This also prevents a rebound hostname from satisfying same-origin checks.
+    (when-not (and (string? host)
+                   (re-matches #"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+)?" host))
+      (throw (ex-info "Loopback Host required" {:category :forbidden})))
+    (when-let [peer (:remote-addr req)]
+      (when-not (and (string? peer)
+                     (re-matches #"(?:127\.0\.0\.1(?::[0-9]+)?|\[::1\](?::[0-9]+)?|::1)" peer))
+        (throw (ex-info "Loopback peer required" {:category :forbidden}))))
+    (when (and origin (not= origin (str scheme "://" host)))
+      (throw (ex-info "Foreign origin rejected" {:category :forbidden})))
+    (when (and (= method :post)
+               (not= "application/json" (str/lower-case (str/trim (first (str/split (or (header req "content-type") "") #";"))))))
+      (throw (ex-info "JSON content type required" {:category :forbidden})))))
+(defn- browser-handler [request! req]
+  (try
+    (let [path (:path req) method (keyword (str/lower-case (name (or (:request-method req) :get))))
+          _ (browser-request! req method)
+          body (when (= method :post)
+                 (try (let [value (json/read-json (or (:body req) "{}"))]
+                        (when-not (map? value) (throw (ex-info "Expected JSON object" {}))) value)
+                      (catch Object _ (throw (ex-info "Expected JSON object" {:category :invalid-request})))))
+          parts (str/split path #"/") id (nth parts 2 nil) action (nth parts 3 nil)
+          reply (fn [op fields] (browser-response (ask request! op fields) 200))]
+      (cond
+        (and (= path "/") (= method :get))
+        {:status 200 :headers {"Content-Type" "text/html; charset=utf-8" "Cache-Control" "no-store"
+                              "X-Frame-Options" "DENY" "Referrer-Policy" "no-referrer"
+                              "Content-Security-Policy" "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}
+         :body thread-ui/page}
+        (and (= path "/threads") (= method :get)) (reply :thread/list {})
+        (and (= path "/threads") (= method :post)) (reply :session/open {})
+        (and (= 3 (count parts)) (= method :get)) (reply :thread/read {:thread_id id})
+        (and (= 4 (count parts)) (= method :post))
+        (case action
+          "messages" (let [text (get body "text") behavior (get body "behavior" "steer")]
+                       (when-not (and (string? text) (not (str/blank? text)) (contains? #{"steer" "followup"} behavior))
+                         (throw (ex-info "Expected text and steer/followup behavior" {:category :invalid-request})))
+                       (browser-response
+                         (dissoc (ask request! :thread/submit {:thread_id id :text text :behavior (keyword behavior)}) :completion)
+                         200))
+          "cancel" (reply :thread/cancel {:thread_id id})
+          "resume" (reply :thread/resume {:thread_id id})
+          (browser-response {:error "Unknown thread action"} 404))
+        :else (browser-response {:error "Endpoint not found"} 404)))
+    (catch Object e
+      (browser-response (merge {:error (ex-message e)} (select-keys (ex-data e) [:request_id :outcome_unknown]))
+                        (case (:category (ex-data e)) :forbidden 403 :invalid-request 400
+                          :unknown-thread 404 :thread-archived 409 :thread-live 409 :incomplete-tool-turn 409
+                          :request-timeout 503 :stopped 503 :connection-closed 503 :transport-error 503 500)))))
+(defn make-handler [request!]
+  (let [legacy (pipeline-handler request!)]
+    (fn [req]
+      (if (or (= "/" (:path req)) (= "/threads" (:path req)) (str/starts-with? (or (:path req) "") "/threads/"))
+        (browser-handler request! req)
+        (legacy req)))))

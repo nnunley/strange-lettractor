@@ -63,7 +63,7 @@
 (defn- parse-clause [source]
   (let [source (str/trim source)]
     (cond
-      (str/blank? source) nil
+      (str/blank? source) (syntax-error! "Empty condition clause")
       (re-matches #"^[A-Za-z_][A-Za-z0-9_.]*$" source) {:key source}
       :else
       (if-let [parts (re-matches #"(?s)^([A-Za-z_][A-Za-z0-9_.]*)\s*(!=|=)\s*(.+)$" source)]
@@ -93,6 +93,12 @@
     true
     (let [clauses (mapv parse-clause (split-clauses condition))]
       (every? #(evaluate-parsed-clause % outcome context) clauses))))
+
+(defn condition-references-key? [condition key]
+  (boolean
+    (and (not (str/blank? condition))
+         (some #(= key (:key %))
+               (map parse-clause (split-clauses condition))))))
 
 (defn validate-condition-syntax [condition]
   (try
