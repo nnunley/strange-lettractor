@@ -1,7 +1,15 @@
 (ns attractor.session-error-http-bounded-test
-  (:require [clojure.test :refer [deftest is]] [probes.session-error-http-bounded :as bounded]))
+  (:require [clojure.test :refer [deftest is]] [attractor.http-fixture :refer [quote-shell]]
+            [harness.runtime :as runtime] [probes.session-error-http-bounded :as bounded]))
+;; Literal expectations: the command test below builds its expected string with
+;; quote-shell, so it cannot catch a quoting bug on its own.
+(deftest quote-shell-literals
+  (is (= "'/usr/bin/lg'" (quote-shell "/usr/bin/lg")))
+  (is (= "'a b'" (quote-shell "a b")))
+  (is (= "'a'\"'\"'b'" (quote-shell "a'b"))))
 (deftest bounded-command-validation
-  (let [base "/Users/ndn/development/let-go/lg -source-paths src:test test/probes/session_error_http_check.lg run"]
+  (let [base (str (quote-shell (runtime/lg-path))
+                  " -source-paths src:test test/probes/session_error_http_check.lg run")]
     (is (= base (bounded/command [])))
     (is (= (str base " 31001") (bounded/command ["31001"])))
     (doseq [args [["0"] ["65536"] ["bad"] ["31001; echo bad"] ["31001" "extra"]]]
